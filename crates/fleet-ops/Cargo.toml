@@ -15,6 +15,10 @@ fleet-crypto.workspace = true
 # process: child programs (fixed paths, argv only).
 tokio = { workspace = true, features = ["process"] }
 thiserror.workspace = true
+# systemd Manager/Unit over the system bus (services group).
+zbus.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest.workspace = true

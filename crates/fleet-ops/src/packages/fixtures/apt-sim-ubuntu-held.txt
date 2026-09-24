@@ -1,0 +1,19 @@
+NOTE: This is only a simulation!
+      apt-get needs root privileges for real execution.
+      Keep also in mind that locking is deactivated,
+      so don't depend on the relevance to the real current situation!
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+The following packages have been kept back:
+  docker-ce nginx
+The following packages will be upgraded:
+  libc-bin libc6 libc6:i386
+3 upgraded, 0 newly installed, 0 to remove and 2 not upgraded.
+Inst libc6 [2.35-0ubuntu3.6] (2.35-0ubuntu3.7 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64]) [libc-bin:amd64 ]
+Inst libc6:i386 [2.35-0ubuntu3.6] (2.35-0ubuntu3.7 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [i386])
+Inst libc-bin [2.35-0ubuntu3.6] (2.35-0ubuntu3.7 Ubuntu:22.04/jammy-updates [amd64])
+Conf libc6 (2.35-0ubuntu3.7 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])
+Conf libc6:i386 (2.35-0ubuntu3.7 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [i386])
+Conf libc-bin (2.35-0ubuntu3.7 Ubuntu:22.04/jammy-updates [amd64])

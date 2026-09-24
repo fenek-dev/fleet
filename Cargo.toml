@@ -57,6 +57,9 @@ unicode-normalization = "0.1.25"
 redb = "4.3.0"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "io-util", "macros", "time", "signal", "sync", "fs"] }
 thiserror = "2.0.21"
+# systemd D-Bus client (fleet-ops services); tokio executor, no async-io.
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 # Mac core
 # SSH client (design §3.2). `ring` backend only: no RSA, no zlib, no aws-lc

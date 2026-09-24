@@ -193,6 +193,7 @@ impl Registry {
             fleet_proto::op::tag::SYSTEM_INFO,
             Rc::new(crate::system::SystemInfoHandler),
         );
+        crate::packages::register(&mut r);
         r
     }
 
@@ -267,10 +268,7 @@ mod tests {
         assert!(r.get(&Op::SystemInfo).is_some());
         assert!(r.get(&Op::AgentHealth).is_none());
         assert!(r.get(&Op::Unknown { tag: 0 }).is_none());
-        assert_eq!(
-            r.tags().collect::<Vec<_>>(),
-            [fleet_proto::op::tag::SYSTEM_INFO]
-        );
+        assert!(r.tags().any(|t| t == fleet_proto::op::tag::SYSTEM_INFO));
     }
 
     #[test]

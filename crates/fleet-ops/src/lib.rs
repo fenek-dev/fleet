@@ -10,7 +10,9 @@
 //!   cleared, timeout and output cap. Never a shell.
 //! - [`scope`]: `systemd-run --scope` wrapping for long-running children.
 //!
-//! Generic handlers live here (`system.info`); handlers bound to exec's
+//! Generic handlers live here (`system.info`, [`packages`]; [`services`]
+//! needs a D-Bus connection, so exec registers it with
+//! [`services::register`]); handlers bound to exec's
 //! state (roster, policy, veto, `agent.health`) are registered by exec
 //! behind the same trait.
 //!
@@ -19,10 +21,14 @@
 
 pub mod ctx;
 pub mod handler;
+pub mod packages;
 pub mod procfs;
 pub mod runner;
 pub mod scope;
+pub mod services;
 pub mod system;
+#[cfg(test)]
+pub(crate) mod testutil;
 
 pub use ctx::{Clock, ManualClock, SysCtx, SystemClock};
 pub use handler::{

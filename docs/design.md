@@ -340,6 +340,8 @@ The **capability group** in the first column is the name the policy uses (sectio
 - Auto-revert ops (`firewall.apply`, `authorized_keys.set`, `profile.apply`, `mesh.join/leave/peers.set`) answer `Payload::ChangePending { change_id, deadline_ms, … }`. `change.confirm` confirms any of them.
 - Streams (`StreamOpen` only): `metrics.subscribe`, `journal.follow`, `logfile.tail`, `docker.logs`, `docker.stats`. Each `StreamData` chunk is one postcard `Payload`. The monitor subset is `agent.health` and `metrics.subscribe`.
 - Arguments never carry secrets (no WireGuard preshared keys, no `.env` contents), because operation arguments are stored in the audit log.
+- `services` (`fleet_ops::services`) talks to systemd over the system bus (`zbus`, behind a `SystemdApi` trait): `ListUnits` merged with `ListUnitFiles` (disabled units aren't loaded), `LoadUnit` + `GetAll` for status, `Start/Stop/Restart/ReloadUnit` in mode `replace` waiting for the job's `JobRemoved` (120 s, then `Timeout`; the job itself keeps running), `Enable/DisableUnitFiles` then `Reload`. Refused with `PolicyDenied` before the nonce is consumed: any change to a `fleet-*` unit, and `unit.stop`/`unit.disable` of `ssh.service`, `sshd.service` or `ssh.socket` (lockout; restart and reload stay allowed). `PropertiesChanged` signals on unit objects feed `service.state_changed` events and the `ServiceDown` rule.
+- `packages` (`fleet_ops::packages`) calls only `/usr/bin/apt-get`, `/usr/bin/apt-mark` and `/usr/bin/dpkg-query`. Mutations run in the op's scope with `DEBIAN_FRONTEND=noninteractive`, `UCF_FORCE_CONFFOLD=1`, `--force-confdef --force-confold` and `DPkg::Lock::Timeout=60` (lock still held after a minute → `Busy`). Every apt transaction is first simulated (`-s`), and refused if it would remove `openssh-server`, `openssh-sftp-server`, `sudo`, `systemd`, `systemd-sysv`, `dbus`, `nftables` or a `fleet*` package, whatever the cause. `pkg.upgradable` parses `apt-get -s dist-upgrade` (`Debug::NoLocking`, so it never waits on a running apt); an upgrade is security when any origin contains `-security`; held packages never appear there. `pkg.upgrade{All}` is `apt-get upgrade --with-new-pkgs` (never removes; upgrades that need removals stay listed). `SecurityOnly` is `apt-get install --only-upgrade name=candidate…` for exactly the security set (not `unattended-upgrade`, whose effect depends on local config, including automatic reboots), and restores the auto-installed marks `install` clears. Results are the `dpkg-query` diff before and after. `pkg.refresh` answers the new `Upgradable`. `pkg.history` is `history.log` plus `dpkg.log` entries apt didn't log (plain `dpkg -i`); both are read as UTC (the baseline sets it). `dpkg.log` is tailed for `packages.changed` events.
 
 | Group | Operations |
 |---|---|
@@ -1141,7 +1143,8 @@ Modules can be run repeatedly without side effects. Each change is recorded in c
 **Updates**
 
 - `unattended-upgrades` for security updates, `needrestart` in automatic mode, and an optional reboot window.
-- `needrestart` never restarts `fleet-*` units; the agent is restarted only through `agent.update` or its own watchdog.
+- `needrestart` never restarts `fleet-*` units; the agent is restarted only through `agent.update` or its own watchdog. The installer drops `packaging/needrestart/fleet.conf` into `/etc/needrestart/conf.d/` (`$nrconf{override_rc}` entries for `^fleet-`, `^fleet@`, `^fleet\.`). Restarting `fleet-exec` from an apt hook would also cut off the package operation that triggered it.
+- `unattended-upgrades` and Fleet's own `pkg.*` operations share the dpkg lock: an operation waits up to 60 s for it, then answers `Busy` (section 4.2).
 
 **Services**
 
