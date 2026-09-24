@@ -23,6 +23,7 @@ serde_json.workspace = true
 x509-parser.workspace = true
 sha2.workspace = true
 blake3.workspace = true
+yaml-rust2.workspace = true
 libc.workspace = true
 
 [dev-dependencies]

@@ -192,6 +192,7 @@ fn pending_changes_expiry() {
     std::fs::write(dir.path().join("pending/.x.tmp"), b"junk").unwrap();
     let mk = |deadline_ms| PendingChange {
         kind: ChangeKind::Firewall,
+        origin: Default::default(),
         snapshot: vec![1, 2, 3],
         deadline_ms,
         audit_seq: 1,

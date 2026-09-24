@@ -8,7 +8,7 @@ use fleet_agent::gate::{self, GateConfig};
 use fleet_agent::install::{self, GATE_USER, InstallInput};
 use fleet_agent::paths::Paths;
 use fleet_agent::pending::{ChangeId, PendingDir};
-use fleet_agent::revert::{self, RevertOutcome, UnavailableRevert};
+use fleet_agent::revert::{self, RevertOutcome};
 use fleet_agent::{bridge, fsutil, now_ms};
 use fleet_proto::ServerId;
 use std::process::ExitCode;
@@ -98,8 +98,9 @@ fn run_install(paths: &Paths, a: &InstallArgs) -> Result<(), String> {
 
 fn run_revert(paths: &Paths, id: ChangeId) -> Result<(), String> {
     let dir = PendingDir::from_paths(paths);
-    // No real restore modules yet: fail loudly rather than claim success.
-    match revert::run_revert(&dir, id, &UnavailableRevert, now_ms()).map_err(|e| e.to_string())? {
+    // Kinds without a restore module fail loudly rather than claim success.
+    let reverter = revert::RegistryRevert::system();
+    match revert::run_revert(&dir, id, &reverter, now_ms()).map_err(|e| e.to_string())? {
         RevertOutcome::Reverted | RevertOutcome::NotPending => Ok(()),
         RevertOutcome::Failed => Err("restore failed".into()),
     }

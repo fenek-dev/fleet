@@ -1,5 +1,6 @@
 //! Operations bound to exec's own state (roster, policy, veto,
-//! `agent.health`, `roster.pending`), behind the `fleet_ops::OpHandler`
+//! `agent.health`, `roster.pending`; `change.confirm` and `changes.list`
+//! over the pending-change files), behind the `fleet_ops::OpHandler`
 //! trait so exec dispatches every op the same way.
 //!
 //! `validate` and `handle` both build the [`Plan`]: `handle` runs right
@@ -7,9 +8,12 @@
 //! `validate` checked.
 
 use super::{PendingState, State, StoredPolicy, log};
+use crate::pending::ChangeId;
+use crate::revert;
 use fleet_crypto::roster::{self, RosterDecision, roster_hash};
 use fleet_ops::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput, SysCtx};
 use fleet_proto::op::tag;
+use fleet_proto::payload::PendingChanges;
 use fleet_proto::{
     AgentHealth, ErrorCode, Event, Hash32, Op, PROTO_VERSION, Payload, Policy, SignedRoster,
 };
@@ -35,6 +39,78 @@ pub(super) enum Plan {
 }
 
 pub(super) struct StateOps(pub(super) Rc<RefCell<State>>);
+
+/// Tags handled by [`ChangeOps`].
+pub(super) const CHANGE_TAGS: [u16; 2] = [tag::CHANGE_CONFIRM, tag::CHANGES_LIST];
+
+/// `change.confirm` and `changes.list` over `pending/` (design §4.10).
+/// Exec's pipeline has already checked that the confirm comes over a
+/// different session than the one that applied the change.
+pub(super) struct ChangeOps(pub(super) Rc<RefCell<State>>);
+
+fn pending_err(e: impl std::fmt::Display) -> OpError {
+    OpError::internal(format!("pending changes: {e}"))
+}
+
+impl OpHandler for ChangeOps {
+    fn validate(&self, _ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<(), OpError> {
+        match op {
+            Op::ChangeConfirm { change_id } => {
+                let st = self.0.borrow();
+                match st
+                    .pending_dir
+                    .get(ChangeId(*change_id))
+                    .map_err(pending_err)?
+                {
+                    Some(_) => Ok(()),
+                    None => Err(ErrorCode::NotFound.into()),
+                }
+            }
+            Op::ChangesList => Ok(()),
+            _ => Err(ErrorCode::Unsupported.into()),
+        }
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a SysCtx,
+        op: &'a Op,
+        _meta: &'a OpMeta,
+    ) -> LocalBoxFuture<'a, Result<OpOutput, OpError>> {
+        Box::pin(async move {
+            let st = self.0.borrow();
+            match op {
+                Op::ChangeConfirm { change_id } => {
+                    let id = ChangeId(*change_id);
+                    // Unlinking is the race with the timer's claim (a
+                    // rename): exactly one wins. Once gone, `revert <id>`
+                    // finds nothing and does nothing.
+                    if !st.pending_dir.remove(id).map_err(pending_err)? {
+                        return Err(ErrorCode::NotFound.into());
+                    }
+                    if let Err(e) = revert::disarm_timer(st.runner.as_ref(), id) {
+                        // Harmless: the timer's revert is now a no-op.
+                        log("disarm revert timer", e);
+                    }
+                    Ok(OpOutput::Payload(Payload::Empty))
+                }
+                Op::ChangesList => {
+                    let changes = st
+                        .pending_dir
+                        .list()
+                        .map_err(pending_err)?
+                        .iter()
+                        .map(|(id, c)| super::wire_pending(*id, c))
+                        .collect();
+                    Ok(OpOutput::Payload(Payload::PendingChanges(PendingChanges {
+                        changes,
+                    })))
+                }
+                _ => Err(ErrorCode::Unsupported.into()),
+            }
+        })
+    }
+}
 
 impl OpHandler for StateOps {
     fn validate(&self, _ctx: &SysCtx, op: &Op, meta: &OpMeta) -> Result<(), OpError> {

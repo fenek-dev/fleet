@@ -68,7 +68,7 @@ fuzz/  tests/vm/
 3. `fleet-agent`: split into gate and exec, with the bridge, Noise handshake and signed `system.info` round-trip.
 4. Rejection tests: tampered, replayed, stale, wrong-server and revoked-device commands must all fail.
 
-Status: steps 1–4 are done (`crates/fleet-agent/tests/e2e.rs` runs Mac client → gate → exec over real sockets; `crates/fleet-core` holds the Mac session client). Still stubbed: ending `sshd` sessions of removed devices (`exec::SessionTerminator`), real snapshot restore (`revert::Revert`), streams (`StreamOpen` answers `Unsupported`). Next work follows `docs/design.md` section 14.
+Status: steps 1–4 are done (`crates/fleet-agent/tests/e2e.rs` runs Mac client → gate → exec over real sockets; `crates/fleet-core` holds the Mac session client). Streams are implemented (`StreamOpen` → sealed `StreamData`, types in `fleet_proto::stream`). Exec runs the full argument pipeline (`check_args`, `expected_version`, request/stream kind), conditional escalation (`OpHandler::requires_elevated`), and the generic auto-revert protocol with `change.confirm` over a new session; `fleet_ops::compose` validates Compose files. Still stubbed: ending `sshd` sessions of removed devices (`exec::SessionTerminator`), the per-kind snapshot/restore modules (`fleet_ops::Revertible`; none registered, so auto-revert ops answer `Unsupported`). Next work follows `docs/design.md` section 14.
 
 See `docs/design.md` section 14 for later phases.
 

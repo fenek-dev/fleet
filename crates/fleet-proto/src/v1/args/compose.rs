@@ -1,8 +1,9 @@
 //! Compose files for `compose.deploy` (design §4.2, §9.6).
 //!
-//! Only size and encoding are checked here: the workspace has no YAML
-//! parser, and a textual scan can't be trusted (quoted keys, escapes, anchors
-//! and merge keys all hide a key from it). The structural deny-list check
+//! Only size and encoding are checked here (`fleet-proto` stays free of a
+//! YAML parser, and a textual scan can't be trusted: quoted keys, escapes,
+//! anchors and merge keys all hide a key from it). The structural deny-list
+//! check (`fleet_ops::compose::validate`)
 //! (`privileged`, `cap_add` beyond the allow-list, `pid`/`ipc`/`network_mode`/
 //! `userns_mode: host`, `devices`, `security_opt` disabling AppArmor or
 //! seccomp, bind mounts outside `/srv/<project>/`) belongs to `fleet-ops`,

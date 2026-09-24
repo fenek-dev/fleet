@@ -214,7 +214,8 @@ fn unavailable_reverter_reports_failure() {
     dir.create().unwrap();
     let id = ChangeId([6; 16]);
     let change = PendingChange {
-        kind: ChangeKind::Sshd,
+        kind: ChangeKind::Ssh,
+        origin: Default::default(),
         snapshot: vec![],
         deadline_ms: 1,
         audit_seq: 1,
@@ -311,6 +312,7 @@ fn revert_runs_once_and_audits() {
         id,
         &PendingChange {
             kind: ChangeKind::Firewall,
+            origin: Default::default(),
             snapshot: vec![],
             deadline_ms: 10,
             audit_seq: origin,

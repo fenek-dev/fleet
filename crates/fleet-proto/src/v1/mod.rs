@@ -14,6 +14,7 @@ pub mod op;
 pub mod payload;
 pub mod policy;
 mod roster;
+pub mod stream;
 
 pub use actor::Actor;
 pub use audit::{
@@ -37,6 +38,7 @@ pub use roster::{
     AgentVersion, Device, Hash32, KeyRef, PrevRecovery, ReleaseManifest, Role, Roster,
     SignedReleaseManifest, SignedRoster,
 };
+pub use stream::{SignedStreamSeal, StreamChunk, StreamSeal};
 
 #[cfg(test)]
 pub(crate) mod test_support {

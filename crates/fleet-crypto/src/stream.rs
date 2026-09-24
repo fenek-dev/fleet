@@ -8,66 +8,17 @@
 //! chain)` at least every [`CHECKPOINT_EVERY`] data chunks and once more at
 //! the end (`outcome` set). [`StreamVerifier`] is the Mac side.
 //!
-//! These types live here until the next `fleet-proto` revision takes them
-//! (with [`STREAM_DOMAIN`] moving to `fleet_proto::domain`).
+//! The wire types and the domain live in `fleet_proto::stream` and
+//! `fleet_proto::domain::STREAM`; they are re-exported here.
 
 use crate::sig::{self, Ed25519Signer};
 use crate::{Error, blake3};
-use fleet_proto::{Ed25519Public, Hash32, Outcome, ServerId, Signature, encode};
-use serde::{Deserialize, Serialize};
+use fleet_proto::{Ed25519Public, Hash32, Outcome, ServerId};
 
-/// Domain for stream seals. Not a prefix of any `fleet_proto::domain`
-/// constant and none of them is a prefix of it (tested below).
-/// TODO: move to `fleet_proto::domain::STREAM`.
-pub const STREAM_DOMAIN: &[u8] = b"fleet/stream/v1";
+pub use fleet_proto::stream::{CHECKPOINT_EVERY, SignedStreamSeal, StreamChunk, StreamSeal};
 
-/// Exec emits a checkpoint seal after at most this many data chunks; the
-/// verifier refuses a stream that goes longer without one.
-pub const CHECKPOINT_EVERY: u64 = 32;
-
-/// The content of one `StreamData.chunk`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StreamChunk {
-    /// `postcard(Payload)`, hashed as sent (an older Mac can still check an
-    /// item whose payload tag it doesn't know).
-    Data(Vec<u8>),
-    /// Signed state after `seal.count` data chunks; `seal.outcome` is `None`.
-    Checkpoint(SignedStreamSeal),
-    /// Last chunk before `StreamEnd`; `seal.outcome` is `Some`.
-    Final(SignedStreamSeal),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamSeal {
-    pub server_id: ServerId,
-    /// BLAKE3 of the `SignedCommand` from `StreamOpen`.
-    pub command_hash: Hash32,
-    /// Checkpoints: the audit intent. Final: the audit result entry, `None`
-    /// when the open was rejected before an intent.
-    pub audit_seq: Option<u64>,
-    /// Data chunks covered.
-    pub count: u64,
-    /// [`chain_step`] folded over those chunks, from `[0; 32]`.
-    pub chain: Hash32,
-    /// `None` for checkpoints; how the stream ended for the final seal.
-    pub outcome: Option<Outcome>,
-    pub time_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedStreamSeal {
-    pub seal: StreamSeal,
-    /// Agent signing key over `STREAM_DOMAIN ‖ postcard(seal)`.
-    pub signature: Signature,
-}
-
-impl SignedStreamSeal {
-    pub fn signed_message(seal: &StreamSeal) -> Vec<u8> {
-        let mut m = STREAM_DOMAIN.to_vec();
-        m.extend_from_slice(&encode(seal));
-        m
-    }
-}
+/// Domain for stream seals (`fleet_proto::domain::STREAM`).
+pub const STREAM_DOMAIN: &[u8] = fleet_proto::domain::STREAM;
 
 /// `chain' = BLAKE3(chain ‖ index: u64 BE ‖ BLAKE3(data))`, `index` counting
 /// data chunks from 1.
@@ -301,7 +252,7 @@ mod tests {
     }
 
     fn enc(c: &StreamChunk) -> Vec<u8> {
-        encode(c)
+        fleet_proto::encode(c)
     }
 
     #[test]

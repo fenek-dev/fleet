@@ -335,7 +335,9 @@ The **capability group** in the first column is the name the policy uses (sectio
 
 - Operations without side effects are Read even when not named `*.list`/`*.get`/`*.query`/`*.status`: `audit.run`, `integrity.status`, `profile.check/plan`, `du.scan`, `find.large`, `logfile.tail`, `docker.logs`, `docker.stats`, `config.history`, `processes.history`, `game.backups.list`.
 - `alert_rules.update` is Elevated (section 4.5); `health_checks.update` is Change (loopback probes only).
-- Conditional Elevated: `cron.set` for `root` from its arguments, and exec escalates for a user in a privileged group; `users.create` and `users.groups.set` when the groups include any of `root`, `sudo`, `docker`, `disk`, `shadow`, `lxd`; `config.rollback` of protected paths, which are those of section 4.9 plus `/etc/passwd`, `/etc/group`, `/etc/gshadow`, `/etc/pam.d/` and `/etc/security/`. `compose.deploy` is tier Change in the catalog and exec escalates it after parsing the file against the deny-list below. The workspace has no YAML parser yet, so the structural check belongs to `fleet-ops`, and the Mac runs the same check to know when to ask for Touch ID.
+- Conditional Elevated: `cron.set` for `root` from its arguments, and exec escalates for a user in a privileged group; `users.create` and `users.groups.set` when the groups include any of `root`, `sudo`, `docker`, `disk`, `shadow`, `lxd`; `config.rollback` of protected paths, which are those of section 4.9 plus `/etc/passwd`, `/etc/group`, `/etc/gshadow`, `/etc/pam.d/` and `/etc/security/`. `compose.deploy` is tier Change in the catalog and exec escalates it after parsing the file against the deny-list below. The structural check is `fleet_ops::compose::validate` (pure, no I/O), and the Mac runs the same check to know when to ask for Touch ID. **Escalation hook:** for ops with `Op::may_escalate`, exec calls the handler's `OpHandler::requires_elevated` after `validate` (helpers in `fleet_ops::escalation`: `compose_deploy`, `cron_set`/`user_is_privileged` from `/etc/passwd` and `/etc/group`); `true` without a verified root approval on the command is `ApprovalRequired`, before the nonce is consumed.
+- **Pipeline checks in exec** (section 5.6), all before the nonce is consumed: `Request` only for non-stream ops and `StreamOpen` only for `Op::is_stream` ops (`Unsupported` otherwise), `Op::check_args` (`InvalidArgument`), `expected_version` present where `requires_expected_version` (`InvalidArgument`), auto-revert ops only when a snapshot module exists for their kind (`Unsupported`). A signed body that doesn't decode gets a signed `InvalidArgument` receipt; the gate forwards such bodies instead of refusing them unsigned.
+- **Path arguments** under an allow-list are opened with `fleet_ops::allowed::open_allowed`: longest matching root (canonicalized, so a symlinked root is trusted), `lstat` of every component below it refusing symlinks, `O_NOFOLLOW | O_NONBLOCK` open, `fstat` identity check, and on Linux `/proc/self/fd` to confirm the opened file is under the root (closes the swap-a-directory race; `std` has no `openat`).
 - `firewall.apply`, `authorized_keys.set`, `cron.set`, `health_checks.update`, `alert_rules.update`, `bans.config.set`, `config.paths.set` and `mesh.peers.set` replace versioned state wholesale and require `CommandBody::expected_version`.
 - Auto-revert ops (`firewall.apply`, `authorized_keys.set`, `profile.apply`, `mesh.join/leave/peers.set`) answer `Payload::ChangePending { change_id, deadline_ms, … }`. `change.confirm` confirms any of them.
 - Streams (`StreamOpen` only): `metrics.subscribe`, `journal.follow`, `logfile.tail`, `docker.logs`, `docker.stats`. Each `StreamData` chunk is one postcard `Payload`. The monitor subset is `agent.health` and `metrics.subscribe`.
@@ -374,6 +376,12 @@ The **capability group** in the first column is the name the policy uses (sectio
 The policy can move operations into Elevated but never out of it. One approval covers a whole batch (a bulk run, a policy push to many servers), so an operator touches Touch ID once per decision rather than once per server.
 
 **Compose validation.** Without Elevated approval, `compose.deploy` rejects `privileged`, `cap_add` outside a small allow-list, `pid: host`, `ipc: host`, `network_mode: host`, `userns_mode: host`, `devices`, `security_opt` that disables AppArmor or seccomp, and bind mounts outside `/srv/<project>/`. Any of these would give a container root on the host.
+
+`fleet_ops::compose` implements it on an event-level YAML parser (`yaml-rust2`, pure Rust; `serde_yaml` is deprecated and `serde_yaml_ng` wraps `unsafe-libyaml`) and returns `ComposeVerdict { ok, requires_elevated: Vec<Finding>, errors }`:
+
+- **Errors** (`InvalidArgument`): input over 256 KiB, nesting over 32, more than 100,000 nodes, anchors or aliases (no billion-laughs expansion, no shared nodes), tags, merge keys (`<<`, quoted or not), duplicate or non-scalar keys, more than one document, wrong shapes for checked keys.
+- **Findings** (Elevated): `privileged` (also `build.privileged`, `build.entitlements`), `cap_add` outside `CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID, NET_BIND_SERVICE, KILL` (`CAP_` prefix and case ignored), `pid`/`ipc`/`network_mode`/`userns_mode`/`cgroup`/`build.network: host`, a top-level network that is the host network, `devices`, `device_cgroup_rules`, `security_opt` other than `no-new-privileges` and `apparmor=docker-default`, bind mounts in short and long syntax and volume `driver_opts.device` outside `/srv/<project>/` (relative paths resolved lexically against it, `~` always outside, unknown mount types count), host files Compose reads outside it (`env_file`, `label_file`, secret and config `file`, build context, Dockerfile, additional contexts), `include` and `extends.file` (their content isn't validated), and `$` in any of these values (interpolation reads `.env`, which the check can't see). A boolean counts as false only for an explicit false/`no`/`off`/`0`/null.
+- **Deploy handler obligations:** write `/srv/<project>/compose.yaml` and run Compose with exactly that `-f` and `--project-directory`, so no `compose.override.yaml` or `COMPOSE_FILE` from `.env` is merged in; check `/srv/<project>` for symlinks a relative bind source could resolve through.
 
 Bulk commands and snippets use `shell.exec` on servers where the policy allows it. Elsewhere they fall back to a plain SSH exec channel, which is authorized by the hardware SSH key, runs as the unprivileged admin user without sudo, and is logged in the Mac's audit log.
 
@@ -461,7 +469,8 @@ Every rule change goes through auto-revert (section 4.10).
 5. **After a reboot**, exec checks `pending/` at startup and reverts any change whose deadline has passed without confirmation, and re-arms timers (remaining seconds) for the rest, since transient timers don't survive a reboot. Its maintenance tick also reverts anything past its deadline, in case a timer was lost.
 6. **Claiming:** whoever reverts (the timer's `revert <id>` or exec) first renames `<id>.bin` to `<id>.claimed`; `rename` is atomic, so exactly one wins. A `.claimed` file found at startup is a revert that crashed midway and is finished then.
 7. **Corrupt files** in `pending/` or `reverted/` are moved to `quarantine/` and audited (`Actor::System`, `Failed(Internal)`); one bad file never blocks startup.
-8. Until the real restore modules exist, the production reverter always fails, so a revert is audited as failed rather than falsely claiming success.
+8. **Plumbing.** Exec runs this protocol generically for every op with `Op::auto_revert`; handlers only apply the change. Each change kind (`payload::ChangeKind`: firewall, mesh, profile, authorized keys, …; `fleet_ops::revertible::change_kind` maps ops to kinds) has a `fleet_ops::Revertible { snapshot(ctx, op), restore(ctx, bytes) }` registered in `fleet_ops::Reverters`. After the audit intent exec snapshots, writes `pending/<id>.bin` (kind, snapshot, deadline, intent seq and origin: device, session, op tag, time), arms the timer (no timer, no apply) and calls the handler; the answer is `Payload::ChangePending` (the handler may return one to report `new_version`). If the handler fails, exec restores at once and stops the timer. An auto-revert op whose kind has no module is refused with `Unsupported` before the nonce is consumed. `fleet-agent revert <id>` and exec's own deadline checks restore through `revert::RegistryRevert`, which dispatches by kind to the same `Reverters`; a kind without a module fails, so the revert is audited as failed rather than falsely claiming success. No restore modules exist yet.
+9. **Confirming.** Exec gives every gate connection (one authenticated Noise session) a random session id of its own; `change.confirm` over the session that applied the change is refused with `PolicyDenied`, so a confirmation always proves that a new session could be established after the change. Confirming unlinks `pending/<id>.bin` (racing the timer's claiming rename: exactly one wins; `NotFound` if the revert won), then stops the timer. `changes.list` lists what is pending.
 
 ---
 
@@ -611,6 +620,8 @@ auto_revert_seconds = 60
 
 The `agent` group (`roster.update`, `policy.update`, `agent.update.*`) is always allowed, but always Elevated: a device-key signature alone isn't enough.
 
+`change.confirm` belongs to the `firewall` group but confirms every auto-revert change (mesh, profile, authorized keys). The device that made a pending change may always confirm it, whatever the policy allows: its original command already passed policy, and refusing the confirmation would only revert an allowed change. Other devices need the `firewall` group. The actor rules still apply.
+
 The actor recorded in a command is asserted by the Mac app, which is the only thing that can sign. Policy limits on the AI actor protect against a misbehaving AI client, not against a compromised app.
 
 ### 5.5 Session setup
@@ -641,7 +652,8 @@ sequenceDiagram
     E->>E: server_id matches, timestamp fresh, (device_id, nonce) not seen before (read-only)
     E->>E: Elevated: root-key approval valid, covers this server and op, leaf unused (read-only)
     E->>E: Policy allows this operation, tier and actor
-    E->>E: Validate arguments, check expected_version
+    E->>E: Request/stream kind, check_args, expected_version present, handler validate
+    E->>E: Conditional Elevated (requires_elevated): approval present, else ApprovalRequired
     E->>E: Commit replay entries: record nonce, then approval leaf
     E->>E: Append intent to the audit log
     E->>E: Execute the typed operation
@@ -854,7 +866,8 @@ struct SignedStreamSeal { seal: StreamSeal, signature: Signature }   // "fleet/s
 - `StreamCancel`, or the connection closing, ends the stream with `Ok`; every admitted stream gets its audit result entry. A reused nonce (the same `StreamOpen` envelope again) is refused with `Replay`; streams have no stored-answer replay.
 - **Backpressure.** Exec's queue towards the gate is bounded. A stream marked *latest-only* (metrics) drops items the queue can't take; dropped items never enter the chain. Any other stream waits up to 10 seconds per chunk, then ends with `Busy` (if the client is still stalled, the final seal can be lost too: "outcome unknown").
 - Chunks are not compressed yet (no zstd dependency in the agent so far); each item must encode to less than 1 MiB.
-- The Mac side is `fleet_crypto::stream::StreamVerifier`. These types and the `"fleet/stream/v1"` domain live in `fleet-crypto` until the next `fleet-proto` revision moves them next to the other wire types.
+- The wire types are `fleet_proto::stream::{StreamChunk, StreamSeal, SignedStreamSeal, CHECKPOINT_EVERY}` with the domain `fleet_proto::domain::STREAM` (golden vectors `stream_chunk_*.hex`); the running hash, `StreamSealer` and the Mac side `StreamVerifier` are in `fleet_crypto::stream`, which re-exports the types.
+- Only ops with `Op::is_stream` are accepted as `StreamOpen`, and those only as `StreamOpen`.
 
 ### 6.4 Signed command
 

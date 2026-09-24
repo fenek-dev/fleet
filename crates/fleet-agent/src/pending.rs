@@ -54,18 +54,29 @@ impl fmt::Display for ChangeId {
     }
 }
 
-/// What a snapshot restores. Local to the agent; never on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChangeKind {
-    Firewall,
-    Sshd,
-    Network,
-    AgentUpdate,
+/// What a snapshot restores (the wire enum, also in `changes.list`).
+pub use fleet_proto::payload::ChangeKind;
+
+/// Exec's per-connection session id: random per gate connection, i.e. per
+/// authenticated Noise session (design §4.10 step 3).
+pub type SessionId = [u8; 16];
+
+/// Who applied a change and how; `change.confirm` checks it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeOrigin {
+    pub device_id: fleet_proto::DeviceId,
+    /// The session that applied it; confirming needs a different one.
+    pub session: SessionId,
+    pub op_tag: u16,
+    pub created_ms: u64,
+    /// `ChangePending::new_version` as the handler reported it.
+    pub new_version: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingChange {
     pub kind: ChangeKind,
+    pub origin: ChangeOrigin,
     /// Opaque state captured before the change was applied.
     pub snapshot: Vec<u8>,
     /// Unix milliseconds after which the change is reverted.

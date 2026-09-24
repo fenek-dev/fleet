@@ -21,11 +21,15 @@
 //! [`Payload`]: fleet_proto::Payload
 #![forbid(unsafe_code)]
 
+pub mod allowed;
+pub mod compose;
 pub mod ctx;
+pub mod escalation;
 pub mod handler;
 pub mod logs;
 pub mod packages;
 pub mod procfs;
+pub mod revertible;
 pub mod runner;
 pub mod scope;
 pub mod security;
@@ -36,9 +40,11 @@ pub(crate) mod test_util;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+pub use allowed::open_allowed;
 pub use ctx::{Clock, ManualClock, SysCtx, SystemClock};
 pub use handler::{
     Invocation, LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput, OpStream, Registry, VecStream,
 };
 pub use procfs::Procfs;
+pub use revertible::{Reverters, Revertible};
 pub use runner::{CommandOutput, CommandRunner, CommandSpec, FakeRunner, RunError, SystemRunner};

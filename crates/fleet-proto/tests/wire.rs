@@ -732,6 +732,40 @@ fn golden_vectors_v1() {
         },
         &mut f,
     );
+    let seal = StreamSeal {
+        server_id: body.server_id.clone(),
+        command_hash: [0x5e; 32],
+        audit_seq: Some(77),
+        count: 33,
+        chain: [0xc1; 32],
+        outcome: None,
+        time_ms: 1_750_000_000_300,
+    };
+    check(
+        "stream_chunk_data",
+        &StreamChunk::Data(vec![0x0b, 0x01]),
+        &mut f,
+    );
+    check(
+        "stream_chunk_checkpoint",
+        &StreamChunk::Checkpoint(SignedStreamSeal {
+            seal: seal.clone(),
+            signature: Signature([0x51; 64]),
+        }),
+        &mut f,
+    );
+    check(
+        "stream_chunk_final",
+        &StreamChunk::Final(SignedStreamSeal {
+            seal: StreamSeal {
+                audit_seq: None,
+                outcome: Some(Outcome::Failed(ErrorCode::Busy)),
+                ..seal
+            },
+            signature: Signature([0x52; 64]),
+        }),
+        &mut f,
+    );
     check(
         "audit_entry",
         &AuditEntry {

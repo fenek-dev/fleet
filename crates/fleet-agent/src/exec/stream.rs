@@ -2,11 +2,12 @@
 //! pipeline (verify, policy, validate, `max_stream_sessions`, nonce, audit
 //! intent), then pumps the handler's `OpStream` as `StreamData` frames.
 //!
-//! Each `StreamData.chunk` is a `fleet_crypto::stream::StreamChunk`: data
-//! (an encoded `Payload`), a signed checkpoint over the running chain at
-//! least every `CHECKPOINT_EVERY` data chunks or `checkpoint_every` of
-//! time, and a signed final seal right before `StreamEnd` — also for a
-//! rejected open, so refusals are as authentic as `Response` receipts.
+//! Each `StreamData.chunk` is a `fleet_proto::StreamChunk`: data (an
+//! encoded `Payload`), a signed checkpoint over the running chain at least
+//! every `CHECKPOINT_EVERY` data chunks or `checkpoint_every` of time, and a
+//! signed final seal right before `StreamEnd` — also for a rejected open, so
+//! refusals are as authentic as `Response` receipts. Only ops with
+//! `Op::is_stream` are accepted here (others: `Unsupported`).
 //!
 //! Backpressure: the connection's outgoing queue is bounded. A
 //! `latest_only` stream drops items the queue can't take (the next one is
@@ -15,14 +16,13 @@
 //! connection closing ends it with `Ok`. Every admitted stream gets its
 //! audit result.
 
-use super::{ActiveStreams, Exec, Out, log, log_op_error};
+use super::{ActiveStreams, Exec, Out, Session, log, log_op_error};
 use crate::now_ms;
-use fleet_crypto::stream::{CHECKPOINT_EVERY, StreamChunk, StreamSealer};
+use fleet_crypto::stream::StreamSealer;
 use fleet_crypto::verify;
 use fleet_ops::{Invocation, OpOutput, OpStream};
-use fleet_proto::{
-    ErrorCode, KeyKind, MAX_FRAME, Message, Outcome, RequestId, SignedCommand, encode,
-};
+use fleet_proto::stream::{CHECKPOINT_EVERY, StreamChunk};
+use fleet_proto::{ErrorCode, MAX_FRAME, Message, Outcome, RequestId, SignedCommand, encode};
 use std::rc::Rc;
 use std::time::Instant;
 use tokio::sync::mpsc::error::TrySendError;
@@ -220,7 +220,7 @@ pub(super) async fn run(
     ex: Rc<Exec>,
     out: Out,
     mut handle: Handle,
-    session: KeyKind,
+    session: Session,
     cmd: SignedCommand,
 ) {
     let hash = verify::command_hash(&cmd);
