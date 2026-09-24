@@ -382,6 +382,14 @@ Bulk commands and snippets use `shell.exec` on servers where the policy allows i
 - **Series cap:** at most 256 series per server. Beyond that, the busiest disks and interfaces are kept individually and the rest are summed; CPU cores beyond 64 are reported in aggregate groups.
 - **Streaming:** only values that changed are sent, as compact binary.
 - **Per-process history:** each minute, the top 10 processes by CPU and the top 10 by memory are stored.
+- **Implementation notes** (`fleet-ops` `telemetry`):
+  - Series names: `cpu.{busy,user,system,iowait,steal}`, `cpu.{busy,iowait,steal}:<core or group>`, `load.{1,5,15}`, `mem.*`, `swap.*`, `disk.{used,inodes}:<mount>` (percent), `disk.free:<mount>`, `disk.{read,write}:<dev>`, `net.{rx,tx}:<if>`, `temp:<chip>/<label>`.
+  - Family budgets keep a tick at about 230 series or fewer: 32 core groups, the 12 busiest whole disks and interfaces (the rest summed as `…:other`), 16 largest filesystems, 16 sensors. The 256 cap is still enforced as a hard limit.
+  - Series ids persist in the store, so history keeps its ids across restarts. An id is reused only after its series has been gone longer than the retention.
+  - A subscription gets the catalog first, then only the values that changed since its own previous item. Every value is re-sent every 10 minutes, which repairs items dropped under `latest_only` backpressure.
+  - A 10-second subscription skips 1-second ticks, so it gets at most one item per 10 seconds.
+  - `process.signal`/`process.renice` refuse pid 1, kernel threads (`PF_KTHREAD`), exec itself, anything with comm `fleet-agent`, and anything whose `/proc/<pid>/exe` is exec's binary.
+  - `statvfs`, `kill` and `setpriority` go through `rustix`, so first-party code stays free of `unsafe`.
 
 ### 4.4 Storage
 
@@ -400,11 +408,29 @@ The agent stores everything in a `redb` database (pure Rust, crash-safe) at `/va
 
 **Pending auto-revert changes are files, not a table.** redb locks the database for one process, so the independent `revert` process (§4.10) couldn't open `state.redb` while exec runs. Each change is `/var/lib/fleet/exec/pending/<id>.bin` (postcard, 0600, written temp + fsync + rename). `fleet-agent revert <id>` reads only that file, restores the snapshot, writes `reverted/<id>.bin`, then deletes the pending file; it never touches redb. Exec, at startup and on a periodic maintenance tick, turns each marker into an `Actor::System` audit entry with `Outcome::Reverted` (or `Failed(Internal)` if restoring failed), emits `change.reverted`, and deletes the marker. At startup it also reverts expired pending files that have no marker yet.
 
+**Metrics storage as built.** Only the unflushed minute is kept in memory, at most 60 frames. Keeping a full hour of 1-second frames in memory would cost about 5 MB of exec's 20 MB budget. Once a minute, one write transaction stores:
+
+- the minute's raw frames
+- the minute's rollups, merged into per-series hour blocks keyed `(hour, series id)`
+- the minute's top processes
+- a changed series catalog
+
+zstd isn't in the dependency set. Rollup blocks therefore use a 60-bit minute bitmap followed by zigzag-varint deltas of `value × 100`. Raw frames use varint id deltas plus `f32` values. `metrics.query` answers on a regular grid. When the answer would exceed 60 000 points (about 720 KB, inside one frame), the step widens, and a widened raw grid returns real per-bucket min, average and max. Alert rules live in `telemetry_meta` beside the catalog.
+
 The disk budget is 64 MB excluding audit archives. At the 256-series cap, 7 days of 1-minute rollups are about 30 MB before compression. Metrics are written in batches rather than one transaction per sample, to limit write amplification and flash wear. Data is compacted hourly.
 
 ### 4.5 Events and alert rules
 
 - Alert rules are part of each server's signed configuration and are evaluated on the agent. They're edited in the app and pushed as Elevated commands, so one Touch ID approval covers a rule change across the whole fleet (section 6.4).
+- **Evaluation** (`fleet-ops` `telemetry::alert`):
+  - Metric rules are checked on every sample.
+  - A condition must hold for `for_s` before `alert.fired`.
+  - A fired alert clears only after the value has fallen below the threshold minus 5% of the threshold (at least 1), and stayed there for `min(for_s, 60 s)`.
+  - `BruteForce` counts failures in a sliding `for_s` window.
+  - Change kinds (new port, user, keys, login source, integrity) fire once per occurrence and never clear.
+  - Changing or removing a rule clears its fired alerts.
+  - Other sources report through `AlertInput::observe` (`Observation::Level` / `Occurrence`).
+  - `alert_rules.update` requires `expected_version` equal to the current version, and a strictly newer set version.
 - When a rule fires, the agent records an event. Connected Macs receive it immediately; others read it in the "while you were away" digest.
 - Built-in event sources: service state changes (systemd D-Bus signals), logins and bans, package changes (dpkg log), config changes, new listening ports, user and group changes, `authorized_keys` changes, integrity violations, certificate expiry, and Docker container events.
 

@@ -23,6 +23,7 @@ pub mod procfs;
 pub mod runner;
 pub mod scope;
 pub mod system;
+pub mod telemetry;
 
 pub use ctx::{Clock, ManualClock, SysCtx, SystemClock};
 pub use handler::{
