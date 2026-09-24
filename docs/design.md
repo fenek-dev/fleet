@@ -892,13 +892,34 @@ The protocol uses fixed error codes: `Unauthorized`, `SignatureInvalid`, `Stale`
 | Core | Rust via UniFFI | Connections, protocol, Noise, bulk actions, cache, provisioning, sync merging, vulnerability data |
 | MCP | `fleetctl` (Rust, `rmcp`) | Stdio MCP server that forwards to the app |
 
-Rust asks Swift to perform all signing through UniFFI callbacks, so private keys never leave the Secure Enclave.
+Rust asks Swift to perform all signing through UniFFI callbacks, so private keys never leave the Secure Enclave. The single callback interface (`fleet_core::signer::DeviceSigner`):
+
+```text
+enum KeyRole { Root, Device, Monitor, Ssh };
+callback interface DeviceSigner {
+  [Throws=SignerError] bytes public_key(KeyRole role);        // 33-byte compressed SEC1
+  [Throws=SignerError] bytes sign(KeyRole role, bytes msg);   // 64-byte r‖s over SHA-256(msg)
+};
+enum SignerError { Unavailable, Cancelled, Failed };
+```
+
+- Swift hashes (CryptoKit `signature(for:)`) and may return high-S; Rust normalizes to low-S.
+- Calls block and may raise Touch ID (root key), so the core never calls them on the main thread.
+- `RoleSigner` adapts one role to `fleet_crypto::sig::Signer`, which the session (`CommandSigner::P256`) and SSH (`P256SshSigner`) take. The recovery keys are in-memory `Ed25519Signer`s during recovery only.
+- **SSH signing:** russh's agent-style path (`authenticate_publickey_with`) hands the core the RFC 4252 to-be-signed bytes; the core asks `sign(Ssh, data)` and returns the `ecdsa-sha2-nistp256` signature blob. No private key ever enters russh.
 
 ### 7.2 Connection manager
 
 - **Always connected:** every server keeps one SSH connection and one Noise session (a monitor session while the app is locked, section 5.10). Metrics arrive every 10 seconds, or every second for servers visible on screen.
 - **Connection states:** `Disconnected → Connecting → Authenticating → Ready → Degraded (retrying) → Offline`.
-- **On wake:** all servers reconnect with the monitor key, with at most 20 handshakes at a time. They upgrade to full sessions once the operator unlocks.
+  - `Connecting`: waiting for a handshake slot, then TCP/SSH (host key pinned, section 3.2). `Authenticating`: agent exec channel, Noise, `DeviceAuth`, signed status read.
+  - `Degraded`: the last attempt failed; retry with exponential backoff from 1 to 60 seconds with equal jitter (`[d/2, d]`). After 5 consecutive failures the state is `Offline`, still retrying at the ceiling.
+  - **Fatal failures** (host key changed, agent Noise key mismatch, SSH key refused, wrong server, unsupported protocol, device unauthorized) go straight to `Offline` and stop retrying until the operator reconnects the server.
+- **On wake:** all servers reconnect with the monitor key, with at most 20 handshakes at a time (a global semaphore; a slot is released when the session is `Ready`). They upgrade to full sessions once the operator unlocks: changing the session kind reconnects every server with the new key, without backoff (the SSH connection is reopened too; reusing it is a later optimization).
+- **Requests** are routed to the server's worker. While it is connecting they queue (bounded, with a per-request timeout; a request whose caller gave up is not sent); while it backs off they fail at once with the current state. A monitor session refuses anything but `agent.health` locally.
+- **Events** from every session fan out on one broadcast channel together with state changes and first-use host key observations (the UI pins the key in the cache after the operator compares fingerprints).
+- **Threading:** a session borrows its signer and is not `Send`, so the manager and its per-server workers run on one core thread (`LocalSet`); the `ManagerHandle` the UI and MCP use is `Send + Sync`. The transport is behind a `Connector` trait (`SshConnector` in the app, in-memory fakes in tests).
+- **Agent channel:** `fleet-agent bridge` writes the mode byte to the gate itself, so over SSH the core uses `Session::connect_bridged`, which sends none and binds the mode into the Noise prologue only. `Session::connect` (sends the byte) is for direct gate-socket connections in tests.
 
 ### 7.3 Bulk action engine
 
@@ -919,6 +940,23 @@ SQLite (`rusqlite`, WAL mode) holding:
 - a mirror of each server's audit log, with the last verified checkpoints
 - a metrics cache (the last 24 hours at 1-minute resolution, for instant charts)
 - the vulnerability database
+
+Schema v1 (tables; migrations are append-only, recorded in `schema_migrations`, and a database from a newer app version is refused):
+
+| Table | Contents |
+|---|---|
+| `groups` | id, name, sort |
+| `servers` | id, name, host, port, user, `proxy_jump` (`user@host:port` hops, first hop first, like `ssh -J`), group |
+| `server_tags` | server, tag |
+| `pinned_keys` | per server: SSH host key (OpenSSH blob), agent Noise key, agent signing key |
+| `jump_host_keys` | host key pins for jump hosts, by host and port |
+| `audit_entries` | per server and seq: raw entry bytes and entry hash (re-verifiable) |
+| `audit_checkpoints` | per server: last verified signed checkpoint |
+| `metrics_1m` | server, metric, minute, value; pruned after 24 hours |
+| `settings` | key → bytes |
+| `roster_chain` | every roster copy by epoch and version, with its hash (a cache: servers are authoritative) |
+
+Foreign keys are on: deleting a server removes its tags, pins, audit mirror and metrics. Snippets, runbooks, profiles, alert rules and vulnerability data get their own migrations when those features land.
 
 ### 7.5 UI structure
 

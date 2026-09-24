@@ -14,3 +14,8 @@ fleet-proto.workspace = true
 fleet-crypto.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+russh.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

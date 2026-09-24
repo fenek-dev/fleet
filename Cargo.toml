@@ -56,6 +56,13 @@ redb = "4.3.0"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "io-util", "macros", "time", "signal", "sync", "fs"] }
 thiserror = "2.0.21"
 
+# Mac core
+# SSH client (design §3.2). `ring` backend only: no RSA, no zlib, no aws-lc
+# C build. Fleet keys are ecdsa-sha2-nistp256 and ssh-ed25519.
+russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+# Local cache (design §7.4); bundled SQLite so the Mac build has no system dep.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
 # Test-only
 tempfile = "3.27.0"
 proptest = "1.11.0"
