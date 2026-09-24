@@ -5,6 +5,7 @@ members = [
     "crates/fleet-crypto",
     "crates/fleet-agent",
     "crates/fleet-core",
+    "crates/fleet-core-ffi",
     "crates/fleet-ops",
 ]
 
@@ -73,6 +74,9 @@ libc = "0.2.189"
 russh = { version = "0.63.3", default-features = false, features = ["ring"] }
 # Local cache (design §7.4); bundled SQLite so the Mac build has no system dep.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Swift bindings (design §7.1), proc-macro mode. `cli` only for the
+# `uniffi-bindgen` bin of fleet-core-ffi (feature `bindgen`).
+uniffi = { version = "0.32.2", default-features = false }
 
 # Test-only
 tempfile = "3.27.0"
