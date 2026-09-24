@@ -194,6 +194,9 @@ impl Registry {
             Rc::new(crate::system::SystemInfoHandler),
         );
         crate::packages::register(&mut r);
+        crate::logs::register(&mut r);
+        // Exec re-registers `logins.query` with its roster resolver.
+        crate::security::register(&mut r, Rc::new(crate::security::NoResolver));
         r
     }
 
@@ -268,7 +271,19 @@ mod tests {
         assert!(r.get(&Op::SystemInfo).is_some());
         assert!(r.get(&Op::AgentHealth).is_none());
         assert!(r.get(&Op::Unknown { tag: 0 }).is_none());
-        assert!(r.tags().any(|t| t == fleet_proto::op::tag::SYSTEM_INFO));
+        use fleet_proto::op::tag;
+        let tags: Vec<_> = r.tags().collect();
+        for t in [
+            tag::SYSTEM_INFO,
+            tag::JOURNAL_QUERY,
+            tag::JOURNAL_FOLLOW,
+            tag::LOGFILE_TAIL,
+            tag::LOGINS_QUERY,
+            tag::PORTS_LIST,
+            tag::CERTS_LIST,
+        ] {
+            assert!(tags.contains(&t), "missing tag {t}");
+        }
     }
 
     #[test]

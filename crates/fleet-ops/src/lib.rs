@@ -10,9 +10,11 @@
 //!   cleared, timeout and output cap. Never a shell.
 //! - [`scope`]: `systemd-run --scope` wrapping for long-running children.
 //!
-//! Generic handlers live here (`system.info`, [`packages`]; [`services`]
-//! needs a D-Bus connection, so exec registers it with
-//! [`services::register`]); handlers bound to exec's
+//! Generic handlers live here (`system.info`, [`packages`], [`logs`], the
+//! stateless [`security`] ops). [`services`] needs a D-Bus connection, so
+//! exec registers it with [`services::register`]; stateful security
+//! services (bans, integrity baseline) are built here and registered by
+//! exec. Handlers bound to exec's
 //! state (roster, policy, veto, `agent.health`) are registered by exec
 //! behind the same trait.
 //!
@@ -21,12 +23,16 @@
 
 pub mod ctx;
 pub mod handler;
+pub mod logs;
 pub mod packages;
 pub mod procfs;
 pub mod runner;
 pub mod scope;
+pub mod security;
 pub mod services;
 pub mod system;
+#[cfg(test)]
+pub(crate) mod test_util;
 #[cfg(test)]
 pub(crate) mod testutil;
 
