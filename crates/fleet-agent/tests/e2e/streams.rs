@@ -88,10 +88,19 @@ fn fixture(pol: Pol, make: fn() -> TestStream) -> Fixture {
     );
     fx.exec = None;
     fx.start_exec_with(move |cfg| {
-        cfg.handlers.push((tag::SYSTEM_INFO, Rc::new(make())));
+        let h: Rc<dyn OpHandler> = Rc::new(make());
+        cfg.handlers.push((tag::SYSTEM_INFO, h.clone()));
+        cfg.handlers.push((tag::METRICS_SUBSCRIBE, h));
         cfg.stream_checkpoint_interval = Duration::from_millis(50);
     });
     fx
+}
+
+/// A stream op (`Op::is_stream`); `system.info` is a request op.
+fn sub() -> Op {
+    Op::MetricsSubscribe {
+        interval: fleet_proto::op::SampleInterval::OneSecond,
+    }
 }
 
 fn signed(fx: &Fixture, mac: &Mac, op: Op) -> SignedCommand {
@@ -286,7 +295,7 @@ fn stream_to_exec_verified_then_replay_refused() {
     run(async {
         let m = &fx.macs[0];
         let mut c = ExecConn::open(&fx, m).await;
-        let cmd = signed(&fx, m, Op::SystemInfo);
+        let cmd = signed(&fx, m, sub());
         c.send(&Message::StreamOpen {
             id: 7,
             cmd: cmd.clone(),
@@ -321,6 +330,34 @@ fn stream_to_exec_verified_then_replay_refused() {
             Message::Response { id: 9, result, .. } => assert_eq!(result, Ok(item(0, false))),
             other => panic!("{other:?}"),
         }
+
+        // A stream op as a request, and a request op as a stream: both
+        // refused (signed), even though the handler would serve both.
+        let req = signed(&fx, m, sub());
+        c.send(&Message::Request { id: 10, cmd: req }).await;
+        match c.recv().await {
+            Message::Response {
+                id: 10,
+                result,
+                receipt,
+            } => {
+                assert_eq!(result, Err(ErrorCode::Unsupported));
+                assert!(receipt.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+        let cmd = signed(&fx, m, Op::SystemInfo);
+        c.send(&Message::StreamOpen {
+            id: 11,
+            cmd: cmd.clone(),
+        })
+        .await;
+        let mut log = StreamLog::new(&fx, &cmd, 11);
+        c.drain(&mut log).await;
+        assert_eq!(
+            log.fin,
+            Some((Outcome::Failed(ErrorCode::Unsupported), None))
+        );
     });
 }
 
@@ -339,7 +376,7 @@ fn stream_rejections_session_limit_and_cancel() {
         let mut c = ExecConn::open(&fx, m).await;
 
         // Forged signature: refused with a signed final seal, no audit.
-        let mut bad = signed(&fx, m, Op::SystemInfo);
+        let mut bad = signed(&fx, m, sub());
         bad.signature = Signature([0; 64]);
         c.send(&Message::StreamOpen {
             id: 1,
@@ -354,7 +391,7 @@ fn stream_rejections_session_limit_and_cancel() {
         );
 
         // One long stream takes the only slot.
-        let long = signed(&fx, m, Op::SystemInfo);
+        let long = signed(&fx, m, sub());
         c.send(&Message::StreamOpen {
             id: 2,
             cmd: long.clone(),
@@ -364,7 +401,7 @@ fn stream_rejections_session_limit_and_cancel() {
         while long_log.data.len() < 3 {
             assert!(!long_log.on(&c.recv().await));
         }
-        let second = signed(&fx, m, Op::SystemInfo);
+        let second = signed(&fx, m, sub());
         c.send(&Message::StreamOpen {
             id: 3,
             cmd: second.clone(),
@@ -388,7 +425,7 @@ fn stream_rejections_session_limit_and_cancel() {
         assert!(audit_seq.is_some());
         assert!(long_log.checkpoints >= 1, "time-based checkpoints");
 
-        let third = signed(&fx, m, Op::SystemInfo);
+        let third = signed(&fx, m, sub());
         c.send(&Message::StreamOpen {
             id: 4,
             cmd: third.clone(),
@@ -414,7 +451,7 @@ fn latest_only_stream_drops_instead_of_blocking() {
     run(async {
         let m = &fx.macs[0];
         let mut c = ExecConn::open(&fx, m).await;
-        let cmd = signed(&fx, m, Op::SystemInfo);
+        let cmd = signed(&fx, m, sub());
         c.send(&Message::StreamOpen {
             id: 1,
             cmd: cmd.clone(),
@@ -439,7 +476,7 @@ fn stream_through_gate_verified() {
     run(async {
         let m = &fx.macs[0];
         let mut c = GateConn::open(&fx, m).await;
-        let cmd = signed(&fx, m, Op::SystemInfo);
+        let cmd = signed(&fx, m, sub());
         c.send(&Message::StreamOpen {
             id: 5,
             cmd: cmd.clone(),
@@ -453,7 +490,7 @@ fn stream_through_gate_verified() {
         assert_eq!(log.end, Some(Ok(())));
 
         // Cancel through the gate.
-        let fx_cmd = signed(&fx, m, Op::SystemInfo);
+        let fx_cmd = signed(&fx, m, sub());
         c.send(&Message::StreamOpen {
             id: 6,
             cmd: fx_cmd.clone(),

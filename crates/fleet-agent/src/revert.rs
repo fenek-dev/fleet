@@ -80,7 +80,7 @@ pub fn disarm_timer(runner: &dyn Runner, id: ChangeId) -> Result<(), RunError> {
     runner.run(&disarm_command(id))
 }
 
-/// Restores a snapshot. Real firewall/sshd/network implementations come later.
+/// Restores a snapshot.
 pub trait Revert {
     fn revert(&self, kind: ChangeKind, snapshot: &[u8]) -> Result<(), RevertError>;
 }
@@ -89,10 +89,38 @@ pub trait Revert {
 #[error("revert of {0:?} failed")]
 pub struct RevertError(pub ChangeKind);
 
-/// Production reverter until the real firewall/sshd/network modules exist:
-/// always fails, so a revert is audited as `Failed` instead of falsely
-/// claiming the snapshot was restored. (No operation creates pending
-/// changes yet, so nothing reaches it today.)
+/// Production reverter: dispatches by kind to the `fleet_ops::Revertible`
+/// modules in `Reverters::with_generic()` (the same set exec snapshots
+/// with). A kind without a module fails, so the revert is audited as
+/// `Failed` rather than falsely claiming the snapshot was restored.
+pub struct RegistryRevert {
+    pub reverters: fleet_ops::Reverters,
+    pub ctx: fleet_ops::SysCtx,
+}
+
+impl RegistryRevert {
+    pub fn system() -> Self {
+        Self {
+            reverters: fleet_ops::Reverters::with_generic(),
+            ctx: fleet_ops::SysCtx::system(),
+        }
+    }
+}
+
+impl Revert for RegistryRevert {
+    fn revert(&self, kind: ChangeKind, snapshot: &[u8]) -> Result<(), RevertError> {
+        self.reverters
+            .restore(&self.ctx, kind, snapshot)
+            .map_err(|e| {
+                if e.detail().is_some() {
+                    eprintln!("fleet-agent revert {kind:?}: {e}");
+                }
+                RevertError(kind)
+            })
+    }
+}
+
+/// Always fails (tests; a kind nothing can restore).
 pub struct UnavailableRevert;
 
 impl Revert for UnavailableRevert {

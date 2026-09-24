@@ -11,6 +11,8 @@ pub const RECEIPT: &[u8] = b"fleet/receipt/v1";
 pub const CHECKPOINT: &[u8] = b"fleet/checkpoint/v1";
 pub const RELEASE: &[u8] = b"fleet/release/v1";
 pub const EVENT: &[u8] = b"fleet/event/v1";
+/// Stream checkpoint and final seals (design §6.3).
+pub const STREAM: &[u8] = b"fleet/stream/v1";
 
 pub(crate) fn concat(domain: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     let len = domain.len() + parts.iter().map(|p| p.len()).sum::<usize>();
@@ -35,6 +37,7 @@ mod tests {
             super::CHECKPOINT,
             super::RELEASE,
             super::EVENT,
+            super::STREAM,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {

@@ -13,8 +13,17 @@
 //!
 //! Operations are dispatched through a `fleet_ops::Registry`: generic ones
 //! come from `fleet-ops`, state-bound ones (roster, policy, veto,
-//! `agent.health`, `roster.pending`) from [`ops`]. `StreamOpen` runs the same
-//! pipeline and then [`stream`] pumps the handler's `OpStream`.
+//! `agent.health`, `roster.pending`, `change.confirm`, `changes.list`) from
+//! [`ops`]. `StreamOpen` runs the same pipeline and then [`stream`] pumps
+//! the handler's `OpStream`.
+//!
+//! Pipeline per command ([`Exec::admit`], design §5.6): verify → policy →
+//! `Request`/`StreamOpen` matches `Op::is_stream` → `Op::check_args` →
+//! `expected_version` present if required → handler `validate` →
+//! escalation (`OpHandler::requires_elevated` for `Op::may_escalate` ops;
+//! Elevated without an approval is `ApprovalRequired`) → stream slot →
+//! commit → intent. Ops with `Op::auto_revert` then run under the
+//! auto-revert protocol (§4.10, [`Exec::apply_reverting`]).
 
 mod ops;
 mod stream;
@@ -24,15 +33,17 @@ use crate::frame::Reassembler;
 use crate::install::GATE_USER;
 use crate::ipc::{self, IpcMsg};
 use crate::paths::Paths;
-use crate::pending::{self, PendingDir, PendingError};
-use crate::revert::{self, Revert, Runner, SystemRunner, UnavailableRevert};
+use crate::pending::{
+    self, ChangeId, ChangeKind, ChangeOrigin, PendingChange, PendingDir, PendingError, SessionId,
+};
+use crate::revert::{self, RegistryRevert, Revert, Runner, SystemRunner};
 use crate::store::{CheckpointSigner, Intent, MetaKey, Store, StoreError};
 use crate::{fsutil, now_ms};
 use fleet_crypto::receipt::{receipt_for, sign_event, sign_receipt};
 use fleet_crypto::roster::{self, PendingRoster, RecoveryClock, next_grace_remaining, roster_hash};
 use fleet_crypto::sig::Ed25519Signer;
 use fleet_crypto::verify::{self, VerifiedCommand, VerifyCtx};
-use fleet_ops::{Invocation, OpHandler, OpMeta, OpOutput, Registry, SysCtx};
+use fleet_ops::{Invocation, OpHandler, OpMeta, OpOutput, Registry, Reverters, Revertible, SysCtx};
 use fleet_proto::chunk::split_frame;
 use fleet_proto::policy::AiAccess;
 use fleet_proto::{
@@ -97,7 +108,13 @@ pub struct ExecConfig {
     /// Reverted markers, expired pending changes, recovery delay countdown,
     /// replay pruning, `authorized_keys` refresh.
     pub maintenance_interval: Duration,
+    /// Restores snapshots (deadline passed, crashed reverts, failed
+    /// applies). Default: `RegistryRevert::system()`, the same modules the
+    /// `revert <id>` process uses.
     pub reverter: Box<dyn Revert>,
+    /// Snapshot modules for auto-revert ops, by kind (§4.10). An auto-revert
+    /// op whose kind has none is refused with `Unsupported`.
+    pub reverters: Reverters,
     /// Arms auto-revert timers again at startup (§4.10).
     pub runner: Box<dyn Runner>,
     pub terminator: Box<dyn SessionTerminator>,
@@ -120,7 +137,8 @@ impl ExecConfig {
             gate_uid,
             checkpoint_interval: Duration::from_secs(3600),
             maintenance_interval: Duration::from_secs(5),
-            reverter: Box::new(UnavailableRevert),
+            reverter: Box::new(RegistryRevert::system()),
+            reverters: Reverters::with_generic(),
             runner: Box::new(SystemRunner),
             terminator: Box::new(NoopTerminator),
             ctx: SysCtx::system(),
@@ -849,9 +867,31 @@ impl State {
             .ok()
     }
 
+    /// The pending change `change.confirm` names, if it's still pending.
+    fn pending_change(&self, op: &Op) -> Result<Option<PendingChange>, ErrorCode> {
+        let Op::ChangeConfirm { change_id } = op else {
+            return Ok(None);
+        };
+        self.pending_dir.get(ChangeId(*change_id)).map_err(|e| {
+            log("read pending change", e);
+            ErrorCode::Internal
+        })
+    }
+
     fn check_policy(&self, v: &VerifiedCommand) -> Result<(), ErrorCode> {
         let op = &v.body.op;
-        if !self.policy.allows_group(op.group()) {
+        // `change.confirm` is in the `firewall` group, but it confirms any
+        // auto-revert change (mesh, profile, authorized keys, …). The device
+        // that made the change may always confirm it (design §5.4): its
+        // original command already passed policy, and refusing the confirm
+        // would only revert an allowed change.
+        let own_change = || {
+            self.pending_change(op)
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.origin.device_id == v.device_id)
+        };
+        if !self.policy.allows_group(op.group()) && !own_change() {
             return Err(ErrorCode::PolicyDenied);
         }
         let tier = self.policy.effective_tier(op);
@@ -890,18 +930,41 @@ struct Admitted {
     meta: OpMeta,
     intent_seq: u64,
     consumed_until: u64,
+    /// Auto-revert ops: the snapshot module for their kind.
+    revertible: Option<(ChangeKind, Rc<dyn Revertible>)>,
+}
+
+/// One gate connection: the key kind the gate authenticated and exec's own
+/// random id for it (`change.confirm` must come over a different one).
+#[derive(Debug, Clone, Copy)]
+struct Session {
+    key: KeyKind,
+    id: SessionId,
 }
 
 /// Shared by every connection: state, dispatch, environment.
 struct Exec {
     st: Rc<RefCell<State>>,
     registry: Registry,
+    reverters: Reverters,
     ctx: SysCtx,
     /// Streams running across all connections
     /// (`limits.max_stream_sessions`).
     streams: Cell<u32>,
     checkpoint_every: Duration,
     send_timeout: Duration,
+}
+
+/// `changes.list` / `ChangePending` view of a pending change.
+fn wire_pending(id: ChangeId, c: &PendingChange) -> fleet_proto::payload::PendingChange {
+    fleet_proto::payload::PendingChange {
+        change_id: id.0,
+        kind: c.kind,
+        op_tag: c.origin.op_tag,
+        created_ms: c.origin.created_ms,
+        deadline_ms: c.deadline_ms,
+        new_version: c.origin.new_version,
+    }
 }
 
 /// Local log only (details never go on the wire); plain codes are routine.
@@ -916,7 +979,7 @@ impl Exec {
     /// → intent (design §5.6). Synchronous: nothing else runs in between.
     fn admit(
         &self,
-        session: KeyKind,
+        session: Session,
         cmd: &SignedCommand,
         inv: Invocation,
         now: u64,
@@ -925,14 +988,43 @@ impl Exec {
             code,
             consumed_until: None,
         };
-        let v = self.st.borrow().verify(session, cmd, now).map_err(refuse)?;
+        let v = self
+            .st
+            .borrow()
+            .verify(session.key, cmd, now)
+            .map_err(refuse)?;
         self.st.borrow().check_policy(&v).map_err(refuse)?;
         let op = &v.body.op;
+        // Streams only as `StreamOpen`, everything else only as `Request`.
+        if op.is_stream() != (inv == Invocation::Stream) {
+            return Err(refuse(ErrorCode::Unsupported));
+        }
+        op.check_args()
+            .map_err(|_| refuse(ErrorCode::InvalidArgument))?;
+        if op.requires_expected_version() && v.body.expected_version.is_none() {
+            return Err(refuse(ErrorCode::InvalidArgument));
+        }
+        // A fresh connection proves access still works (§4.10 step 3).
+        if let Some(c) = self.st.borrow().pending_change(op).map_err(refuse)?
+            && c.origin.session == session.id
+        {
+            return Err(refuse(ErrorCode::PolicyDenied));
+        }
         let handler = self
             .registry
             .get(op)
             .filter(|h| h.supports(op, inv))
             .ok_or(refuse(ErrorCode::Unsupported))?;
+        let revertible = if op.auto_revert() {
+            let kind = fleet_ops::revertible::change_kind(op).ok_or(refuse(ErrorCode::Internal))?;
+            let r = self
+                .reverters
+                .get(kind)
+                .ok_or(refuse(ErrorCode::Unsupported))?;
+            Some((kind, r))
+        } else {
+            None
+        };
         let mut meta = OpMeta {
             command: v,
             approval: cmd.approval.clone(),
@@ -942,12 +1034,23 @@ impl Exec {
         };
         // Replay entries are consumed only once policy and arguments passed,
         // so a refused command doesn't burn its nonce or approval leaf.
-        handler
-            .validate(&self.ctx, &meta.command.body.op, &meta)
-            .map_err(|e| {
-                log_op_error(meta.command.body.op.name(), &e);
-                refuse(e.code())
-            })?;
+        let op = &meta.command.body.op;
+        let op_refused = |e: fleet_ops::OpError| {
+            log_op_error(op.name(), &e);
+            refuse(e.code())
+        };
+        handler.validate(&self.ctx, op, &meta).map_err(op_refused)?;
+        // Conditional Elevated (design §4.2): the handler decides from facts
+        // the arguments don't carry; a verified approval covering this op
+        // (checked in `verify`) is then required.
+        if op.may_escalate()
+            && meta.command.approval.is_none()
+            && handler
+                .requires_elevated(&self.ctx, op, &meta)
+                .map_err(op_refused)?
+        {
+            return Err(refuse(ErrorCode::ApprovalRequired));
+        }
         if inv == Invocation::Stream
             && self.streams.get() >= self.st.borrow().policy.limits.max_stream_sessions
         {
@@ -963,7 +1066,113 @@ impl Exec {
             consumed_until: meta.command.nonce_expires_at_ms,
             meta,
             intent_seq,
+            revertible,
         })
+    }
+
+    /// Runs an admitted request: plain ops through their handler, auto-revert
+    /// ops through [`Self::apply_reverting`].
+    async fn execute(&self, a: &Admitted, session: Session) -> Result<Payload, ErrorCode> {
+        let op = &a.meta.command.body.op;
+        if let Some((kind, r)) = &a.revertible {
+            return self.apply_reverting(a, session, *kind, r.as_ref()).await;
+        }
+        match a.handler.handle(&self.ctx, op, &a.meta).await {
+            Ok(OpOutput::Payload(p)) => Ok(p),
+            Ok(OpOutput::Stream(_)) => Err(ErrorCode::Internal),
+            Err(e) => {
+                log_op_error(op.name(), &e);
+                Err(e.code())
+            }
+        }
+    }
+
+    /// Auto-revert protocol (design §4.10): snapshot, write
+    /// `pending/<id>.bin`, arm the independent timer, and only then apply.
+    /// Answers `Payload::ChangePending`. If applying fails the snapshot is
+    /// restored right away (claimed like any revert, so it's audited as
+    /// `Reverted` by the marker pass) and the timer stopped.
+    async fn apply_reverting(
+        &self,
+        a: &Admitted,
+        session: Session,
+        kind: ChangeKind,
+        r: &dyn Revertible,
+    ) -> Result<Payload, ErrorCode> {
+        let op = &a.meta.command.body.op;
+        let fail = |e: fleet_ops::OpError| {
+            log_op_error(op.name(), &e);
+            e.code()
+        };
+        let snapshot = r.snapshot(&self.ctx, op).map_err(fail)?;
+        let mut raw = [0u8; 16];
+        fleet_crypto::random_bytes(&mut raw).map_err(|_| ErrorCode::Internal)?;
+        let id = ChangeId(raw);
+        let secs = self.st.borrow().policy.safety.auto_revert_seconds.max(1);
+        let created = now_ms();
+        let mut change = PendingChange {
+            kind,
+            origin: ChangeOrigin {
+                device_id: a.meta.command.device_id,
+                session: session.id,
+                op_tag: op.tag(),
+                created_ms: created,
+                new_version: None,
+            },
+            snapshot,
+            deadline_ms: created.saturating_add(u64::from(secs) * 1000),
+            audit_seq: a.intent_seq,
+        };
+        {
+            let st = self.st.borrow();
+            st.pending_dir.insert(id, &change).map_err(|e| {
+                log("write pending change", e);
+                ErrorCode::Internal
+            })?;
+            // Never apply without the independent timer.
+            if let Err(e) = revert::arm_timer(st.runner.as_ref(), id, secs) {
+                log("arm revert timer", e);
+                if let Err(e) = st.pending_dir.remove(id) {
+                    log("remove pending change", e);
+                }
+                return Err(ErrorCode::Internal);
+            }
+        }
+        let applied = match a.handler.handle(&self.ctx, op, &a.meta).await {
+            Ok(OpOutput::Payload(p)) => Ok(p),
+            Ok(OpOutput::Stream(_)) => Err(ErrorCode::Internal),
+            Err(e) => Err(fail(e)),
+        };
+        let st = self.st.borrow();
+        let payload = match applied {
+            Ok(p) => p,
+            Err(code) => {
+                match revert::run_revert(&st.pending_dir, id, st.reverter.as_ref(), now_ms()) {
+                    Ok(_) => {
+                        if let Err(e) = revert::disarm_timer(st.runner.as_ref(), id) {
+                            log("disarm revert timer", e);
+                        }
+                    }
+                    // The timer still reverts at the deadline.
+                    Err(e) => log("revert failed change", e),
+                }
+                return Err(code);
+            }
+        };
+        let new_version = match payload {
+            Payload::ChangePending(p) => p.new_version,
+            _ => None,
+        };
+        if new_version.is_some() {
+            change.origin.new_version = new_version;
+            // Only if still pending: never resurrect a claimed change.
+            if matches!(st.pending_dir.get(id), Ok(Some(_)))
+                && let Err(e) = st.pending_dir.insert(id, &change)
+            {
+                log("update pending change", e);
+            }
+        }
+        Ok(Payload::ChangePending(wire_pending(id, &change)))
     }
 
     /// One `Request`. Every answer is receipted, rejections included
@@ -976,7 +1185,7 @@ impl Exec {
     /// command that did run.
     async fn request(
         &self,
-        session: KeyKind,
+        session: Session,
         cmd: &SignedCommand,
     ) -> (Result<Payload, ErrorCode>, SignedReceipt) {
         let hash = verify::command_hash(cmd);
@@ -988,15 +1197,7 @@ impl Exec {
             match self.admit(session, cmd, Invocation::Request, now) {
                 Err(r) => (Err(r.code), None, r.consumed_until),
                 Ok(a) => {
-                    let op = &a.meta.command.body.op;
-                    let result = match a.handler.handle(&self.ctx, op, &a.meta).await {
-                        Ok(OpOutput::Payload(p)) => Ok(p),
-                        Ok(OpOutput::Stream(_)) => Err(ErrorCode::Internal),
-                        Err(e) => {
-                            log_op_error(op.name(), &e);
-                            Err(e.code())
-                        }
-                    };
+                    let result = self.execute(&a, session).await;
                     let status = result.as_ref().map(drop).map_err(|c| *c);
                     match self.st.borrow_mut().audit_result(a.intent_seq, status) {
                         Some(seq) => (result, Some(seq), Some(a.consumed_until)),
@@ -1099,6 +1300,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     let (cp_every, maint_every) = (cfg.checkpoint_interval, cfg.maintenance_interval);
     let ctx = cfg.ctx.clone();
     let extra = std::mem::take(&mut cfg.handlers);
+    let reverters = std::mem::take(&mut cfg.reverters);
     let (checkpoint_every, send_timeout) =
         (cfg.stream_checkpoint_interval, cfg.stream_send_timeout);
     let mut state = State::load(cfg)?;
@@ -1113,12 +1315,17 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     for tag in ops::TAGS {
         registry.register(tag, state_ops.clone());
     }
+    let change_ops: Rc<dyn OpHandler> = Rc::new(ops::ChangeOps(st.clone()));
+    for tag in ops::CHANGE_TAGS {
+        registry.register(tag, change_ops.clone());
+    }
     for (tag, h) in extra {
         registry.register(tag, h);
     }
     let exec = Rc::new(Exec {
         st: st.clone(),
         registry,
+        reverters,
         ctx,
         streams: Cell::new(0),
         checkpoint_every,
@@ -1224,6 +1431,10 @@ async fn connection(
         IpcMsg::ControlOpen => return control(r, w, view_rx).await,
         _ => return None,
     };
+    // Exec's own id for this session; the gate can't choose it.
+    let mut id = [0u8; 16];
+    fleet_crypto::random_bytes(&mut id).ok()?;
+    let key = Session { key, id };
     let hello = exec.st.borrow().hello();
     for m in &frame(&hello) {
         ipc::write_msg(&mut w, m).await.ok()?;

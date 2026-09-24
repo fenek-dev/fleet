@@ -43,6 +43,11 @@ const SERVER: &str = "srv_test01";
 #[path = "e2e/streams.rs"]
 mod streams;
 
+/// Pipeline checks, escalation, auto-revert and `change.confirm`
+/// (`tests/e2e/pipeline.rs`).
+#[path = "e2e/pipeline.rs"]
+mod pipeline;
+
 fn run(f: impl Future<Output = ()>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -146,6 +151,8 @@ struct Pol {
     commands_per_minute: u32,
     ai: &'static str,
     max_streams: u32,
+    /// TOML list body of `capabilities.allow`.
+    groups: &'static str,
 }
 
 impl Default for Pol {
@@ -154,6 +161,7 @@ impl Default for Pol {
             commands_per_minute: 240,
             ai: "full",
             max_streams: 32,
+            groups: r#""system""#,
         }
     }
 }
@@ -163,13 +171,14 @@ fn policy_toml(fleet: FleetId, version: u64, pol: Pol) -> String {
         commands_per_minute,
         ai,
         max_streams,
+        groups,
     } = pol;
     format!(
         r#"version = {version}
 fleet_id = "{fleet}"
 server_id = "{SERVER}"
 [capabilities]
-allow = ["system"]
+allow = [{groups}]
 shell_exec = false
 shell_exec_users = []
 [elevated]
@@ -1194,6 +1203,7 @@ fn exec_startup_recovers_pending_dir() {
     let now = now_ms();
     let change = |deadline_ms| PendingChange {
         kind: ChangeKind::Firewall,
+        origin: Default::default(),
         snapshot: vec![],
         deadline_ms,
         audit_seq: 999,

@@ -57,6 +57,12 @@ unicode-normalization = "0.1.25"
 redb = "4.3.0"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "io-util", "macros", "time", "signal", "sync", "fs"] }
 thiserror = "2.0.21"
+# Open-flag constants only (`O_NOFOLLOW`, `O_NONBLOCK`); no FFI calls.
+libc = "0.2.189"
+# Compose validation (design §4.2): event-level parser only (no loader), so
+# anchors/aliases are rejected before anything is built. Pure Rust, YAML 1.2;
+# chosen over serde_yaml (deprecated) and serde_yaml_ng (unsafe-libyaml).
+yaml-rust2 = { version = "0.13.0", default-features = false }
 
 # Mac core
 # SSH client (design §3.2). `ring` backend only: no RSA, no zlib, no aws-lc

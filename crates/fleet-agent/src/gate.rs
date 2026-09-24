@@ -488,9 +488,15 @@ impl Relay {
         }
     }
 
-    /// Session mode (an early filter; exec checks again).
+    /// Session mode (an early filter; exec checks again). A body that
+    /// doesn't decode goes to exec, which answers a signed
+    /// `InvalidArgument` if the envelope signature verifies.
     fn command_ok(&self, cmd: &SignedCommand) -> bool {
-        cmd.key == self.auth.key && cmd.decode_body().is_ok_and(|b| self.auth.op_allowed(&b.op))
+        cmd.key == self.auth.key
+            && cmd
+                .decode_body()
+                .ok()
+                .is_none_or(|b| self.auth.op_allowed(&b.op))
     }
 }
 

@@ -163,6 +163,17 @@ pub trait OpHandler {
         Ok(())
     }
 
+    /// Conditional Elevated from facts the arguments don't carry (design
+    /// §4.2): `cron.set` for a user in a privileged group, `compose.deploy`
+    /// using a deny-listed feature. Exec asks only for ops where
+    /// `Op::may_escalate()` holds (so the Mac knows when to run the same
+    /// check), right after [`validate`](Self::validate); `true` without a
+    /// valid root approval on the command is `ApprovalRequired`. Must not
+    /// change anything. Helpers: [`crate::escalation`].
+    fn requires_elevated(&self, _ctx: &SysCtx, _op: &Op, _meta: &OpMeta) -> Result<bool, OpError> {
+        Ok(false)
+    }
+
     /// Runs the operation. For `Invocation::Stream` return
     /// [`OpOutput::Stream`]; for requests [`OpOutput::Payload`] (exec
     /// answers a mismatch with `Internal`).
