@@ -27,6 +27,7 @@
 
 mod ops;
 mod stream;
+mod telemetry;
 
 use crate::authorized_keys;
 use crate::frame::Reassembler;
@@ -1319,6 +1320,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     for tag in ops::CHANGE_TAGS {
         registry.register(tag, change_ops.clone());
     }
+    let tel = telemetry::start(&st, &ctx, &mut registry);
     for (tag, h) in extra {
         registry.register(tag, h);
     }
@@ -1335,6 +1337,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
+            tokio::task::spawn_local(tel.run(exec.ctx.clone()));
             tokio::pin!(shutdown);
             let mut maint = tokio::time::interval(maint_every);
             let mut cp = tokio::time::interval(cp_every);

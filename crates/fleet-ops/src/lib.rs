@@ -35,6 +35,7 @@ pub mod scope;
 pub mod security;
 pub mod services;
 pub mod system;
+pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_util;
 #[cfg(test)]

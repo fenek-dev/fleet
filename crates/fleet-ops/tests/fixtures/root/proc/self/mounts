@@ -1,0 +1,9 @@
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+udev /dev devtmpfs rw,nosuid,relatime,size=4052000k,nr_inodes=1013000,mode=755 0 0
+/dev/sda1 / ext4 rw,relatime,errors=remount-ro 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,noexec,relatime,size=814800k,mode=755 0 0
+/dev/nvme0n1p1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077 0 0
+/dev/sda1 /var/lib/docker ext4 rw,relatime 0 0
+overlay /var/lib/docker/overlay2/abc/merged overlay rw,relatime,lowerdir=/x,upperdir=/y,workdir=/z 0 0
+/dev/sdb1 /srv/game\040data xfs rw,relatime 0 0

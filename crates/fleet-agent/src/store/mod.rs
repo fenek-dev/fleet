@@ -9,10 +9,12 @@
 
 mod audit;
 mod meta;
+mod metrics;
 mod replay;
 
 pub use audit::{AuditLog, ChainError, ChainHead, CheckpointSigner, Intent};
 pub use meta::{Meta, MetaKey};
+pub use metrics::MetricsDb;
 pub use replay::ReplayCache;
 
 use std::path::Path;
@@ -47,7 +49,8 @@ from_redb!(
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct Store {
-    db: redb::Database,
+    /// Shared with [`MetricsDb`] (the telemetry sampler task).
+    db: std::sync::Arc<redb::Database>,
 }
 
 impl Store {
@@ -59,8 +62,13 @@ impl Store {
         replay::create_tables(&tx)?;
         audit::create_tables(&tx)?;
         meta::create_tables(&tx)?;
+        metrics::create_tables(&tx)?;
         tx.commit()?;
-        Ok(Self { db })
+        Ok(Self { db: db.into() })
+    }
+
+    pub fn metrics(&self) -> MetricsDb {
+        MetricsDb::new(self.db.clone())
     }
 
     pub fn replay(&self) -> ReplayCache<'_> {
