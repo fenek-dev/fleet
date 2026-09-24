@@ -1,7 +1,11 @@
 //! Child processes (design §4.2 rule: fixed absolute binary paths plus an
 //! argument vector, never a shell). The environment is cleared and replaced
-//! by [`BASE_ENV`]; stdin is `/dev/null`; stdout and stderr are capped;
-//! a timeout kills the child.
+//! by [`BASE_ENV`]; stdin is `/dev/null` unless [`CommandSpec::stdin`]
+//! supplies bytes (e.g. `nft -f -`); stdout and stderr are capped; a
+//! timeout kills the child.
+//!
+//! [`CommandRunner::run_blocking`] is the synchronous variant for callers
+//! that can't await (`Revertible::snapshot`/`restore`).
 
 use crate::handler::LocalBoxFuture;
 use std::cell::RefCell;
@@ -29,6 +33,9 @@ pub struct CommandSpec {
     pub timeout: Duration,
     /// Bytes kept of stdout and of stderr each; the rest is read and dropped.
     pub output_cap: usize,
+    /// Written to the child's stdin, which is then closed; `None` is
+    /// `/dev/null`.
+    pub stdin: Option<Vec<u8>>,
 }
 
 impl CommandSpec {
@@ -39,7 +46,13 @@ impl CommandSpec {
             env: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             output_cap: DEFAULT_OUTPUT_CAP,
+            stdin: None,
         }
+    }
+
+    pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(bytes.into());
+        self
     }
 
     pub fn arg(mut self, a: impl Into<OsString>) -> Self {
@@ -117,15 +130,107 @@ pub enum RunError {
 
 pub trait CommandRunner {
     fn run(&self, spec: CommandSpec) -> LocalBoxFuture<'_, Result<CommandOutput, RunError>>;
+
+    /// Same contract as [`CommandRunner::run`], blocking the thread. For
+    /// synchronous callers only (`Revertible`); the default refuses.
+    fn run_blocking(&self, _spec: CommandSpec) -> Result<CommandOutput, RunError> {
+        Err(RunError::Spawn(std::io::ErrorKind::Unsupported))
+    }
 }
 
-/// Real processes via `tokio::process`.
+/// Real processes via `tokio::process` (or `std::process` when blocking).
 pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     fn run(&self, spec: CommandSpec) -> LocalBoxFuture<'_, Result<CommandOutput, RunError>> {
         Box::pin(run_system(spec))
     }
+
+    fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutput, RunError> {
+        run_system_blocking(spec)
+    }
+}
+
+fn run_system_blocking(spec: CommandSpec) -> Result<CommandOutput, RunError> {
+    use std::io::{Read, Write};
+    if !spec.program.starts_with('/') {
+        return Err(RunError::NotAbsolute);
+    }
+    let mut cmd = std::process::Command::new(spec.program);
+    cmd.args(&spec.args)
+        .env_clear()
+        .envs(BASE_ENV)
+        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+        .current_dir("/")
+        .stdin(if spec.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| RunError::Spawn(e.kind()))?;
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(RunError::Io(std::io::ErrorKind::BrokenPipe));
+    };
+    let cap = spec.output_cap;
+    let reader = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || -> std::io::Result<(Vec<u8>, bool)> {
+            let mut kept = Vec::new();
+            let mut buf = [0u8; 8192];
+            let mut truncated = false;
+            loop {
+                let n = r.read(&mut buf)?;
+                if n == 0 {
+                    return Ok((kept, truncated));
+                }
+                let room = cap.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+                truncated |= n > room;
+            }
+        })
+    };
+    let t_out = reader(Box::new(out));
+    let t_err = reader(Box::new(err));
+    let t_in = match (child.stdin.take(), spec.stdin) {
+        (Some(mut w), Some(bytes)) => Some(std::thread::spawn(move || {
+            // A child that exits without reading gets EPIPE; its exit
+            // status tells the story.
+            let _ = w.write_all(&bytes);
+        })),
+        _ => None,
+    };
+    let deadline = std::time::Instant::now() + spec.timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Timeout);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(e) => return Err(RunError::Io(e.kind())),
+        }
+    };
+    if let Some(t) = t_in {
+        let _ = t.join();
+    }
+    let join = |t: std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>| {
+        t.join()
+            .map_err(|_| RunError::Io(std::io::ErrorKind::Other))?
+            .map_err(|e| RunError::Io(e.kind()))
+    };
+    let (stdout, t1) = join(t_out)?;
+    let (stderr, t2) = join(t_err)?;
+    Ok(CommandOutput {
+        code: status.code(),
+        stdout,
+        stderr,
+        truncated: t1 || t2,
+    })
 }
 
 async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
@@ -138,7 +243,11 @@ async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
         .envs(BASE_ENV)
         .envs(spec.env.iter().map(|(k, v)| (k, v)))
         .current_dir("/")
-        .stdin(Stdio::null())
+        .stdin(if spec.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -146,9 +255,24 @@ async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(RunError::Io(std::io::ErrorKind::BrokenPipe));
     };
+    let stdin = child.stdin.take().zip(spec.stdin);
+    let feed = async move {
+        use tokio::io::AsyncWriteExt;
+        if let Some((mut w, bytes)) = stdin {
+            // EPIPE from a child that exits early: its status tells.
+            let _ = w.write_all(&bytes).await;
+            let _ = w.shutdown().await;
+        }
+    };
     let cap = spec.output_cap;
     let res = tokio::time::timeout(spec.timeout, async {
-        tokio::join!(read_capped(out, cap), read_capped(err, cap), child.wait())
+        let (o, e, (), s) = tokio::join!(
+            read_capped(out, cap),
+            read_capped(err, cap),
+            feed,
+            child.wait()
+        );
+        (o, e, s)
     })
     .await;
     let Ok((out, err, status)) = res else {
@@ -230,19 +354,28 @@ impl FakeRunner {
     }
 }
 
-impl CommandRunner for FakeRunner {
-    fn run(&self, spec: CommandSpec) -> LocalBoxFuture<'_, Result<CommandOutput, RunError>> {
+impl FakeRunner {
+    fn answer(&self, spec: CommandSpec) -> Result<CommandOutput, RunError> {
         let key = CommandSpecKey {
             program: spec.program,
             args: spec.args.clone(),
         };
         self.calls.borrow_mut().push(spec);
         let mut q = self.expected.borrow_mut();
-        let reply = match q.front() {
+        match q.front() {
             Some((k, _)) if *k == key => q.pop_front().map_or(Err(RunError::Unexpected), |e| e.1),
             _ => Err(RunError::Unexpected),
-        };
-        Box::pin(std::future::ready(reply))
+        }
+    }
+}
+
+impl CommandRunner for FakeRunner {
+    fn run(&self, spec: CommandSpec) -> LocalBoxFuture<'_, Result<CommandOutput, RunError>> {
+        Box::pin(std::future::ready(self.answer(spec)))
+    }
+
+    fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutput, RunError> {
+        self.answer(spec)
     }
 }
 
@@ -296,5 +429,26 @@ mod tests {
 
         let r = block(SystemRunner.run(CommandSpec::new("relative")));
         assert_eq!(r, Err(RunError::NotAbsolute));
+    }
+
+    #[test]
+    fn stdin_async_and_blocking() {
+        let spec = CommandSpec::new("/bin/cat").stdin(b"table inet fleet\n".to_vec());
+        let out = block(SystemRunner.run(spec.clone())).unwrap();
+        assert_eq!(out.stdout, b"table inet fleet\n");
+        let out = SystemRunner.run_blocking(spec).unwrap();
+        assert!(out.success());
+        assert_eq!(out.stdout, b"table inet fleet\n");
+        // No stdin: /dev/null, immediate EOF.
+        let out = SystemRunner
+            .run_blocking(CommandSpec::new("/bin/cat"))
+            .unwrap();
+        assert!(out.stdout.is_empty());
+        let r = SystemRunner.run_blocking(
+            CommandSpec::new("/bin/sleep")
+                .arg("5")
+                .timeout(Duration::from_millis(100)),
+        );
+        assert_eq!(r, Err(RunError::Timeout));
     }
 }

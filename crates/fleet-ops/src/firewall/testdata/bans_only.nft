@@ -1,0 +1,85 @@
+add table inet fleet
+add set inet fleet banned4 { type ipv4_addr; flags interval, timeout; }
+add set inet fleet banned6 { type ipv6_addr; flags interval, timeout; }
+add set inet fleet exempt4 { type ipv4_addr; flags interval, timeout; }
+add set inet fleet exempt6 { type ipv6_addr; flags interval, timeout; }
+add chain inet fleet input { type filter hook input priority filter; policy accept; }
+add chain inet fleet forward { type filter hook forward priority filter; policy accept; }
+delete chain inet fleet input
+delete chain inet fleet forward
+add set inet fleet m4_0 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_0
+add set inet fleet m6_0 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_0
+add set inet fleet m4_1 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_1
+add set inet fleet m6_1 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_1
+add set inet fleet m4_2 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_2
+add set inet fleet m6_2 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_2
+add set inet fleet m4_3 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_3
+add set inet fleet m6_3 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_3
+add set inet fleet m4_4 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_4
+add set inet fleet m6_4 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_4
+add set inet fleet m4_5 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_5
+add set inet fleet m6_5 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_5
+add set inet fleet m4_6 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_6
+add set inet fleet m6_6 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_6
+add set inet fleet m4_7 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_7
+add set inet fleet m6_7 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_7
+add set inet fleet m4_8 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_8
+add set inet fleet m6_8 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_8
+add set inet fleet m4_9 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_9
+add set inet fleet m6_9 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_9
+add set inet fleet m4_10 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_10
+add set inet fleet m6_10 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_10
+add set inet fleet m4_11 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_11
+add set inet fleet m6_11 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_11
+add set inet fleet m4_12 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_12
+add set inet fleet m6_12 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_12
+add set inet fleet m4_13 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_13
+add set inet fleet m6_13 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_13
+add set inet fleet m4_14 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_14
+add set inet fleet m6_14 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_14
+add set inet fleet m4_15 { type ipv4_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m4_15
+add set inet fleet m6_15 { type ipv6_addr; size 65535; flags dynamic, timeout; timeout 1m; }
+delete set inet fleet m6_15
+table inet fleet {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		ip saddr != @exempt4 ip saddr @banned4 drop comment "base"
+		ip6 saddr != @exempt6 ip6 saddr @banned6 drop comment "base"
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		ip saddr != @exempt4 ip saddr @banned4 drop comment "base"
+		ip6 saddr != @exempt6 ip6 saddr @banned6 drop comment "base"
+	}
+}

@@ -25,6 +25,7 @@ pub mod allowed;
 pub mod compose;
 pub mod ctx;
 pub mod escalation;
+pub mod firewall;
 pub mod handler;
 pub mod logs;
 pub mod packages;

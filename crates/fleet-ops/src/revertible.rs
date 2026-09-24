@@ -70,10 +70,16 @@ impl Reverters {
         Self::default()
     }
 
-    /// Every restore module in this crate. None exist yet, so every kind is
-    /// unavailable (a revert is audited as failed, never as restored).
+    /// Every restore module in this crate (firewall so far). A kind without
+    /// one is unavailable (a revert is audited as failed, never as
+    /// restored).
     pub fn with_generic() -> Self {
-        Self::new()
+        let mut r = Self::new();
+        r.register(
+            ChangeKind::Firewall,
+            Rc::new(crate::firewall::FirewallRevert),
+        );
+        r
     }
 
     /// Registers (or replaces) the module for `kind`.
@@ -133,10 +139,9 @@ mod tests {
     fn registry_restores_by_kind() {
         let ctx = SysCtx::system();
         let mut r = Reverters::with_generic();
+        assert!(r.get(ChangeKind::Firewall).is_some());
         assert_eq!(
-            r.restore(&ctx, ChangeKind::Firewall, b"x")
-                .unwrap_err()
-                .code(),
+            r.restore(&ctx, ChangeKind::Ssh, b"x").unwrap_err().code(),
             ErrorCode::Unsupported
         );
         let m = Rc::new(Mem(RefCell::new(b"old".to_vec())));
