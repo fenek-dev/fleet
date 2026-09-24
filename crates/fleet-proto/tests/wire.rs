@@ -128,7 +128,6 @@ fn signed_roster() -> impl Strategy<Value = SignedRoster> {
 }
 
 fn op() -> impl Strategy<Value = Op> {
-    const KNOWN: [u16; 6] = [0, 1500, 1510, 1511, 1512, 1520];
     prop_oneof![
         Just(Op::SystemInfo),
         Just(Op::AgentHealth),
@@ -139,7 +138,7 @@ fn op() -> impl Strategy<Value = Op> {
         arr::<32>().prop_map(|pending_hash| Op::RosterVeto { pending_hash }),
         ".{0,200}".prop_map(|policy_toml| Op::PolicyUpdate { policy_toml }),
         any::<u16>()
-            .prop_filter("unknown", |t| !KNOWN.contains(t))
+            .prop_filter("unknown", |t| !Op::is_known_tag(*t))
             .prop_map(|tag| Op::Unknown { tag }),
     ]
 }
@@ -784,7 +783,204 @@ fn golden_vectors_v1() {
         &mut f,
     );
 
+    catalog_vectors(&body, &mut f);
     assert!(f.is_empty(), "golden vector mismatches:\n{}", f.join("\n"));
+}
+
+/// A representative sample of the full operation catalog, payloads and
+/// events (not every variant).
+fn catalog_vectors(body: &CommandBody, f: &mut Vec<String>) {
+    use args::*;
+    use fleet_proto::op::{CronEntry, PkgSpec};
+
+    let ruleset = FirewallRuleSet {
+        mode: FirewallMode::Managed,
+        rules: vec![FirewallRule {
+            chain: FwChain::Input,
+            action: FwAction::Accept,
+            proto: Protocol::Tcp,
+            ports: vec![
+                PortRange::single(Port::new(22).unwrap()),
+                PortRange::new(Port::new(60000).unwrap(), Port::new(61000).unwrap()).unwrap(),
+            ],
+            source: Some("198.51.100.0/24".parse().unwrap()),
+            rate_limit: Some(RateLimit {
+                per_minute: 30,
+                burst: 10,
+            }),
+            comment: FwComment::new("ssh office").unwrap(),
+        }],
+    };
+    check(
+        "op_unit_restart",
+        &Op::UnitRestart {
+            unit: UnitName::new("nginx.service").unwrap(),
+        },
+        f,
+    );
+    check("op_firewall_apply", &Op::FirewallApply(ruleset.clone()), f);
+    check(
+        "command_body_firewall_apply",
+        &CommandBody {
+            op: Op::FirewallApply(ruleset),
+            expected_version: Some(41),
+            ..body.clone()
+        },
+        f,
+    );
+    check(
+        "op_pkg_install",
+        &Op::PkgInstall {
+            packages: vec![
+                PkgSpec {
+                    name: DebPackageName::new("htop").unwrap(),
+                    version: None,
+                },
+                PkgSpec {
+                    name: DebPackageName::new("libssl3").unwrap(),
+                    version: Some(DebVersion::new("3.0.15-1~deb12u1").unwrap()),
+                },
+            ],
+        },
+        f,
+    );
+    check(
+        "op_cron_set",
+        &Op::CronSet {
+            user: UserName::new("ops").unwrap(),
+            entries: vec![CronEntry {
+                schedule: CronSpec::new("*/15 2-4 * * 1-5").unwrap(),
+                command: CronCommand::new("/usr/local/bin/backup --quiet").unwrap(),
+                comment: Label::new("nightly backup").unwrap(),
+            }],
+        },
+        f,
+    );
+    let mut blob = Vec::new();
+    for part in [&b"ssh-ed25519"[..], &[0x5a; 32][..]] {
+        blob.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        blob.extend_from_slice(part);
+    }
+    check(
+        "op_authorized_keys_set",
+        &Op::AuthorizedKeysSet {
+            user: UserName::new("ops").unwrap(),
+            keys: vec![SshPublicKey::new(SshKeyAlgo::Ed25519, blob, "ci@build".into()).unwrap()],
+        },
+        f,
+    );
+    check(
+        "op_compose_deploy",
+        &Op::ComposeDeploy {
+            project: ComposeProject::new("blog").unwrap(),
+            file: ComposeFile::new("services:\n  web:\n    image: ghost:5\n").unwrap(),
+            pull: true,
+        },
+        f,
+    );
+    check(
+        "op_agent_update_stage",
+        &Op::AgentUpdateStage {
+            manifest: Box::new(SignedReleaseManifest {
+                manifest: ReleaseManifest {
+                    version: AgentVersion {
+                        major: 0,
+                        minor: 2,
+                        patch: 0,
+                    },
+                    blake3: [0xb3; 32],
+                    min_proto: 1,
+                },
+                device_id: DeviceId([0xd1; 16]),
+                signature: Signature([0x51; 64]),
+            }),
+            staged_path_hash: [0xb3; 32],
+        },
+        f,
+    );
+    check(
+        "op_alert_rules_update",
+        &Op::AlertRulesUpdate(alert::AlertRuleSet {
+            version: 7,
+            rules: vec![
+                alert::AlertRule {
+                    id: RuleId::new("disk-root").unwrap(),
+                    kind: alert::AlertKind::DiskUsage {
+                        mount: Some(AbsPath::new("/").unwrap()),
+                    },
+                    threshold: 900,
+                    for_s: 300,
+                    severity: alert::Severity::Critical,
+                    enabled: true,
+                },
+                alert::AlertRule {
+                    id: RuleId::new("ssh-down").unwrap(),
+                    kind: alert::AlertKind::ServiceDown {
+                        unit: UnitName::new("ssh.service").unwrap(),
+                    },
+                    threshold: 0,
+                    for_s: 60,
+                    severity: alert::Severity::Critical,
+                    enabled: true,
+                },
+            ],
+        }),
+        f,
+    );
+    check(
+        "op_journal_follow",
+        &Op::JournalFollow(JournalQuery {
+            units: vec![UnitName::new("ssh.service").unwrap()],
+            priority: Some(Priority::Warning),
+            range: TimeRange {
+                since_ms: Some(1_750_000_000_000),
+                until_ms: None,
+            },
+            grep: Some(GrepPattern::new("Failed password").unwrap()),
+            after_cursor: None,
+            limit: 500,
+        }),
+        f,
+    );
+    check(
+        "payload_metrics_sample",
+        &Payload::MetricsSample(payload::MetricsSample {
+            time_ms: 1_750_000_000_123,
+            values: vec![(0, F32(12.5)), (7, F32(0.0)), (255, F32(f32::NAN))],
+        }),
+        f,
+    );
+    check(
+        "payload_change_pending",
+        &Payload::ChangePending(payload::PendingChange {
+            change_id: [0xc4; 16],
+            kind: payload::ChangeKind::Firewall,
+            op_tag: op::tag::FIREWALL_APPLY,
+            created_ms: 1_750_000_000_000,
+            deadline_ms: 1_750_000_060_000,
+            new_version: Some(42),
+        }),
+        f,
+    );
+    check(
+        "event_alert_fired",
+        &Event::AlertFired {
+            rule_id: "disk-root".into(),
+            severity: alert::Severity::Critical,
+            subject: "/".into(),
+            value: 951,
+        },
+        f,
+    );
+    check(
+        "event_service_state_changed",
+        &Event::ServiceStateChanged {
+            unit: "nginx.service".into(),
+            from: payload::UnitActiveState::Active,
+            to: payload::UnitActiveState::Failed,
+        },
+        f,
+    );
 }
 
 #[test]
