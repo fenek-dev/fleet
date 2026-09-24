@@ -39,6 +39,10 @@ use tokio::sync::oneshot;
 
 const SERVER: &str = "srv_test01";
 
+/// Stream sessions (`tests/e2e/streams.rs`), sharing this fixture.
+#[path = "e2e/streams.rs"]
+mod streams;
+
 fn run(f: impl Future<Output = ()>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -141,6 +145,7 @@ fn wait_for(path: &std::path::Path) {
 struct Pol {
     commands_per_minute: u32,
     ai: &'static str,
+    max_streams: u32,
 }
 
 impl Default for Pol {
@@ -148,6 +153,7 @@ impl Default for Pol {
         Self {
             commands_per_minute: 240,
             ai: "full",
+            max_streams: 32,
         }
     }
 }
@@ -156,6 +162,7 @@ fn policy_toml(fleet: FleetId, version: u64, pol: Pol) -> String {
     let Pol {
         commands_per_minute,
         ai,
+        max_streams,
     } = pol;
     format!(
         r#"version = {version}
@@ -173,7 +180,7 @@ ai_bulk_confirm_above = 5
 ai_commands_per_minute = 60
 [limits]
 commands_per_minute = {commands_per_minute}
-max_stream_sessions = 32
+max_stream_sessions = {max_streams}
 [safety]
 auto_revert_seconds = 60
 "#

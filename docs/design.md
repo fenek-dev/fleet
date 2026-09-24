@@ -320,7 +320,7 @@ MemoryMax=32M
 TasksMax=32
 ```
 
-**`fleet-exec` limits:** `MemoryMax=128M`, `CPUQuota=15%`, `TasksMax=256`, `LimitNOFILE=1024`, `WatchdogSec=30`, and `Restart=on-failure` with backoff. Hardening that root exec and apt tolerate: `ProtectKernelLogs`, `ProtectClock`, `ProtectHostname`, `RestrictRealtime`, `LockPersonality`, `SystemCallArchitectures=native`, `ProtectHome=read-only` (relax when user-management ops land), `PrivateTmp`. Deliberately not set: `ProtectKernelModules` (hides `/usr/lib/modules`, which kernel package installs write), `RestrictNamespaces` (the Docker role runs compose helpers from exec), and anything that removes root's filesystem write access or capabilities. Operations that start long-running child processes (apt, SteamCMD, `docker compose pull`) run in their own transient systemd scopes named `fleet-op-<id>.scope`, so the agent's limits don't throttle them and file changes can be attributed to the operation (section 4.9). Blocking work (file hashing, `/etc` scans, database compaction) runs on the blocking thread pool so it never delays the watchdog. Anything that must survive an exec crash (auto-revert and update rollback deadlines) is armed as an independent transient systemd timer, not as an in-process timer (sections 4.10 and 10.2).
+**`fleet-exec` limits:** `MemoryMax=128M`, `CPUQuota=15%`, `TasksMax=256`, `LimitNOFILE=1024`, `WatchdogSec=30`, and `Restart=on-failure` with backoff. Hardening that root exec and apt tolerate: `ProtectKernelLogs`, `ProtectClock`, `ProtectHostname`, `RestrictRealtime`, `LockPersonality`, `SystemCallArchitectures=native`, `ProtectHome=read-only` (relax when user-management ops land), `PrivateTmp`. Deliberately not set: `ProtectKernelModules` (hides `/usr/lib/modules`, which kernel package installs write), `RestrictNamespaces` (the Docker role runs compose helpers from exec), and anything that removes root's filesystem write access or capabilities. **Operation dispatch:** exec looks up each verified op by its wire tag in a `fleet_ops::Registry`. Generic handlers live in the `fleet-ops` crate and run against an injectable `SysCtx` (filesystem root, child-process runner with fixed absolute paths, cleared environment, timeout and output cap, clock, `/proc` reader), so they are tested against a temp directory and canned command output; handlers bound to exec's own state (`roster.*`, `policy.update`, `agent.health`) are registered by exec behind the same `OpHandler` trait. A handler's `validate` (no side effects) runs before the nonce is consumed; `handle` runs after the audit intent and returns a `Payload` or an `OpStream`. Each request runs as its own task (at most 16 per gate connection), so a long operation doesn't hold up others or a `StreamCancel`; everything from verification to the start of `handle` runs without yielding. Operations that start long-running child processes (apt, SteamCMD, `docker compose pull`) run in their own transient systemd scopes named `fleet-op-<id>.scope` (`<id>` is the audit intent seq; built by `fleet_ops::scope::scoped`, `/usr/bin/systemd-run --scope --quiet --collect --unit fleet-op-<id> -- <program> <args>`), so the agent's limits don't throttle them and file changes can be attributed to the operation (section 4.9). Blocking work (file hashing, `/etc` scans, database compaction) runs on the blocking thread pool so it never delays the watchdog. Anything that must survive an exec crash (auto-revert and update rollback deadlines) is armed as an independent transient systemd timer, not as an in-process timer (sections 4.10 and 10.2).
 
 ### 4.2 Operation catalog
 
@@ -639,6 +639,7 @@ sequenceDiagram
 - **Replayed identical command → original answer:** for every command that consumed its nonce, exec stores the response (result and signed receipt) keyed by `command_hash` in the `replay` table, with the nonce's expiry, pruned with it. When the exact same `SignedCommand` arrives again it returns that original response unchanged, before any verification: a gate that drops exec's `Ok` reply and re-forwards the command gets the real receipt, not a signed `Replay` "failure" for a command that ran. A different envelope reusing the nonce or approval leaf still gets `Replay` (a reused leaf reports `Replay` too, not `ApprovalInvalid`). The Mac treats a signed `Replay` for a state-changing op as **outcome unknown**, never as a failure.
 - **Server binding:** `server_id` is part of the signed body, so a command signed for one server fails on every other server.
 - **Signed receipts:** for **every** response to a command it could decode — success or error, reads included — exec returns `Receipt { server_id, command_hash, audit_seq: Option<u64>, outcome, payload_hash, time_ms }` signed with the agent signing key (`"fleet/receipt/v1"`). `outcome` is `Ok` or `Failed(code)` matching the response; `payload_hash` is BLAKE3 of the encoded `Payload` (zeros for errors); `audit_seq` is `None` when the command was rejected before an audit intent. The Mac checks all of it (`receipt::verify_response`), so the gate can neither forge success for, say, a roster update that never happened, nor turn a real success into an error or alter a payload. A response without a receipt comes only from the gate (rate limit, session mode) or from a frame exec couldn't decode; for a state-changing op the Mac treats it as **outcome unknown**, never as proof of failure. A read without a valid receipt is an error too (its claimed error code, e.g. the gate's `Busy`, is shown as advisory only).
+- **Streams:** `StreamOpen` runs this same pipeline; instead of one receipt, exec signs running-hash checkpoints and a final seal over the stream's data (section 6.3).
 - **Signed events:** the Mac accepts an `Event` only if `receipt::verify_event` passes (pinned agent key, this server), its `run_id` is the one in the signed `agent.health` read at connect, its `time_ms` is not before the session start minus skew (30 s), and its `seq` is above the last one accepted in the session (exec's counter restarts with exec, which also ends the session). Events that arrive before that read are held until it completes; recovery sessions (no `agent.health`) accept none. A `seq` that skips ahead is accepted and counted as a gap. Others are dropped and counted. At most 1,024 events are buffered between reads; the oldest are dropped first.
 - **Replay entries** (nonce, approval leaf) are consumed only after policy and argument checks pass, so a refused command doesn't burn its approval. `policy.update` enforces `expected_version` when given (`VersionConflict { current }`).
 - **Signed events:** events carry `SignedEvent { server_id, run_id, seq, time_ms, event, sig }`, signed by the agent key over `"fleet/event/v1" ‖ postcard((server_id, run_id, seq, time_ms, event))`. `run_id` is random per exec start and also reported in `AgentHealth`. The Mac verifies the signature, the run and freshness, and tracks `seq` for gaps or repeats, so a gate can't inject, replay (from an earlier run) or suppress-and-replace alerts.
@@ -807,6 +808,34 @@ struct Receipt {
 }
 struct SignedReceipt { receipt: Receipt, signature: Signature }   // "fleet/receipt/v1"
 ```
+
+**Streams.** `StreamOpen { id, cmd }` goes through the full pipeline of section 5.6 (verify, policy, handler argument checks, `limits.max_stream_sessions` across the whole exec — `Busy` beyond it — nonce, audit intent) before any data flows; the handler must declare that it supports streaming, otherwise `Unsupported`. The gate forwards stream frames like requests (it refuses `StreamOpen` early only for rate limit and session mode, with an unsigned `StreamEnd`). Each `StreamData.chunk` is `postcard(StreamChunk)`:
+
+```rust
+enum StreamChunk {
+    Data(Vec<u8>),                   // postcard(Payload), hashed exactly as sent
+    Checkpoint(SignedStreamSeal),    // outcome: None
+    Final(SignedStreamSeal),         // outcome: Some; always right before StreamEnd
+}
+struct StreamSeal {
+    server_id: ServerId,
+    command_hash: [u8; 32],   // of the StreamOpen's SignedCommand
+    audit_seq: Option<u64>,   // checkpoint: intent; final: result entry (None if refused before intent)
+    count: u64,               // data chunks covered
+    chain: [u8; 32],          // chain_n = BLAKE3(chain_{n-1} ‖ n: u64 BE ‖ BLAKE3(data_n)), chain_0 = 0
+    outcome: Option<Outcome>,
+    time_ms: u64,
+}
+struct SignedStreamSeal { seal: StreamSeal, signature: Signature }   // "fleet/stream/v1"
+```
+
+- `StreamData.seq` counts every `StreamData` of the stream from 0 (data, checkpoints and the final seal alike); the Mac rejects gaps.
+- Exec signs a checkpoint after at most 32 data chunks, and after 5 seconds when unsealed data is pending; the Mac refuses a stream that sends a 33rd data chunk without one, so at most 32 items are ever unauthenticated. Data is shown as provisional until a seal covers it.
+- The final seal is sent for **every** stream exec could decode, including refusals (`Failed(code)`, `audit_seq: None`), so a stream refusal is as authentic as a `Response` receipt. `StreamEnd` itself is unsigned: a `StreamEnd` without a verified final seal before it means "outcome unknown" (a gate refusal or a cut stream).
+- `StreamCancel`, or the connection closing, ends the stream with `Ok`; every admitted stream gets its audit result entry. A reused nonce (the same `StreamOpen` envelope again) is refused with `Replay`; streams have no stored-answer replay.
+- **Backpressure.** Exec's queue towards the gate is bounded. A stream marked *latest-only* (metrics) drops items the queue can't take; dropped items never enter the chain. Any other stream waits up to 10 seconds per chunk, then ends with `Busy` (if the client is still stalled, the final seal can be lost too: "outcome unknown").
+- Chunks are not compressed yet (no zstd dependency in the agent so far); each item must encode to less than 1 MiB.
+- The Mac side is `fleet_crypto::stream::StreamVerifier`. These types and the `"fleet/stream/v1"` domain live in `fleet-crypto` until the next `fleet-proto` revision moves them next to the other wire types.
 
 ### 6.4 Signed command
 

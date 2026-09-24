@@ -12,6 +12,7 @@ pub mod receipt;
 pub mod recovery;
 pub mod roster;
 pub mod sig;
+pub mod stream;
 pub mod verify;
 
 pub use error::Error;

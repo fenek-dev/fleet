@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 fleet-proto.workspace = true
 fleet-crypto.workspace = true
+fleet-ops.workspace = true
 serde.workspace = true
 postcard.workspace = true
 blake3.workspace = true

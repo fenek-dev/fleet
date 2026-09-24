@@ -543,6 +543,7 @@ dependencies = [
  "blake3",
  "fleet-core",
  "fleet-crypto",
+ "fleet-ops",
  "fleet-proto",
  "hex",
  "postcard",
@@ -589,6 +590,17 @@ dependencies = [
  "unicode-normalization",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "fleet-ops"
+version = "0.1.0"
+dependencies = [
+ "fleet-crypto",
+ "fleet-proto",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

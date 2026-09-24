@@ -5,6 +5,7 @@ members = [
     "crates/fleet-crypto",
     "crates/fleet-agent",
     "crates/fleet-core",
+    "crates/fleet-ops",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ todo = "warn"
 fleet-proto = { path = "crates/fleet-proto" }
 fleet-crypto = { path = "crates/fleet-crypto" }
 fleet-core = { path = "crates/fleet-core" }
+fleet-ops = { path = "crates/fleet-ops" }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }

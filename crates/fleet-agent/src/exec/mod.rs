@@ -10,6 +10,14 @@
 //! session plus the gate's control connection; see `ipc` for the message
 //! order. Single-threaded: state lives in one `RefCell`, and command handling
 //! never awaits while holding it.
+//!
+//! Operations are dispatched through a `fleet_ops::Registry`: generic ones
+//! come from `fleet-ops`, state-bound ones (roster, policy, veto,
+//! `agent.health`, `roster.pending`) from [`ops`]. `StreamOpen` runs the same
+//! pipeline and then [`stream`] pumps the handler's `OpStream`.
+
+mod ops;
+mod stream;
 
 use crate::authorized_keys;
 use crate::frame::Reassembler;
@@ -19,27 +27,27 @@ use crate::paths::Paths;
 use crate::pending::{self, PendingDir, PendingError};
 use crate::revert::{self, Revert, Runner, SystemRunner, UnavailableRevert};
 use crate::store::{CheckpointSigner, Intent, MetaKey, Store, StoreError};
-use crate::{fsutil, now_ms, sysinfo};
+use crate::{fsutil, now_ms};
 use fleet_crypto::receipt::{receipt_for, sign_event, sign_receipt};
-use fleet_crypto::roster::{
-    self, PendingRoster, RecoveryClock, RosterDecision, next_grace_remaining, roster_hash,
-};
+use fleet_crypto::roster::{self, PendingRoster, RecoveryClock, next_grace_remaining, roster_hash};
 use fleet_crypto::sig::Ed25519Signer;
 use fleet_crypto::verify::{self, VerifiedCommand, VerifyCtx};
+use fleet_ops::{Invocation, OpHandler, OpMeta, OpOutput, Registry, SysCtx};
 use fleet_proto::chunk::split_frame;
 use fleet_proto::policy::AiAccess;
 use fleet_proto::{
-    Actor, AgentHealth, ErrorCode, Event, Hash32, KeyKind, Message, Op, OpSummary, Outcome,
-    P256Public, PROTO_VERSION, Payload, PendingRecovery, Policy, RootApproval, ServerId, Signature,
+    Actor, ErrorCode, Event, Hash32, KeyKind, Message, Op, OpSummary, Outcome, P256Public,
+    PROTO_VERSION, Payload, PendingRecovery, Policy, RequestId, RootApproval, ServerId, Signature,
     SignedCommand, SignedEvent, SignedReceipt, SignedRoster, Tier, decode, encode,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
 /// A gate must send `SessionOpen`/`ControlOpen` within this after connecting.
 pub const SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -54,6 +62,9 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60);
 /// A pending recovery's remaining delay (and the remaining local recovery
 /// grace) is persisted at least this often.
 const PENDING_PERSIST_EVERY_MS: u64 = 60_000;
+/// Requests of one gate connection running at once; the connection stops
+/// reading while all are busy.
+const MAX_INFLIGHT_REQUESTS: usize = 16;
 
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
@@ -90,6 +101,16 @@ pub struct ExecConfig {
     /// Arms auto-revert timers again at startup (§4.10).
     pub runner: Box<dyn Runner>,
     pub terminator: Box<dyn SessionTerminator>,
+    /// Environment of every operation (root, processes, clock, `/proc`).
+    pub ctx: SysCtx,
+    /// Registered after the built-in handlers, replacing any with the same
+    /// tag (tests; later, optional op families).
+    pub handlers: Vec<(u16, Rc<dyn OpHandler>)>,
+    /// Longest gap between stream checkpoints while data is flowing.
+    pub stream_checkpoint_interval: Duration,
+    /// A non-`latest_only` stream whose client can't take a chunk for this
+    /// long is ended with `Busy`.
+    pub stream_send_timeout: Duration,
 }
 
 impl ExecConfig {
@@ -102,6 +123,10 @@ impl ExecConfig {
             reverter: Box::new(UnavailableRevert),
             runner: Box::new(SystemRunner),
             terminator: Box::new(NoopTerminator),
+            ctx: SysCtx::system(),
+            handlers: Vec::new(),
+            stream_checkpoint_interval: Duration::from_secs(5),
+            stream_send_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -214,14 +239,6 @@ impl CheckpointSigner for AgentKey<'_> {
     fn sign(&self, msg: &[u8]) -> Signature {
         self.0.sign(msg)
     }
-}
-
-/// Validated plan for one command; built before the audit intent.
-enum Plan {
-    Read,
-    Roster(Box<SignedRoster>, RosterDecision),
-    Veto(Hash32),
-    Policy(Box<Policy>, StoredPolicy),
 }
 
 struct State {
@@ -747,90 +764,60 @@ impl State {
         }
     }
 
-    /// The full pipeline for one command (design §5.6). Every answer is
-    /// receipted, rejections included (`audit_seq` `None` before the intent).
-    ///
-    /// The answer to a command that consumed its nonce is kept (as long as
-    /// the nonce) and returned again, unchanged, for the identical command:
-    /// a gate that drops the reply and re-forwards the command gets the
-    /// original result and receipt, never a signed `Replay` failure for a
-    /// command that did run.
-    fn handle(
-        &mut self,
-        session: KeyKind,
-        cmd: &SignedCommand,
-    ) -> (Result<Payload, ErrorCode>, SignedReceipt) {
-        let hash = verify::command_hash(cmd);
-        match self.store.replay().get_response(&hash) {
-            Ok(Some(bytes)) => {
-                match decode::<(Result<Payload, ErrorCode>, SignedReceipt)>(&bytes) {
-                    Ok(original) => return original,
-                    // Falls through to verification, which answers `Replay`.
-                    Err(e) => log("stored response", e),
+    /// The stored answer to an identical command that already ran.
+    fn stored_response(
+        &self,
+        hash: &Hash32,
+    ) -> Option<(Result<Payload, ErrorCode>, SignedReceipt)> {
+        match self.store.replay().get_response(hash) {
+            Ok(Some(bytes)) => match decode(&bytes) {
+                Ok(original) => Some(original),
+                // Falls through to verification, which answers `Replay`.
+                Err(e) => {
+                    log("stored response", e);
+                    None
                 }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                log("stored response", e);
+                None
             }
-            Ok(None) => {}
-            Err(e) => log("stored response", e),
         }
-        let now = now_ms();
-        let (result, audit_seq, consumed_until) = self.run_command(session, cmd, now);
-        let receipt = sign_receipt(
-            receipt_for(self.server_id.clone(), hash, audit_seq, &result, now_ms()),
-            &self.signer,
-        );
-        if let Some(expires) = consumed_until
-            && let Err(e) =
-                self.store
-                    .replay()
-                    .put_response(&hash, expires, &encode(&(&result, &receipt)))
-        {
-            // A later replay then gets `Replay`, which the Mac reads as
-            // "outcome unknown".
-            log("store response", e);
-        }
-        (result, receipt)
     }
 
-    /// Result, audit seq of the result entry and, once the nonce was
-    /// consumed, until when it stays recorded.
-    fn run_command(
-        &mut self,
+    fn verify(
+        &self,
         session: KeyKind,
         cmd: &SignedCommand,
         now: u64,
-    ) -> (Result<Payload, ErrorCode>, Option<u64>, Option<u64>) {
-        let verified = {
-            let ctx = VerifyCtx {
-                roster: &self.roster.roster,
-                server_id: &self.server_id,
-                now_ms: now,
-                skew_ms: verify::DEFAULT_SKEW_MS,
-                max_ttl_ms: verify::DEFAULT_MAX_TTL_MS,
-                // Asserted by the gate; it can only narrow what the command's
-                // own key kind already permits.
-                session_key_kind: session,
-                grace_remaining_ms: self.grace_remaining(),
-            };
-            verify::verify_command(cmd, &ctx, &self.store.replay())
+    ) -> Result<VerifiedCommand, ErrorCode> {
+        let ctx = VerifyCtx {
+            roster: &self.roster.roster,
+            server_id: &self.server_id,
+            now_ms: now,
+            skew_ms: verify::DEFAULT_SKEW_MS,
+            max_ttl_ms: verify::DEFAULT_MAX_TTL_MS,
+            // Asserted by the gate; it can only narrow what the command's
+            // own key kind already permits.
+            session_key_kind: session,
+            grace_remaining_ms: self.grace_remaining(),
         };
-        let v = match verified {
-            Ok(v) => v,
-            Err(e) => return (Err(e.code()), None, None),
-        };
-        let plan = match self
-            .check_policy(&v)
-            .and_then(|()| self.prepare(&v, cmd, now))
-        {
-            Ok(p) => p,
-            Err(code) => return (Err(code), None, None),
-        };
-        // Replay entries are consumed only once policy and arguments passed,
-        // so a refused command doesn't burn its nonce or approval leaf (exec
-        // is single-threaded: nothing runs between verify and commit).
-        if let Err(e) = v.commit(&mut self.store.replay()) {
-            return (Err(e.code()), None, None);
-        }
-        let consumed = Some(v.nonce_expires_at_ms);
+        verify::verify_command(cmd, &ctx, &self.store.replay()).map_err(|e| e.code())
+    }
+
+    /// Consumes the replay entries, then appends the audit intent; returns
+    /// its seq.
+    fn commit_intent(
+        &mut self,
+        v: &VerifiedCommand,
+        cmd: &SignedCommand,
+        now: u64,
+    ) -> Result<u64, Refused> {
+        v.commit(&mut self.store.replay()).map_err(|e| Refused {
+            code: e.code(),
+            consumed_until: None,
+        })?;
         let intent = Intent {
             time_ms: now,
             actor: v.body.actor.clone(),
@@ -839,24 +826,27 @@ impl State {
             signature: cmd.signature,
             op: OpSummary::from(&v.body.op),
         };
-        let Ok(intent_seq) = self.store.audit().append_intent(intent) else {
-            return (Err(ErrorCode::Internal), None, consumed);
+        self.store
+            .audit()
+            .append_intent(intent)
+            .map_err(|_| Refused {
+                code: ErrorCode::Internal,
+                consumed_until: Some(v.nonce_expires_at_ms),
+            })
+    }
+
+    /// Appends the result entry; `None` if that failed (the change, if any,
+    /// happened, but startup will mark the intent Interrupted).
+    fn audit_result(&mut self, intent_seq: u64, status: Result<(), ErrorCode>) -> Option<u64> {
+        let outcome = match status {
+            Ok(()) => Outcome::Ok,
+            Err(c) => Outcome::Failed(c),
         };
-        let result = self.execute(plan, &v, now);
-        let outcome = match &result {
-            Ok(_) => Outcome::Ok,
-            Err(c) => Outcome::Failed(*c),
-        };
-        match self
-            .store
+        self.store
             .audit()
             .append_result(intent_seq, now_ms(), outcome)
-        {
-            Ok(seq) => (result, Some(seq), consumed),
-            // The change (if any) happened, but its result isn't audited;
-            // startup will mark the intent Interrupted.
-            Err(_) => (Err(ErrorCode::Internal), Some(intent_seq), consumed),
-        }
+            .map_err(|e| log("audit result", e))
+            .ok()
     }
 
     fn check_policy(&self, v: &VerifiedCommand) -> Result<(), ErrorCode> {
@@ -884,116 +874,156 @@ impl State {
         }
         Ok(())
     }
+}
 
-    /// Argument validation; nothing is changed here.
-    fn prepare(
+/// A command refused before it ran: the code, and until when its nonce
+/// stays recorded if it was consumed.
+struct Refused {
+    code: ErrorCode,
+    consumed_until: Option<u64>,
+}
+
+/// A command that passed every check; its nonce is consumed and its audit
+/// intent written (`meta.audit_seq`).
+struct Admitted {
+    handler: Rc<dyn OpHandler>,
+    meta: OpMeta,
+    intent_seq: u64,
+    consumed_until: u64,
+}
+
+/// Shared by every connection: state, dispatch, environment.
+struct Exec {
+    st: Rc<RefCell<State>>,
+    registry: Registry,
+    ctx: SysCtx,
+    /// Streams running across all connections
+    /// (`limits.max_stream_sessions`).
+    streams: Cell<u32>,
+    checkpoint_every: Duration,
+    send_timeout: Duration,
+}
+
+/// Local log only (details never go on the wire); plain codes are routine.
+fn log_op_error(op_name: &str, e: &fleet_ops::OpError) {
+    if e.detail().is_some() {
+        log(op_name, e);
+    }
+}
+
+impl Exec {
+    /// verify → policy → handler supports/validate → stream slot → commit
+    /// → intent (design §5.6). Synchronous: nothing else runs in between.
+    fn admit(
         &self,
-        v: &VerifiedCommand,
+        session: KeyKind,
         cmd: &SignedCommand,
+        inv: Invocation,
         now: u64,
-    ) -> Result<Plan, ErrorCode> {
-        match &v.body.op {
-            Op::SystemInfo | Op::AgentHealth | Op::RosterPending => Ok(Plan::Read),
-            Op::RosterUpdate { roster: cand } => {
-                let d = roster::evaluate(&self.roster, &self.epoch_hashes, cand, self.clock(now))
-                    .map_err(|e| e.code())?;
-                // One pending recovery at a time (design §5.3): a second
-                // submission is refused until the first is vetoed or has
-                // activated; it can't displace or restart the countdown.
-                if matches!(d, RosterDecision::Pending { .. }) && self.pending.is_some() {
-                    return Err(ErrorCode::Busy);
-                }
-                Ok(Plan::Roster(cand.clone(), d))
-            }
-            Op::RosterVeto { pending_hash } => {
-                let p = self.pending.as_ref().ok_or(ErrorCode::NotFound)?;
-                roster::check_veto(v, &p.roster_at(now), now)
-                    .map_err(|_| ErrorCode::InvalidArgument)?;
-                Ok(Plan::Veto(*pending_hash))
-            }
-            Op::PolicyUpdate { policy_toml } => {
-                let current = self.policy.version;
-                if v.body.expected_version.is_some_and(|e| e != current) {
-                    return Err(ErrorCode::VersionConflict { current });
-                }
-                let p = Policy::from_toml(policy_toml).map_err(|_| ErrorCode::InvalidArgument)?;
-                if p.fleet_id != self.roster.roster.fleet_id || p.server_id != self.server_id {
-                    return Err(ErrorCode::InvalidArgument);
-                }
-                if p.version <= current {
-                    return Err(ErrorCode::VersionConflict { current });
-                }
-                let stored = StoredPolicy {
-                    toml: policy_toml.clone(),
-                    approval: cmd.approval.clone(),
-                };
-                Ok(Plan::Policy(Box::new(p), stored))
-            }
-            Op::Unknown { .. } => Err(ErrorCode::Unsupported),
+    ) -> Result<Admitted, Refused> {
+        let refuse = |code| Refused {
+            code,
+            consumed_until: None,
+        };
+        let v = self.st.borrow().verify(session, cmd, now).map_err(refuse)?;
+        self.st.borrow().check_policy(&v).map_err(refuse)?;
+        let op = &v.body.op;
+        let handler = self
+            .registry
+            .get(op)
+            .filter(|h| h.supports(op, inv))
+            .ok_or(refuse(ErrorCode::Unsupported))?;
+        let mut meta = OpMeta {
+            command: v,
+            approval: cmd.approval.clone(),
+            audit_seq: None,
+            now_ms: now,
+            invocation: inv,
+        };
+        // Replay entries are consumed only once policy and arguments passed,
+        // so a refused command doesn't burn its nonce or approval leaf.
+        handler
+            .validate(&self.ctx, &meta.command.body.op, &meta)
+            .map_err(|e| {
+                log_op_error(meta.command.body.op.name(), &e);
+                refuse(e.code())
+            })?;
+        if inv == Invocation::Stream
+            && self.streams.get() >= self.st.borrow().policy.limits.max_stream_sessions
+        {
+            return Err(refuse(ErrorCode::Busy));
         }
+        let intent_seq = self
+            .st
+            .borrow_mut()
+            .commit_intent(&meta.command, cmd, now)?;
+        meta.audit_seq = Some(intent_seq);
+        Ok(Admitted {
+            handler,
+            consumed_until: meta.command.nonce_expires_at_ms,
+            meta,
+            intent_seq,
+        })
     }
 
-    fn execute(&mut self, plan: Plan, v: &VerifiedCommand, now: u64) -> Result<Payload, ErrorCode> {
-        let internal = |_| ErrorCode::Internal;
-        match plan {
-            Plan::Read => Ok(match &v.body.op {
-                Op::SystemInfo => Payload::SystemInfo(sysinfo::collect()),
-                Op::AgentHealth => Payload::AgentHealth(self.health(now)),
-                _ => Payload::RosterPending(self.pending_wire(now)),
-            }),
-            Plan::Roster(new, RosterDecision::Accept) => {
-                self.install_roster(*new, now).map_err(internal)?;
-                Ok(Payload::Empty)
-            }
-            Plan::Roster(new, RosterDecision::Pending { activates_at_ms }) => {
-                let remaining_ms = activates_at_ms.saturating_sub(now);
-                let p = PendingState {
-                    hash: roster_hash(&new),
-                    roster: *new,
-                    submitted_at_ms: now,
-                    remaining_ms,
-                    persisted_ms: remaining_ms,
-                    grace_until_ms: self.clock(now).local_grace_until_ms,
-                };
-                let wire = p.wire(now);
-                self.set_pending(Some(p)).map_err(internal)?;
-                self.emit(Event::RecoveryPending(wire));
-                Ok(Payload::RosterPending(Some(wire)))
-            }
-            Plan::Veto(hash) => {
-                self.set_pending(None).map_err(internal)?;
-                self.emit(Event::RecoveryVetoed { hash });
-                Ok(Payload::Empty)
-            }
-            Plan::Policy(p, stored) => {
-                self.store
-                    .meta()
-                    .set(MetaKey::Policy, &encode(&stored))
-                    .map_err(internal)?;
-                let version = p.version;
-                self.policy = *p;
-                self.push_view();
-                self.emit(Event::PolicyChanged { version });
-                Ok(Payload::Empty)
-            }
+    /// One `Request`. Every answer is receipted, rejections included
+    /// (`audit_seq` `None` before the intent).
+    ///
+    /// The answer to a command that consumed its nonce is kept (as long as
+    /// the nonce) and returned again, unchanged, for the identical command:
+    /// a gate that drops the reply and re-forwards the command gets the
+    /// original result and receipt, never a signed `Replay` failure for a
+    /// command that did run.
+    async fn request(
+        &self,
+        session: KeyKind,
+        cmd: &SignedCommand,
+    ) -> (Result<Payload, ErrorCode>, SignedReceipt) {
+        let hash = verify::command_hash(cmd);
+        if let Some(original) = self.st.borrow().stored_response(&hash) {
+            return original;
         }
-    }
-
-    fn health(&self, now: u64) -> AgentHealth {
-        AgentHealth {
-            agent_version: crate::agent_version(),
-            proto_version: PROTO_VERSION,
-            uptime_s: self.started.elapsed().as_secs(),
-            // The gate's RSS isn't visible from here yet.
-            gate_rss_bytes: 0,
-            exec_rss_bytes: sysinfo::self_rss_bytes(),
-            audit_seq: self.store.audit().head().map_or(0, |h| h.seq),
-            roster_epoch: self.roster.roster.epoch,
-            roster_version: self.roster.roster.version,
-            policy_version: self.policy.version,
-            pending_recovery: self.pending_wire(now),
-            run_id: self.run_id,
+        let now = now_ms();
+        let (result, audit_seq, consumed_until) =
+            match self.admit(session, cmd, Invocation::Request, now) {
+                Err(r) => (Err(r.code), None, r.consumed_until),
+                Ok(a) => {
+                    let op = &a.meta.command.body.op;
+                    let result = match a.handler.handle(&self.ctx, op, &a.meta).await {
+                        Ok(OpOutput::Payload(p)) => Ok(p),
+                        Ok(OpOutput::Stream(_)) => Err(ErrorCode::Internal),
+                        Err(e) => {
+                            log_op_error(op.name(), &e);
+                            Err(e.code())
+                        }
+                    };
+                    let status = result.as_ref().map(drop).map_err(|c| *c);
+                    match self.st.borrow_mut().audit_result(a.intent_seq, status) {
+                        Some(seq) => (result, Some(seq), Some(a.consumed_until)),
+                        None => (
+                            Err(ErrorCode::Internal),
+                            Some(a.intent_seq),
+                            Some(a.consumed_until),
+                        ),
+                    }
+                }
+            };
+        let st = self.st.borrow();
+        let receipt = sign_receipt(
+            receipt_for(st.server_id.clone(), hash, audit_seq, &result, now_ms()),
+            &st.signer,
+        );
+        if let Some(expires) = consumed_until
+            && let Err(e) =
+                st.store
+                    .replay()
+                    .put_response(&hash, expires, &encode(&(&result, &receipt)))
+        {
+            // A later replay then gets `Replay`, which the Mac reads as
+            // "outcome unknown".
+            log("store response", e);
         }
+        (result, receipt)
     }
 }
 
@@ -1063,10 +1093,14 @@ impl Drop for ConnGuard {
 }
 
 /// Runs exec until `shutdown` completes. The store is closed on return.
-pub async fn run(cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Result<(), ExecError> {
+pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Result<(), ExecError> {
     let paths = cfg.paths.clone();
     let gate_uid = cfg.gate_uid;
     let (cp_every, maint_every) = (cfg.checkpoint_interval, cfg.maintenance_interval);
+    let ctx = cfg.ctx.clone();
+    let extra = std::mem::take(&mut cfg.handlers);
+    let (checkpoint_every, send_timeout) =
+        (cfg.stream_checkpoint_interval, cfg.stream_send_timeout);
     let mut state = State::load(cfg)?;
     state.startup(now_ms())?;
 
@@ -1074,6 +1108,22 @@ pub async fn run(cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Result<
     crate::notify::notify("READY=1");
 
     let st = Rc::new(RefCell::new(state));
+    let mut registry = Registry::with_generic();
+    let state_ops: Rc<dyn OpHandler> = Rc::new(ops::StateOps(st.clone()));
+    for tag in ops::TAGS {
+        registry.register(tag, state_ops.clone());
+    }
+    for (tag, h) in extra {
+        registry.register(tag, h);
+    }
+    let exec = Rc::new(Exec {
+        st: st.clone(),
+        registry,
+        ctx,
+        streams: Cell::new(0),
+        checkpoint_every,
+        send_timeout,
+    });
     let budget = Rc::new(Budget::default());
     let local = tokio::task::LocalSet::new();
     local
@@ -1092,9 +1142,9 @@ pub async fn run(cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Result<
                             }
                             budget.conns.set(budget.conns.get() + 1);
                             let guard = ConnGuard { budget: budget.clone(), bytes: Cell::new(0) };
-                            let st = st.clone();
+                            let exec = exec.clone();
                             tokio::task::spawn_local(async move {
-                                let _ = connection(stream, st, gate_uid, &guard).await;
+                                let _ = connection(stream, exec, gate_uid, &guard).await;
                             });
                         }
                     }
@@ -1113,9 +1163,36 @@ pub async fn run(cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Result<
     Ok(())
 }
 
+/// Outgoing side of one gate connection, shared by its request and stream
+/// tasks: frames messages (exec frame ids, top bit clear) into a bounded
+/// queue drained by the connection's single writer.
+#[derive(Clone)]
+struct Out {
+    tx: mpsc::Sender<Vec<IpcMsg>>,
+    ids: Rc<Cell<u32>>,
+}
+
+impl Out {
+    fn frame(&self, msg: &Message) -> Vec<IpcMsg> {
+        let id = self.ids.get();
+        self.ids.set(id.wrapping_add(1) & !ipc::GATE_FRAME_BIT);
+        split_frame(id, &encode(msg))
+            .into_iter()
+            .map(IpcMsg::Chunk)
+            .collect()
+    }
+
+    async fn send(&self, msg: &Message) -> Option<()> {
+        self.tx.send(self.frame(msg)).await.ok()
+    }
+}
+
+/// Running streams of one connection: id → (generation, cancel).
+type ActiveStreams = Rc<RefCell<HashMap<RequestId, (u64, oneshot::Sender<()>)>>>;
+
 async fn connection(
     stream: UnixStream,
-    st: Rc<RefCell<State>>,
+    exec: Rc<Exec>,
     gate_uid: u32,
     guard: &ConnGuard,
 ) -> Option<()> {
@@ -1124,18 +1201,15 @@ async fn connection(
     }
     let (mut r, mut w) = stream.into_split();
     let (mut view_rx, mut ev_rx) = {
-        let s = st.borrow();
+        let s = exec.st.borrow();
         (s.view.subscribe(), s.events.subscribe())
     };
-    let ids = Cell::new(0u32);
-    let frame = |msg: &Message| -> Vec<IpcMsg> {
-        let id = ids.get();
-        ids.set(id.wrapping_add(1) & !ipc::GATE_FRAME_BIT);
-        split_frame(id, &encode(msg))
-            .into_iter()
-            .map(IpcMsg::Chunk)
-            .collect()
+    let (tx, mut rx) = mpsc::channel::<Vec<IpcMsg>>(16);
+    let out = Out {
+        tx,
+        ids: Rc::new(Cell::new(0)),
     };
+    let frame = |msg: &Message| out.frame(msg);
 
     let init = view_rx.borrow_and_update().msgs();
     for m in &init {
@@ -1150,14 +1224,16 @@ async fn connection(
         IpcMsg::ControlOpen => return control(r, w, view_rx).await,
         _ => return None,
     };
-    let hello = st.borrow().hello();
+    let hello = exec.st.borrow().hello();
     for m in &frame(&hello) {
         ipc::write_msg(&mut w, m).await.ok()?;
     }
 
-    let (tx, mut rx) = mpsc::channel::<Vec<IpcMsg>>(16);
+    let active: ActiveStreams = Rc::default();
+    let inflight = Rc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS));
     let up = async {
         let mut reasm = Reassembler::for_exec();
+        let mut generation = 0u64;
         loop {
             let IpcMsg::Chunk(c) = ipc::read_msg(&mut r).await.ok()?? else {
                 return None::<()>;
@@ -1169,25 +1245,61 @@ async fn connection(
             let Some((_, bytes)) = done else {
                 continue;
             };
-            let reply = match decode::<Message>(&bytes).ok()? {
+            match decode::<Message>(&bytes).ok()? {
+                // Each request runs as its own task, so a long operation
+                // doesn't hold up `StreamCancel` or other requests. It runs
+                // to completion (and is audited) even if the gate goes away.
                 Message::Request { id, cmd } => {
-                    let (result, receipt) = st.borrow_mut().handle(key, &cmd);
-                    Message::Response {
-                        id,
-                        result,
-                        receipt: Some(receipt),
+                    // Released by the task (`Rc`: no owned permits).
+                    inflight.acquire().await.ok()?.forget();
+                    let (exec, out, inflight) = (exec.clone(), out.clone(), inflight.clone());
+                    tokio::task::spawn_local(async move {
+                        let (result, receipt) = exec.request(key, &cmd).await;
+                        let reply = Message::Response {
+                            id,
+                            result,
+                            receipt: Some(receipt),
+                        };
+                        let _ = out.send(&reply).await;
+                        inflight.add_permits(1);
+                    });
+                }
+                Message::StreamOpen { id, cmd } => {
+                    if active.borrow().contains_key(&id) {
+                        // Client bug; unsigned, nothing was verified.
+                        let end = Message::StreamEnd {
+                            id,
+                            status: Err(ErrorCode::InvalidArgument),
+                        };
+                        out.send(&end).await?;
+                        continue;
+                    }
+                    generation += 1;
+                    let (cancel_tx, cancel_rx) = oneshot::channel();
+                    active.borrow_mut().insert(id, (generation, cancel_tx));
+                    tokio::task::spawn_local(stream::run(
+                        exec.clone(),
+                        out.clone(),
+                        stream::Handle {
+                            active: active.clone(),
+                            generation,
+                            id,
+                            cancel: cancel_rx,
+                        },
+                        key,
+                        cmd,
+                    ));
+                }
+                Message::StreamCancel { id } => {
+                    if let Some((_, c)) = active.borrow_mut().remove(&id) {
+                        let _ = c.send(());
                     }
                 }
-                Message::StreamOpen { id, .. } => Message::StreamEnd {
-                    id,
-                    status: Err(ErrorCode::Unsupported),
-                },
-                Message::StreamCancel { .. } => continue,
                 _ => return None,
-            };
-            tx.send(frame(&reply)).await.ok()?;
+            }
         }
     };
+    let tx = out.tx.clone();
     let down = async {
         loop {
             tokio::select! {
@@ -1217,6 +1329,9 @@ async fn connection(
         _ = down => {},
         _ = writer => {},
     }
+    // Dropping the cancel senders ends this connection's streams (each
+    // still audits its result).
+    active.borrow_mut().clear();
     Some(())
 }
 

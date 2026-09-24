@@ -15,7 +15,6 @@ pub mod paths;
 pub mod pending;
 pub mod revert;
 pub mod store;
-pub mod sysinfo;
 
 /// Wall clock in Unix milliseconds (0 if the clock is before 1970).
 pub fn now_ms() -> u64 {
