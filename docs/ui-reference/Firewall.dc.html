@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>web-04 firewall</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#0b0c0d;color-scheme:dark}
+input,select{background:#25262b;color:#ededee}
+a{color:#87a9f4}a:hover{color:#b3c9f8}
+</style>
+</helmet>
+<div style="width:1440px;height:900px;display:flex;overflow:hidden;background:#121315;color:#ededee;font-family:'Geist',system-ui,sans-serif;font-size:13px">
+
+<nav aria-label="Main" style="width:240px;flex-shrink:0;box-sizing:border-box;background:#141518;border-right:1px solid #26272b;display:flex;flex-direction:column;gap:20px;padding:14px 12px 12px">
+<div aria-hidden="true" style="display:flex;gap:8px;padding:2px 6px">
+<span style="width:12px;height:12px;border-radius:6px;background:#ff5f57"></span>
+<span style="width:12px;height:12px;border-radius:6px;background:#febc2e"></span>
+<span style="width:12px;height:12px;border-radius:6px;background:#28c840"></span>
+</div>
+<button type="button" style="display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#a3a7ae;font-family:inherit;font-size:13px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg><span style="flex-grow:1;text-align:left">Search or run…</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">⌘K</span></button>
+<div style="display:flex;flex-direction:column;gap:2px">
+<a href="Main.dc.html" aria-current="page" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;background:#26272c;color:#ededee;text-decoration:none;font-weight:500"><span style="display:flex;color:{{accentText}}"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="4" width="18" height="7" rx="2"></rect><rect x="3" y="13" width="18" height="7" rx="2"></rect><path d="M7 7.5h.01M7 16.5h.01"></path></svg></span><span style="flex-grow:1">Fleet</span><span style="font-size:12px;font-weight:400;color:#8d9199">48</span></a>
+<a href="Security.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"></path></svg><span style="flex-grow:1">Alerts</span><span style="min-width:20px;height:18px;padding:0 6px;box-sizing:border-box;border-radius:9px;background:#33230f;color:#f0a257;font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center">3</span></a>
+<a href="ServerDetail.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg><span style="flex-grow:1">Timeline</span></a>
+<a href="BulkRun.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"></path></svg><span style="flex-grow:1">Runbooks</span></a>
+<a href="Provision.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="3" width="18" height="18" rx="4"></rect><path d="M12 8v8M8 12h8"></path></svg><span style="flex-grow:1">Provision</span></a>
+</div>
+<div style="display:flex;flex-direction:column;gap:2px">
+<div style="padding:0 10px 6px;font-size:11px;font-weight:600;color:#8d9199">Groups</div>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Production</span><span style="font-size:12px;color:#8d9199">24</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Staging</span><span style="font-size:12px;color:#8d9199">8</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Game servers</span><span style="font-size:12px;color:#8d9199">6</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Edge</span><span style="font-size:12px;color:#8d9199">10</span></a>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="padding:0 10px;font-size:11px;font-weight:600;color:#8d9199">Tags</div>
+<div style="display:flex;flex-wrap:wrap;gap:6px;padding:0 8px">
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">web</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">docker</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">game</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">eu-central</span>
+</div>
+</div>
+<div style="margin-top:auto;display:flex;flex-direction:column;gap:8px">
+<a href="Settings.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"></path><circle cx="15" cy="7" r="2"></circle><circle cx="9" cy="17" r="2"></circle></svg><span style="flex-grow:1">Settings</span></a>
+<div style="background:#1d1e22;border:1px solid #2a2b30;border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:10px">
+<div style="display:flex;align-items:center;gap:10px;color:#a3a7ae"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg><div style="display:flex;flex-direction:column;gap:1px"><span style="font-weight:500;color:#ededee">MacBook Pro 16</span><span style="font-size:11px;color:#8d9199">Unlocked · locks in 14 min</span></div></div>
+<div style="display:flex;align-items:center;gap:10px"><span style="display:flex;color:{{accentText}}"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"></path></svg></span><span style="flex-grow:1;font-size:12px;color:#d4d6da">AI agents active</span><button type="button" aria-label="Pause AI agents" style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #34363c;border-radius:7px;background:#25262b;color:#d4d6da;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M9 6v12M15 6v12"></path></svg></button></div>
+</div>
+</div>
+</nav>
+
+<main style="flex-grow:1;min-width:0;display:flex;flex-direction:column">
+<header style="flex-shrink:0;box-sizing:border-box;padding:16px 28px 0;background:#151619;border-bottom:1px solid #2a2b30;display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#8d9199"><a href="Main.dc.html" style="color:#a3a7ae;text-decoration:none">Fleet</a><span aria-hidden="true">/</span><span>Production</span><span aria-hidden="true">/</span><span style="color:#d4d6da">web-04</span></div>
+<div style="display:flex;align-items:center;gap:16px">
+<div style="display:flex;flex-direction:column;gap:4px;flex-grow:1">
+<div style="display:flex;align-items:center;gap:10px"><h1 style="margin:0;font-size:22px;font-weight:600;letter-spacing:-0.02em">web-04</h1><span style="display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:11px;font-size:12px;font-weight:500;background:#33230f;color:#f0a257"><span style="width:6px;height:6px;border-radius:3px;background:#e8832a"></span>nginx restarted</span></div>
+<div style="font-family:'Geist Mono',monospace;font-size:12px;color:#a3a7ae">203.0.113.14 · Ubuntu 24.04 LTS · 8 vCPU · 16 GB · up 12 d · agent 0.9.2</div>
+</div>
+<a href="Access.dc.html" style="display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px;box-sizing:border-box;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;font-size:13px;font-weight:500;text-decoration:none">Terminal</a>
+<button type="button" aria-label="More actions" style="width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;cursor:pointer"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:3;stroke-linecap:round"><path d="M6 12h.01M12 12h.01M18 12h.01"></path></svg></button>
+</div>
+<nav aria-label="Server sections" style="display:flex;gap:22px">
+<sc-for list="{{tabs}}" as="t" hint-placeholder-count="12">
+<sc-if value="{{t.active}}" hint-placeholder-val="{{false}}"><a href="{{t.href}}" aria-current="page" style="height:38px;box-sizing:border-box;display:flex;align-items:center;border-bottom:2px solid {{accent}};color:#ededee;font-size:13px;font-weight:500;text-decoration:none">{{t.label}}</a></sc-if>
+<sc-if value="{{t.inactive}}" hint-placeholder-val="{{true}}"><a href="{{t.href}}" style="height:38px;box-sizing:border-box;display:flex;align-items:center;border-bottom:2px solid transparent;color:#a3a7ae;font-size:13px;font-weight:500;text-decoration:none">{{t.label}}</a></sc-if>
+</sc-for>
+</nav>
+</header>
+
+<div style="flex-grow:1;min-height:0;box-sizing:border-box;padding:20px 28px 24px;display:flex;flex-direction:column;gap:16px">
+<div role="status" style="display:flex;align-items:center;gap:14px;padding:12px 16px;border-radius:12px;background:#33230f;border:1px solid #5a3a17">
+<span style="display:flex;color:#f0a257"><svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg></span>
+<div style="display:flex;flex-direction:column;gap:2px;flex-grow:1">
+<span style="font-weight:600;color:#f3b77a">Change applied · confirm within 0:42</span>
+<span style="font-size:12px;color:#f3b77a">Added 9100/tcp from the mesh. Confirm from a fresh connection, or the previous ruleset comes back automatically.</span>
+</div>
+<button type="button" style="height:32px;padding:0 14px;border:1px solid #6b4520;border-radius:8px;background:#25262b;color:#f3b77a;font-family:inherit;font-size:13px;font-weight:500;cursor:pointer">Revert now</button>
+<button type="button" style="height:32px;padding:0 14px;border:1px solid {{accent}};border-radius:8px;background:{{accent}};color:#ffffff;font-family:inherit;font-size:13px;font-weight:500;cursor:pointer">Confirm change</button>
+</div>
+
+<div style="display:grid;grid-template-columns:minmax(0, 1fr) 340px;gap:16px;flex-grow:1;min-height:0">
+<section aria-label="Inbound rules" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;overflow:hidden;align-self:start">
+<div style="display:flex;align-items:center;gap:12px;height:56px;padding:0 16px">
+<div style="display:flex;flex-direction:column;gap:2px;flex-grow:1"><h2 style="margin:0;font-size:14px;font-weight:600">Inbound rules</h2><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">table inet fleet · policy drop · IPv4 + IPv6</span></div>
+<button type="button" style="height:30px;padding:0 12px;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">Preview diff</button>
+<button type="button" style="height:30px;padding:0 12px;border:1px solid {{accent}};border-radius:8px;background:{{accent}};color:#ffffff;font-family:inherit;font-size:12px;font-weight:500;display:inline-flex;align-items:center;gap:6px;cursor:pointer"><svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round"><path d="M12 5v14M5 12h14"></path></svg>Add rule</button>
+</div>
+<div style="display:grid;grid-template-columns:30px 80px 120px 180px 90px minmax(0, 1fr) 90px;align-items:center;height:30px;padding:0 16px;background:#1f2024;border-top:1px solid #26272c;border-bottom:1px solid #26272c;font-size:12px;font-weight:500;color:#a3a7ae"><span>#</span><span>Action</span><span>Port</span><span>Source</span><span>Rate limit</span><span>Comment</span><span style="text-align:right">Hits · 24 h</span></div>
+<sc-for list="{{rules}}" as="r" hint-placeholder-count="6">
+<div style="display:grid;grid-template-columns:30px 80px 120px 180px 90px minmax(0, 1fr) 90px;align-items:center;height:44px;padding:0 16px;border-bottom:1px solid #232429;background:{{r.bg}}">
+<span style="font-size:12px;color:#8d9199">{{r.n}}</span>
+<span style="display:flex"><span style="height:20px;padding:0 7px;border-radius:5px;background:#15291d;color:#6fd49a;font-size:11px;font-weight:600;display:inline-flex;align-items:center">Allow</span></span>
+<span style="font-family:'Geist Mono',monospace;font-size:12px">{{r.port}}</span>
+<span style="font-size:12px;color:#d4d6da">{{r.source}}</span>
+<span style="font-size:12px;color:#a3a7ae">{{r.rate}}</span>
+<div style="display:flex;align-items:center;gap:8px;min-width:0"><span style="font-size:12px;color:#d4d6da;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{r.comment}}</span><sc-if value="{{r.isNew}}" hint-placeholder-val="{{false}}"><span style="height:18px;padding:0 6px;border-radius:5px;background:{{accent}};color:#ffffff;font-size:10px;font-weight:600;display:inline-flex;align-items:center">Added</span></sc-if></div>
+<span style="font-size:12px;color:#a3a7ae;text-align:right;font-variant-numeric:tabular-nums">{{r.hits}}</span>
+</div>
+</sc-for>
+<div style="display:grid;grid-template-columns:30px 80px minmax(0, 1fr);align-items:center;height:44px;padding:0 16px;background:#1f2024">
+<span style="font-size:12px;color:#8d9199">—</span>
+<span style="display:flex"><span style="height:20px;padding:0 7px;border-radius:5px;background:#2a2b30;color:#c3c6cb;font-size:11px;font-weight:600;display:inline-flex;align-items:center">Drop</span></span>
+<span style="font-size:12px;color:#a3a7ae">All other inbound traffic · 12 addresses currently banned by intrusion blocking</span>
+</div>
+</section>
+
+<div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+<section aria-label="Container ports" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;flex-direction:column;gap:2px"><h2 style="margin:0;font-size:14px;font-weight:600">Container ports</h2><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">DOCKER-USER chain</span></div>
+<div style="display:flex;align-items:center;gap:10px"><div style="display:flex;flex-direction:column;gap:1px;flex-grow:1"><span style="font-weight:500">app-web-1</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">127.0.0.1:8080 → 80</span></div><span style="height:20px;padding:0 7px;border-radius:5px;background:#26272c;color:#c3c6cb;font-size:11px;font-weight:500;display:inline-flex;align-items:center">Local only</span></div>
+<div style="display:flex;align-items:center;gap:10px"><div style="display:flex;flex-direction:column;gap:1px;flex-grow:1"><span style="font-weight:500">app-redis-1</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">not published</span></div><span style="height:20px;padding:0 7px;border-radius:5px;background:#26272c;color:#c3c6cb;font-size:11px;font-weight:500;display:inline-flex;align-items:center">Internal</span></div>
+</section>
+
+<section aria-label="Ruleset history" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:12px">
+<h2 style="margin:0;font-size:14px;font-weight:600">Ruleset history</h2>
+<sc-for list="{{history}}" as="h" hint-placeholder-count="3">
+<div style="display:grid;grid-template-columns:34px minmax(0, 1fr) auto;gap:10px;align-items:start">
+<span style="font-family:'Geist Mono',monospace;font-size:12px;color:#8d9199;padding-top:1px">{{h.v}}</span>
+<div style="display:flex;flex-direction:column;gap:2px;min-width:0"><span style="font-weight:500">{{h.title}}</span><span style="font-size:12px;color:#8d9199">{{h.meta}}</span></div>
+<sc-if value="{{h.canRollBack}}" hint-placeholder-val="{{true}}"><button type="button" style="height:26px;padding:0 10px;border:1px solid #34363c;border-radius:7px;background:#25262b;color:#e6e7e9;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">Roll back</button></sc-if>
+<sc-if value="{{h.pending}}" hint-placeholder-val="{{false}}"><span style="font-size:12px;font-weight:500;color:#f0a257;padding-top:3px">Pending</span></sc-if>
+</div>
+</sc-for>
+</section>
+
+<section aria-label="Cooperative mode" style="background:#1f2024;border:1px solid #2a2b30;border-radius:12px;padding:14px 16px;display:flex;gap:12px">
+<span style="display:flex;color:#a3a7ae;padding-top:1px"><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path><path d="m9 12 2 2 4-4"></path></svg></span>
+<div style="display:flex;flex-direction:column;gap:3px"><span style="font-weight:500">Cooperative mode</span><span style="font-size:12px;color:#a3a7ae;line-height:1.5">Fleet only manages its own table. Docker's rules and other tables are never flushed or edited.</span></div>
+</section>
+</div>
+</div>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#2563eb","options":["#2563eb","#0f766e","#7c3aed","#c2410c"]},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const accent = this.props.accent ?? '#2563eb';
+    const tint = (hex, t) => { const n = parseInt(hex.slice(1), 16); return '#' + [n >> 16, (n >> 8) & 255, n & 255].map((v) => Math.round(v + (255 - v) * t).toString(16).padStart(2, '0')).join(''); };
+    const accentText = tint(accent, 0.45);
+    const tabList = [['Overview', 'ServerDetail.dc.html'], ['Terminal', 'Access.dc.html'], ['Files', 'Access.dc.html'], ['Logs', '#'], ['Security', 'Security.dc.html'], ['Services', '#'], ['Firewall', 'Firewall.dc.html'], ['Packages', '#'], ['Docker', '#'], ['Cron', '#'], ['History', '#'], ['Timeline', '#']];
+    const tabs = tabList.map(([label, href]) => ({ label, href, active: label === 'Firewall', inactive: label !== 'Firewall' }));
+    const R = (n, port, source, rate, comment, hits, isNew) => ({ n, port, source, rate, comment, hits, isNew: !!isNew, bg: isNew ? '#182338' : 'transparent' });
+    const rules = [
+      R('1', '22/tcp', 'Your Macs · 3 IPs', '10 / min', 'SSH', '1,284'),
+      R('2', '80/tcp', 'Anywhere', '—', 'HTTP, redirects to HTTPS', '48,210'),
+      R('3', '443/tcp', 'Anywhere', '—', 'HTTPS', '391,772'),
+      R('4', '443/udp', 'Anywhere', '—', 'HTTP/3', '88,019'),
+      R('5', 'icmp · essential', 'Anywhere', '20 / s', 'Ping, path MTU, ICMPv6 ND', '2,113'),
+      R('6', '9100/tcp', '10.8.0.0/24 · mesh', '—', 'Metrics over WireGuard mesh', '0', true)
+    ];
+    const history = [
+      { v: 'v23', title: 'Added 9100/tcp from mesh', meta: 'Just now · You · MacBook Pro 16', pending: true, canRollBack: false },
+      { v: 'v22', title: 'SSH rate limit set to 10 / min', meta: 'Sep 20 · Mac Studio', pending: false, canRollBack: true },
+      { v: 'v21', title: 'Opened 443/udp for HTTP/3', meta: 'Sep 12 · You · MacBook Pro 16', pending: false, canRollBack: true }
+    ];
+    return { accent, accentText, tabs, rules, history };
+  }
+}
+</script>
+</body>
+</html>

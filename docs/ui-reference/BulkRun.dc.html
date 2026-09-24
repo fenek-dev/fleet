@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Run on servers</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#0b0c0d;color-scheme:dark}
+input,select{background:#25262b;color:#ededee}
+a{color:#87a9f4}a:hover{color:#b3c9f8}
+</style>
+</helmet>
+<div style="width:1440px;height:900px;display:flex;overflow:hidden;background:#121315;color:#ededee;font-family:'Geist',system-ui,sans-serif;font-size:13px">
+
+<nav aria-label="Main" style="width:240px;flex-shrink:0;box-sizing:border-box;background:#141518;border-right:1px solid #26272b;display:flex;flex-direction:column;gap:20px;padding:14px 12px 12px">
+<div aria-hidden="true" style="display:flex;gap:8px;padding:2px 6px">
+<span style="width:12px;height:12px;border-radius:6px;background:#ff5f57"></span>
+<span style="width:12px;height:12px;border-radius:6px;background:#febc2e"></span>
+<span style="width:12px;height:12px;border-radius:6px;background:#28c840"></span>
+</div>
+<button type="button" style="display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#a3a7ae;font-family:inherit;font-size:13px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg><span style="flex-grow:1;text-align:left">Search or run…</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">⌘K</span></button>
+<div style="display:flex;flex-direction:column;gap:2px">
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="4" width="18" height="7" rx="2"></rect><rect x="3" y="13" width="18" height="7" rx="2"></rect><path d="M7 7.5h.01M7 16.5h.01"></path></svg><span style="flex-grow:1">Fleet</span><span style="font-size:12px;font-weight:400;color:#8d9199">48</span></a>
+<a href="Security.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"></path></svg><span style="flex-grow:1">Alerts</span><span style="min-width:20px;height:18px;padding:0 6px;box-sizing:border-box;border-radius:9px;background:#33230f;color:#f0a257;font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center">3</span></a>
+<a href="ServerDetail.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg><span style="flex-grow:1">Timeline</span></a>
+<a href="BulkRun.dc.html" aria-current="page" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;background:#26272c;color:#ededee;text-decoration:none;font-weight:500"><span style="display:flex;color:{{accentText}}"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"></path></svg></span><span style="flex-grow:1">Runbooks</span></a>
+<a href="Provision.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="3" width="18" height="18" rx="4"></rect><path d="M12 8v8M8 12h8"></path></svg><span style="flex-grow:1">Provision</span></a>
+</div>
+<div style="display:flex;flex-direction:column;gap:2px">
+<div style="padding:0 10px 6px;font-size:11px;font-weight:600;color:#8d9199">Groups</div>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Production</span><span style="font-size:12px;color:#8d9199">24</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Staging</span><span style="font-size:12px;color:#8d9199">8</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Game servers</span><span style="font-size:12px;color:#8d9199">6</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Edge</span><span style="font-size:12px;color:#8d9199">10</span></a>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="padding:0 10px;font-size:11px;font-weight:600;color:#8d9199">Tags</div>
+<div style="display:flex;flex-wrap:wrap;gap:6px;padding:0 8px">
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">web</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">docker</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">game</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">eu-central</span>
+</div>
+</div>
+<div style="margin-top:auto;display:flex;flex-direction:column;gap:8px">
+<a href="Settings.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"></path><circle cx="15" cy="7" r="2"></circle><circle cx="9" cy="17" r="2"></circle></svg><span style="flex-grow:1">Settings</span></a>
+<div style="background:#1d1e22;border:1px solid #2a2b30;border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:10px">
+<div style="display:flex;align-items:center;gap:10px;color:#a3a7ae"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg><div style="display:flex;flex-direction:column;gap:1px"><span style="font-weight:500;color:#ededee">MacBook Pro 16</span><span style="font-size:11px;color:#8d9199">Unlocked · locks in 14 min</span></div></div>
+<div style="display:flex;align-items:center;gap:10px"><span style="display:flex;color:{{accentText}}"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"></path></svg></span><span style="flex-grow:1;font-size:12px;color:#d4d6da">AI agents active</span><button type="button" aria-label="Pause AI agents" style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #34363c;border-radius:7px;background:#25262b;color:#d4d6da;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M9 6v12M15 6v12"></path></svg></button></div>
+</div>
+</div>
+</nav>
+
+<main style="flex-grow:1;min-width:0;display:flex;flex-direction:column">
+<header style="height:60px;flex-shrink:0;box-sizing:border-box;display:flex;align-items:center;gap:16px;padding:0 24px;border-bottom:1px solid #2a2b30;background:#151619">
+<div style="display:flex;flex-direction:column;gap:2px;flex-grow:1">
+<h1 style="margin:0;font-size:17px;font-weight:600;letter-spacing:-0.01em">Run on servers</h1>
+<span style="font-size:12px;color:#8d9199">packages.upgrade · 12 targets · started 14:06</span>
+</div>
+<button type="button" style="height:32px;padding:0 12px;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;font-family:inherit;font-size:13px;font-weight:500;cursor:pointer">Save as runbook</button>
+</header>
+
+<div style="flex-grow:1;min-height:0;box-sizing:border-box;padding:24px;display:grid;grid-template-columns:440px minmax(0, 1fr);gap:20px">
+<div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+
+<section aria-label="What to run" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:14px">
+<div style="display:flex;align-items:center"><h2 style="margin:0;font-size:14px;font-weight:600;flex-grow:1">What to run</h2>
+<div aria-label="Run type" style="display:flex;gap:2px;padding:3px;border-radius:9px;background:#0f1012">
+<button type="button" aria-pressed="true" style="height:24px;padding:0 10px;border:none;border-radius:6px;background:#25262b;color:#ededee;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">Operation</button>
+<button type="button" aria-pressed="false" style="height:24px;padding:0 10px;border:none;border-radius:6px;background:transparent;color:#a3a7ae;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">Shell</button>
+</div>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px">
+<label for="op" style="font-size:12px;font-weight:500;color:#a3a7ae">Operation</label>
+<select id="op" style="height:34px;padding:0 10px;border:1px solid #34363c;border-radius:8px;background:#25262b;font-family:'Geist Mono',monospace;font-size:12px;color:#ededee"><option>packages.upgrade</option><option>unit.restart</option><option>compose.pull</option></select>
+</div>
+<div style="display:flex;flex-direction:column;gap:6px">
+<span style="font-size:12px;font-weight:500;color:#a3a7ae">Scope</span>
+<div style="display:flex;gap:8px">
+<label style="flex:1;display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1.5px solid {{accent}};border-radius:8px;background:#172033;cursor:pointer"><input type="radio" name="scope" value="security" checked="checked" style="margin:0;accent-color:{{accentText}}"><span style="font-weight:500">Security only</span></label>
+<label style="flex:1;display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1px solid #34363c;border-radius:8px;background:#25262b;cursor:pointer"><input type="radio" name="scope" value="all" style="margin:0;accent-color:{{accentText}}"><span>All upgradable</span></label>
+</div>
+</div>
+<span style="font-size:12px;color:#8d9199;line-height:1.5">A typed operation: validated arguments, no shell involved, signed separately for every server.</span>
+</section>
+
+<section aria-label="Targets" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;align-items:center"><h2 style="margin:0;font-size:14px;font-weight:600;flex-grow:1">Targets</h2><span style="font-size:12px;color:#a3a7ae">12 servers</span></div>
+<div style="display:flex;gap:6px;flex-wrap:wrap">
+<span style="height:26px;padding:0 10px;border-radius:7px;background:#26272c;color:#d4d6da;font-size:12px;display:inline-flex;align-items:center">Group: Production</span>
+<span style="height:26px;padding:0 10px;border-radius:7px;background:#26272c;color:#d4d6da;font-size:12px;display:inline-flex;align-items:center">Tag: docker</span>
+</div>
+<label style="display:flex;align-items:center;gap:10px;cursor:pointer"><input type="checkbox" checked="checked" style="margin:0;accent-color:{{accentText}}"><span>Skip db-02 · disk at 91%</span></label>
+</section>
+
+<section aria-label="Rollout" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:12px">
+<h2 style="margin:0;font-size:14px;font-weight:600">Rollout</h2>
+<div style="display:flex;align-items:center;gap:12px"><span style="flex-grow:1">Canary</span><span style="color:#a3a7ae">1 server, then health check</span></div>
+<div style="display:flex;align-items:center;gap:12px"><label for="batch" style="flex-grow:1">Then in batches of</label><input id="batch" type="number" value="4" style="width:64px;height:30px;box-sizing:border-box;padding:0 8px;border:1px solid #34363c;border-radius:7px;font-family:inherit;font-size:13px"></div>
+<label style="display:flex;align-items:center;gap:10px;cursor:pointer"><input type="checkbox" checked="checked" style="margin:0;accent-color:{{accentText}}"><span>Stop on first failure</span></label>
+<label style="display:flex;align-items:center;gap:10px;cursor:pointer"><input type="checkbox" style="margin:0;accent-color:{{accentText}}"><span>Reboot if required, in each server's reboot window</span></label>
+</section>
+
+<section aria-label="Dry run" style="background:#1f2024;border:1px solid #2a2b30;border-radius:12px;padding:14px 18px;display:flex;align-items:center;gap:12px">
+<span style="display:flex;color:#3fb772"><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="m5 12.5 4.5 4.5L19 7.5"></path></svg></span>
+<div style="display:flex;flex-direction:column;gap:2px;flex-grow:1"><span style="font-weight:500">Dry run passed</span><span style="font-size:12px;color:#8d9199">23 packages across 12 servers · no config prompts</span></div>
+<button type="button" style="height:28px;padding:0 10px;border:1px solid #34363c;border-radius:7px;background:#25262b;color:#e6e7e9;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">View plan</button>
+</section>
+</div>
+
+<section aria-label="Rollout progress" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;display:flex;flex-direction:column;overflow:hidden;min-width:0">
+<div style="display:flex;flex-direction:column;gap:14px;padding:16px 18px;border-bottom:1px solid #26272c">
+<div style="display:flex;align-items:center;gap:10px">
+<h2 style="margin:0;font-size:14px;font-weight:600;flex-grow:1">Rollout</h2>
+<span style="display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:11px;background:#182338;color:#8fb3ff;font-size:12px;font-weight:500"><span style="width:6px;height:6px;border-radius:3px;background:{{accent}}"></span>Running</span>
+<button type="button" style="height:30px;padding:0 12px;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">Pause</button>
+<button type="button" style="height:30px;padding:0 12px;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#ff8a7d;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">Cancel</button>
+</div>
+<div style="display:flex;gap:3px;height:8px">
+<div style="flex:5;border-radius:4px;background:{{accent}}"></div>
+<div style="flex:4;border-radius:4px;background:{{accent}};opacity:0.35"></div>
+<div style="flex:3;border-radius:4px;background:#2a2b30"></div>
+</div>
+<div style="display:flex;gap:18px;font-size:12px;color:#a3a7ae"><span><span style="font-weight:600;color:#ededee">5</span> done</span><span><span style="font-weight:600;color:#ededee">4</span> running</span><span><span style="font-weight:600;color:#ededee">3</span> queued</span><span style="flex-grow:1"></span><span>Canary passed · batch 2 of 3</span></div>
+</div>
+<div style="display:grid;grid-template-columns:28px 150px 100px minmax(0, 1fr) 110px;align-items:center;height:30px;padding:0 18px;background:#1f2024;border-bottom:1px solid #26272c;font-size:12px;font-weight:500;color:#a3a7ae"><span></span><span>Server</span><span>Stage</span><span>Status</span><span style="text-align:right">Time</span></div>
+<sc-for list="{{rows}}" as="r" hint-placeholder-count="12">
+<div style="display:grid;grid-template-columns:28px 150px 100px minmax(0, 1fr) 110px;align-items:center;height:40px;padding:0 18px;border-bottom:1px solid #232429">
+<span style="display:flex">
+<sc-if value="{{r.done}}" hint-placeholder-val="{{true}}"><span style="width:18px;height:18px;border-radius:9px;background:#15291d;color:#6fd49a;display:inline-flex;align-items:center;justify-content:center"><svg width="11" height="11" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:3;stroke-linecap:round;stroke-linejoin:round"><path d="m5 12.5 4.5 4.5L19 7.5"></path></svg></span></sc-if>
+<sc-if value="{{r.running}}" hint-placeholder-val="{{false}}"><svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="7" style="fill:none;stroke:#2a3350;stroke-width:2.5"></circle><path d="M9 2a7 7 0 0 1 7 7" style="fill:none;stroke:{{accent}};stroke-width:2.5;stroke-linecap:round"></path></svg></sc-if>
+<sc-if value="{{r.queued}}" hint-placeholder-val="{{false}}"><span style="width:14px;height:14px;box-sizing:border-box;margin:2px;border-radius:7px;border:1.5px dashed #a3a7ae"></span></sc-if>
+</span>
+<span style="font-weight:500">{{r.name}}</span>
+<span style="font-size:12px;color:#a3a7ae">{{r.stage}}</span>
+<span style="font-size:12px;color:{{r.color}}">{{r.status}}</span>
+<span style="font-size:12px;color:#8d9199;text-align:right;font-variant-numeric:tabular-nums">{{r.time}}</span>
+</div>
+</sc-for>
+<div style="margin-top:auto;display:flex;align-items:center;gap:8px;padding:12px 18px;border-top:1px solid #26272c;background:#1f2024;font-size:12px;color:#a3a7ae">
+<svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>
+<span>Each command is signed by MacBook Pro 16, bound to one server, and written to that server's audit log.</span>
+</div>
+</section>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#2563eb","options":["#2563eb","#0f766e","#7c3aed","#c2410c"]},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const accent = this.props.accent ?? '#2563eb';
+    const tint = (hex, t) => { const n = parseInt(hex.slice(1), 16); return '#' + [n >> 16, (n >> 8) & 255, n & 255].map((v) => Math.round(v + (255 - v) * t).toString(16).padStart(2, '0')).join(''); };
+    const accentText = tint(accent, 0.45);
+    const D = (name, stage, status, time) => ({ name, stage, status, time, done: true, running: false, queued: false, color: '#d4d6da' });
+    const R = (name, stage, status) => ({ name, stage, status, time: '—', done: false, running: true, queued: false, color: '#8fb3ff' });
+    const Q = (name, stage) => ({ name, stage, status: 'Queued', time: '—', done: false, running: false, queued: true, color: '#8d9199' });
+    const rows = [
+      D('web-01', 'Canary', 'Upgraded 3 packages · healthy', '41 s'),
+      D('web-02', 'Batch 1', 'Upgraded 3 packages · healthy', '36 s'),
+      D('web-03', 'Batch 1', 'Upgraded 3 packages · healthy', '39 s'),
+      D('api-01', 'Batch 1', 'Upgraded 2 packages · healthy', '44 s'),
+      D('api-02', 'Batch 1', 'Upgraded 2 packages · healthy', '40 s'),
+      R('web-04', 'Batch 2', 'Installing 2 of 3'),
+      R('api-03', 'Batch 2', 'Health check'),
+      R('api-04', 'Batch 2', 'Downloading'),
+      R('db-01', 'Batch 2', 'Unpacking'),
+      Q('worker-01', 'Batch 3'),
+      Q('worker-02', 'Batch 3'),
+      Q('cache-01', 'Batch 3')
+    ];
+    return { accent, accentText, rows };
+  }
+}
+</script>
+</body>
+</html>

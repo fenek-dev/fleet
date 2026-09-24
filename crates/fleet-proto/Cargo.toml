@@ -1,0 +1,20 @@
+[package]
+name = "fleet-proto"
+description = "Fleet wire protocol: messages, Op enum, CommandBody, roster/policy types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+toml.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>web-04 overview</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#0b0c0d;color-scheme:dark}
+input,select{background:#25262b;color:#ededee}
+a{color:#87a9f4}a:hover{color:#b3c9f8}
+</style>
+</helmet>
+<div style="width:1440px;height:900px;display:flex;overflow:hidden;background:#121315;color:#ededee;font-family:'Geist',system-ui,sans-serif;font-size:13px">
+
+<nav aria-label="Main" style="width:240px;flex-shrink:0;box-sizing:border-box;background:#141518;border-right:1px solid #26272b;display:flex;flex-direction:column;gap:20px;padding:14px 12px 12px">
+<div aria-hidden="true" style="display:flex;gap:8px;padding:2px 6px">
+<span style="width:12px;height:12px;border-radius:6px;background:#ff5f57"></span>
+<span style="width:12px;height:12px;border-radius:6px;background:#febc2e"></span>
+<span style="width:12px;height:12px;border-radius:6px;background:#28c840"></span>
+</div>
+<button type="button" style="display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#a3a7ae;font-family:inherit;font-size:13px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg><span style="flex-grow:1;text-align:left">Search or run…</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">⌘K</span></button>
+<div style="display:flex;flex-direction:column;gap:2px">
+<a href="Main.dc.html" aria-current="page" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;background:#26272c;color:#ededee;text-decoration:none;font-weight:500"><span style="display:flex;color:{{accentText}}"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="4" width="18" height="7" rx="2"></rect><rect x="3" y="13" width="18" height="7" rx="2"></rect><path d="M7 7.5h.01M7 16.5h.01"></path></svg></span><span style="flex-grow:1">Fleet</span><span style="font-size:12px;font-weight:400;color:#8d9199">48</span></a>
+<a href="Security.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"></path></svg><span style="flex-grow:1">Alerts</span><span style="min-width:20px;height:18px;padding:0 6px;box-sizing:border-box;border-radius:9px;background:#33230f;color:#f0a257;font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center">3</span></a>
+<a href="ServerDetail.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg><span style="flex-grow:1">Timeline</span></a>
+<a href="BulkRun.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"></path></svg><span style="flex-grow:1">Runbooks</span></a>
+<a href="Provision.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="3" width="18" height="18" rx="4"></rect><path d="M12 8v8M8 12h8"></path></svg><span style="flex-grow:1">Provision</span></a>
+</div>
+<div style="display:flex;flex-direction:column;gap:2px">
+<div style="padding:0 10px 6px;font-size:11px;font-weight:600;color:#8d9199">Groups</div>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Production</span><span style="font-size:12px;color:#8d9199">24</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Staging</span><span style="font-size:12px;color:#8d9199">8</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Game servers</span><span style="font-size:12px;color:#8d9199">6</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Edge</span><span style="font-size:12px;color:#8d9199">10</span></a>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="padding:0 10px;font-size:11px;font-weight:600;color:#8d9199">Tags</div>
+<div style="display:flex;flex-wrap:wrap;gap:6px;padding:0 8px">
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">web</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">docker</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">game</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">eu-central</span>
+</div>
+</div>
+<div style="margin-top:auto;display:flex;flex-direction:column;gap:8px">
+<a href="Settings.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"></path><circle cx="15" cy="7" r="2"></circle><circle cx="9" cy="17" r="2"></circle></svg><span style="flex-grow:1">Settings</span></a>
+<div style="background:#1d1e22;border:1px solid #2a2b30;border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:10px">
+<div style="display:flex;align-items:center;gap:10px;color:#a3a7ae"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg><div style="display:flex;flex-direction:column;gap:1px"><span style="font-weight:500;color:#ededee">MacBook Pro 16</span><span style="font-size:11px;color:#8d9199">Unlocked · locks in 14 min</span></div></div>
+<div style="display:flex;align-items:center;gap:10px"><span style="display:flex;color:{{accentText}}"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"></path></svg></span><span style="flex-grow:1;font-size:12px;color:#d4d6da">AI agents active</span><button type="button" aria-label="Pause AI agents" style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #34363c;border-radius:7px;background:#25262b;color:#d4d6da;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M9 6v12M15 6v12"></path></svg></button></div>
+</div>
+</div>
+</nav>
+
+<main style="flex-grow:1;min-width:0;display:flex;flex-direction:column">
+<header style="flex-shrink:0;box-sizing:border-box;padding:16px 28px 0;background:#151619;border-bottom:1px solid #2a2b30;display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#8d9199"><a href="Main.dc.html" style="color:#a3a7ae;text-decoration:none">Fleet</a><span aria-hidden="true">/</span><span>Production</span><span aria-hidden="true">/</span><span style="color:#d4d6da">web-04</span></div>
+<div style="display:flex;align-items:center;gap:16px">
+<div style="display:flex;flex-direction:column;gap:4px;flex-grow:1">
+<div style="display:flex;align-items:center;gap:10px"><h1 style="margin:0;font-size:22px;font-weight:600;letter-spacing:-0.02em">web-04</h1><span style="display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:11px;font-size:12px;font-weight:500;background:#33230f;color:#f0a257"><span style="width:6px;height:6px;border-radius:3px;background:#e8832a"></span>nginx restarted</span></div>
+<div style="font-family:'Geist Mono',monospace;font-size:12px;color:#a3a7ae">203.0.113.14 · Ubuntu 24.04 LTS · 8 vCPU · 16 GB · up 12 d · agent 0.9.2</div>
+</div>
+<a href="Access.dc.html" style="display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px;box-sizing:border-box;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;font-size:13px;font-weight:500;text-decoration:none"><svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="m7 9 3 3-3 3M13 15h4"></path></svg>Terminal</a>
+<a href="BulkRun.dc.html" style="display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px;box-sizing:border-box;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;font-size:13px;font-weight:500;text-decoration:none">Run command</a>
+<button type="button" aria-label="More actions" style="width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;cursor:pointer"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:3;stroke-linecap:round"><path d="M6 12h.01M12 12h.01M18 12h.01"></path></svg></button>
+</div>
+<nav aria-label="Server sections" style="display:flex;gap:22px">
+<sc-for list="{{tabs}}" as="t" hint-placeholder-count="12">
+<sc-if value="{{t.active}}" hint-placeholder-val="{{false}}"><a href="{{t.href}}" aria-current="page" style="height:38px;box-sizing:border-box;display:flex;align-items:center;border-bottom:2px solid {{accent}};color:#ededee;font-size:13px;font-weight:500;text-decoration:none">{{t.label}}</a></sc-if>
+<sc-if value="{{t.inactive}}" hint-placeholder-val="{{true}}"><a href="{{t.href}}" style="height:38px;box-sizing:border-box;display:flex;align-items:center;border-bottom:2px solid transparent;color:#a3a7ae;font-size:13px;font-weight:500;text-decoration:none">{{t.label}}</a></sc-if>
+</sc-for>
+</nav>
+</header>
+
+<div style="flex-grow:1;min-height:0;box-sizing:border-box;padding:20px 28px 24px;display:grid;grid-template-columns:minmax(0, 1fr) 340px;gap:20px">
+<div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+<div style="display:flex;align-items:center;gap:12px">
+<h2 style="margin:0;font-size:14px;font-weight:600;flex-grow:1">Resources</h2>
+<div aria-label="Time range" style="display:flex;gap:2px;padding:3px;border-radius:9px;background:#0f1012">
+<button type="button" aria-pressed="false" style="height:24px;padding:0 10px;border:none;border-radius:6px;background:transparent;color:#a3a7ae;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">1 h</button>
+<button type="button" aria-pressed="true" style="height:24px;padding:0 10px;border:none;border-radius:6px;background:#25262b;color:#ededee;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">24 h</button>
+<button type="button" aria-pressed="false" style="height:24px;padding:0 10px;border:none;border-radius:6px;background:transparent;color:#a3a7ae;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">7 d</button>
+</div>
+</div>
+<div style="display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:16px">
+<sc-for list="{{metrics}}" as="m" hint-placeholder-count="4">
+<div style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:14px 16px 12px;display:flex;flex-direction:column;gap:8px">
+<div style="display:flex;align-items:baseline;gap:10px"><span style="font-size:12px;color:#a3a7ae;flex-grow:1">{{m.label}}</span><span style="font-size:12px;color:#8d9199">{{m.sub}}</span></div>
+<span style="font-size:24px;font-weight:600;letter-spacing:-0.02em;font-variant-numeric:tabular-nums">{{m.value}}</span>
+<svg width="352" height="72" viewBox="0 0 352 72" aria-hidden="true" style="display:block"><line x1="0" y1="71.5" x2="352" y2="71.5" style="stroke:#2a2b30;stroke-width:1"></line><path d="{{m.fill}}" style="fill:{{accent}};fill-opacity:0.09;stroke:none"></path><polyline points="{{m.line}}" style="fill:none;stroke:{{accent}};stroke-width:1.6;stroke-linejoin:round;stroke-linecap:round"></polyline></svg>
+</div>
+</sc-for>
+</div>
+<section aria-label="Top processes" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;overflow:hidden">
+<div style="display:flex;align-items:center;height:44px;padding:0 16px;gap:12px"><h2 style="margin:0;font-size:14px;font-weight:600;flex-grow:1">Top processes</h2><span style="font-size:12px;color:#8d9199">By CPU · live</span></div>
+<div style="display:grid;grid-template-columns:70px minmax(0, 1fr) 110px 90px 100px;align-items:center;height:30px;padding:0 16px;background:#1f2024;border-top:1px solid #26272c;border-bottom:1px solid #26272c;font-size:12px;font-weight:500;color:#a3a7ae"><span>PID</span><span>Process</span><span>User</span><span>CPU</span><span>Memory</span></div>
+<sc-for list="{{procs}}" as="p" hint-placeholder-count="6">
+<div style="display:grid;grid-template-columns:70px minmax(0, 1fr) 110px 90px 100px;align-items:center;height:34px;padding:0 16px;border-bottom:1px solid #232429">
+<span style="font-family:'Geist Mono',monospace;font-size:12px;color:#8d9199">{{p.pid}}</span>
+<span style="font-family:'Geist Mono',monospace;font-size:12px;color:#ededee;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{p.cmd}}</span>
+<span style="color:#a3a7ae">{{p.user}}</span>
+<span style="font-variant-numeric:tabular-nums">{{p.cpu}}</span>
+<span style="font-variant-numeric:tabular-nums">{{p.mem}}</span>
+</div>
+</sc-for>
+</section>
+</div>
+
+<div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+<section aria-label="Timeline" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;align-items:center"><h2 style="margin:0;font-size:14px;font-weight:600;flex-grow:1">Timeline · today</h2><a href="ServerDetail.dc.html" style="font-size:12px;color:{{accentText}};text-decoration:none;font-weight:500">View all</a></div>
+<sc-for list="{{events}}" as="e" hint-placeholder-count="6">
+<div style="display:grid;grid-template-columns:44px 10px minmax(0, 1fr);gap:8px;align-items:start">
+<span style="font-family:'Geist Mono',monospace;font-size:12px;color:#8d9199;padding-top:1px">{{e.time}}</span>
+<span style="width:8px;height:8px;border-radius:4px;margin-top:5px;background:{{e.dot}}"></span>
+<div style="display:flex;flex-direction:column;gap:2px;min-width:0"><span style="font-weight:500">{{e.title}}</span><span style="font-size:12px;color:#8d9199">{{e.detail}}</span></div>
+</div>
+</sc-for>
+</section>
+<section aria-label="Containers" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:10px">
+<div style="display:flex;align-items:center"><h2 style="margin:0;font-size:14px;font-weight:600;flex-grow:1">Containers</h2><span style="font-size:12px;color:#8d9199">Compose · /srv/app</span></div>
+<sc-for list="{{containers}}" as="c" hint-placeholder-count="3">
+<div style="display:flex;align-items:center;gap:10px">
+<span style="width:7px;height:7px;border-radius:4px;background:#3fb772;flex-shrink:0"></span>
+<div style="display:flex;flex-direction:column;gap:1px;flex-grow:1;min-width:0"><span style="font-weight:500">{{c.name}}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">{{c.image}}</span></div>
+<span style="font-size:12px;color:#a3a7ae;white-space:nowrap">{{c.status}}</span>
+</div>
+</sc-for>
+</section>
+<section aria-label="Profile" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:14px 16px;display:flex;align-items:center;gap:12px">
+<div style="display:flex;flex-direction:column;gap:6px;flex-grow:1">
+<span style="font-size:12px;color:#a3a7ae">Profile</span>
+<div style="display:flex;gap:6px;flex-wrap:wrap">
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">Baseline</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">Docker</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">Web · nginx</span>
+</div>
+</div>
+<a href="Security.dc.html" style="display:flex;flex-direction:column;align-items:flex-end;gap:2px;text-decoration:none"><span style="font-size:22px;font-weight:600;color:#ededee;letter-spacing:-0.02em">92</span><span style="font-size:11px;color:#8d9199">Hardening score</span></a>
+</section>
+</div>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#2563eb","options":["#2563eb","#0f766e","#7c3aed","#c2410c"]},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const accent = this.props.accent ?? '#2563eb';
+    const tint = (hex, t) => { const n = parseInt(hex.slice(1), 16); return '#' + [n >> 16, (n >> 8) & 255, n & 255].map((v) => Math.round(v + (255 - v) * t).toString(16).padStart(2, '0')).join(''); };
+    const accentText = tint(accent, 0.45);
+    const tabList = [['Overview', 'ServerDetail.dc.html'], ['Terminal', 'Access.dc.html'], ['Files', 'Access.dc.html'], ['Logs', '#'], ['Security', 'Security.dc.html'], ['Services', '#'], ['Firewall', 'Firewall.dc.html'], ['Packages', '#'], ['Docker', '#'], ['Cron', '#'], ['History', '#'], ['Timeline', '#']];
+    const tabs = tabList.map(([label, href]) => ({ label, href, active: label === 'Overview', inactive: label !== 'Overview' }));
+    const area = (v, w, h) => {
+      const pts = v.map((y, i) => [(i * w / (v.length - 1)).toFixed(1), (h - (y / 100) * (h - 8) - 3).toFixed(1)]);
+      const seq = pts.map((p) => p[0] + ',' + p[1]);
+      return { line: seq.join(' '), fill: 'M0,' + h + ' L' + seq.join(' L') + ' L' + w + ',' + h + ' Z' };
+    };
+    const series = [
+      ['CPU', '64%', '8 cores · load 3.9', [22, 20, 19, 18, 17, 18, 21, 24, 28, 31, 33, 35, 38, 36, 39, 41, 44, 48, 52, 57, 60, 63, 66, 64]],
+      ['Memory', '9.3 GB', 'of 16 GB · 58%', [48, 48, 49, 49, 50, 50, 51, 51, 52, 53, 53, 54, 54, 55, 55, 56, 56, 57, 57, 57, 58, 58, 58, 58]],
+      ['Disk I/O', '12.4 MB/s', 'read 3.1 · write 9.3', [12, 10, 8, 8, 9, 14, 30, 22, 18, 16, 20, 24, 19, 17, 15, 26, 34, 28, 22, 18, 20, 24, 21, 19]],
+      ['Network', '48 Mbit/s', 'in 31 · out 17', [20, 18, 15, 12, 10, 12, 18, 26, 34, 40, 42, 45, 44, 46, 48, 50, 47, 52, 55, 50, 48, 46, 49, 48]]
+    ];
+    const metrics = series.map(([label, value, sub, v]) => ({ label, value, sub, ...area(v, 352, 72) }));
+    const procs = [
+      { pid: '2231', cmd: 'node /app/server.js', user: '1000', cpu: '18.4%', mem: '612 MB' },
+      { pid: '1190', cmd: 'nginx: worker process', user: 'www-data', cpu: '6.1%', mem: '48 MB' },
+      { pid: '812', cmd: '/usr/bin/dockerd', user: 'root', cpu: '2.3%', mem: '142 MB' },
+      { pid: '2410', cmd: 'redis-server *:6379', user: '999', cpu: '0.8%', mem: '38 MB' },
+      { pid: '604', cmd: 'fleet-agent exec', user: 'root', cpu: '0.1%', mem: '14 MB' },
+      { pid: '603', cmd: 'fleet-agent gate', user: 'fleet-gate', cpu: '0.0%', mem: '3.1 MB' }
+    ];
+    const warn = '#e8832a';
+    const calm = '#9a9ea6';
+    const events = [
+      { time: '14:08', title: 'You connected', detail: 'MacBook Pro 16 · 198.51.100.23', dot: calm },
+      { time: '14:02', title: 'nginx.service restarted', detail: 'External edit to /etc/nginx/nginx.conf', dot: warn },
+      { time: '13:41', title: '203.0.113.77 banned for 1 h', detail: '12 failed SSH logins as root', dot: calm },
+      { time: '11:30', title: 'Security updates installed', detail: 'openssl, libssl3 · by Mac Studio', dot: accent },
+      { time: '09:12', title: 'CPU above 60% for 20 min', detail: 'node /app/server.js', dot: warn },
+      { time: '03:00', title: 'Config snapshot', detail: '/etc · 3 files changed', dot: calm }
+    ];
+    const containers = [
+      { name: 'app-web-1', image: 'ghcr.io/acme/web:1.14.2', status: 'Up 22 h · healthy' },
+      { name: 'app-worker-1', image: 'ghcr.io/acme/worker:1.14.2', status: 'Up 22 h' },
+      { name: 'app-redis-1', image: 'redis:7-alpine', status: 'Up 3 d' }
+    ];
+    return { accent, accentText, tabs, metrics, procs, events, containers };
+  }
+}
+</script>
+</body>
+</html>

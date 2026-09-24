@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fleet overview</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#0b0c0d;color-scheme:dark}
+input,select{background:#25262b;color:#ededee}
+a{color:#87a9f4}a:hover{color:#b3c9f8}
+</style>
+</helmet>
+<div style="width:1440px;height:900px;display:flex;overflow:hidden;background:#121315;color:#ededee;font-family:'Geist',system-ui,sans-serif;font-size:13px">
+
+<nav aria-label="Main" style="width:240px;flex-shrink:0;box-sizing:border-box;background:#141518;border-right:1px solid #26272b;display:flex;flex-direction:column;gap:20px;padding:14px 12px 12px">
+<div aria-hidden="true" style="display:flex;gap:8px;padding:2px 6px">
+<span style="width:12px;height:12px;border-radius:6px;background:#ff5f57"></span>
+<span style="width:12px;height:12px;border-radius:6px;background:#febc2e"></span>
+<span style="width:12px;height:12px;border-radius:6px;background:#28c840"></span>
+</div>
+<button type="button" style="display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#a3a7ae;font-family:inherit;font-size:13px;cursor:pointer"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg><span style="flex-grow:1;text-align:left">Search or run…</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">⌘K</span></button>
+<div style="display:flex;flex-direction:column;gap:2px">
+<a href="Main.dc.html" aria-current="page" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;background:#26272c;color:#ededee;text-decoration:none;font-weight:500"><span style="display:flex;color:{{accentText}}"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="4" width="18" height="7" rx="2"></rect><rect x="3" y="13" width="18" height="7" rx="2"></rect><path d="M7 7.5h.01M7 16.5h.01"></path></svg></span><span style="flex-grow:1">Fleet</span><span style="font-size:12px;font-weight:400;color:#8d9199">48</span></a>
+<a href="Security.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"></path><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"></path></svg><span style="flex-grow:1">Alerts</span><span style="min-width:20px;height:18px;padding:0 6px;box-sizing:border-box;border-radius:9px;background:#33230f;color:#f0a257;font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center">3</span></a>
+<a href="ServerDetail.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg><span style="flex-grow:1">Timeline</span></a>
+<a href="BulkRun.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"></path></svg><span style="flex-grow:1">Runbooks</span></a>
+<a href="Provision.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="3" width="18" height="18" rx="4"></rect><path d="M12 8v8M8 12h8"></path></svg><span style="flex-grow:1">Provision</span></a>
+</div>
+<div style="display:flex;flex-direction:column;gap:2px">
+<div style="padding:0 10px 6px;font-size:11px;font-weight:600;color:#8d9199">Groups</div>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Production</span><span style="font-size:12px;color:#8d9199">24</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Staging</span><span style="font-size:12px;color:#8d9199">8</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Game servers</span><span style="font-size:12px;color:#8d9199">6</span></a>
+<a href="Main.dc.html" style="display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none"><span style="width:8px;height:8px;border-radius:2px;background:#7b818b"></span><span style="flex-grow:1">Edge</span><span style="font-size:12px;color:#8d9199">10</span></a>
+</div>
+<div style="display:flex;flex-direction:column;gap:8px">
+<div style="padding:0 10px;font-size:11px;font-weight:600;color:#8d9199">Tags</div>
+<div style="display:flex;flex-wrap:wrap;gap:6px;padding:0 8px">
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">web</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">docker</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">game</span>
+<span style="height:22px;padding:0 8px;border-radius:6px;background:#26272c;color:#c3c6cb;font-size:12px;display:inline-flex;align-items:center">eu-central</span>
+</div>
+</div>
+<div style="margin-top:auto;display:flex;flex-direction:column;gap:8px">
+<a href="Settings.dc.html" style="display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;border-radius:7px;color:#d4d6da;text-decoration:none;font-weight:500"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"></path><circle cx="15" cy="7" r="2"></circle><circle cx="9" cy="17" r="2"></circle></svg><span style="flex-grow:1">Settings</span></a>
+<div style="background:#1d1e22;border:1px solid #2a2b30;border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:10px">
+<div style="display:flex;align-items:center;gap:10px;color:#a3a7ae"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg><div style="display:flex;flex-direction:column;gap:1px"><span style="font-weight:500;color:#ededee">MacBook Pro 16</span><span style="font-size:11px;color:#8d9199">Unlocked · locks in 14 min</span></div></div>
+<div style="display:flex;align-items:center;gap:10px"><span style="display:flex;color:{{accentText}}"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" style="flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"></path></svg></span><span style="flex-grow:1;font-size:12px;color:#d4d6da">AI agents active</span><button type="button" aria-label="Pause AI agents" style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border:1px solid #34363c;border-radius:7px;background:#25262b;color:#d4d6da;cursor:pointer"><svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M9 6v12M15 6v12"></path></svg></button></div>
+</div>
+</div>
+</nav>
+
+<main style="flex-grow:1;min-width:0;display:flex;flex-direction:column">
+<header style="height:60px;flex-shrink:0;box-sizing:border-box;display:flex;align-items:center;gap:16px;padding:0 24px;border-bottom:1px solid #2a2b30;background:#151619">
+<div style="display:flex;flex-direction:column;gap:2px">
+<h1 style="margin:0;font-size:17px;font-weight:600;letter-spacing:-0.01em">Fleet</h1>
+<span style="font-size:12px;color:#8d9199">48 servers · 4 groups · agents on 0.9.2</span>
+</div>
+<div aria-label="Filter servers" style="display:flex;gap:2px;padding:3px;margin-left:16px;border-radius:9px;background:#0f1012">
+<button type="button" aria-pressed="true" style="height:26px;padding:0 12px;border:none;border-radius:6px;background:#25262b;color:#ededee;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">All</button>
+<button type="button" aria-pressed="false" style="height:26px;padding:0 12px;border:none;border-radius:6px;background:transparent;color:#a3a7ae;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">Needs attention · 3</button>
+<button type="button" aria-pressed="false" style="height:26px;padding:0 12px;border:none;border-radius:6px;background:transparent;color:#a3a7ae;font-family:inherit;font-size:12px;font-weight:500;cursor:pointer">Updates · 12</button>
+</div>
+<div style="flex-grow:1"></div>
+<a href="BulkRun.dc.html" style="display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px;box-sizing:border-box;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;font-size:13px;font-weight:500;text-decoration:none"><svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="m7 9 3 3-3 3M13 15h4"></path></svg>Run command</a>
+<a href="Provision.dc.html" style="display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px;box-sizing:border-box;border:1px solid {{accent}};border-radius:8px;background:{{accent}};color:#ffffff;font-size:13px;font-weight:500;text-decoration:none"><svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round"><path d="M12 5v14M5 12h14"></path></svg>Provision server</a>
+</header>
+
+<div style="flex-grow:1;min-height:0;box-sizing:border-box;padding:24px;display:flex;flex-direction:column;gap:16px">
+<div style="display:grid;grid-template-columns:repeat(4, minmax(0, 1fr));gap:16px">
+<div style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:6px">
+<span style="font-size:12px;color:#a3a7ae">Online</span>
+<div style="display:flex;align-items:baseline;gap:4px"><span style="font-size:28px;font-weight:600;letter-spacing:-0.02em;font-variant-numeric:tabular-nums">47</span><span style="font-size:15px;color:#8d9199">/ 48</span></div>
+<span style="font-size:12px;color:#8d9199">staging-01 unreachable for 2 h</span>
+</div>
+<div style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:6px">
+<span style="font-size:12px;color:#a3a7ae">Open alerts</span>
+<span style="font-size:28px;font-weight:600;letter-spacing:-0.02em;color:#f0a257;font-variant-numeric:tabular-nums">3</span>
+<span style="font-size:12px;color:#8d9199">1 critical · 2 warnings</span>
+</div>
+<div style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:6px">
+<span style="font-size:12px;color:#a3a7ae">Security updates</span>
+<span style="font-size:28px;font-weight:600;letter-spacing:-0.02em;font-variant-numeric:tabular-nums">12</span>
+<span style="font-size:12px;color:#8d9199">Across 5 servers · <a href="BulkRun.dc.html" style="color:{{accentText}};text-decoration:none;font-weight:500">Roll out</a></span>
+</div>
+<div style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;gap:6px">
+<span style="font-size:12px;color:#a3a7ae">Reboot required</span>
+<span style="font-size:28px;font-weight:600;letter-spacing:-0.02em;font-variant-numeric:tabular-nums">4</span>
+<span style="font-size:12px;color:#8d9199">Kernel updates installed</span>
+</div>
+</div>
+
+<section aria-label="While you were away" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;display:flex;align-items:center;gap:24px;padding:14px 18px">
+<div style="display:flex;flex-direction:column;gap:2px;flex-shrink:0;width:160px"><span style="font-weight:600">While you were away</span><span style="font-size:12px;color:#8d9199">Since yesterday 22:14</span></div>
+<div style="display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:24px;flex-grow:1">
+<div style="display:flex;flex-direction:column;gap:2px"><span style="font-weight:500">214 SSH attempts blocked</span><span style="font-size:12px;color:#8d9199">31 IPs banned across 9 servers</span></div>
+<div style="display:flex;flex-direction:column;gap:2px"><span style="font-weight:500;color:#f0a257">nginx restarted on web-04</span><span style="font-size:12px;color:#8d9199">External edit to /etc/nginx/nginx.conf</span></div>
+<div style="display:flex;flex-direction:column;gap:2px"><span style="font-weight:500;color:#ff8a7d">db-02 disk at 91%</span><span style="font-size:12px;color:#8d9199">Grew 6% overnight</span></div>
+</div>
+<a href="ServerDetail.dc.html" style="display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px;box-sizing:border-box;border:1px solid #34363c;border-radius:8px;background:#25262b;color:#e6e7e9;font-size:13px;font-weight:500;text-decoration:none;flex-shrink:0">Open timeline</a>
+</section>
+
+<section aria-label="Servers" style="background:#1a1b1e;border:1px solid #2a2b30;border-radius:12px;overflow:hidden">
+<div style="display:grid;grid-template-columns:230px 150px 170px 140px 130px 130px 90px 70px;align-items:center;height:36px;padding:0 16px;background:#1f2024;border-bottom:1px solid #26272c;font-size:12px;font-weight:500;color:#a3a7ae">
+<span>Server</span><span>Group</span><span>Status</span><span>CPU · 1 h</span><span>Memory</span><span>Disk</span><span>Updates</span><span>Uptime</span>
+</div>
+<sc-for list="{{rows}}" as="r" hint-placeholder-count="12">
+<div style="display:grid;grid-template-columns:230px 150px 170px 140px 130px 130px 90px 70px;align-items:center;height:42px;padding:0 16px;border-bottom:1px solid #232429">
+<div style="display:flex;flex-direction:column;gap:1px;min-width:0">
+<a href="ServerDetail.dc.html" style="color:#ededee;text-decoration:none;font-weight:500">{{r.name}}</a>
+<span style="font-family:'Geist Mono',monospace;font-size:11px;color:#8d9199">{{r.ip}}</span>
+</div>
+<div style="display:flex;flex-direction:column;gap:1px"><span>{{r.group}}</span><span style="font-size:11px;color:#8d9199">{{r.tags}}</span></div>
+<div style="display:flex">
+<sc-if value="{{r.isOk}}" hint-placeholder-val="{{true}}"><span style="display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:11px;font-size:12px;font-weight:500;white-space:nowrap;background:#15291d;color:#6fd49a"><span style="width:6px;height:6px;border-radius:3px;background:#3fb772"></span>{{r.note}}</span></sc-if>
+<sc-if value="{{r.isWarn}}" hint-placeholder-val="{{false}}"><span style="display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:11px;font-size:12px;font-weight:500;white-space:nowrap;background:#33230f;color:#f0a257"><span style="width:6px;height:6px;border-radius:3px;background:#e8832a"></span>{{r.note}}</span></sc-if>
+<sc-if value="{{r.isCrit}}" hint-placeholder-val="{{false}}"><span style="display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:11px;font-size:12px;font-weight:500;white-space:nowrap;background:#3a1a17;color:#ff8a7d"><span style="width:6px;height:6px;border-radius:3px;background:#ef5a4a"></span>{{r.note}}</span></sc-if>
+<sc-if value="{{r.isOff}}" hint-placeholder-val="{{false}}"><span style="display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:11px;font-size:12px;font-weight:500;white-space:nowrap;background:#2a2b30;color:#a3a7ae"><span style="width:7px;height:7px;box-sizing:border-box;border-radius:4px;border:1.5px solid #7b818b"></span>Offline · 2 h</span></sc-if>
+</div>
+<div>
+<sc-if value="{{r.isOn}}" hint-placeholder-val="{{true}}"><div style="display:flex;align-items:center;gap:8px"><svg width="72" height="24" viewBox="0 0 72 24" aria-hidden="true" style="flex-shrink:0"><polyline points="{{r.spark}}" style="fill:none;stroke:{{r.sparkColor}};stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round"></polyline></svg><span style="font-variant-numeric:tabular-nums;color:#d4d6da">{{r.cpu}}</span></div></sc-if>
+<sc-if value="{{r.isOff}}" hint-placeholder-val="{{false}}"><span style="color:#8d9199">—</span></sc-if>
+</div>
+<div>
+<sc-if value="{{r.isOn}}" hint-placeholder-val="{{true}}"><div style="display:flex;align-items:center;gap:8px"><div style="width:64px;height:6px;border-radius:3px;background:#2a2b30;overflow:hidden"><div style="width:{{r.mem}};height:6px;border-radius:3px;background:#7b818b"></div></div><span style="font-variant-numeric:tabular-nums;color:#d4d6da">{{r.mem}}</span></div></sc-if>
+<sc-if value="{{r.isOff}}" hint-placeholder-val="{{false}}"><span style="color:#8d9199">—</span></sc-if>
+</div>
+<div>
+<sc-if value="{{r.diskNorm}}" hint-placeholder-val="{{true}}"><div style="display:flex;align-items:center;gap:8px"><div style="width:64px;height:6px;border-radius:3px;background:#2a2b30;overflow:hidden"><div style="width:{{r.disk}};height:6px;border-radius:3px;background:#7b818b"></div></div><span style="font-variant-numeric:tabular-nums;color:#d4d6da">{{r.disk}}</span></div></sc-if>
+<sc-if value="{{r.diskHot}}" hint-placeholder-val="{{false}}"><div style="display:flex;align-items:center;gap:8px"><div style="width:64px;height:6px;border-radius:3px;background:#3a1a17;overflow:hidden"><div style="width:{{r.disk}};height:6px;border-radius:3px;background:#ef5a4a"></div></div><span style="font-variant-numeric:tabular-nums;font-weight:600;color:#ff8a7d">{{r.disk}}</span></div></sc-if>
+<sc-if value="{{r.isOff}}" hint-placeholder-val="{{false}}"><span style="color:#8d9199">—</span></sc-if>
+</div>
+<div>
+<sc-if value="{{r.hasUpd}}" hint-placeholder-val="{{false}}"><span style="display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:6px;background:#182338;color:#8fb3ff;font-size:12px;font-weight:500">{{r.upd}} pending</span></sc-if>
+<sc-if value="{{r.upToDate}}" hint-placeholder-val="{{true}}"><span style="font-size:12px;color:#8d9199">Up to date</span></sc-if>
+<sc-if value="{{r.isOff}}" hint-placeholder-val="{{false}}"><span style="color:#8d9199">—</span></sc-if>
+</div>
+<span style="font-variant-numeric:tabular-nums;color:#d4d6da">{{r.up}}</span>
+</div>
+</sc-for>
+</section>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#2563eb","options":["#2563eb","#0f766e","#7c3aed","#c2410c"]},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const accent = this.props.accent ?? '#2563eb';
+    const tint = (hex, t) => { const n = parseInt(hex.slice(1), 16); return '#' + [n >> 16, (n >> 8) & 255, n & 255].map((v) => Math.round(v + (255 - v) * t).toString(16).padStart(2, '0')).join(''); };
+    const accentText = tint(accent, 0.45);
+    const spark = (v) => v.map((y, i) => (i * 72 / (v.length - 1)).toFixed(1) + ',' + (22 - y * 0.2).toFixed(1)).join(' ');
+    const raw = [
+      ['web-01', '203.0.113.11', 'Production', 'web · docker', 'ok', 'Healthy', 23, 41, 38, '0', '41 d', [18, 22, 20, 25, 30, 24, 21, 26, 23, 19, 22, 23]],
+      ['web-02', '203.0.113.12', 'Production', 'web · docker', 'ok', 'Healthy', 31, 44, 39, '0', '41 d', [28, 30, 35, 31, 27, 33, 36, 30, 29, 32, 34, 31]],
+      ['web-03', '203.0.113.13', 'Production', 'web · docker', 'ok', 'Healthy', 18, 39, 37, '2', '12 d', [15, 17, 20, 16, 19, 22, 18, 17, 15, 19, 20, 18]],
+      ['web-04', '203.0.113.14', 'Production', 'web · docker', 'warn', 'nginx restarted', 64, 58, 42, '2', '12 d', [30, 32, 35, 38, 45, 52, 60, 71, 68, 62, 66, 64]],
+      ['api-01', '203.0.113.21', 'Production', 'docker', 'ok', 'Healthy', 42, 63, 51, '0', '27 d', [40, 38, 44, 47, 41, 39, 45, 43, 40, 42, 46, 42]],
+      ['api-02', '203.0.113.22', 'Production', 'docker', 'ok', 'Healthy', 37, 60, 49, '0', '27 d', [35, 39, 36, 33, 38, 40, 37, 34, 36, 39, 38, 37]],
+      ['db-01', '203.0.113.31', 'Production', 'docker', 'ok', 'Healthy', 12, 72, 67, '3', '88 d', [10, 12, 11, 14, 13, 12, 10, 11, 13, 12, 11, 12]],
+      ['db-02', '203.0.113.32', 'Production', 'docker', 'crit', 'Disk 91%', 29, 81, 91, '3', '88 d', [22, 25, 24, 28, 30, 27, 26, 31, 29, 28, 30, 29]],
+      ['worker-01', '203.0.113.41', 'Edge', 'docker', 'ok', 'Healthy', 76, 52, 33, '0', '6 d', [60, 72, 80, 78, 74, 81, 77, 70, 75, 79, 73, 76]],
+      ['mc-survival', '198.51.100.7', 'Game servers', 'game', 'ok', 'Healthy', 48, 69, 44, '1', '3 d', [30, 35, 42, 50, 55, 52, 49, 46, 44, 47, 50, 48]],
+      ['valheim-eu', '198.51.100.8', 'Game servers', 'game', 'ok', 'Healthy', 22, 55, 30, '1', '3 d', [20, 21, 24, 23, 22, 25, 21, 20, 22, 23, 24, 22]],
+      ['staging-01', '192.0.2.5', 'Staging', 'web · docker', 'off', 'Offline', 0, 0, 0, '—', '—', [0, 0]]
+    ];
+    const rows = raw.map(([name, ip, group, tags, status, note, cpu, mem, disk, upd, up, c]) => {
+      const on = status !== 'off';
+      return {
+        name, ip, group, tags, note, up, upd,
+        cpu: cpu + '%', mem: mem + '%', disk: disk + '%',
+        spark: spark(c),
+        sparkColor: status === 'warn' ? '#e8832a' : accent,
+        isOk: status === 'ok', isWarn: status === 'warn', isCrit: status === 'crit', isOff: !on, isOn: on,
+        diskHot: on && disk >= 85, diskNorm: on && disk < 85,
+        hasUpd: on && upd !== '0', upToDate: on && upd === '0'
+      };
+    });
+    return { accent, accentText, rows };
+  }
+}
+</script>
+</body>
+</html>

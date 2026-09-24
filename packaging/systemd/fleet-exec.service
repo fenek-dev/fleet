@@ -1,0 +1,56 @@
+[Unit]
+Description=Fleet executor (verifies and runs signed operations)
+After=network.target systemd-tmpfiles-setup.service
+# Restart backoff: at most 5 starts per 5 minutes, then stay failed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# exec sends READY=1 once exec.sock listens and WATCHDOG=1 every
+# WATCHDOG_USEC/2 (std UnixDatagram to $NOTIFY_SOCKET; design §4.1).
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+ExecStart=/usr/lib/fleet/fleet-agent exec
+Restart=on-failure
+RestartSec=5s
+
+# Limits from docs/design.md §4.1. Long-running children run in their own
+# transient scopes (fleet-op-<id>.scope) and are not throttled by these.
+MemoryMax=128M
+CPUQuota=15%
+TasksMax=256
+# Gate connections are capped at 64 in exec itself; this bounds everything
+# else (redb, pending files, child pipes).
+LimitNOFILE=1024
+
+# Hardening that root exec (and the apt/systemctl/nft children it will run)
+# tolerates. Exec must stay root with full filesystem write access: it
+# manages packages, /etc, sshd, the firewall and units, so ProtectSystem,
+# NoNewPrivileges, CapabilityBoundingSet and SystemCallFilter are NOT set.
+# ProtectKernelModules is NOT set: besides blocking module loading it hides
+# /usr/lib/modules, and apt installing a kernel package (and its
+# initramfs hook) writes there.
+# dmesg/kmsg: not needed; system.info reads /proc only.
+ProtectKernelLogs=yes
+# Time is NTP's job; exec never sets the clock (and a clock change can't
+# speed up recovery activation, design §5.3).
+ProtectClock=yes
+# Hostname changes will go through a typed op calling hostnamectl
+# (systemd-hostnamed does the work outside this sandbox).
+ProtectHostname=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# authorized_keys live under /etc/fleet, so home directories are never
+# written today; read-only keeps a bug from touching them. Must be relaxed
+# when user-management ops (useradd -m) land.
+ProtectHome=read-only
+# apt and friends get a private /tmp; nothing is shared through /tmp.
+PrivateTmp=yes
+# RestrictNamespaces is deliberately NOT set: the Docker role add-on will
+# run `docker compose`/containerd helpers from exec, which create
+# namespaces. Revisit (RestrictNamespaces=yes) if that moves out of exec.
+
+[Install]
+WantedBy=multi-user.target

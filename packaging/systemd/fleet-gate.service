@@ -1,0 +1,49 @@
+[Unit]
+Description=Fleet gate (Noise session termination, unprivileged)
+After=fleet-exec.service systemd-tmpfiles-setup.service
+Wants=fleet-exec.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/fleet/fleet-agent gate
+Restart=on-failure
+RestartSec=2s
+
+# Sandbox: exact block from docs/design.md §4.1.
+User=fleet-gate
+Group=fleet
+# Group of /run/fleet-exec and exec.sock (root:fleet-gate 0710 / 0660).
+SupplementaryGroups=fleet-gate
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Only agent.sock is written. /run/fleet-exec stays read-only: connect()
+# needs write permission on the socket inode (0660, group fleet-gate), which
+# a read-only mount does not block for sockets. The Noise key is only read.
+ReadWritePaths=/run/fleet
+MemoryMax=32M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
