@@ -6,7 +6,7 @@
 
 use super::Result;
 use fleet_proto::DeviceId;
-use redb::{Database, ReadableDatabase, TableDefinition, WriteTransaction};
+use redb::{ReadableDatabase, TableDefinition, WriteTransaction};
 
 /// `device_id (16) ‖ nonce (16)` → expiry_ms.
 const NONCES: TableDefinition<&[u8; 32], u64> = TableDefinition::new("replay_nonce");
@@ -27,11 +27,11 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<()> {
 }
 
 pub struct ReplayCache<'a> {
-    db: &'a Database,
+    db: super::DbRead<'a>,
 }
 
 impl<'a> ReplayCache<'a> {
-    pub(super) fn new(db: &'a Database) -> Self {
+    pub(super) fn new(db: super::DbRead<'a>) -> Self {
         Self { db }
     }
 

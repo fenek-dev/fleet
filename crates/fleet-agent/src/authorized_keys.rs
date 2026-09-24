@@ -103,13 +103,18 @@ fn ssh_string(out: &mut Vec<u8>, s: &[u8]) {
     out.extend_from_slice(s);
 }
 
-fn ecdsa_line(key: &P256Public) -> Option<String> {
+/// OpenSSH `ecdsa-sha2-nistp256` public key blob (what sshd fingerprints).
+pub fn ecdsa_blob(key: &P256Public) -> Option<Vec<u8>> {
     let point = fleet_crypto::sig::p256_uncompressed(key).ok()?;
     let mut blob = Vec::new();
     ssh_string(&mut blob, b"ecdsa-sha2-nistp256");
     ssh_string(&mut blob, b"nistp256");
     ssh_string(&mut blob, &point);
-    Some(format!("ecdsa-sha2-nistp256 {}", base64(&blob)))
+    Some(blob)
+}
+
+fn ecdsa_line(key: &P256Public) -> Option<String> {
+    Some(format!("ecdsa-sha2-nistp256 {}", base64(&ecdsa_blob(key)?)))
 }
 
 fn ed25519_line(key: &Ed25519Public) -> String {

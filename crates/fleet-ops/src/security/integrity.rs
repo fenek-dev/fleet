@@ -3,8 +3,10 @@
 //! (through [`BaselineStore`]). The first run with no baseline records
 //! one and reports no violations.
 //!
-//! Package upgrades legitimately change binaries on the list; re-baselining
-//! after `dpkg` runs is exec's job (not wired yet).
+//! Package upgrades legitimately change binaries on the list. Exec
+//! re-baselines ([`IntegrityHandler::rebaseline`]) only the files of
+//! packages changed by a Fleet package op ([`package_paths`]); a `dpkg`
+//! run Fleet didn't start still shows up as a violation.
 
 use crate::ctx::SysCtx;
 use crate::handler::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput};
@@ -112,6 +114,71 @@ pub fn compare(baseline: &Baseline, current: &Baseline, now_ms: u64) -> Vec<Inte
     out
 }
 
+/// dpkg's per-package file lists.
+pub const DPKG_INFO: &str = "/var/lib/dpkg/info";
+
+/// A package name as dpkg writes it into its log and file names
+/// (`name` or `name:arch`). Anything else (the log is untrusted text) is
+/// refused before it becomes part of a path.
+fn dpkg_name_ok(n: &str) -> bool {
+    let (name, arch) = n.split_once(':').unwrap_or((n, ""));
+    (2..=128).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"+-.".contains(&b))
+        && arch.len() <= 32
+        && arch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Which of `candidates` belong to any of the packages `names`, from
+/// `/var/lib/dpkg/info/<name>[:<arch>].list`. Bounded: at most 4 MiB read
+/// per list.
+pub fn package_paths(ctx: &SysCtx, names: &[String], candidates: &[String]) -> Vec<String> {
+    let Some(info) = ctx.path(DPKG_INFO) else {
+        return Vec::new();
+    };
+    let mut lists = Vec::new();
+    for n in names.iter().filter(|n| dpkg_name_ok(n)) {
+        if n.contains(':') {
+            lists.push(info.join(format!("{n}.list")));
+            continue;
+        }
+        lists.push(info.join(format!("{n}.list")));
+        if let Ok(rd) = std::fs::read_dir(&info) {
+            let prefix = format!("{n}:");
+            lists.extend(rd.flatten().map(|e| e.file_name()).filter_map(|f| {
+                let f = f.to_str()?;
+                (f.starts_with(&prefix) && f.ends_with(".list")).then(|| info.join(f))
+            }));
+        }
+    }
+    let mut found = BTreeSet::new();
+    for l in lists {
+        let Ok(f) = std::fs::File::open(&l) else {
+            continue;
+        };
+        let mut text = String::new();
+        if f.take(4 << 20).read_to_string(&mut text).is_err() {
+            continue;
+        }
+        for line in text.lines() {
+            // Merged /usr: a list may say `/bin/su` for `/usr/bin/su`.
+            let merged = ["/bin/", "/sbin/", "/lib/"]
+                .iter()
+                .any(|p| line.starts_with(p))
+                .then(|| format!("/usr{line}"));
+            if let Some(c) = candidates
+                .iter()
+                .find(|c| c.as_str() == line || Some(c.as_str()) == merged.as_deref())
+            {
+                found.insert(c.clone());
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
 /// Where exec keeps the baseline (its redb store in production).
 pub trait BaselineStore {
     fn load(&self) -> Option<Baseline>;
@@ -148,6 +215,34 @@ impl IntegrityHandler {
             store,
             DEFAULT_CRITICAL.iter().map(|s| (*s).to_owned()).collect(),
         )
+    }
+
+    /// The watched files.
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    /// Records the current state of `paths` (those on the list) as their
+    /// new baseline, leaving every other entry alone. Used after a package
+    /// transaction Fleet itself ran. Returns the paths updated.
+    pub fn rebaseline(&self, ctx: &SysCtx, paths: &[String]) -> Result<Vec<String>, OpError> {
+        let wanted: Vec<String> = paths
+            .iter()
+            .filter(|p| self.paths.contains(p))
+            .cloned()
+            .collect();
+        if wanted.is_empty() {
+            return Ok(wanted);
+        }
+        let Some(mut base) = self.store.load() else {
+            // No baseline yet: the next check records a full one.
+            return Ok(Vec::new());
+        };
+        for p in &wanted {
+            base.insert(p.clone(), file_state(ctx, p));
+        }
+        self.store.save(&base)?;
+        Ok(wanted)
     }
 
     pub fn status(&self, ctx: &SysCtx, now_ms: u64) -> Result<IntegrityStatus, OpError> {
@@ -267,5 +362,44 @@ mod tests {
         assert!(w.observe(&s.violations).is_empty());
         assert!(w.observe(&[]).is_empty());
         assert_eq!(w.observe(&s.violations[..1]).len(), 1);
+    }
+
+    #[test]
+    fn rebaseline_only_package_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for p in ["usr/bin", "usr/sbin", "var/lib/dpkg/info"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        std::fs::write(d.join("usr/bin/su"), "v1").unwrap();
+        std::fs::write(d.join("usr/sbin/sshd"), "v1").unwrap();
+        let info = d.join("var/lib/dpkg/info");
+        std::fs::write(
+            info.join("util-linux.list"),
+            "/.\n/bin/su\n/usr/bin/other\n",
+        )
+        .unwrap();
+        std::fs::write(info.join("openssh-server:amd64.list"), "/usr/sbin/sshd\n").unwrap();
+        let ctx = ctx_at(d, Rc::new(FakeRunner::new()));
+        let paths: Vec<String> = ["/usr/bin/su", "/usr/sbin/sshd"].map(String::from).to_vec();
+        let store = Rc::new(MemoryBaselineStore::default());
+        let h = IntegrityHandler::new(store.clone(), paths.clone());
+        assert!(h.status(&ctx, 1).unwrap().violations.is_empty());
+
+        std::fs::write(d.join("usr/bin/su"), "v2").unwrap();
+        std::fs::write(d.join("usr/sbin/sshd"), "v2").unwrap();
+        // Hostile names never reach the filesystem.
+        let names = ["util-linux", "../../etc/passwd", "a/b"].map(String::from);
+        let owned = package_paths(&ctx, &names, &paths);
+        assert_eq!(owned, ["/usr/bin/su"]);
+        assert_eq!(h.rebaseline(&ctx, &owned).unwrap(), owned);
+        let v = h.status(&ctx, 2).unwrap().violations;
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "/usr/sbin/sshd");
+        // Arch-qualified lists are found from the bare name too.
+        let owned = package_paths(&ctx, &["openssh-server".into()], &paths);
+        assert_eq!(owned, ["/usr/sbin/sshd"]);
+        h.rebaseline(&ctx, &owned).unwrap();
+        assert!(h.status(&ctx, 3).unwrap().violations.is_empty());
     }
 }

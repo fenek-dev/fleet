@@ -31,6 +31,26 @@ pub trait FingerprintResolver {
     fn device_for(&self, fingerprint: &str) -> Option<DeviceId>;
 }
 
+/// OpenSSH's `SHA256:<base64, no padding>` fingerprint of a public key
+/// blob (the base64-decoded middle field of an `authorized_keys` line), as
+/// `sshd` logs it under `LogLevel VERBOSE`.
+pub fn ssh_fingerprint(blob: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let d = Sha256::digest(blob);
+    let mut out = String::from("SHA256:");
+    for c in d.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        let chars = c.len() + 1;
+        for i in 0..chars {
+            out.push(A[(n >> (18 - 6 * i)) as usize & 63] as char);
+        }
+    }
+    out
+}
+
 /// Resolves nothing (no roster wired in).
 pub struct NoResolver;
 
@@ -262,6 +282,35 @@ mod tests {
     use crate::logs::lines::FakeLineSpawner;
     use crate::security::utmp::tests::record;
     use crate::test_util::{block, ctx_at, meta};
+
+    #[test]
+    fn fingerprint_matches_ssh_keygen() {
+        fn b64(s: &str) -> Vec<u8> {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let v: Vec<u32> = s
+                .bytes()
+                .filter(|b| *b != b'=')
+                .map(|b| A.iter().position(|a| *a == b).unwrap() as u32)
+                .collect();
+            let mut out = Vec::new();
+            for c in v.chunks(4) {
+                let n = c
+                    .iter()
+                    .enumerate()
+                    .fold(0, |n, (i, x)| n | x << (18 - 6 * i));
+                out.extend(&n.to_be_bytes()[1..c.len()]);
+            }
+            out
+        }
+        // `ssh-keygen -lf` of this key.
+        let blob = b64(
+            "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBKJE7MGhV1KRwnWX0sGPhHyDcjpkFm7dBLnegSSB6SW3jzWmf8ex4lMVdhSUowGHJRebrBdsBmQjBM3uxWyDIwk=",
+        );
+        assert_eq!(
+            ssh_fingerprint(&blob),
+            "SHA256:PZ/ADm/POhDW0tGKvk5poaPYtYCyQz2o+/H764kvHMw"
+        );
+    }
 
     struct OneMac;
     impl FingerprintResolver for OneMac {

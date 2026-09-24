@@ -2,7 +2,7 @@
 //! Nothing here is trusted blindly; exec re-validates on load.
 
 use super::Result;
-use redb::{Database, ReadableDatabase, TableDefinition, WriteTransaction};
+use redb::{ReadableDatabase, TableDefinition, WriteTransaction};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
@@ -49,11 +49,11 @@ impl MetaKey {
 }
 
 pub struct Meta<'a> {
-    db: &'a Database,
+    db: super::DbRead<'a>,
 }
 
 impl<'a> Meta<'a> {
-    pub(super) fn new(db: &'a Database) -> Self {
+    pub(super) fn new(db: super::DbRead<'a>) -> Self {
         Self { db }
     }
 

@@ -25,6 +25,7 @@ use crate::frame::{self, FrameError};
 use fleet_proto::chunk::MAX_CHUNK;
 use fleet_proto::{DeviceId, KeyKind, MAX_FRAME};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Largest IPC frame: a roster (≤ `MAX_FRAME`) plus envelope.
@@ -51,6 +52,10 @@ pub enum IpcMsg {
         mode: u8,
         device_id: DeviceId,
         key: KeyKind,
+        /// The bridge's `SSH_CONNECTION` client address: an untrusted hint,
+        /// used only for ban-exemption learning once sshd's journal
+        /// corroborates it (design §4.7).
+        client_ip: Option<IpAddr>,
     },
     /// gate → exec, instead of `SessionOpen`: this is the gate's control
     /// connection; exec sends only `RosterUpdate`/`Limits` on it.
