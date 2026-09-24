@@ -1,13 +1,17 @@
 //! Protocol version 1 wire types. Frozen once released (design §6.2).
 
 mod actor;
+pub mod alert;
+pub mod args;
 mod audit;
 mod command;
 mod error;
+pub mod event;
 mod ids;
 mod keys;
 mod message;
 pub mod op;
+pub mod payload;
 pub mod policy;
 mod roster;
 
@@ -20,13 +24,14 @@ pub use command::{
     ApprovalBody, ApprovalItem, CommandBody, MerkleProof, RootApproval, SignedCommand,
 };
 pub use error::ErrorCode;
+pub use event::{ContainerAction, Event, UserChangeKind, event_tag};
 pub use ids::{BoundedString, DeviceId, FleetId, IdError, ServerId};
 pub use keys::{Ed25519Public, KeyKind, P256Public, Signature, X25519Public};
 pub use message::{
-    AgentHealth, Event, Message, MessageKind, Payload, PendingRecovery, RequestId, SignedEvent,
-    SystemInfo, event_tag, payload_tag,
+    AgentHealth, Message, MessageKind, PendingRecovery, RequestId, SignedEvent, SystemInfo,
 };
-pub use op::{Authorization, Group, Op, Tier};
+pub use op::{Authorization, ChangeId, Group, Op, Tier};
+pub use payload::{F32, Payload, payload_tag};
 pub use policy::{Policy, PolicyError};
 pub use roster::{
     AgentVersion, Device, Hash32, KeyRef, PrevRecovery, ReleaseManifest, Role, Roster,

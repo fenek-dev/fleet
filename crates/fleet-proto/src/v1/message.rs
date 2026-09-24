@@ -1,11 +1,10 @@
 //! Application frames inside the Noise session (design §6.3).
 
 use super::{
-    AgentVersion, DeviceId, ErrorCode, Hash32, KeyKind, ServerId, Signature, SignedCommand,
-    SignedReceipt,
+    AgentVersion, DeviceId, ErrorCode, Event, Hash32, KeyKind, Payload, ServerId, Signature,
+    SignedCommand, SignedReceipt,
 };
-use crate::tagged::{Tagged, tagged_serde, unit};
-use crate::{DecodeError, decode, domain, encode};
+use crate::{domain, encode};
 use serde::{Deserialize, Serialize};
 
 pub type RequestId = u32;
@@ -158,69 +157,6 @@ pub struct PendingRecovery {
     pub activates_at_ms: u64,
 }
 
-/// `Payload` wire tags (design §6.2). Explicit; never reorder or reuse.
-pub mod payload_tag {
-    pub const EMPTY: u16 = 0;
-    pub const SYSTEM_INFO: u16 = 1;
-    pub const AGENT_HEALTH: u16 = 2;
-    pub const ROSTER_PENDING: u16 = 3;
-}
-
-/// Successful response payloads. Tagged like `Op`: an app that doesn't know a
-/// tag gets [`Payload::Unknown`] instead of a decode failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Payload {
-    Empty,
-    SystemInfo(SystemInfo),
-    AgentHealth(AgentHealth),
-    RosterPending(Option<PendingRecovery>),
-    /// A tag this build doesn't know. Serializes with an empty payload.
-    Unknown {
-        tag: u16,
-    },
-}
-
-impl Payload {
-    pub fn tag(&self) -> u16 {
-        match self {
-            Payload::Empty => payload_tag::EMPTY,
-            Payload::SystemInfo(_) => payload_tag::SYSTEM_INFO,
-            Payload::AgentHealth(_) => payload_tag::AGENT_HEALTH,
-            Payload::RosterPending(_) => payload_tag::ROSTER_PENDING,
-            Payload::Unknown { tag } => *tag,
-        }
-    }
-}
-
-impl Tagged for Payload {
-    const EXPECTING: &'static str = "(payload tag, payload)";
-
-    fn wire_tag(&self) -> u16 {
-        self.tag()
-    }
-
-    fn wire_payload(&self) -> Vec<u8> {
-        match self {
-            Payload::Empty | Payload::Unknown { .. } => Vec::new(),
-            Payload::SystemInfo(v) => encode(v),
-            Payload::AgentHealth(v) => encode(v),
-            Payload::RosterPending(v) => encode(v),
-        }
-    }
-
-    fn from_wire(tag: u16, payload: &[u8]) -> Result<Self, DecodeError> {
-        Ok(match tag {
-            payload_tag::EMPTY => unit(Payload::Empty, payload)?,
-            payload_tag::SYSTEM_INFO => Payload::SystemInfo(decode(payload)?),
-            payload_tag::AGENT_HEALTH => Payload::AgentHealth(decode(payload)?),
-            payload_tag::ROSTER_PENDING => Payload::RosterPending(decode(payload)?),
-            tag => Payload::Unknown { tag },
-        })
-    }
-}
-
-tagged_serde!(Payload);
-
 /// Server-reported strings are untrusted data (security rule 6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemInfo {
@@ -283,206 +219,13 @@ impl SignedEvent {
     }
 }
 
-/// `Event` wire tags (design §6.2). Explicit; never reorder or reuse.
-pub mod event_tag {
-    pub const ROSTER_CHANGED: u16 = 0;
-    pub const RECOVERY_PENDING: u16 = 1;
-    pub const RECOVERY_VETOED: u16 = 2;
-    pub const POLICY_CHANGED: u16 = 3;
-    pub const CHANGE_REVERTED: u16 = 4;
-}
-
-/// Pushed events. Tagged like `Op`, so newer agents can add events without
-/// breaking older apps (they see [`Event::Unknown`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
-    RosterChanged {
-        epoch: u32,
-        version: u64,
-    },
-    RecoveryPending(PendingRecovery),
-    RecoveryVetoed {
-        hash: Hash32,
-    },
-    PolicyChanged {
-        version: u64,
-    },
-    /// An auto-revert timer fired and restored a pending change (design §4.10).
-    ChangeReverted {
-        change_id: [u8; 16],
-        /// Seq of the `Actor::System` audit entry that recorded the revert.
-        audit_seq: u64,
-    },
-    /// A tag this build doesn't know. Serializes with an empty payload.
-    Unknown {
-        tag: u16,
-    },
-}
-
-impl Event {
-    pub fn tag(&self) -> u16 {
-        match self {
-            Event::RosterChanged { .. } => event_tag::ROSTER_CHANGED,
-            Event::RecoveryPending(_) => event_tag::RECOVERY_PENDING,
-            Event::RecoveryVetoed { .. } => event_tag::RECOVERY_VETOED,
-            Event::PolicyChanged { .. } => event_tag::POLICY_CHANGED,
-            Event::ChangeReverted { .. } => event_tag::CHANGE_REVERTED,
-            Event::Unknown { tag } => *tag,
-        }
-    }
-}
-
-impl Tagged for Event {
-    const EXPECTING: &'static str = "(event tag, payload)";
-
-    fn wire_tag(&self) -> u16 {
-        self.tag()
-    }
-
-    fn wire_payload(&self) -> Vec<u8> {
-        match self {
-            Event::RosterChanged { epoch, version } => encode(&(epoch, version)),
-            Event::RecoveryPending(p) => encode(p),
-            Event::RecoveryVetoed { hash } => encode(hash),
-            Event::PolicyChanged { version } => encode(version),
-            Event::ChangeReverted {
-                change_id,
-                audit_seq,
-            } => encode(&(change_id, audit_seq)),
-            Event::Unknown { .. } => Vec::new(),
-        }
-    }
-
-    fn from_wire(tag: u16, payload: &[u8]) -> Result<Self, DecodeError> {
-        Ok(match tag {
-            event_tag::ROSTER_CHANGED => {
-                let (epoch, version) = decode(payload)?;
-                Event::RosterChanged { epoch, version }
-            }
-            event_tag::RECOVERY_PENDING => Event::RecoveryPending(decode(payload)?),
-            event_tag::RECOVERY_VETOED => Event::RecoveryVetoed {
-                hash: decode(payload)?,
-            },
-            event_tag::POLICY_CHANGED => Event::PolicyChanged {
-                version: decode(payload)?,
-            },
-            event_tag::CHANGE_REVERTED => {
-                let (change_id, audit_seq) = decode(payload)?;
-                Event::ChangeReverted {
-                    change_id,
-                    audit_seq,
-                }
-            }
-            tag => Event::Unknown { tag },
-        })
-    }
-}
-
-tagged_serde!(Event);
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tagged::Bytes;
-
-    fn payloads() -> Vec<Payload> {
-        fn _exhaustive(p: &Payload) {
-            match p {
-                Payload::Empty
-                | Payload::SystemInfo(_)
-                | Payload::AgentHealth(_)
-                | Payload::RosterPending(_)
-                | Payload::Unknown { .. } => {}
-            }
-        }
-        let v = AgentVersion {
-            major: 1,
-            minor: 2,
-            patch: 3,
-        };
-        vec![
-            Payload::Empty,
-            Payload::SystemInfo(SystemInfo {
-                hostname: "h".into(),
-                os_id: "debian".into(),
-                os_version: "12".into(),
-                kernel: "6.1".into(),
-                arch: "x86_64".into(),
-                cpu_count: 4,
-                mem_total_bytes: 1 << 30,
-                uptime_s: 9,
-            }),
-            Payload::AgentHealth(AgentHealth {
-                agent_version: v,
-                proto_version: 1,
-                uptime_s: 1,
-                gate_rss_bytes: 2,
-                exec_rss_bytes: 3,
-                audit_seq: 4,
-                roster_epoch: 5,
-                roster_version: 6,
-                policy_version: 7,
-                pending_recovery: Some(PendingRecovery {
-                    hash: [8; 32],
-                    activates_at_ms: 9,
-                }),
-                run_id: [10; 16],
-            }),
-            Payload::RosterPending(None),
-        ]
-    }
-
-    fn events() -> Vec<Event> {
-        fn _exhaustive(e: &Event) {
-            match e {
-                Event::RosterChanged { .. }
-                | Event::RecoveryPending(_)
-                | Event::RecoveryVetoed { .. }
-                | Event::PolicyChanged { .. }
-                | Event::ChangeReverted { .. }
-                | Event::Unknown { .. } => {}
-            }
-        }
-        vec![
-            Event::RosterChanged {
-                epoch: 1,
-                version: 2,
-            },
-            Event::RecoveryPending(PendingRecovery {
-                hash: [1; 32],
-                activates_at_ms: 3,
-            }),
-            Event::RecoveryVetoed { hash: [2; 32] },
-            Event::PolicyChanged { version: 4 },
-            Event::ChangeReverted {
-                change_id: [5; 16],
-                audit_seq: 6,
-            },
-        ]
-    }
+    use crate::decode;
 
     #[test]
-    fn tags_unique_and_roundtrip() {
-        let mut tags = std::collections::HashSet::new();
-        for p in payloads() {
-            assert!(tags.insert(p.tag()), "duplicate payload tag {}", p.tag());
-            assert_eq!(decode::<Payload>(&encode(&p)).unwrap(), p);
-        }
-        let mut tags = std::collections::HashSet::new();
-        for e in events() {
-            assert!(tags.insert(e.tag()), "duplicate event tag {}", e.tag());
-            assert_eq!(decode::<Event>(&encode(&e)).unwrap(), e);
-        }
-    }
-
-    #[test]
-    fn unknown_tags_skip_payload() {
-        let bytes = encode(&(900u16, Bytes(&[1, 2, 3]), 42u8));
-        let (p, rest): (Payload, u8) = decode(&bytes).unwrap();
-        assert_eq!((p, rest), (Payload::Unknown { tag: 900 }, 42));
-        let (e, rest): (Event, u8) = decode(&bytes).unwrap();
-        assert_eq!((e, rest), (Event::Unknown { tag: 900 }, 42));
-        // Inside a full frame.
+    fn unknown_event_inside_frame() {
         let ev = Message::Event(SignedEvent {
             server_id: ServerId::new("srv_abcdef").unwrap(),
             run_id: [0; 16],
@@ -591,15 +334,5 @@ mod tests {
         assert_eq!(Message::kind_tag(&[]), None);
         assert_eq!(Message::kind_tag(&[10]), None);
         assert_eq!(Message::kind_tag(&[0x80, 0x01]), None);
-    }
-
-    #[test]
-    fn known_tags_reject_bad_payload() {
-        let bytes = encode(&(payload_tag::EMPTY, Bytes(&[0])));
-        assert!(decode::<Payload>(&bytes).is_err());
-        let bytes = encode(&(event_tag::POLICY_CHANGED, Bytes(&[])));
-        assert!(decode::<Event>(&bytes).is_err());
-        let bytes = encode(&(event_tag::CHANGE_REVERTED, Bytes(&[0; 16])));
-        assert!(decode::<Event>(&bytes).is_err());
     }
 }

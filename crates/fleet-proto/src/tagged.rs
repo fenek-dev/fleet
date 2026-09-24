@@ -23,15 +23,6 @@ pub(crate) trait Tagged: Sized {
     fn from_wire(tag: u16, payload: &[u8]) -> Result<Self, DecodeError>;
 }
 
-/// `value` if `payload` is empty (unit variants).
-pub(crate) fn unit<T>(value: T, payload: &[u8]) -> Result<T, DecodeError> {
-    if payload.is_empty() {
-        Ok(value)
-    } else {
-        Err(DecodeError::TrailingBytes(payload.len()))
-    }
-}
-
 pub(crate) struct Bytes<'a>(pub &'a [u8]);
 
 impl Serialize for Bytes<'_> {
@@ -105,3 +96,109 @@ macro_rules! tagged_serde {
     };
 }
 pub(crate) use tagged_serde;
+
+/// Declares a tagged wire enum (`Op`, `Payload`, `Event`) from a catalog.
+///
+/// Each variant is unit, `Name(binding: Type)` or `Name { field: Type, .. }`,
+/// followed by `= CONST(tag, "name")`. Generates the tag module (`CONST`s,
+/// `ALL`, `NAMES`), the enum plus an `Unknown { tag }` variant, `tag()`,
+/// `name()`, `is_known_tag()`, `payload()` and the [`Tagged`] impl. The
+/// payload is the postcard tuple of the variant's fields in order, so a
+/// one-field variant encodes exactly like its field.
+macro_rules! tagged_enum {
+    (
+        $(#[$em:meta])*
+        pub enum $E:ident, tags = $tagmod:ident, expecting = $exp:literal {
+            $(
+                $(#[$m:meta])*
+                $V:ident
+                $( ( $tv:ident : $T:ty ) )?
+                $( { $( $(#[$fm:meta])* $f:ident : $ft:ty ),* $(,)? } )?
+                = $TAG:ident ( $num:literal, $name:literal )
+            ),* $(,)?
+        }
+    ) => {
+        /// Wire tags. Explicit constants; never reorder or reuse.
+        pub mod $tagmod {
+            $( pub const $TAG: u16 = $num; )*
+            /// Every known tag, in catalog order.
+            pub const ALL: &[u16] = &[$($num),*];
+            /// Name of every known variant, in the same order as [`ALL`].
+            pub const NAMES: &[&str] = &[$($name),*];
+        }
+
+        $(#[$em])*
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum $E {
+            $(
+                $(#[$m])*
+                $V $( ($T) )? $( { $( $(#[$fm])* $f : $ft ),* } )?,
+            )*
+            /// A tag this build doesn't know. Never acted on; serializes with
+            /// an empty payload.
+            Unknown { tag: u16 },
+        }
+
+        impl $E {
+            pub fn tag(&self) -> u16 {
+                match self {
+                    $( $E::$V { .. } => $tagmod::$TAG, )*
+                    $E::Unknown { tag } => *tag,
+                }
+            }
+
+            /// Catalog name (`"unknown"` for [`Self::Unknown`]).
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $( $E::$V { .. } => $name, )*
+                    $E::Unknown { .. } => "unknown",
+                }
+            }
+
+            /// Whether this build has a variant for `tag`.
+            pub fn is_known_tag(tag: u16) -> bool {
+                $tagmod::ALL.contains(&tag)
+            }
+
+            /// Postcard encoding of the variant's fields.
+            pub(crate) fn payload(&self) -> Vec<u8> {
+                match self {
+                    $(
+                        $E::$V $( ($tv) )? $( { $($f),* } )? =>
+                            $crate::encode(&( $($tv,)? $($($f,)*)? )),
+                    )*
+                    $E::Unknown { .. } => Vec::new(),
+                }
+            }
+        }
+
+        impl $crate::tagged::Tagged for $E {
+            const EXPECTING: &'static str = $exp;
+
+            fn wire_tag(&self) -> u16 {
+                self.tag()
+            }
+
+            fn wire_payload(&self) -> Vec<u8> {
+                self.payload()
+            }
+
+            #[allow(clippy::let_unit_value)]
+            fn from_wire(tag: u16, payload: &[u8]) -> Result<Self, $crate::DecodeError> {
+                Ok(match tag {
+                    $(
+                        $tagmod::$TAG => {
+                            let ( $($tv,)? $($($f,)*)? ): ( $($T,)? $($($ft,)*)? ) =
+                                $crate::decode(payload)?;
+                            $E::$V $( ($tv) )? $( { $($f),* } )?
+                        }
+                    )*
+                    tag => $E::Unknown { tag },
+                })
+            }
+        }
+
+        $crate::tagged::tagged_serde!($E);
+    };
+}
+pub(crate) use tagged_enum;

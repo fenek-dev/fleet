@@ -929,7 +929,8 @@ impl State {
                 };
                 Ok(Plan::Policy(Box::new(p), stored))
             }
-            Op::Unknown { .. } => Err(ErrorCode::Unsupported),
+            // Catalog ops without a handler yet, and unknown tags.
+            _ => Err(ErrorCode::Unsupported),
         }
     }
 

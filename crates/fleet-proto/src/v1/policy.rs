@@ -256,9 +256,11 @@ auto_revert_seconds = 60
             Err(PolicyError::UnknownOp("roster.pendng".into()))
         );
         assert!(matches!(
-            with("[\"roster.pending\"]", "[\"cron.set\"]"),
+            with("[\"roster.pending\"]", "[\"cron.purge\"]"),
             Err(PolicyError::UnknownOp(_))
         ));
+        // Catalog ops beyond Phase 0 are accepted.
+        assert!(with("[\"roster.pending\"]", "[\"cron.set\"]").is_ok());
         assert!(matches!(with("= 240", "= 0"), Err(PolicyError::Zero(_))));
         assert!(matches!(
             with("ai = \"full\"", "ai = \"root\""),
