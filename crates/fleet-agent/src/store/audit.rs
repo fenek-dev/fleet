@@ -15,7 +15,7 @@ use fleet_proto::{
     Actor, AuditEntry, Checkpoint, DeviceId, Hash32, OpSummary, Outcome, Phase, ResultSummary,
     ServerId, Signature, SignedCheckpoint, decode, encode,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
 const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 const OPEN: TableDefinition<u64, ()> = TableDefinition::new("audit_open");
@@ -74,11 +74,11 @@ pub fn entry_hash(entry: &AuditEntry) -> Hash32 {
 }
 
 pub struct AuditLog<'a> {
-    db: &'a Database,
+    db: super::DbRead<'a>,
 }
 
 impl<'a> AuditLog<'a> {
-    pub(super) fn new(db: &'a Database) -> Self {
+    pub(super) fn new(db: super::DbRead<'a>) -> Self {
         Self { db }
     }
 

@@ -48,6 +48,10 @@ mod streams;
 #[path = "e2e/pipeline.rs"]
 mod pipeline;
 
+/// Event sources, bans, integrity, services wiring (`tests/e2e/sources.rs`).
+#[path = "e2e/sources.rs"]
+mod sources;
+
 fn run(f: impl Future<Output = ()>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -310,6 +314,9 @@ impl Fixture {
                 let uid = fsutil::current_uid().unwrap();
                 let mut cfg = ExecConfig::new(p, uid);
                 cfg.maintenance_interval = Duration::from_millis(100);
+                // No journalctl/D-Bus/pollers against the host; tests that
+                // want them use fakes (`tests/e2e/sources.rs`).
+                cfg.sources.enabled = false;
                 tweak(&mut cfg);
                 exec::run(cfg, async {
                     let _ = rx.await;
@@ -852,6 +859,7 @@ fn compromised_gate_cannot_forge_commands() {
             mode: 0,
             device_id: m.id,
             key: KeyKind::Device,
+            client_ip: None,
         };
         ipc::write_msg(&mut s, &open).await.unwrap();
         let mut reasm = Reassembler::for_exec();

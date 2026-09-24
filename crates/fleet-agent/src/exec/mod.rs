@@ -25,9 +25,13 @@
 //! commit → intent. Ops with `Op::auto_revert` then run under the
 //! auto-revert protocol (§4.10, [`Exec::apply_reverting`]).
 
+mod events;
 mod ops;
+mod sources;
 mod stream;
 mod telemetry;
+
+pub use sources::{LazySystemd, SourcesConfig};
 
 use crate::authorized_keys;
 use crate::frame::Reassembler;
@@ -38,7 +42,7 @@ use crate::pending::{
     self, ChangeId, ChangeKind, ChangeOrigin, PendingChange, PendingDir, PendingError, SessionId,
 };
 use crate::revert::{self, RegistryRevert, Revert, Runner, SystemRunner};
-use crate::store::{CheckpointSigner, Intent, MetaKey, Store, StoreError};
+use crate::store::{CheckpointSigner, Compaction, Intent, MetaKey, Store, StoreError};
 use crate::{fsutil, now_ms};
 use fleet_crypto::receipt::{receipt_for, sign_event, sign_receipt};
 use fleet_crypto::roster::{self, PendingRoster, RecoveryClock, next_grace_remaining, roster_hash};
@@ -48,9 +52,9 @@ use fleet_ops::{Invocation, OpHandler, OpMeta, OpOutput, Registry, Reverters, Re
 use fleet_proto::chunk::split_frame;
 use fleet_proto::policy::AiAccess;
 use fleet_proto::{
-    Actor, ErrorCode, Event, Hash32, KeyKind, Message, Op, OpSummary, Outcome, P256Public,
-    PROTO_VERSION, Payload, PendingRecovery, Policy, RequestId, RootApproval, ServerId, Signature,
-    SignedCommand, SignedEvent, SignedReceipt, SignedRoster, Tier, decode, encode,
+    Actor, DeviceId, ErrorCode, Event, Hash32, KeyKind, Message, Op, OpSummary, Outcome,
+    P256Public, PROTO_VERSION, Payload, PendingRecovery, Policy, RequestId, RootApproval, ServerId,
+    Signature, SignedCommand, SignedEvent, SignedReceipt, SignedRoster, Tier, decode, encode,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -129,6 +133,11 @@ pub struct ExecConfig {
     /// A non-`latest_only` stream whose client can't take a chunk for this
     /// long is ended with `Busy`.
     pub stream_send_timeout: Duration,
+    /// Event sources (sshd, systemd, pollers) and their inputs.
+    pub sources: SourcesConfig,
+    /// How often the database is compacted if it has much unused space
+    /// (design §4.4); deferred while requests or streams are running.
+    pub compact_interval: Duration,
 }
 
 impl ExecConfig {
@@ -146,6 +155,8 @@ impl ExecConfig {
             handlers: Vec::new(),
             stream_checkpoint_interval: Duration::from_secs(5),
             stream_send_timeout: Duration::from_secs(10),
+            sources: SourcesConfig::system(),
+            compact_interval: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -485,6 +496,27 @@ impl State {
         }
     }
 
+    /// Daily compaction (design §4.4). `false`: the database was in use,
+    /// try again at the next idle maintenance tick.
+    fn compact(&self) -> bool {
+        let started = Instant::now();
+        match self.store.compact(crate::store::COMPACT_MIN_FREE) {
+            Ok(Compaction::Busy) => false,
+            Ok(Compaction::Done { before, after }) => {
+                log(
+                    "database compacted",
+                    format!("{before} → {after} bytes in {:?}", started.elapsed()),
+                );
+                true
+            }
+            Ok(Compaction::NotNeeded { .. }) => true,
+            Err(e) => {
+                log("database compaction", e);
+                true
+            }
+        }
+    }
+
     fn checkpoint(&self, now: u64) {
         let res = self
             .store
@@ -621,6 +653,7 @@ impl State {
                     continue;
                 }
             };
+            drop(audit);
             self.emit(Event::ChangeReverted {
                 change_id: e.id.0,
                 audit_seq: seq,
@@ -941,6 +974,11 @@ struct Admitted {
 struct Session {
     key: KeyKind,
     id: SessionId,
+    /// What the gate reported in `SessionOpen` (untrusted): the device it
+    /// authenticated, the bridge mode, and the bridge's client address.
+    device: DeviceId,
+    recovery: bool,
+    client_ip: Option<std::net::IpAddr>,
 }
 
 /// Shared by every connection: state, dispatch, environment.
@@ -952,8 +990,11 @@ struct Exec {
     /// Streams running across all connections
     /// (`limits.max_stream_sessions`).
     streams: Cell<u32>,
+    /// Requests running now (compaction waits for idle).
+    requests: Cell<u32>,
     checkpoint_every: Duration,
     send_timeout: Duration,
+    sources: Rc<sources::Sources>,
 }
 
 /// `changes.list` / `ChangePending` view of a pending change.
@@ -1078,6 +1119,13 @@ impl Exec {
         if let Some((kind, r)) = &a.revertible {
             return self.apply_reverting(a, session, *kind, r.as_ref()).await;
         }
+        // dpkg changes made while this runs are Fleet's own: their files
+        // are re-baselined for integrity when it ends (design §4.7).
+        let _pkg = matches!(
+            op,
+            Op::PkgInstall { .. } | Op::PkgUpgrade { .. } | Op::PkgRemove { .. }
+        )
+        .then(|| self.sources.fleet_pkg_op());
         match a.handler.handle(&self.ctx, op, &a.meta).await {
             Ok(OpOutput::Payload(p)) => Ok(p),
             Ok(OpOutput::Stream(_)) => Err(ErrorCode::Internal),
@@ -1194,10 +1242,12 @@ impl Exec {
             return original;
         }
         let now = now_ms();
+        let _busy = Busy::new(&self.requests);
         let (result, audit_seq, consumed_until) =
             match self.admit(session, cmd, Invocation::Request, now) {
                 Err(r) => (Err(r.code), None, r.consumed_until),
                 Ok(a) => {
+                    self.learn_hint(session, &a.meta.command);
                     let result = self.execute(&a, session).await;
                     let status = result.as_ref().map(drop).map_err(|c| *c);
                     match self.st.borrow_mut().audit_result(a.intent_seq, status) {
@@ -1226,6 +1276,37 @@ impl Exec {
             log("store response", e);
         }
         (result, receipt)
+    }
+
+    /// Ban-exemption learning, session side (design §4.7): a command exec
+    /// itself verified, from the device the gate reported for this normal
+    /// (non-recovery) session, whose bridge sent a client address. The
+    /// address is still only a hint; [`sources::Correlator`] learns it only
+    /// if sshd's journal shows that device's key accepted from it.
+    fn learn_hint(&self, session: Session, v: &VerifiedCommand) {
+        if let Some(ip) = session.client_ip
+            && !session.recovery
+            && v.key != KeyKind::Recovery
+            && v.device_id == session.device
+        {
+            self.sources.session_verified(ip, v.device_id);
+        }
+    }
+}
+
+/// Counts a running request for as long as it lives.
+struct Busy<'a>(&'a Cell<u32>);
+
+impl<'a> Busy<'a> {
+    fn new(c: &'a Cell<u32>) -> Self {
+        c.set(c.get() + 1);
+        Self(c)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
     }
 }
 
@@ -1304,6 +1385,8 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     let reverters = std::mem::take(&mut cfg.reverters);
     let (checkpoint_every, send_timeout) =
         (cfg.stream_checkpoint_interval, cfg.stream_send_timeout);
+    let compact_every = cfg.compact_interval;
+    let sources_cfg = std::mem::replace(&mut cfg.sources, SourcesConfig::system());
     let mut state = State::load(cfg)?;
     state.startup(now_ms())?;
 
@@ -1320,7 +1403,10 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     for tag in ops::CHANGE_TAGS {
         registry.register(tag, change_ops.clone());
     }
-    let tel = telemetry::start(&st, &ctx, &mut registry);
+    let bus = events::EventBus::new(st.clone(), ctx.clock.clone());
+    let tel = telemetry::start(&st, &ctx, &mut registry, &bus);
+    let sources = sources::Sources::new(&st, &ctx, bus.clone(), sources_cfg);
+    sources.register(&mut registry);
     for (tag, h) in extra {
         registry.register(tag, h);
     }
@@ -1330,17 +1416,23 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         reverters,
         ctx,
         streams: Cell::new(0),
+        requests: Cell::new(0),
         checkpoint_every,
         send_timeout,
+        sources: sources.clone(),
     });
     let budget = Rc::new(Budget::default());
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            tokio::task::spawn_local(tel.run(exec.ctx.clone()));
+            tokio::task::spawn_local(tel.clone().run(exec.ctx.clone()));
+            sources.spawn();
             tokio::pin!(shutdown);
             let mut maint = tokio::time::interval(maint_every);
             let mut cp = tokio::time::interval(cp_every);
+            let mut compact = tokio::time::interval(compact_every);
+            compact.reset(); // not at startup
+            let mut compact_due = false;
             let wd_every = crate::notify::watchdog_interval();
             let mut wd = tokio::time::interval(wd_every.unwrap_or(Duration::from_secs(3600)));
             loop {
@@ -1358,7 +1450,14 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
                             });
                         }
                     }
-                    _ = maint.tick() => st.borrow_mut().maintenance(now_ms()),
+                    _ = maint.tick() => {
+                        st.borrow_mut().maintenance(now_ms());
+                        bus.flush();
+                        if compact_due && exec.requests.get() == 0 && exec.streams.get() == 0 {
+                            compact_due = !st.borrow().compact();
+                        }
+                    }
+                    _ = compact.tick() => compact_due = true,
                     _ = cp.tick() => st.borrow().checkpoint(now_ms()),
                     _ = wd.tick(), if wd_every.is_some() => crate::notify::notify("WATCHDOG=1"),
                     () = &mut shutdown => break,
@@ -1366,6 +1465,8 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
             }
         })
         .await;
+    sources.persist();
+    drop((sources, bus, tel, exec));
     // Dropping the LocalSet ends every connection task and with them the
     // last references to the state (and the redb lock).
     drop(local);
@@ -1429,15 +1530,26 @@ async fn connection(
         .await
         .ok()?
         .ok()??;
-    let key = match first {
-        IpcMsg::SessionOpen { key, .. } => key,
+    let (key, device, mode, client_ip) = match first {
+        IpcMsg::SessionOpen {
+            key,
+            device_id,
+            mode,
+            client_ip,
+        } => (key, device_id, mode, client_ip),
         IpcMsg::ControlOpen => return control(r, w, view_rx).await,
         _ => return None,
     };
     // Exec's own id for this session; the gate can't choose it.
     let mut id = [0u8; 16];
     fleet_crypto::random_bytes(&mut id).ok()?;
-    let key = Session { key, id };
+    let key = Session {
+        key,
+        id,
+        device,
+        recovery: mode != crate::bridge::BridgeMode::Normal.header(),
+        client_ip,
+    };
     let hello = exec.st.borrow().hello();
     for m in &frame(&hello) {
         ipc::write_msg(&mut w, m).await.ok()?;

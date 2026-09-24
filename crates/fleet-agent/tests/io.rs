@@ -161,7 +161,7 @@ fn bridge_relays_both_ways() {
             ssh_out.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"pong");
         };
-        let run = bridge::run(&sock, BridgeMode::Recovery, bridge_in, bridge_out);
+        let run = bridge::run(&sock, BridgeMode::Recovery, None, bridge_in, bridge_out);
         let (r, (), ()) = tokio::join!(run, gate, client);
         r.unwrap();
         drop(ssh_side);
@@ -175,16 +175,28 @@ fn bridge_stdin_eof_first_still_relays_output() {
         let sock = dir.path().join("agent.sock");
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let (bridge_out, mut ssh_out) = tokio::io::duplex(1024);
+        let hint = bridge::ssh_client_ip("203.0.113.5 50000 192.0.2.1 22").unwrap();
         let gate = async {
             let (mut s, _) = listener.accept().await.unwrap();
             let mut rest = Vec::new();
-            // Header, then EOF (stdin was empty): the write half is shut.
+            // Header (with the client-address hint), then EOF (stdin was
+            // empty): the write half is shut.
             s.read_to_end(&mut rest).await.unwrap();
-            assert_eq!(rest, [0]);
+            assert_eq!(rest[..2], [bridge::HINT_FLAG, 11]);
+            assert_eq!(
+                bridge::read_header(&mut &rest[..]).await,
+                Some((BridgeMode::Normal, Some(hint)))
+            );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             s.write_all(b"late reply").await.unwrap();
         };
-        let run = bridge::run(&sock, BridgeMode::Normal, tokio::io::empty(), bridge_out);
+        let run = bridge::run(
+            &sock,
+            BridgeMode::Normal,
+            Some(hint),
+            tokio::io::empty(),
+            bridge_out,
+        );
         let (r, ()) = tokio::join!(run, gate);
         r.unwrap();
         let mut got = Vec::new();
@@ -242,6 +254,7 @@ fn bridge_fails_without_socket() {
         let r = bridge::run(
             &dir.path().join("missing.sock"),
             BridgeMode::Normal,
+            None,
             tokio::io::empty(),
             tokio::io::sink(),
         )

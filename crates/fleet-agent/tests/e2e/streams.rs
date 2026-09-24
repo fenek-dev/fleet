@@ -189,6 +189,7 @@ impl ExecConn {
             mode: 0,
             device_id: mac.id,
             key: KeyKind::Device,
+            client_ip: None,
         };
         ipc::write_msg(&mut s, &open).await.unwrap();
         let mut c = Self {

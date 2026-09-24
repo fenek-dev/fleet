@@ -24,9 +24,8 @@ use fleet_ops::telemetry::store::{RAW_RETENTION_MS, ROLLUP_RETENTION_MS, RawVisi
 use fleet_ops::telemetry::{Batch, MetricsStore, Rollup, StoreResult};
 use fleet_proto::alert::AlertRuleSet;
 use fleet_proto::payload::{MetricSeries, MetricUnit, TopProcessMinute};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 const RAW: TableDefinition<u64, &[u8]> = TableDefinition::new("metrics_raw");
 const MINUTES: TableDefinition<(u32, u16), &[u8]> = TableDefinition::new("metrics_1m");
@@ -176,16 +175,20 @@ type StoredSeries = Vec<(String, u16, MetricUnit, u64)>;
 /// keeps it without borrowing exec's state.
 #[derive(Clone)]
 pub struct MetricsDb {
-    db: Arc<Database>,
+    db: super::Db,
 }
 
 impl MetricsDb {
-    pub(super) fn new(db: Arc<Database>) -> Self {
+    pub(super) fn new(db: super::Db) -> Self {
         Self { db }
     }
 
+    fn db(&self) -> super::DbRead<'_> {
+        super::read(&self.db)
+    }
+
     fn meta_get(&self, key: &str) -> StoreResult<Option<Vec<u8>>> {
-        let tx = self.db.begin_read().map_err(err)?;
+        let tx = self.db().begin_read().map_err(err)?;
         let t = tx.open_table(META).map_err(err)?;
         Ok(t.get(key).map_err(err)?.map(|v| v.value().to_vec()))
     }
@@ -212,7 +215,7 @@ impl MetricsStore for MetricsDb {
     }
 
     fn save_rules(&self, rules: &AlertRuleSet) -> StoreResult<()> {
-        let tx = self.db.begin_write().map_err(err)?;
+        let tx = self.db().begin_write().map_err(err)?;
         tx.open_table(META)
             .map_err(err)?
             .insert("alert_rules", &fleet_proto::encode(rules)[..])
@@ -221,7 +224,7 @@ impl MetricsStore for MetricsDb {
     }
 
     fn write(&self, b: &Batch<'_>) -> StoreResult<()> {
-        let tx = self.db.begin_write().map_err(err)?;
+        let tx = self.db().begin_write().map_err(err)?;
         {
             let mut raw = tx.open_table(RAW).map_err(err)?;
             for f in b.raw {
@@ -281,7 +284,7 @@ impl MetricsStore for MetricsDb {
         if since_ms >= until_ms {
             return Ok(());
         }
-        let tx = self.db.begin_read().map_err(err)?;
+        let tx = self.db().begin_read().map_err(err)?;
         let t = tx.open_table(RAW).map_err(err)?;
         let mut values = Vec::new();
         for row in t.range(since_ms..until_ms).map_err(err)? {
@@ -304,7 +307,7 @@ impl MetricsStore for MetricsDb {
         if since_ms >= until_ms || ids.is_empty() {
             return Ok(());
         }
-        let tx = self.db.begin_read().map_err(err)?;
+        let tx = self.db().begin_read().map_err(err)?;
         let t = tx.open_table(MINUTES).map_err(err)?;
         let first = u32::try_from(since_ms / HOUR_MS).unwrap_or(u32::MAX);
         let last = u32::try_from((until_ms - 1) / HOUR_MS).unwrap_or(u32::MAX);
@@ -347,7 +350,7 @@ impl MetricsStore for MetricsDb {
         if since_ms >= until_ms {
             return Ok(Vec::new());
         }
-        let tx = self.db.begin_read().map_err(err)?;
+        let tx = self.db().begin_read().map_err(err)?;
         let t = tx.open_table(TOP).map_err(err)?;
         let mut out = Vec::new();
         for row in t.range(since_ms..until_ms).map_err(err)?.rev() {
@@ -367,7 +370,7 @@ impl MetricsStore for MetricsDb {
         let raw_cut = now_ms.saturating_sub(RAW_RETENTION_MS);
         let cut = now_ms.saturating_sub(ROLLUP_RETENTION_MS);
         let cut_hour = u32::try_from(cut / HOUR_MS).unwrap_or(u32::MAX);
-        let tx = self.db.begin_write().map_err(err)?;
+        let tx = self.db().begin_write().map_err(err)?;
         {
             tx.open_table(RAW)
                 .map_err(err)?

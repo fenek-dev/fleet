@@ -108,9 +108,14 @@ fn run_revert(paths: &Paths, id: ChangeId) -> Result<(), String> {
 
 fn run_bridge(paths: &Paths, mode: bridge::BridgeMode) -> Result<(), String> {
     let rt = runtime()?;
+    // Set by sshd; an untrusted hint (design §4.7).
+    let hint = std::env::var("SSH_CONNECTION")
+        .ok()
+        .and_then(|c| bridge::ssh_client_ip(&c));
     let result = rt.block_on(bridge::run(
         &paths.agent_sock,
         mode,
+        hint,
         tokio::io::stdin(),
         tokio::io::stdout(),
     ));

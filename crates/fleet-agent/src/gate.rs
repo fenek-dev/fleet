@@ -32,7 +32,6 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 use tokio::sync::{Notify, mpsc};
 
@@ -675,7 +674,7 @@ async fn setup(
     sh: &Rc<Shared>,
     slot: &mut PreauthSlot,
 ) -> Option<Setup> {
-    let mode = BridgeMode::from_header(br.read_u8().await.ok()?)?;
+    let (mode, client_ip) = crate::bridge::read_header(br).await?;
     let recovery = mode == BridgeMode::Recovery;
     if recovery {
         slot.move_to_recovery();
@@ -750,6 +749,7 @@ async fn setup(
         mode: mode.header(),
         device_id,
         key,
+        client_ip,
     };
     ipc::write_msg(&mut exec_w, &open).await.ok()?;
     Some(Setup {

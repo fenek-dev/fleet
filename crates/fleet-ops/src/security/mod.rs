@@ -18,10 +18,10 @@ pub mod utmp;
 pub mod webscan;
 
 pub use authlog::{AuthEvent, AuthKind, parse_sshd};
-pub use bans::{BanEngine, BanService, BansHandler, LearnedMacIps};
+pub use bans::{BanEngine, BanService, BanState, BansHandler, LearnedMacIps};
 pub use certs::{CertWatcher, CertsHandler};
 pub use integrity::{BaselineStore, IntegrityHandler, IntegrityWatcher, MemoryBaselineStore};
-pub use logins::{FingerprintResolver, LoginsHandler, NoResolver};
+pub use logins::{FingerprintResolver, LoginsHandler, NoResolver, ssh_fingerprint};
 pub use ports::{PortWatcher, PortsHandler};
 
 use crate::handler::Registry;

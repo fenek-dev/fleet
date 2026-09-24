@@ -20,8 +20,10 @@
 //!
 //! - [`BansHandler`]: `bans.list/add/remove`, `bans.config.get/set`.
 //!
-//! State is in memory: after an exec restart the kernel keeps the bans
-//! until their timeouts, but strikes and the list start empty.
+//! State is in memory; exec persists [`BanService::export`] whenever
+//! [`BanService::revision`] moves and restores it at startup
+//! ([`BanService::import`], then [`BanService::restore_kernel`] for sets
+//! the kernel lost).
 
 use super::EventSink;
 use super::authlog::AuthEvent;
@@ -33,6 +35,7 @@ use fleet_proto::args::Cidr;
 use fleet_proto::op::{BanConfig, tag};
 use fleet_proto::payload::{BanEntry, BanReason, Bans};
 use fleet_proto::{ErrorCode, Event, Op, Payload};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, Ipv6Addr};
@@ -113,6 +116,8 @@ pub struct BanEngine {
     bans: BTreeMap<BanKey, BanEntry>,
     /// Learned Mac address → last successful Fleet login.
     learned: HashMap<IpAddr, u64>,
+    /// Bumped by every change worth persisting ([`BanEngine::revision`]).
+    rev: u64,
 }
 
 impl BanEngine {
@@ -123,7 +128,14 @@ impl BanEngine {
             strikes: HashMap::new(),
             bans: BTreeMap::new(),
             learned: HashMap::new(),
+            rev: 0,
         }
+    }
+
+    /// Changes whenever bans, strikes, learned addresses or the config
+    /// change (exec persists [`BanEngine::export`] when it moved).
+    pub fn revision(&self) -> u64 {
+        self.rev
     }
 
     pub fn config(&self) -> &BanConfig {
@@ -146,6 +158,7 @@ impl BanEngine {
             .copied()
             .collect();
         self.config = config;
+        self.rev += 1;
         (removed, added)
     }
 
@@ -180,6 +193,7 @@ impl BanEngine {
             }
         }
         let prev = self.learned.insert(ip, now_ms);
+        self.rev += 1;
         Some(prev.is_some_and(|t| now_ms < t.saturating_add(LEARNED_TTL_MS)))
     }
 
@@ -213,6 +227,7 @@ impl BanEngine {
         now_ms: u64,
     ) -> Decision {
         let replace = self.active(&key, now_ms);
+        self.rev += 1;
         let until_ms = now_ms.saturating_add(u64::from(duration_s) * 1000);
         self.bans.insert(
             key,
@@ -312,6 +327,7 @@ impl BanEngine {
     /// `bans.remove`: forgets the ban, its failures and strikes.
     pub fn remove(&mut self, ip: IpAddr) -> Option<BanEntry> {
         let key = ban_key(ip);
+        self.rev += 1;
         self.failures.remove(&key);
         self.strikes.remove(&key);
         self.bans.remove(&key)
@@ -319,6 +335,7 @@ impl BanEngine {
 
     /// Undo of a ban whose nft update failed.
     fn forget_ban(&mut self, key: &BanKey) {
+        self.rev += 1;
         self.bans.remove(key);
     }
 
@@ -339,6 +356,109 @@ impl BanEngine {
             learned_exempt: self.learned(now_ms),
         }
     }
+
+    /// What survives an exec restart: config, active bans, strikes still
+    /// inside [`STRIKE_MEMORY_MS`], learned addresses still inside
+    /// [`LEARNED_TTL_MS`]. Failure windows are not kept (minutes long).
+    pub fn export(&self, now_ms: u64) -> BanState {
+        let mut learned: Vec<(IpAddr, u64)> = self
+            .learned
+            .iter()
+            .filter(|(_, t)| now_ms < t.saturating_add(LEARNED_TTL_MS))
+            .map(|(ip, t)| (*ip, *t))
+            .collect();
+        learned.sort();
+        let mut strikes: Vec<(IpAddr, u8, u16, u64)> = self
+            .strikes
+            .iter()
+            .filter(|(_, (_, t))| now_ms.saturating_sub(*t) <= STRIKE_MEMORY_MS)
+            .map(|(k, (n, t))| (k.addr, k.prefix, *n, *t))
+            .collect();
+        strikes.sort();
+        BanState {
+            config: self.config.clone(),
+            bans: self.snapshot(now_ms).bans,
+            strikes,
+            learned,
+        }
+    }
+
+    /// Restores [`BanEngine::export`]ed state. Entries are re-validated
+    /// (the database is exec's, but nothing is trusted blindly): keys must
+    /// be canonical ban keys, expired entries are dropped, sizes bounded;
+    /// an invalid config falls back to the current one.
+    pub fn import(&mut self, st: BanState, now_ms: u64) {
+        if st.config.validate().is_ok() {
+            self.config = st.config;
+        }
+        let valid = |addr: IpAddr, prefix: u8| {
+            let k = ban_key(addr);
+            k.addr == addr && k.prefix == prefix && !never_bannable(addr)
+        };
+        self.bans = st
+            .bans
+            .into_iter()
+            .filter(|b| b.until_ms > now_ms && valid(b.addr, b.prefix))
+            .take(MAX_TRACKED)
+            .map(|b| {
+                (
+                    BanKey {
+                        addr: b.addr,
+                        prefix: b.prefix,
+                    },
+                    b,
+                )
+            })
+            .collect();
+        self.strikes = st
+            .strikes
+            .into_iter()
+            .filter(|(a, p, n, t)| {
+                *n > 0 && now_ms.saturating_sub(*t) <= STRIKE_MEMORY_MS && valid(*a, *p)
+            })
+            .take(MAX_TRACKED)
+            .map(|(addr, prefix, n, t)| (BanKey { addr, prefix }, (n, t)))
+            .collect();
+        self.learned = st
+            .learned
+            .into_iter()
+            .filter(|(ip, t)| {
+                canonical(*ip) == *ip
+                    && !never_bannable(*ip)
+                    && now_ms < t.saturating_add(LEARNED_TTL_MS)
+            })
+            .take(MAX_TRACKED)
+            .collect();
+        self.failures.clear();
+        self.rev += 1;
+    }
+}
+
+/// Persisted form of a [`BanEngine`] (exec's redb, design §4.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BanState {
+    pub config: BanConfig,
+    pub bans: Vec<BanEntry>,
+    /// `(addr, prefix, offences, last offence ms)`.
+    pub strikes: Vec<(IpAddr, u8, u16, u64)>,
+    /// `(address, last Fleet login ms)`.
+    pub learned: Vec<(IpAddr, u64)>,
+}
+
+/// Whether `nft -j list set …` output shows a set without elements.
+/// `None` if the output isn't a recognisable set listing.
+pub fn nft_set_is_empty(json: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let set = v
+        .get("nftables")?
+        .as_array()?
+        .iter()
+        .find_map(|o| o.get("set"))?;
+    Some(
+        set.get("elem")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty),
+    )
 }
 
 // ---- nft argv ----
@@ -544,6 +664,101 @@ impl BanService {
     pub fn expire(&self, now_ms: u64) {
         self.engine.borrow_mut().expire(now_ms);
     }
+
+    pub fn revision(&self) -> u64 {
+        self.engine.borrow().revision()
+    }
+
+    pub fn export(&self, now_ms: u64) -> BanState {
+        self.engine.borrow().export(now_ms)
+    }
+
+    pub fn import(&self, st: BanState, now_ms: u64) {
+        self.engine.borrow_mut().import(st, now_ms);
+    }
+
+    /// After an exec restart: puts restored state back into the kernel,
+    /// per set, **only if that set is empty** (the kernel keeps its
+    /// elements across an exec restart; it loses them on reboot or a
+    /// ruleset reload). Bans get their remaining time; exempt sets get the
+    /// configured ranges and learned addresses. A set that can't be listed
+    /// (firewall table not set up yet) is skipped. Returns elements added.
+    pub async fn restore_kernel(&self, ctx: &SysCtx, now_ms: u64) -> usize {
+        let (bans, exempt, learned) = {
+            let e = self.engine.borrow();
+            (
+                e.snapshot(now_ms).bans,
+                e.config().exempt.clone(),
+                e.learned
+                    .iter()
+                    .filter(|(ip, t)| {
+                        now_ms < t.saturating_add(LEARNED_TTL_MS) && !e.in_configured(**ip)
+                    })
+                    .map(|(ip, t)| (*ip, *t))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut added = 0;
+        for v4 in [true, false] {
+            let fam = |a: &IpAddr| a.is_ipv4() == v4;
+            let n = if v4 { "4" } else { "6" };
+            if set_empty(ctx, &format!("banned{n}")).await == Some(true) {
+                for b in bans.iter().filter(|b| fam(&b.addr)) {
+                    let left_s = b.until_ms.saturating_sub(now_ms).div_ceil(1000).max(1);
+                    let args = nft_add_args(
+                        &set_name("banned", b.addr),
+                        &element(b.addr, b.prefix),
+                        Some(left_s),
+                        false,
+                    );
+                    added += usize::from(run_nft(ctx, args).await.is_ok());
+                }
+            }
+            if set_empty(ctx, &format!("exempt{n}")).await == Some(true) {
+                for c in exempt.iter().filter(|c| fam(&c.addr())) {
+                    added += usize::from(run_nft(ctx, exempt_args(c, true)).await.is_ok());
+                }
+                for (ip, t) in learned.iter().filter(|(ip, _)| fam(ip)) {
+                    let full = if ip.is_ipv4() { 32 } else { 128 };
+                    let left_s = t
+                        .saturating_add(LEARNED_TTL_MS)
+                        .saturating_sub(now_ms)
+                        .div_ceil(1000)
+                        .max(1);
+                    let args = nft_add_args(
+                        &set_name("exempt", *ip),
+                        &element(*ip, full),
+                        Some(left_s),
+                        false,
+                    );
+                    added += usize::from(run_nft(ctx, args).await.is_ok());
+                }
+            }
+        }
+        added
+    }
+}
+
+/// `nft -j list set inet fleet <set>`: `Some(true)` if it has no elements,
+/// `None` if it can't be listed.
+async fn set_empty(ctx: &SysCtx, set: &str) -> Option<bool> {
+    let args: Vec<String> = ["-j", "list", "set", TABLE[0], TABLE[1], set]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let out = ctx
+        .runner
+        .run(
+            CommandSpec::new(NFT)
+                .args(args)
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        .ok()?;
+    if !out.success() {
+        return None;
+    }
+    nft_set_is_empty(&String::from_utf8_lossy(&out.stdout))
 }
 
 impl LearnedMacIps for BanService {
@@ -913,5 +1128,94 @@ mod tests {
         let mut r = Registry::new();
         svc.register(&mut r);
         assert_eq!(r.tags().count(), 5);
+    }
+
+    #[test]
+    fn export_import_round_trip_and_revalidation() {
+        let t = 1_000_000_000;
+        let mut e = BanEngine::new(default_config());
+        let a = ip("198.51.100.7");
+        let r0 = e.revision();
+        let d = (0..5)
+            .find_map(|i| e.observe(a, BanReason::SshBruteForce, t + i))
+            .unwrap();
+        assert!(e.revision() > r0);
+        e.learn(ip("203.0.113.9"), t).unwrap();
+        let st = e.export(t + 10);
+        assert_eq!(st.bans.len(), 1);
+        assert_eq!(st.strikes, vec![(a, 32, 1, d.until_ms - 3_600_000)]);
+        let back: BanState = fleet_proto::decode(&fleet_proto::encode(&st)).unwrap();
+
+        let mut f = BanEngine::new(default_config());
+        f.import(back.clone(), t + 10);
+        assert_eq!(f.export(t + 10), st);
+        // The strike survived: the next offence escalates to 24 h.
+        let later = t + 2 * 3_600_000;
+        let d2 = (0..5)
+            .find_map(|i| f.observe(a, BanReason::SshBruteForce, later + i))
+            .unwrap();
+        assert_eq!(d2.duration_s, 86_400);
+        assert!(f.is_exempt(ip("203.0.113.9"), later));
+
+        // Expired and non-canonical entries are dropped on import.
+        let mut bad = back;
+        bad.bans[0].prefix = 24;
+        bad.strikes.push((ip("127.0.0.1"), 32, 3, t));
+        bad.learned.push((ip("::ffff:192.0.2.1"), t));
+        bad.config.threshold = 0;
+        let mut g = BanEngine::new(default_config());
+        g.import(bad, t + 10);
+        let st = g.export(t + 10);
+        assert!(st.bans.is_empty());
+        assert_eq!(st.strikes.len(), 1);
+        assert_eq!(st.learned, vec![(ip("203.0.113.9"), t)]);
+        assert_eq!(st.config, default_config());
+        let mut h = BanEngine::new(default_config());
+        h.import(f.export(t), t + 8 * 86_400_000);
+        assert!(h.export(t + 8 * 86_400_000).learned.is_empty());
+    }
+
+    #[test]
+    fn nft_set_listing() {
+        let empty = r#"{"nftables":[{"metainfo":{"version":"1.0.6"}},{"set":{"family":"inet","name":"banned4","table":"fleet","type":"ipv4_addr","handle":3,"flags":["interval","timeout"]}}]}"#;
+        let full = r#"{"nftables":[{"metainfo":{}},{"set":{"name":"banned4","elem":[{"elem":{"val":"198.51.100.7","timeout":3600,"expires":3500}}]}}]}"#;
+        assert_eq!(nft_set_is_empty(empty), Some(true));
+        assert_eq!(nft_set_is_empty(full), Some(false));
+        assert_eq!(nft_set_is_empty("{}"), None);
+        assert_eq!(nft_set_is_empty("garbage"), None);
+    }
+
+    #[test]
+    fn restore_kernel_only_fills_empty_sets() {
+        let runner = Rc::new(FakeRunner::new());
+        let dir = tempfile::tempdir().unwrap();
+        let c = ctx_at(dir.path(), runner.clone());
+        let now = 1_700_000_000_000;
+        let svc = BanService::new(default_config(), Rc::new(VecSink::default()));
+        let mut st = svc.export(now);
+        st.bans.push(BanEntry {
+            addr: ip("198.51.100.7"),
+            prefix: 32,
+            until_ms: now + 1_800_000,
+            reason: BanReason::SshBruteForce,
+            strikes: 1,
+        });
+        st.learned.push((ip("203.0.113.9"), now));
+        svc.import(st, now);
+        let list = |set: &'static str| ["-j", "list", "set", "inet", "fleet", set];
+        let empty = r#"{"nftables":[{"set":{"name":"x"}}]}"#;
+        let full = r#"{"nftables":[{"set":{"name":"x","elem":[1]}}]}"#;
+        runner.expect(NFT, &list("banned4"), Ok(CommandOutput::ok(empty)));
+        runner.expect(
+            NFT,
+            &argv(nft_add_args("banned4", "198.51.100.7", Some(1_800), false)),
+            Ok(CommandOutput::ok("")),
+        );
+        // The kernel kept its exemptions: nothing re-added there.
+        runner.expect(NFT, &list("exempt4"), Ok(CommandOutput::ok(full)));
+        runner.expect(NFT, &list("banned6"), Ok(CommandOutput::exit(1)));
+        runner.expect(NFT, &list("exempt6"), Ok(CommandOutput::ok(empty)));
+        assert_eq!(block(svc.restore_kernel(&c, now)), 1);
+        assert_eq!(runner.pending(), 0);
     }
 }
