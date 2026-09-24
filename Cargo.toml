@@ -57,6 +57,12 @@ unicode-normalization = "0.1.25"
 redb = "4.3.0"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "io-util", "macros", "time", "signal", "sync", "fs"] }
 thiserror = "2.0.21"
+# `journalctl -o json`, `wtmpdb --json`, web access logs (untrusted input).
+serde_json = "1.0.151"
+# TLS certificate discovery (design §2.4); pure Rust, no default features.
+x509-parser = { version = "0.18.1", default-features = false }
+# Constants only (`O_NOFOLLOW`); already in the tree via tokio.
+libc = "0.2.189"
 
 # Mac core
 # SSH client (design §3.2). `ring` backend only: no RSA, no zlib, no aws-lc

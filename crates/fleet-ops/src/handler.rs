@@ -193,6 +193,9 @@ impl Registry {
             fleet_proto::op::tag::SYSTEM_INFO,
             Rc::new(crate::system::SystemInfoHandler),
         );
+        crate::logs::register(&mut r);
+        // Exec re-registers `logins.query` with its roster resolver.
+        crate::security::register(&mut r, Rc::new(crate::security::NoResolver));
         r
     }
 
@@ -267,9 +270,18 @@ mod tests {
         assert!(r.get(&Op::SystemInfo).is_some());
         assert!(r.get(&Op::AgentHealth).is_none());
         assert!(r.get(&Op::Unknown { tag: 0 }).is_none());
+        use fleet_proto::op::tag;
         assert_eq!(
             r.tags().collect::<Vec<_>>(),
-            [fleet_proto::op::tag::SYSTEM_INFO]
+            [
+                tag::SYSTEM_INFO,
+                tag::JOURNAL_QUERY,
+                tag::JOURNAL_FOLLOW,
+                tag::LOGFILE_TAIL,
+                tag::LOGINS_QUERY,
+                tag::PORTS_LIST,
+                tag::CERTS_LIST,
+            ]
         );
     }
 
