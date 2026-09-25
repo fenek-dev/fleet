@@ -170,6 +170,8 @@ pub(super) struct State {
     last_prune: Option<Instant>,
     pub(super) policy: Policy,
     admin_user: Option<String>,
+    /// Device lines of the authorized_keys roster section, per roster.
+    ak_cache: authorized_keys::DeviceLinesCache,
     pub(super) started: Instant,
     /// Random per exec start; binds this run's events (design §6.3).
     pub(super) run_id: [u8; 16],
@@ -280,6 +282,7 @@ impl State {
             last_prune: None,
             policy,
             admin_user,
+            ak_cache: authorized_keys::DeviceLinesCache::default(),
             started: Instant::now(),
             run_id,
             event_run,
@@ -633,6 +636,7 @@ impl State {
                 user,
                 &self.roster.roster,
                 self.clock(now),
+                &self.ak_cache,
             )
         {
             log("authorized_keys", e);

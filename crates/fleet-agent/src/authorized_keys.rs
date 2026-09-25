@@ -11,7 +11,9 @@ use crate::paths::AGENT_BIN;
 use fleet_crypto::roster::{RecoveryClock, recovery_ssh_keys_at};
 pub use fleet_ops::users::authorized_keys::{BEGIN, END, MergeError, merge};
 use fleet_proto::{Ed25519Public, P256Public, Roster};
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
 /// OpenSSH options on the recovery key: it can only open the recovery bridge.
 pub fn recovery_options() -> String {
@@ -29,7 +31,13 @@ pub fn monitor_options() -> String {
 /// the rotated-out one while its grace window is open, else the current
 /// one (never both).
 pub fn roster_section(roster: &Roster, clock: RecoveryClock) -> String {
-    let mut out = format!("{BEGIN}\n");
+    section_from(&device_lines(roster), roster, clock)
+}
+
+/// The per-device lines of [`roster_section`]: the expensive part (every
+/// P-256 key is decompressed), and a function of the roster alone.
+fn device_lines(roster: &Roster) -> String {
+    let mut out = String::new();
     for d in &roster.devices {
         // A key that isn't a valid point can't be written; skip it rather
         // than fail the whole roster (the roster itself verified).
@@ -48,6 +56,13 @@ pub fn roster_section(roster: &Roster, clock: RecoveryClock) -> String {
             ));
         }
     }
+    out
+}
+
+/// Markers around `devices` (from [`device_lines`]) and the recovery key
+/// accepted at `clock` (the only part that changes with time).
+fn section_from(devices: &str, roster: &Roster, clock: RecoveryClock) -> String {
+    let mut out = format!("{BEGIN}\n{devices}");
     for k in recovery_ssh_keys_at(roster, clock) {
         out.push_str(&format!(
             "{} {} fleet-recovery\n",
@@ -60,6 +75,31 @@ pub fn roster_section(roster: &Roster, clock: RecoveryClock) -> String {
     out
 }
 
+/// [`device_lines`] of the last roster synced, by `(epoch, version)`.
+/// Exec syncs on every maintenance tick (the recovery key's grace window
+/// ends with time); redoing the key decoding each tick for a large roster
+/// kept exec's single thread busy enough to starve its connections.
+#[derive(Default)]
+pub struct DeviceLinesCache(RefCell<Option<CachedLines>>);
+
+/// `((epoch, version), device lines)`.
+type CachedLines = ((u32, u64), Rc<str>);
+
+impl DeviceLinesCache {
+    fn get(&self, roster: &Roster) -> Rc<str> {
+        let v = (roster.epoch, roster.version);
+        let mut c = self.0.borrow_mut();
+        match c.as_ref() {
+            Some((cv, lines)) if *cv == v => lines.clone(),
+            _ => {
+                let lines: Rc<str> = device_lines(roster).into();
+                *c = Some((v, lines.clone()));
+                lines
+            }
+        }
+    }
+}
+
 /// Rewrites `<dir>/<user>` if the roster section changed. Returns whether
 /// the file was written.
 pub fn sync(
@@ -67,6 +107,7 @@ pub fn sync(
     user: &str,
     roster: &Roster,
     clock: RecoveryClock,
+    cache: &DeviceLinesCache,
 ) -> std::io::Result<bool> {
     let path = dir.join(user);
     let existing = match std::fs::read_to_string(&path) {
@@ -74,7 +115,8 @@ pub fn sync(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
-    let new = merge(&existing, &roster_section(roster, clock))
+    let section = section_from(&cache.get(roster), roster, clock);
+    let new = merge(&existing, &section)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if new == existing {
         return Ok(false);
@@ -252,7 +294,8 @@ mod tests {
             recovery_delay_s: 0,
             prev_recovery: None,
         };
-        assert!(sync(d.path(), "admin", &roster, RecoveryClock::at(0)).is_err());
+        let cache = DeviceLinesCache::default();
+        assert!(sync(d.path(), "admin", &roster, RecoveryClock::at(0), &cache).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
     }
 }
