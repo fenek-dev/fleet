@@ -26,6 +26,7 @@ blake3.workspace = true
 yaml-rust2.workspace = true
 libc.workspace = true
 rustix.workspace = true
+bollard.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -208,6 +208,12 @@ impl Registry {
         crate::logs::register(&mut r);
         // Exec re-registers `logins.query` with its roster resolver.
         crate::security::register(&mut r, Rc::new(crate::security::NoResolver));
+        crate::cron::register(&mut r);
+        // Lazy socket connection: fine on servers without Docker. Exec
+        // re-registers with its own `api` to share it with `events::watch`.
+        crate::docker::register(&mut r, Rc::new(crate::docker::BollardDocker::new()));
+        // Null sink here; exec re-registers with its event log.
+        crate::users::register(&mut r, Rc::new(crate::security::NullSink));
         r
     }
 

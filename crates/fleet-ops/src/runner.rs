@@ -29,6 +29,9 @@ pub struct CommandSpec {
     pub timeout: Duration,
     /// Bytes kept of stdout and of stderr each; the rest is read and dropped.
     pub output_cap: usize,
+    /// Written to the child's stdin, which is then closed; `None` means
+    /// `/dev/null` (e.g. `crontab -u <user> -`).
+    pub stdin: Option<Vec<u8>>,
 }
 
 impl CommandSpec {
@@ -39,7 +42,13 @@ impl CommandSpec {
             env: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             output_cap: DEFAULT_OUTPUT_CAP,
+            stdin: None,
         }
+    }
+
+    pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(bytes.into());
+        self
     }
 
     pub fn arg(mut self, a: impl Into<OsString>) -> Self {
@@ -138,7 +147,11 @@ async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
         .envs(BASE_ENV)
         .envs(spec.env.iter().map(|(k, v)| (k, v)))
         .current_dir("/")
-        .stdin(Stdio::null())
+        .stdin(if spec.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -146,9 +159,24 @@ async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(RunError::Io(std::io::ErrorKind::BrokenPipe));
     };
+    let input = child.stdin.take().zip(spec.stdin);
     let cap = spec.output_cap;
     let res = tokio::time::timeout(spec.timeout, async {
-        tokio::join!(read_capped(out, cap), read_capped(err, cap), child.wait())
+        // Written concurrently with the reads (no pipe deadlock); dropping
+        // the handle closes stdin. A child that exits without reading gets
+        // EPIPE, which is its business: the exit status decides.
+        let feed = async move {
+            if let Some((mut w, bytes)) = input {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut w, &bytes).await;
+            }
+        };
+        let (_, out, err, status) = tokio::join!(
+            feed,
+            read_capped(out, cap),
+            read_capped(err, cap),
+            child.wait()
+        );
+        (out, err, status)
     })
     .await;
     let Ok((out, err, status)) = res else {
@@ -293,6 +321,9 @@ mod tests {
             ),
         );
         assert_eq!(r, Err(RunError::Timeout));
+
+        let out = block(SystemRunner.run(CommandSpec::new("/bin/cat").stdin("in\n"))).unwrap();
+        assert_eq!(out.stdout, b"in\n");
 
         let r = block(SystemRunner.run(CommandSpec::new("relative")));
         assert_eq!(r, Err(RunError::NotAbsolute));

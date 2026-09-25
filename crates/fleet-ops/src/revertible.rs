@@ -70,10 +70,15 @@ impl Reverters {
         Self::default()
     }
 
-    /// Every restore module in this crate. None exist yet, so every kind is
+    /// Every restore module in this crate. Kinds without one are
     /// unavailable (a revert is audited as failed, never as restored).
     pub fn with_generic() -> Self {
-        Self::new()
+        let mut r = Self::new();
+        r.register(
+            ChangeKind::AuthorizedKeys,
+            Rc::new(crate::users::authorized_keys::AuthorizedKeysReverter),
+        );
+        r
     }
 
     /// Registers (or replaces) the module for `kind`.
