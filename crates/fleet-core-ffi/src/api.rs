@@ -57,6 +57,8 @@ pub struct FleetCore {
     pending_host_keys: PendingKeys,
     pub(crate) live: LiveMetrics,
     pub(crate) sftp: SftpCache,
+    /// App side of the `fleetctl` socket, created on first use (`mcp`).
+    pub(crate) mcp: std::sync::OnceLock<Arc<fleet_core::mcp_host::McpHost>>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -282,6 +284,7 @@ impl FleetCore {
             pending_host_keys: Arc::default(),
             live: Arc::default(),
             sftp: Mutex::default(),
+            mcp: std::sync::OnceLock::new(),
         }))
     }
 

@@ -31,6 +31,9 @@ tokio.workspace = true
 thiserror.workspace = true
 uniffi.workspace = true
 hex.workspace = true
+# Bulk runs, snippets/runbooks and the MCP socket (design §7.3, §2.3, §8).
+fleetctl-proto.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

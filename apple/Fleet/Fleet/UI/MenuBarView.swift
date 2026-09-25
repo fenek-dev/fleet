@@ -4,6 +4,7 @@ import SwiftUI
 struct MenuBarView: View {
     @Environment(CoreBridge.self) private var core
     @Environment(AppLock.self) private var lock
+    @Environment(AIModel.self) private var ai
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -13,8 +14,7 @@ struct MenuBarView: View {
         Button(lock.isLocked ? "Unlock Fleet" : "Lock Fleet") {
             if lock.isLocked { Task { await lock.unlock() } } else { lock.lock() }
         }
-        Button("Pause AI agents") {}
-            .disabled(true)
+        Button(ai.paused ? "Resume AI agents" : "Pause AI agents") { ai.setPaused(!ai.paused) }
         Divider()
         Button("Open Fleet") {
             openWindow(id: "main")

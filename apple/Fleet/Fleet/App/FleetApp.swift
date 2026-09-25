@@ -6,6 +6,8 @@ struct FleetApp: App {
     @State private var terminals = TerminalStore()
     @State private var lock: AppLock
     @State private var paletteShown = false
+    @State private var ai = AIModel()
+    @State private var scheduler = RunbookScheduler()
     private let gate: KeyGate
 
     init() {
@@ -20,8 +22,10 @@ struct FleetApp: App {
                 .environment(core)
                 .environment(terminals)
                 .environment(lock)
+                .environment(ai)
                 .preferredColorScheme(.dark)
                 .task { start() }
+                .onChange(of: core.status, initial: true) { startServices() }
         }
         .commands {
             CommandGroup(after: .newItem) {
@@ -38,16 +42,25 @@ struct FleetApp: App {
             SettingsView()
                 .environment(core)
                 .environment(lock)
+                .environment(ai)
         }
 
         MenuBarExtra {
             MenuBarView()
                 .environment(core)
                 .environment(lock)
+                .environment(ai)
         } label: {
             MenuBarLabel()
                 .environment(core)
         }
+    }
+
+    /// MCP socket and the runbook scheduler, once the manager runs.
+    private func startServices() {
+        guard core.status == .running, let api = core.api else { return }
+        ai.start(core: api)
+        scheduler.start(core: api) { [lock] in lock.isLocked }
     }
 
     /// Opens the core once. Starts locked (monitor key) per design §5.10.

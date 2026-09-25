@@ -8,6 +8,8 @@ members = [
     "crates/fleet-core-ffi",
     "crates/fleet-ops",
     "crates/fleet-it",
+    "crates/fleetctl-proto",
+    "crates/fleetctl",
 ]
 
 [workspace.package]
@@ -31,6 +33,7 @@ fleet-proto = { path = "crates/fleet-proto" }
 fleet-crypto = { path = "crates/fleet-crypto" }
 fleet-core = { path = "crates/fleet-core" }
 fleet-ops = { path = "crates/fleet-ops" }
+fleetctl-proto = { path = "crates/fleetctl-proto" }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -92,6 +95,12 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Swift bindings (design §7.1), proc-macro mode. `cli` only for the
 # `uniffi-bindgen` bin of fleet-core-ffi (feature `bindgen`).
 uniffi = { version = "0.32.2", default-features = false }
+
+# MCP (design §8): `fleetctl mcp` stdio server. Server + stdio transport
+# only; no HTTP, no auth, no client.
+rmcp = { version = "3.4.0", default-features = false, features = ["server", "transport-io"] }
+# Tool input schemas (the version rmcp's `server` feature uses).
+schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
 
 # Test-only
 tempfile = "3.27.0"

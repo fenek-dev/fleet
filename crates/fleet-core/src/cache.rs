@@ -113,7 +113,28 @@ const MIGRATIONS: &[&str] = &[
         mac       BLOB NOT NULL,
         PRIMARY KEY (route, host, port)
     );",
+    // v3: snippets, runbooks, paired MCP clients (`cache::library`). JSON
+    // bodies, MAC'd: they decide what runs on servers and who may ask.
+    "CREATE TABLE snippets (
+        id          TEXT PRIMARY KEY,
+        body        BLOB NOT NULL,
+        mac         BLOB NOT NULL
+    );
+    CREATE TABLE runbooks (
+        id          TEXT PRIMARY KEY,
+        body        BLOB NOT NULL,
+        mac         BLOB NOT NULL,
+        last_run_ms INTEGER
+    );
+    CREATE TABLE mcp_clients (
+        key         TEXT PRIMARY KEY,
+        body        BLOB NOT NULL,
+        mac         BLOB NOT NULL
+    );",
 ];
+
+mod library;
+pub use library::McpClientRecord;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
