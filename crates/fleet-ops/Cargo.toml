@@ -20,6 +20,8 @@ zbus.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Game templates (profiles/games/*.toml, embedded) and instance records.
+toml.workspace = true
 x509-parser.workspace = true
 sha2.workspace = true
 blake3.workspace = true

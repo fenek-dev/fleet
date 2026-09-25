@@ -20,8 +20,11 @@
 //! - **systemd signals**: [`ServiceEvents`] over the lazily connected bus
 //!   ([`LazySystemd`]); `ServiceDown` rules are seeded with each watched
 //!   unit's current state on every (re)subscribe.
-//! - **pollers**: listening ports, certificates, file integrity, the dpkg
-//!   log, web access logs (only files that exist), and a persist tick.
+//! - **pollers**: listening ports (`blocked` from Fleet's firewall model),
+//!   certificates, file integrity, the dpkg log, web access logs (only
+//!   files that exist; scanner hits ban only from logs opted in through
+//!   `web_bans_conf`), the host's own addresses (never banned from a web
+//!   log) and a persist tick.
 //!
 //! Followers restart with exponential backoff. Memory is bounded (line
 //! length, correlation tables, known login sources, failed-login event
@@ -39,7 +42,9 @@ use fleet_ops::logs::lines::LineSpawner;
 use fleet_ops::logs::logfile::open_nofollow;
 use fleet_ops::packages::DpkgLogWatcher;
 use fleet_ops::security::authlog::{AuthEvent, AuthKind};
-use fleet_ops::security::bans::{BanState, canonical, default_config};
+use fleet_ops::security::bans::{
+    BanState, WEB_BANS_CONF, canonical, default_config, parse_web_bans,
+};
 use fleet_ops::security::integrity::{Baseline, package_paths};
 use fleet_ops::security::webscan::parse_access_line;
 use fleet_ops::security::{
@@ -52,7 +57,7 @@ use fleet_ops::services::{
     ZbusSystemd,
 };
 use fleet_ops::telemetry::Observation;
-use fleet_ops::{CommandSpec, Registry, SysCtx};
+use fleet_ops::{CommandSpec, Registry, SysCtx, firewall};
 use fleet_proto::alert::AlertKind;
 use fleet_proto::op::tag;
 use fleet_proto::payload::LoginMethod;
@@ -102,6 +107,13 @@ pub struct SourcesConfig {
     pub backoff_max: Duration,
     /// JSON access logs tailed when they exist (web role).
     pub web_logs: Vec<String>,
+    /// Opt-in file naming which of `web_logs` may ban
+    /// (`fleet_ops::security::bans::WEB_BANS_CONF`, under the context
+    /// root); absent means web bans are off.
+    pub web_bans_conf: String,
+    /// Re-read of that file and of the host's own addresses (never banned
+    /// from a web log).
+    pub own_addrs_every: Duration,
     pub integrity_paths: Vec<String>,
     pub cert_patterns: Vec<String>,
     /// Journal accept ↔ session hint distance for learning (design §4.7).
@@ -126,6 +138,8 @@ impl SourcesConfig {
                 "/var/log/caddy/access.log".into(),
                 "/var/log/nginx/access.log".into(),
             ],
+            web_bans_conf: WEB_BANS_CONF.into(),
+            own_addrs_every: Duration::from_secs(300),
             integrity_paths: fleet_ops::security::integrity::DEFAULT_CRITICAL
                 .iter()
                 .map(|s| (*s).to_owned())
@@ -603,6 +617,7 @@ impl Sources {
                 log("bans", format!("restored {n} kernel set elements"));
             }
         });
+        self.refresh_web_config();
         tokio::task::spawn_local(self.clone().sshd_follower());
         tokio::task::spawn_local(self.clone().service_events());
         tokio::task::spawn_local(self.clone().pollers());
@@ -865,9 +880,11 @@ impl Sources {
         );
         let (mut dpkg, mut web, mut persist) =
             (tick(c.dpkg_every), tick(c.web_every), tick(c.persist_every));
+        let mut addrs = tick(c.own_addrs_every);
         loop {
             tokio::select! {
-                _ = ports.tick() => self.poll_ports(),
+                _ = addrs.tick() => self.refresh_web_config(),
+                _ = ports.tick() => self.poll_ports().await,
                 _ = certs.tick() => self.poll_certs(),
                 _ = integ.tick() => self.poll_integrity(),
                 _ = dpkg.tick() => {
@@ -880,13 +897,56 @@ impl Sources {
         }
     }
 
-    fn poll_ports(&self) {
+    /// New listening ports, with `blocked` from Fleet's firewall model
+    /// when the table is Fleet-rendered (unknown → `false`). Loopback
+    /// listeners are never blocked by it.
+    async fn poll_ports(&self) {
         let p = ports::collect(&self.ctx);
         let eph = ports::ephemeral_range(&self.ctx);
-        let evs = self.ports.borrow_mut().observe(&p, eph);
+        let mut evs = self.ports.borrow_mut().observe(&p, eph);
+        if !evs.is_empty() {
+            let model = match firewall::table_from(
+                self.ctx.runner.run(firewall::list_table_spec()).await,
+            ) {
+                Ok(firewall::Table::Present(t)) => t.model,
+                _ => None,
+            };
+            if let Some(m) = model {
+                let ssh = firewall::model::ssh_ports_lenient(&self.ctx);
+                for e in &mut evs {
+                    if let Event::NewListeningPort {
+                        proto,
+                        addr,
+                        port,
+                        blocked,
+                        ..
+                    } = e
+                    {
+                        *blocked = !addr.is_loopback()
+                            && firewall::model::port_blocked(&m, &ssh, *proto, *port);
+                    }
+                }
+            }
+        }
         for e in evs {
             self.emit(e);
         }
+    }
+
+    /// Re-reads the web-ban opt-in file and the host's own addresses.
+    pub(super) fn refresh_web_config(&self) {
+        let sources =
+            match fleet_ops::fswrite::read_regular(&self.ctx, &self.cfg.web_bans_conf, 64 * 1024) {
+                Ok(Some(b)) => parse_web_bans(&String::from_utf8_lossy(&b), &self.cfg.web_logs),
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    log("web bans config", e);
+                    Vec::new()
+                }
+            };
+        self.bans.set_web_sources(sources);
+        self.bans
+            .set_own_addrs(fleet_ops::security::ownaddrs::collect(&self.ctx));
     }
 
     fn poll_certs(&self) {
@@ -922,18 +982,29 @@ impl Sources {
         }
     }
 
+    /// Scanner hits ban only from logs opted in by `web_bans_conf`
+    /// (`BanService::observe_access_from` checks the path).
     async fn poll_web(&self) {
-        let lines: Vec<Vec<u8>> = self
+        let lines: Vec<(String, Vec<u8>)> = self
             .web
             .borrow_mut()
             .iter_mut()
-            .flat_map(|t| t.poll(&self.ctx))
+            .flat_map(|t| {
+                let path = t.path.clone();
+                t.poll(&self.ctx)
+                    .into_iter()
+                    .map(move |l| (path.clone(), l))
+            })
             .collect();
-        for l in lines {
+        for (path, l) in lines {
             let Some(hit) = parse_access_line(&l) else {
                 continue;
             };
-            if let Err(e) = self.bans.observe_access(&self.ctx, &hit, self.now()).await {
+            let r = self
+                .bans
+                .observe_access_from(&self.ctx, std::path::Path::new(&path), &hit, self.now())
+                .await;
+            if let Err(e) = r {
                 log("ban", e);
             }
         }

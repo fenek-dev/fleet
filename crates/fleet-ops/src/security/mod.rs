@@ -13,6 +13,7 @@ pub mod bans;
 pub mod certs;
 pub mod integrity;
 pub mod logins;
+pub mod ownaddrs;
 pub mod ports;
 pub mod utmp;
 pub mod webscan;

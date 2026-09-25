@@ -217,6 +217,9 @@ impl Registry {
         crate::docker::register(&mut r, Rc::new(crate::docker::BollardDocker::new()));
         // Null sink here; exec re-registers with its event log.
         crate::users::register(&mut r, Rc::new(crate::security::NullSink));
+        crate::mesh::register(&mut r);
+        // Refuses everyone; exec re-registers with its policy.
+        crate::shell::register(&mut r, Rc::new(crate::shell::DenyAll));
         r
     }
 

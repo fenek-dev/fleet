@@ -248,6 +248,8 @@ fn start_with(
             backoff_min: fast,
             backoff_max: Duration::from_millis(200),
             web_logs: Vec::new(),
+            web_bans_conf: "/etc/fleet/web-bans.conf".into(),
+            own_addrs_every: Duration::from_secs(3600),
             integrity_paths: vec!["/etc/passwd".into(), "/usr/bin/su".into()],
             cert_patterns: Vec::new(),
             correlation_window: Duration::from_secs(60),
@@ -775,5 +777,75 @@ fn confirm_needs_sshd_login_after_the_change() {
         assert_eq!(ask(&mut s2, fx, confirm).await, Ok(Payload::Empty));
         let stop = timers.lock().unwrap().last().cloned().unwrap();
         assert_eq!(stop[..2], ["/usr/bin/systemctl", "stop"]);
+    });
+}
+
+/// Web bans end to end (design §4.7): only the access log opted in by
+/// `/etc/fleet/web-bans.conf` bans, capped at its step; the host's own
+/// address (from `/proc/net/fib_trie`) and a log that isn't opted in
+/// never ban.
+#[test]
+fn web_scanner_bans_only_from_opted_in_logs() {
+    const CADDY: &str = "/var/log/caddy/access.log";
+    const NGINX: &str = "/var/log/nginx/access.log";
+    const OWN: &str = "203.0.113.7";
+    const OTHER: &str = "198.51.100.8";
+    let (mut fx, root) = fixture();
+    let r = root.path().to_owned();
+    for d in ["var/log/caddy", "var/log/nginx", "etc/fleet", "proc/net"] {
+        std::fs::create_dir_all(r.join(d)).unwrap();
+    }
+    std::fs::write(r.join("var/log/caddy/access.log"), "").unwrap();
+    std::fs::write(r.join("var/log/nginx/access.log"), "").unwrap();
+    std::fs::write(r.join("etc/fleet/web-bans.conf"), format!("{CADDY} 600\n")).unwrap();
+    std::fs::write(
+        r.join("proc/net/fib_trie"),
+        format!("Local:\n  +-- 0.0.0.0/0 3 0 5\n     |-- {OWN}\n        /32 host LOCAL\n"),
+    )
+    .unwrap();
+    let feeds = start_with(&mut fx, r.clone(), None, |cfg| {
+        cfg.sources.web_logs = vec![CADDY.into(), NGINX.into()];
+    });
+    let line = |ip: &str| {
+        format!(r#"{{"request":{{"client_ip":"{ip}","uri":"/.env"}},"status":404}}"#) + "\n"
+    };
+    let append = |p: &str, text: &str| {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(r.join(p.trim_start_matches('/')))
+            .unwrap();
+        std::io::Write::write_all(&mut f, text.as_bytes()).unwrap();
+    };
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
+        // First poll positions the tails at the end.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        append(NGINX, &line(OTHER).repeat(6));
+        append(CADDY, &line(OWN).repeat(6));
+        append(CADDY, &line(ATTACKER).repeat(6));
+        let evs = events_until(&mut s, |e| matches!(e, Event::BanChanged { .. })).await;
+        assert!(matches!(
+            evs.last(),
+            Some(Event::BanChanged {
+                banned: true,
+                reason: BanReason::WebScanner,
+                addr,
+                ..
+            }) if *addr == ip(ATTACKER)
+        ));
+        // Capped at the source's 600 s step (the SSH default is 3600 s).
+        let want: Vec<String> = [
+            "add", "element", "inet", "fleet", "banned4", "{", ATTACKER, "timeout", "600s", "}",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert!(feeds.nft.lock().unwrap().contains(&want));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let r = ask(&mut s, &fx, Op::BansList).await;
+        let Ok(Payload::Bans(b)) = r else {
+            panic!("{r:?}")
+        };
+        let banned: Vec<IpAddr> = b.bans.iter().map(|b| b.addr).collect();
+        assert_eq!(banned, vec![ip(ATTACKER)]);
     });
 }

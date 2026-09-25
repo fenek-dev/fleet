@@ -50,6 +50,34 @@ pub fn canonical_ports(ports: &[PortRange]) -> Vec<PortRange> {
         .collect()
 }
 
+/// Whether `set` keeps new inbound connections to `proto`/`port` out
+/// (`NewListeningPort::blocked`, design §4.8): the first input rule
+/// matching the port decides (accept from any or some source → reachable;
+/// drop/reject from any source → blocked; a source-limited drop doesn't
+/// decide), otherwise the chain policy (Managed drops, bans-only accepts).
+/// sshd's ports are always reachable (fixed base rule).
+pub fn port_blocked(set: &FirewallRuleSet, ssh_ports: &[u16], proto: Protocol, port: u16) -> bool {
+    if set.mode == FirewallMode::BansOnly || ssh_ports.contains(&port) && proto == Protocol::Tcp {
+        return false;
+    }
+    for r in &set.rules {
+        let hit = r.chain == FwChain::Input
+            && r.proto == proto
+            && r.ports
+                .iter()
+                .any(|p| (p.start().get()..=p.end().get()).contains(&port));
+        if !hit {
+            continue;
+        }
+        match (r.action, r.source) {
+            (FwAction::Accept, _) => return false,
+            (_, None) => return true,
+            (_, Some(_)) => {}
+        }
+    }
+    true
+}
+
 /// The form that is rendered, parsed back and hashed.
 pub fn canonical(set: &FirewallRuleSet) -> FirewallRuleSet {
     FirewallRuleSet {

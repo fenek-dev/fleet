@@ -1210,6 +1210,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "x509-parser",
  "yaml-rust2",
  "zbus",

@@ -82,6 +82,7 @@ impl Reverters {
             ChangeKind::AuthorizedKeys,
             Rc::new(crate::users::authorized_keys::AuthorizedKeysReverter),
         );
+        r.register(ChangeKind::Mesh, Rc::new(crate::mesh::MeshRevert));
         r
     }
 
@@ -157,6 +158,7 @@ mod tests {
         *m.0.borrow_mut() = b"new".to_vec();
         r.restore(&ctx, ChangeKind::Firewall, &snap).unwrap();
         assert_eq!(*m.0.borrow(), b"old");
-        assert!(r.get(ChangeKind::Mesh).is_none());
+        assert!(r.get(ChangeKind::Mesh).is_some());
+        assert!(r.get(ChangeKind::Network).is_none());
     }
 }

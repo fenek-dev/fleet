@@ -77,6 +77,34 @@ fn managed(rules: Vec<FirewallRule>) -> FirewallRuleSet {
     }
 }
 
+#[test]
+fn port_blocked_first_match() {
+    use FwAction::*;
+    use FwChain::*;
+    use Protocol::*;
+    let set = fixture_model();
+    let b = |proto, port| model::port_blocked(&set, &[22], proto, port);
+    assert!(!b(Tcp, 443), "accepted");
+    assert!(!b(Tcp, 9050), "accepted from some sources");
+    assert!(!b(Udp, 27015));
+    assert!(!b(Tcp, 22), "sshd");
+    assert!(b(Tcp, 8080), "forward rule doesn't open the host port");
+    assert!(b(Udp, 443), "other protocol");
+    assert!(b(Tcp, 5432), "Managed default drop");
+    let mut dropped = managed(vec![
+        rule(Input, Drop, Tcp, vec![p(25565)]),
+        rule(Input, Accept, Tcp, vec![p(25565)]),
+    ]);
+    assert!(model::port_blocked(&dropped, &[], Tcp, 25565));
+    dropped.rules[0] = from(dropped.rules[0].clone(), "198.51.100.0/24");
+    assert!(!model::port_blocked(&dropped, &[], Tcp, 25565));
+    let open = FirewallRuleSet {
+        mode: FirewallMode::BansOnly,
+        rules: Vec::new(),
+    };
+    assert!(!model::port_blocked(&open, &[], Tcp, 5432));
+}
+
 /// The model `testdata/managed.json` holds (ports deliberately
 /// unsorted: canonical form sorts them).
 fn fixture_model() -> FirewallRuleSet {
