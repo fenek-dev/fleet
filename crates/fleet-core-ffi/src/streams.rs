@@ -55,7 +55,7 @@ impl StreamHandle {
 }
 
 impl StreamHandle {
-    fn new() -> (Arc<Self>, oneshot::Receiver<()>) {
+    pub(crate) fn new() -> (Arc<Self>, oneshot::Receiver<()>) {
         let (tx, rx) = oneshot::channel();
         (
             Arc::new(Self {
@@ -67,7 +67,7 @@ impl StreamHandle {
 }
 
 /// Opens `op()` on `id`, forwards items, reopens after a lost link.
-async fn run_stream(
+pub(crate) async fn run_stream(
     handle: ManagerHandle,
     id: ServerId,
     op: impl Fn() -> Op + Send,

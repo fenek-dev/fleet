@@ -6,12 +6,15 @@ enum ServerTab: String, CaseIterable, Identifiable {
     case files = "Files"
     case logs = "Logs"
     case security = "Security"
+    case users = "Users"
     case services = "Services"
     case firewall = "Firewall"
     case packages = "Packages"
     case docker = "Docker"
     case cron = "Cron"
     case config = "Config history"
+    case mesh = "Mesh"
+    case games = "Games"
     case timeline = "Timeline"
     var id: String { rawValue }
 }
@@ -61,7 +64,12 @@ struct ServerDetailView: View {
             case .firewall: FirewallTab(server: s)
             case .packages: PackagesTab(server: s)
             case .timeline: TimelineTab(server: s)
-            case .docker, .cron, .config: PlaceholderTab(name: tab.rawValue)
+            case .users: UsersTab(server: s)
+            case .docker: DockerTab(server: s)
+            case .cron: CronTab(server: s)
+            case .config: ConfigHistoryTab(server: s)
+            case .mesh: MeshTab(server: s)
+            case .games: GamesTab(server: s)
             }
         }
     }

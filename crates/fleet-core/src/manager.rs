@@ -313,6 +313,22 @@ pub trait AgentLink {
         actor: Actor,
         approval: Option<RootApproval>,
     ) -> impl Future<Output = Result<PendingReply, ClientError>>;
+    /// [`AgentLink::start_request`] with [`RequestOpts`]. The default
+    /// refuses an `expected_version` it can't put in the envelope.
+    fn start_request_with(
+        &mut self,
+        op: Op,
+        actor: Actor,
+        approval: Option<RootApproval>,
+        opts: RequestOpts,
+    ) -> impl Future<Output = Result<PendingReply, ClientError>> {
+        async move {
+            if opts.expected_version.is_some() {
+                return Err(ClientError::Rejected(ErrorCode::Unsupported));
+            }
+            self.start_request(op, actor, approval).await
+        }
+    }
     /// Must be cancel-safe, and must keep routing responses to pending
     /// requests while it waits.
     fn next_event(&mut self) -> impl Future<Output = Result<(u64, Event), ClientError>>;
@@ -343,6 +359,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentLink for Session<'_, S> {
         approval: Option<RootApproval>,
     ) -> Result<PendingReply, ClientError> {
         Session::start_request(self, op, actor, approval).await
+    }
+
+    async fn start_request_with(
+        &mut self,
+        op: Op,
+        actor: Actor,
+        approval: Option<RootApproval>,
+        opts: RequestOpts,
+    ) -> Result<PendingReply, ClientError> {
+        let opts = crate::session::CommandOpts {
+            expected_version: opts.expected_version,
+            ..Default::default()
+        };
+        Session::start_request_with(self, op, actor, approval, &opts).await
     }
 
     async fn next_event(&mut self) -> Result<(u64, Event), ClientError> {
@@ -383,11 +413,19 @@ pub trait Connector: 'static {
     ) -> impl Future<Output = Result<ServeEnd, LinkError>>;
 }
 
+/// Per-request envelope options for [`ManagerHandle::request_with`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestOpts {
+    /// For ops that replace versioned state (`Op::requires_expected_version`).
+    pub expected_version: Option<u64>,
+}
+
 enum Work {
     Request {
         op: Op,
         actor: Actor,
         approval: Option<RootApproval>,
+        opts: RequestOpts,
         reply: oneshot::Sender<Result<Reply, RequestError>>,
     },
     OpenStream {
@@ -564,7 +602,7 @@ impl LinkCtx<'_> {
                 work = w.requests.recv(), if room => {
                     let Some(work) = work else { return Ok(ServeEnd::Stopped) };
                     let res = match work {
-                        Work::Request { op, actor, approval, reply } => {
+                        Work::Request { op, actor, approval, opts, reply } => {
                             // The caller gave up (timeout): don't run it late.
                             if reply.is_closed() {
                                 continue;
@@ -573,7 +611,11 @@ impl LinkCtx<'_> {
                                 let _ = reply.send(Err(RequestError::Locked));
                                 continue;
                             }
-                            let res = link.start_request(op, actor, approval).await;
+                            let res = if opts == RequestOpts::default() {
+                                link.start_request(op, actor, approval).await
+                            } else {
+                                link.start_request_with(op, actor, approval, opts).await
+                            };
                             w.emit_events(link.take_events());
                             match res {
                                 Ok(rx) => {
@@ -948,6 +990,19 @@ impl ManagerHandle {
         actor: Actor,
         approval: Option<RootApproval>,
     ) -> Result<Reply, RequestError> {
+        self.request_with(id, op, actor, approval, RequestOpts::default())
+            .await
+    }
+
+    /// [`ManagerHandle::request`] with envelope options (`expected_version`).
+    pub async fn request_with(
+        &self,
+        id: &ServerId,
+        op: Op,
+        actor: Actor,
+        approval: Option<RootApproval>,
+        opts: RequestOpts,
+    ) -> Result<Reply, RequestError> {
         let tx = self
             .slots()
             .get(id)
@@ -959,6 +1014,7 @@ impl ManagerHandle {
             op,
             actor,
             approval,
+            opts,
             reply,
         };
         let fut = async {

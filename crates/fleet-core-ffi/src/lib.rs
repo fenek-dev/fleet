@@ -26,13 +26,17 @@
 //! scaffolding the proc macros expand.
 #![forbid(unsafe_code)]
 
+mod admin_ops;
+mod admin_rows;
 mod api;
 mod bulk;
+mod docker_ops;
 mod enrollment;
 mod files;
 mod fleet_mgmt;
 mod install;
 mod mcp;
+mod mesh_game;
 mod ops;
 mod recovery;
 mod rows;
@@ -46,8 +50,14 @@ mod types;
 mod validate;
 mod vuln;
 
+pub use admin_ops::{
+    config_rollback_needs_approval, firewall_check, firewall_diff, firewall_rules_to_args,
+    privileged_groups,
+};
+pub use admin_rows::*;
 pub use api::FleetCore;
 pub use bulk::{BulkListener, BulkRunHandle};
+pub use docker_ops::{DockerLogSink, DockerStatsSink, compose_validate};
 pub use enrollment::Enrollment;
 pub use files::TransferListener;
 pub use fleet_mgmt::{FleetListener, SyncSecrets};

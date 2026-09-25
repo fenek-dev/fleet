@@ -250,6 +250,11 @@ struct OverviewTab: View {
                     Text(Format.bytes(p.rssBytes)).monospacedDigit().frame(width: 70, alignment: .trailing)
                 }
                 .font(.base).foregroundStyle(Color.text).frame(height: 26)
+                .contentShape(Rectangle())
+                .processActions(serverId: server.id, process: p) { e in
+                    error = e
+                    Task { await loadProcesses() }
+                }
                 Divider().overlay(Color.divider)
             }
         }
