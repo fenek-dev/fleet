@@ -6,6 +6,8 @@ enum NavItem: Hashable {
     case server(String)
     case alerts
     case timeline
+    case search
+    case vulnerabilities
     case runbooks
     case provision
 }
@@ -54,6 +56,9 @@ struct SidebarView: View {
                     }
                     .tag(NavItem.alerts)
                     Label("Timeline", systemImage: "clock").tag(NavItem.timeline)
+                    Label("Search", systemImage: "magnifyingglass").tag(NavItem.search)
+                    Label("Vulnerabilities", systemImage: "shield.lefthalf.filled")
+                        .tag(NavItem.vulnerabilities)
                     Label("Snippets & Runbooks", systemImage: "list.bullet").tag(NavItem.runbooks)
                     Label("Provision", systemImage: "plus.square").tag(NavItem.provision)
                 }

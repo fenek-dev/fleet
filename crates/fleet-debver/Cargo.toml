@@ -1,0 +1,17 @@
+[package]
+name = "fleet-debver"
+description = "Debian package version parsing and ordering (dpkg --compare-versions)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies: used by the agent (fleet-ops, static musl) and the Mac
+# core (vulnerability matching, design §7.7).
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true

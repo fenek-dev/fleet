@@ -51,6 +51,9 @@ struct ContentView: View {
         }
         .frame(minWidth: 1100, minHeight: 700)
         .background(Color.window)
+        .onReceive(NotificationCenter.default.publisher(for: .fleetSearch)) { _ in
+            selection = .search
+        }
     }
 
     @ViewBuilder private var detail: some View {
@@ -64,7 +67,11 @@ struct ContentView: View {
         case .alerts:
             AlertsView()
         case .timeline:
-            PlaceholderTab(name: "Timeline")
+            FleetTimelineView(selection: $selection)
+        case .search:
+            FleetSearchView(selection: $selection)
+        case .vulnerabilities:
+            FleetVulnerabilitiesView(selection: $selection)
         case .runbooks:
             RunbooksView()
         case .provision:

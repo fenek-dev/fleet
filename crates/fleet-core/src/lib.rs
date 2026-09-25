@@ -17,11 +17,15 @@
 //! - [`runbook`]: snippets and runbooks (§2.3); [`mcp_host`]: the app side
 //!   of the `fleetctl` socket — pairing, pause, lock, rate limit, approvals,
 //!   untrusted results (§5.10, §8).
+//! - [`vuln`]: vulnerability feeds and matching (§2.4, §7.7);
+//!   [`fleetsearch`]: fleet-wide `search.*` fan-out (§2.7); [`timeline`]:
+//!   the unified per-server and fleet timeline (§2.7).
 #![forbid(unsafe_code)]
 
 pub mod bulk;
 pub mod cache;
 pub mod enroll;
+pub mod fleetsearch;
 pub mod install;
 pub mod manager;
 pub mod mcp_host;
@@ -32,6 +36,8 @@ pub mod session;
 pub mod sftp;
 pub mod signer;
 pub mod ssh;
+pub mod timeline;
+pub mod vuln;
 
 pub use session::{
     ClientError, CommandOpts, CommandSigner, HelloInfo, MAX_BUFFERED_EVENTS, PendingReply, Reply,

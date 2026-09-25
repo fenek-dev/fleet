@@ -10,6 +10,7 @@ members = [
     "crates/fleet-it",
     "crates/fleetctl-proto",
     "crates/fleetctl",
+    "crates/fleet-debver",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ fleet-crypto = { path = "crates/fleet-crypto" }
 fleet-core = { path = "crates/fleet-core" }
 fleet-ops = { path = "crates/fleet-ops" }
 fleetctl-proto = { path = "crates/fleetctl-proto" }
+fleet-debver = { path = "crates/fleet-debver" }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -95,6 +97,15 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Swift bindings (design §7.1), proc-macro mode. `cli` only for the
 # `uniffi-bindgen` bin of fleet-core-ffi (feature `bindgen`).
 uniffi = { version = "0.32.2", default-features = false }
+# Vulnerability feeds (design §7.7), fetched by the Mac only. rustls with
+# the `ring` provider (no aws-lc C build, no native-tls) and the macOS
+# trust store via rustls-platform-verifier (reqwest `rustls-no-provider`).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2"] }
+rustls = { version = "0.23.4", default-features = false, features = ["ring", "std", "tls12"] }
+# Feed decompression, pure Rust: gzip (Debian tracker, miniz_oxide
+# backend) and bzip2 (Ubuntu USN database, libbz2-rs-sys).
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+bzip2 = "0.6.1"
 
 # MCP (design §8): `fleetctl mcp` stdio server. Server + stdio transport
 # only; no HTTP, no auth, no client.

@@ -28,6 +28,10 @@ final class CoreBridge {
     private(set) var securityAlert: String?
     /// The alert was dismissed (the banner stays).
     var securityAlertSeen = false
+    /// Bumped on every live agent event; `lastEventServer` names its
+    /// server (the timeline catches up on it).
+    private(set) var eventTick = 0
+    private(set) var lastEventServer: String?
 
     @ObservationIgnored private var core: FleetCore?
     @ObservationIgnored private var keys: SecureEnclaveKeys?
@@ -176,6 +180,8 @@ final class CoreBridge {
     }
 
     fileprivate func apply(_ event: AgentEventRow) {
+        lastEventServer = event.serverId
+        eventTick &+= 1
         guard let alert = event.alert else { return }
         let key = "\(event.serverId)|\(alert.ruleId)|\(alert.subject)"
         if alert.cleared {
@@ -261,6 +267,7 @@ extension Error {
         case .File(let m): return "File operation failed: \(m)"
         case .Enrollment(let reason): return "Enrollment: \(reason)."
         case .Stream(let m): return "Stream failed: \(m)"
+        case .VulnData(let m): return "Vulnerability data: \(m)"
         case .Session(let m): return "Session error: \(m)"
         case .HostKeyMismatch: return "The host key differs from the fingerprint you confirmed. Nothing was pinned."
         case .HostKeyAlreadyPinned: return "This server already has a pinned host key. Use Replace host key to change it."

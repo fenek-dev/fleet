@@ -208,6 +208,9 @@ pub struct RosterRow {
     pub signed: Vec<u8>,
 }
 
+/// Read access to the audit mirror (timeline).
+mod audit_mirror;
+
 pub struct Cache {
     conn: Connection,
     key: CacheKey,

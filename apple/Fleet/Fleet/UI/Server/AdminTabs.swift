@@ -336,6 +336,7 @@ struct SecurityTab: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 TabHeader(title: "Security", loading: loading, error: error, refresh: { Task { await load() } })
+                VulnerabilitiesSection(server: server)
                 section("Logins · 7 days") {
                     Toggle("Failed only", isOn: $failedOnly)
                         .onChange(of: failedOnly) { _, _ in Task { await loadLogins() } }

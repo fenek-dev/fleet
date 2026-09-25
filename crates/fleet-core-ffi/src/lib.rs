@@ -34,12 +34,15 @@ mod install;
 mod mcp;
 mod ops;
 mod rows;
+mod search;
 mod signer;
 mod streams;
 mod terminal;
 mod text;
+mod timeline;
 mod types;
 mod validate;
+mod vuln;
 
 pub use api::FleetCore;
 pub use bulk::{BulkListener, BulkRunHandle};
@@ -48,10 +51,13 @@ pub use files::TransferListener;
 pub use install::InstallListener;
 pub use mcp::{McpConnection, McpDelegate};
 pub use rows::*;
+pub use search::*;
 pub use signer::{CoreListener, DeviceSigner, KeyStore, SignerAdapter};
 pub use streams::{JournalSink, MetricsSink, StreamHandle};
 pub use terminal::{TerminalSession, TerminalSink};
+pub use timeline::*;
 pub use types::*;
+pub use vuln::*;
 
 uniffi::setup_scaffolding!("fleet_core");
 

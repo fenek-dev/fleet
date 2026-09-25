@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 fleet-proto.workspace = true
 fleet-crypto.workspace = true
+fleet-debver.workspace = true
 # process: child programs (fixed paths, argv only).
 tokio = { workspace = true, features = ["process"] }
 thiserror.workspace = true
