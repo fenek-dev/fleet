@@ -25,4 +25,7 @@ pub enum Error {
     Kdf,
     #[error("OS random number generator failed")]
     Rng,
+    /// AEAD open failed: wrong key, tampered ciphertext or AAD.
+    #[error("decryption failed")]
+    Decrypt,
 }

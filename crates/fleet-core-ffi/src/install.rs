@@ -92,13 +92,18 @@ impl FleetCore {
         };
         // The genesis a server will trust forever must be ours: every key
         // this Mac's, self-signed by our root key (cache tampering guard).
-        fleet_core::enroll::check_genesis_is_ours(
+        // A Mac that joined later isn't in the genesis: then the genesis
+        // must anchor the verified chain that lists this Mac.
+        if let Err(e) = fleet_core::enroll::check_genesis_is_ours(
             &genesis,
             &*self.keys,
             self.noise_key()?.public(),
             device_id,
             fleet_core::now_ms(),
-        )?;
+        ) {
+            self.genesis_is_anchor(&genesis, device_id)
+                .map_err(|_| FleetError::from(e))?;
+        }
         let listener: Arc<dyn InstallListener> = Arc::from(listener);
         let core = self.clone();
         self.on_core(async move {
@@ -130,6 +135,9 @@ impl FleetCore {
                 },
             )?;
             core.connect_pinned(&id)?;
+            // Per-server sudo password (design §5.9): Keychain + sync.
+            // Best effort: sync may not be set up yet.
+            let _ = core.ensure_sudo_password(id.to_string());
 
             listener.on_progress(InstallProgress::step(InstallStep::WaitingForAgent));
             let (handle, _) = core.running()?;

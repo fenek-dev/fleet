@@ -4,8 +4,10 @@
 //! storage (replay state goes through [`verify::ReplayStore`]).
 #![forbid(unsafe_code)]
 
+pub mod aead;
 pub mod approval;
 mod error;
+pub mod hpke;
 pub mod merkle;
 pub mod noise;
 pub mod receipt;

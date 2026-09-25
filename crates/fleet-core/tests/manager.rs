@@ -317,6 +317,52 @@ async fn transient_failures_back_off_then_recover_and_link_loss_reconnects() {
         .await;
 }
 
+/// Locked: a refused monitor SSH key (a roster that predates it) parks the
+/// server, raises no "removed" alert, and unlocking retries at once. A
+/// refused device SSH key does raise it.
+#[tokio::test]
+async fn monitor_key_refusal_waits_for_unlock_and_removal_alerts() {
+    LocalSet::new()
+        .run_until(async {
+            let fake = std::rc::Rc::new(Fake::default());
+            fake.fail(1, 1, Fail::Fatal);
+            let h = start(fake.clone(), cfg(), SessionKind::Monitor);
+            let mut ev = h.subscribe();
+            h.add_server(spec(1));
+            wait_state(&h, &sid(1), ConnState::Offline).await;
+            h.set_session_kind(SessionKind::Device);
+            wait_state(&h, &sid(1), ConnState::Ready).await;
+            assert_eq!(
+                fake.kinds.borrow().last(),
+                Some(&(sid(1), SessionKind::Device))
+            );
+            let mut removed = 0;
+            while let Ok(e) = ev.try_recv() {
+                if matches!(
+                    e,
+                    fleet_core::manager::ManagerEvent::RemovedFromFleet { .. }
+                ) {
+                    removed += 1;
+                }
+            }
+            assert_eq!(removed, 0);
+
+            fake.fail(2, 1, Fail::Fatal);
+            h.add_server(spec(2));
+            wait_state(&h, &sid(2), ConnState::Offline).await;
+            let mut signed = None;
+            while let Ok(e) = ev.try_recv() {
+                if let fleet_core::manager::ManagerEvent::RemovedFromFleet { server, signed: s } = e
+                {
+                    assert_eq!(server, sid(2));
+                    signed = Some(s);
+                }
+            }
+            assert_eq!(signed, Some(false), "an SSH refusal is a hint, not signed");
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn fatal_failure_blocks_until_reconnect() {
     LocalSet::new()

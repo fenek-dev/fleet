@@ -74,6 +74,9 @@ struct ServerDetailView: View {
                 if !s.agentPinned {
                     Button("Install agent…", systemImage: "shippingbox") { installing = true }
                 }
+                if s.agentPinned {
+                    SudoPasswordButton(serverId: s.id, serverName: s.name)
+                }
                 Button("Reconnect", systemImage: "arrow.clockwise") { core.reconnect(s.id) }
                 Button("Terminal", systemImage: "terminal") { tab = .terminal }
                     .disabled(s.state != .ready)

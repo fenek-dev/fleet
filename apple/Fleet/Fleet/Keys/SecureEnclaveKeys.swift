@@ -44,7 +44,10 @@ final class KeyGate: Sendable {
 ///   only (still gated by `KeyGate` in software); new enrollments get the
 ///   new ACL. Moving an existing Mac over means new keys and a roster
 ///   update (design §5.12), not done automatically.
-/// - Monitor: Secure Enclave, `.privateKeyUsage`; usable while locked.
+/// - Monitor, monitor SSH: Secure Enclave, `.privateKeyUsage`; usable while
+///   locked. The monitor SSH key authenticates only the read-only monitor
+///   bridge (`authorized_keys` forces `bridge --monitor`), so a locked app
+///   keeps metrics and alerts without the unlock-gated SSH key.
 ///
 /// Each key's `dataRepresentation` (an enclave-wrapped blob) is kept in the
 /// Keychain. Keys are created only while `creationAllowed` (enrollment);
@@ -111,7 +114,7 @@ final class SecureEnclaveKeys: DeviceSigner {
         case .device, .ssh:
             guard let ctx = gate.context else { throw SignerError.Unavailable }
             return try signWith(role, context: ctx, msg: msg)
-        case .monitor:
+        case .monitor, .monitorSsh:
             let ctx = Self.silentContext()
             defer { ctx.invalidate() }
             return try signWith(role, context: ctx, msg: msg)
@@ -181,6 +184,7 @@ final class SecureEnclaveKeys: DeviceSigner {
         case .root: "p256-root"
         case .device: "p256-device"
         case .monitor: "p256-monitor"
+        case .monitorSsh: "p256-monitor-ssh"
         case .ssh: "p256-ssh"
         }
     }
@@ -199,7 +203,11 @@ final class SecureEnclaveKeys: DeviceSigner {
                     key = .enclave(try SecureEnclave.P256.Signing.PrivateKey(
                         dataRepresentation: blob, authenticationContext: context))
                 } else {
-                    guard creationAllowed else { throw SignerError.Missing }
+                    // The monitor SSH key is new for enrolled Macs: create it
+                    // on first use (it only authenticates the read-only
+                    // monitor bridge, and servers accept it once a roster
+                    // lists it).
+                    guard creationAllowed || role == .monitorSsh else { throw SignerError.Missing }
                     let k = try SecureEnclave.P256.Signing.PrivateKey(
                         compactRepresentable: false,
                         accessControl: try Self.accessControl(role),
@@ -215,7 +223,7 @@ final class SecureEnclaveKeys: DeviceSigner {
                 if let raw = stored {
                     key = .software(try P256.Signing.PrivateKey(rawRepresentation: raw))
                 } else {
-                    guard creationAllowed else { throw SignerError.Missing }
+                    guard creationAllowed || role == .monitorSsh else { throw SignerError.Missing }
                     let k = P256.Signing.PrivateKey(compactRepresentable: false)
                     try Keychain.add(account, k.rawRepresentation)
                     key = .software(k)
@@ -250,7 +258,7 @@ final class SecureEnclaveKeys: DeviceSigner {
         switch role {
         case .root: flags.insert(.biometryCurrentSet)
         case .device, .ssh: flags.insert(.userPresence)
-        case .monitor: break
+        case .monitor, .monitorSsh: break
         }
         var error: Unmanaged<CFError>?
         guard let ac = SecAccessControlCreateWithFlags(

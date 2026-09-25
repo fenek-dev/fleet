@@ -270,6 +270,37 @@ async fn external_p256_signer_auth_and_agent_channel() {
     );
 }
 
+/// The locked app's connection: the monitor SSH key (a separate enclave
+/// key) and the monitor bridge command.
+#[tokio::test]
+async fn monitor_ssh_key_opens_the_monitor_bridge() {
+    use fleet_core::SessionMode;
+    use fleet_core::signer::{KeyRole, RoleSigner, SoftwareDeviceSigner};
+    let keys = SoftwareDeviceSigner::generate().unwrap();
+    let monitor = P256SshSigner(RoleSigner::new(&keys, KeyRole::MonitorSsh).unwrap());
+    let device = P256SshSigner(RoleSigner::new(&keys, KeyRole::Ssh).unwrap());
+    assert_ne!(monitor.public_key(), device.public_key());
+    let srv = start_server(5, &[&monitor]).await;
+    let (c, _) = SshConnection::connect(&target(srv.port), &monitor, Some(srv.host_key.clone()))
+        .await
+        .unwrap();
+    let mut s = c
+        .open_agent_channel_mode(SessionMode::Monitor)
+        .await
+        .unwrap();
+    roundtrip(&mut s, b"monitor").await;
+    assert_eq!(
+        srv.log.lock().unwrap().execs,
+        vec![fleet_core::ssh::AGENT_BRIDGE_MONITOR.to_owned()]
+    );
+    // The device SSH key isn't the monitor key.
+    let e = SshConnection::connect(&target(srv.port), &device, Some(srv.host_key.clone()))
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(e, SshError::AuthRejected), "{e}");
+}
+
 #[tokio::test]
 async fn recovery_ed25519_key_auth() {
     let rec = Ed25519Signer::from_seed(&[9; 32]);

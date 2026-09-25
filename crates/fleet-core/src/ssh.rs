@@ -27,6 +27,8 @@ use tokio::time::timeout;
 pub const AGENT_BRIDGE: &str = "/usr/lib/fleet/fleet-agent bridge";
 /// Recovery variant; the recovery key's forced command runs this anyway.
 pub const AGENT_BRIDGE_RECOVERY: &str = "/usr/lib/fleet/fleet-agent bridge --recovery";
+/// Monitor variant; the monitor SSH key's forced command runs this anyway.
+pub const AGENT_BRIDGE_MONITOR: &str = "/usr/lib/fleet/fleet-agent bridge --monitor";
 
 /// Byte stream of the agent exec channel, for
 /// [`crate::Session::connect_bridged`].
@@ -535,11 +537,25 @@ impl SshConnection {
     /// The bridge sends the mode byte to the gate itself, so use
     /// [`crate::Session::connect_bridged`] on the returned stream.
     pub async fn open_agent_channel(&self, recovery: bool) -> Result<AgentStream, SshError> {
-        let mut ch = self.open_session().await?;
-        let cmd = if recovery {
-            AGENT_BRIDGE_RECOVERY
+        self.open_agent_channel_mode(if recovery {
+            crate::SessionMode::Recovery
         } else {
-            AGENT_BRIDGE
+            crate::SessionMode::Normal
+        })
+        .await
+    }
+
+    /// Agent channel for `mode` (`bridge`, `bridge --recovery`,
+    /// `bridge --monitor`); restricted keys force their own flag anyway.
+    pub async fn open_agent_channel_mode(
+        &self,
+        mode: crate::SessionMode,
+    ) -> Result<AgentStream, SshError> {
+        let mut ch = self.open_session().await?;
+        let cmd = match mode {
+            crate::SessionMode::Normal => AGENT_BRIDGE,
+            crate::SessionMode::Recovery => AGENT_BRIDGE_RECOVERY,
+            crate::SessionMode::Monitor => AGENT_BRIDGE_MONITOR,
         };
         ch.exec(true, cmd).await?;
         // The gate never speaks first (the Noise initiator does), so no

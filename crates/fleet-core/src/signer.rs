@@ -20,6 +20,9 @@ pub enum KeyRole {
     Monitor,
     /// `ecdsa-sha2-nistp256` SSH client key.
     Ssh,
+    /// `ecdsa-sha2-nistp256` SSH key usable while locked; `authorized_keys`
+    /// pins it to `fleet-agent bridge --monitor` (design §5.9).
+    MonitorSsh,
 }
 
 impl KeyRole {
@@ -136,6 +139,7 @@ pub struct SoftwareDeviceSigner {
     pub device: SoftwareP256Signer,
     pub monitor: SoftwareP256Signer,
     pub ssh: SoftwareP256Signer,
+    pub monitor_ssh: SoftwareP256Signer,
 }
 
 impl SoftwareDeviceSigner {
@@ -145,6 +149,7 @@ impl SoftwareDeviceSigner {
             device: SoftwareP256Signer::generate()?,
             monitor: SoftwareP256Signer::generate()?,
             ssh: SoftwareP256Signer::generate()?,
+            monitor_ssh: SoftwareP256Signer::generate()?,
         })
     }
 
@@ -154,6 +159,7 @@ impl SoftwareDeviceSigner {
             KeyRole::Device => &self.device,
             KeyRole::Monitor => &self.monitor,
             KeyRole::Ssh => &self.ssh,
+            KeyRole::MonitorSsh => &self.monitor_ssh,
         }
     }
 }

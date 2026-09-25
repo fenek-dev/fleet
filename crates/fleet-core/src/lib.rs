@@ -12,17 +12,28 @@
 //!   per-server policy (§5.4).
 //! - [`sftp`]: file browser over the server's SSH connection (§2.3).
 //! - [`signer`]: the Secure Enclave signing interface Swift implements (§7.1).
+//! - [`roster_mgmt`]: adding/revoking Macs, chain pushes, veto (§5.12);
+//!   [`catchup`]: `events.query` catch-up on connect; [`sync`]: end-to-end
+//!   encrypted iCloud sync (§7.6); [`recovery_flow`]: recovery and the
+//!   drill (§5.11); [`sudo`]: per-server sudo passwords (§5.9);
+//!   [`runner`]: the op-sending trait those flows share.
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod catchup;
 pub mod enroll;
 pub mod install;
 pub mod manager;
 pub mod policy;
+pub mod recovery_flow;
+pub mod roster_mgmt;
+pub mod runner;
 pub mod session;
 pub mod sftp;
 pub mod signer;
 pub mod ssh;
+pub mod sudo;
+pub mod sync;
 
 pub use session::{
     ClientError, CommandOpts, CommandSigner, HelloInfo, MAX_BUFFERED_EVENTS, PendingReply, Reply,

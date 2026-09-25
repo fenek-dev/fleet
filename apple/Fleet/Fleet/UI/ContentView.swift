@@ -9,7 +9,7 @@ struct ContentView: View {
         @Bindable var core = core
         Group {
             if core.status == .notEnrolled {
-                EnrollmentView()
+                OnboardingView()
                     .frame(minWidth: 900, minHeight: 640)
             } else {
                 main
@@ -73,7 +73,14 @@ struct AlertsView: View {
 
     var body: some View {
         let alerts = core.alerts.values.sorted { $0.seq > $1.seq }
-        Group {
+        VStack(spacing: 0) {
+            // Roster, recovery and sync alerts (design §5.10) first.
+            if !core.fleetAlerts.isEmpty {
+                Form { FleetAlertsSection() }
+                    .formStyle(.grouped)
+                    .scrollContentBackground(.hidden)
+                    .frame(maxHeight: 320)
+            }
             if alerts.isEmpty {
                 ContentUnavailableView("No open alerts", systemImage: "checkmark.seal")
             } else {
