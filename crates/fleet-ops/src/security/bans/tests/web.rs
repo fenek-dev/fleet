@@ -17,6 +17,24 @@ fn probe(src: &str) -> AccessHit {
 }
 
 #[test]
+fn web_bans_config_only_tailed_paths() {
+    let tailed = vec![LOG.to_owned(), "/var/log/nginx/access.log".to_owned()];
+    let text = format!(
+        "# opt in\n{LOG} 600\n/var/log/nginx/access.log\n/etc/shadow\n{LOG} 99\n\
+         /var/log/nginx/access.log x\n/var/log/nginx/access.log 1 2\n"
+    );
+    let v = parse_web_bans(&text, &tailed);
+    assert_eq!(
+        v,
+        vec![
+            WebBanSource::new(LOG, 600),
+            WebBanSource::new("/var/log/nginx/access.log", DEFAULT_WEB_MAX_STEP_S)
+        ]
+    );
+    assert!(parse_web_bans("", &tailed).is_empty());
+}
+
+#[test]
 fn internal_ranges() {
     for (s, internal) in [
         ("10.1.2.3", true),

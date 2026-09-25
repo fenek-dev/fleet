@@ -54,7 +54,7 @@ pub use nft::{
     unban_args,
 };
 pub use service::{BanService, LearnedMacIps};
-pub use web::{DEFAULT_WEB_MAX_STEP_S, WebBanSource, is_internal};
+pub use web::{DEFAULT_WEB_MAX_STEP_S, WEB_BANS_CONF, WebBanSource, is_internal, parse_web_bans};
 
 use fleet_proto::args::Cidr;
 use fleet_proto::op::BanConfig;

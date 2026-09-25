@@ -1,0 +1,47 @@
+# Valheim dedicated server via SteamCMD (design §9.6).
+# Embedded in fleet-agent at build time; reviewed with the agent release.
+# Placeholders: {name} (instance), {dir} (/srv/games/<name>),
+# {server} (<dir>/server). ${VAR} is expanded by systemd from the
+# instance's root-only environment file (/var/lib/fleet/games/<name>.env).
+
+id = "valheim"
+name = "Valheim dedicated server"
+
+[install]
+method = "steamcmd"
+app_id = 896660
+# Relative to {server}.
+exec = "valheim_server.x86_64"
+args = [
+    "-nographics", "-batchmode",
+    "-name", "{name}",
+    "-port", "2456",
+    "-world", "{name}",
+    # Generated at install (at least 5 characters, as Valheim requires).
+    "-password", "${FLEET_GAME_PASSWORD}",
+    "-public", "0",
+]
+env = [
+    "SteamAppId=892970",
+    "LD_LIBRARY_PATH={server}/linux64",
+]
+
+[[ports]]
+proto = "udp"
+port = 2456
+end = 2458
+
+[limits]
+memory_max = "6G"
+tasks_max = 512
+cpu_quota = "400%"
+
+# Valheim has no RCON: no console, player count or restart warnings.
+
+[backup]
+# Relative to {dir} (the game user's home).
+paths = [".config/unity3d/IronGate/Valheim/worlds_local"]
+keep = 7
+
+[schedule]
+restart_utc = "05:00"

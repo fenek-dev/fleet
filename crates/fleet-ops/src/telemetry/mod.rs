@@ -43,7 +43,7 @@ pub use store::{Batch, Frame, MemStore, MetricsStore, Rollup, StoreResult};
 
 use crate::ctx::SysCtx;
 use fleet_proto::alert::AlertRuleSet;
-use fleet_proto::payload::{MetricSeries, TopProcessMinute};
+use fleet_proto::payload::{MetricSeries, MetricUnit, TopProcessMinute};
 use procs::ProcTracker;
 use series::Catalog;
 use std::cell::{Cell, RefCell};
@@ -60,6 +60,26 @@ const MINUTE_MS: u64 = 60_000;
 const PRUNE_EVERY_MS: u64 = 3_600_000;
 /// Frames kept unflushed if the store keeps failing (bounded memory).
 const MAX_PENDING_FRAMES: usize = 600;
+/// Gauges other modules publish (health checks, game players).
+pub const MAX_GAUGES: usize = 128;
+
+/// Values other modules add to every sample (`health.ok:<id>`,
+/// `game.players:<name>`); they join the series catalog like collected
+/// ones. Implemented by [`Telemetry`].
+pub trait GaugeSink {
+    /// Sets (or replaces) a gauge; ignored beyond [`MAX_GAUGES`] names.
+    fn set_gauge(&self, name: &str, unit: MetricUnit, value: f32);
+    /// Removes a gauge (its series goes stale like a vanished disk).
+    fn clear_gauge(&self, name: &str);
+}
+
+/// Drops gauges (tests, no telemetry).
+pub struct NoGauges;
+
+impl GaugeSink for NoGauges {
+    fn set_gauge(&self, _: &str, _: MetricUnit, _: f32) {}
+    fn clear_gauge(&self, _: &str) {}
+}
 
 fn log(what: &str, e: impl std::fmt::Display) {
     eprintln!("fleet-exec: telemetry: {what}: {e}");
@@ -98,6 +118,7 @@ pub struct Telemetry {
     latest: watch::Sender<Option<Rc<Frame>>>,
     fast_subscribers: Cell<usize>,
     wake: Notify,
+    gauges: RefCell<BTreeMap<String, (MetricUnit, f32)>>,
 }
 
 impl Telemetry {
@@ -142,6 +163,7 @@ impl Telemetry {
             latest: watch::channel(None).0,
             fast_subscribers: Cell::new(0),
             wake: Notify::new(),
+            gauges: RefCell::default(),
         })
     }
 
@@ -179,7 +201,18 @@ impl Telemetry {
         let mut g = self.inner.borrow_mut();
         let inner = &mut *g;
         let snap = inner.collector.collect(ctx, &*self.sys, now);
-        let named = series::named_values(&snap);
+        let mut named = series::named_values(&snap);
+        named.extend(
+            self.gauges
+                .borrow()
+                .iter()
+                .filter(|(_, (_, v))| v.is_finite())
+                .map(|(name, (unit, value))| series::NamedValue {
+                    name: name.clone(),
+                    unit: *unit,
+                    value: *value,
+                }),
+        );
         let values = inner.catalog.resolve(&named, now);
         let frame = Rc::new(Frame {
             time_ms: now,
@@ -263,6 +296,12 @@ impl Telemetry {
                 by_memory,
             });
         }
+        self.write_pending(inner);
+    }
+
+    /// Writes everything unflushed in one batch (dropped on failure so
+    /// memory stays bounded).
+    fn write_pending(&self, inner: &mut Inner) {
         let batch = Batch {
             raw: &inner.pending_raw,
             minutes: &inner.pending_minutes,
@@ -276,6 +315,22 @@ impl Telemetry {
         inner.pending_raw.clear();
         inner.pending_minutes.clear();
         inner.pending_top.clear();
+    }
+
+    /// Writes the unflushed frames, finished minutes and top-process
+    /// records now instead of at the next minute boundary (exec calls it on
+    /// shutdown). The running minute's rollup is not closed: its raw
+    /// frames are written, so nothing sampled is lost.
+    pub fn flush(&self) {
+        let mut g = self.inner.borrow_mut();
+        let inner = &mut *g;
+        if inner.pending_raw.is_empty()
+            && inner.pending_minutes.is_empty()
+            && inner.pending_top.is_empty()
+        {
+            return;
+        }
+        self.write_pending(inner);
     }
 
     /// Latest frame (none before the first tick).
@@ -346,6 +401,20 @@ impl Telemetry {
         self.fast_subscribers.set(self.fast_subscribers.get() + 1);
         self.wake.notify_one();
         FastGuard(self.clone())
+    }
+}
+
+impl GaugeSink for Telemetry {
+    fn set_gauge(&self, name: &str, unit: MetricUnit, value: f32) {
+        let mut g = self.gauges.borrow_mut();
+        if g.len() >= MAX_GAUGES && !g.contains_key(name) {
+            return;
+        }
+        g.insert(name.to_owned(), (unit, value));
+    }
+
+    fn clear_gauge(&self, name: &str) {
+        self.gauges.borrow_mut().remove(name);
     }
 }
 
@@ -434,6 +503,40 @@ pub(crate) mod tests {
         assert_eq!(r.tel.pending_raw().len(), 1);
         let f = r.tel.latest().unwrap();
         assert!(f.values.len() > 20);
+    }
+
+    #[test]
+    fn gauges_join_samples_and_flush_writes_now() {
+        let r = rig();
+        r.tel.set_gauge("health.ok:api", MetricUnit::Ratio, 1.0);
+        r.tel.set_gauge("game.players:mc", MetricUnit::Count, 3.0);
+        bump_stat(r.dir.path(), 10, 80, 10);
+        r.tel.tick(&r.ctx);
+        let live = r.tel.catalog_live();
+        let id = |n: &str| live.iter().find(|s| s.name == n).map(|s| s.id);
+        let players = id("game.players:mc").unwrap();
+        assert!(id("health.ok:api").is_some());
+        let f = r.tel.latest().unwrap();
+        assert!(f.values.contains(&(players, 3.0)));
+        r.tel.clear_gauge("game.players:mc");
+        r.clock.advance(SLOW);
+        r.tel.tick(&r.ctx);
+        assert!(
+            !r.tel
+                .latest()
+                .unwrap()
+                .values
+                .iter()
+                .any(|v| v.0 == players)
+        );
+
+        assert_eq!(r.store.writes.get(), 0);
+        r.tel.flush();
+        assert_eq!(r.store.writes.get(), 1);
+        assert_eq!(r.store.raw.borrow().len(), 2);
+        assert!(r.tel.pending_raw().is_empty());
+        r.tel.flush(); // nothing left: no empty write
+        assert_eq!(r.store.writes.get(), 1);
     }
 
     #[test]

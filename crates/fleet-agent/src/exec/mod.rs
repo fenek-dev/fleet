@@ -38,6 +38,7 @@ mod sshd;
 mod state;
 mod stream;
 mod telemetry;
+mod wiring;
 
 pub use sources::{LazySystemd, SourcesConfig};
 pub use sshd::{Login, Logins, ProcessSignaller, Sigterm, SshdTerminator, trusted_entry};
@@ -650,6 +651,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         (cfg.stream_checkpoint_interval, cfg.stream_send_timeout);
     let (compact_every, compact_force_after) = (cfg.compact_interval, cfg.compact_force_after);
     let sources_cfg = std::mem::replace(&mut cfg.sources, SourcesConfig::system());
+    let background = sources_cfg.enabled;
     let ssh_logins = Rc::new(RefCell::new(Logins::default()));
     let terminator = cfg.terminator.take().unwrap_or_else(|| {
         Box::new(SshdTerminator {
@@ -685,6 +687,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     let sources = sources::Sources::new(&st, &ctx, bus.clone(), sources_cfg, ssh_logins);
     sources.register(&mut registry);
     let config = confighist::start(&st, &mut registry, &bus);
+    let wired = wiring::start(&st, &paths, &mut registry, &bus, &tel);
     for (tag, h) in extra {
         registry.register(tag, h);
     }
@@ -713,6 +716,9 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         .run_until(async {
             tokio::task::spawn_local(tel.clone().run(exec.ctx.clone()));
             sources.spawn();
+            if background {
+                wired.spawn(&exec.ctx);
+            }
             if let Some(c) = config {
                 tokio::task::spawn_local(confighist::run(c, exec.ctx.clone()));
             }
@@ -757,8 +763,9 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         .await;
     // Last words: sources' state, then events still queued on the bus.
     sources.persist();
+    tel.flush();
     bus.flush();
-    drop((sources, bus, tel, exec));
+    drop((sources, bus, tel, exec, wired));
     // Dropping the LocalSet ends every connection task and with them the
     // last references to the state (and the redb lock). A compaction still
     // running on the blocking pool holds its own handle; the runtime waits

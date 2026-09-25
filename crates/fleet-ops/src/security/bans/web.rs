@@ -42,6 +42,34 @@ impl WebBanSource {
     }
 }
 
+/// Opt-in file for web bans (root-owned, absent by default): one tailed
+/// access log per line, `<path> [max_step_s]`, `#` comments.
+pub const WEB_BANS_CONF: &str = "/etc/fleet/web-bans.conf";
+
+/// Parses [`WEB_BANS_CONF`]: only paths in `tailed` (the access logs exec
+/// reads) are accepted; unknown paths and malformed lines are skipped.
+pub fn parse_web_bans(text: &str, tailed: &[String]) -> Vec<WebBanSource> {
+    let mut out: Vec<WebBanSource> = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut f = line.split_whitespace();
+        let Some(path) = f.next() else { continue };
+        let step = match f.next().map(str::parse::<u32>) {
+            None => DEFAULT_WEB_MAX_STEP_S,
+            Some(Ok(s)) => s,
+            Some(Err(_)) => continue,
+        };
+        if f.next().is_some() || !tailed.iter().any(|t| t == path) {
+            continue;
+        }
+        if out.iter().any(|s| s.path == Path::new(path)) {
+            continue;
+        }
+        out.push(WebBanSource::new(path, step));
+    }
+    out
+}
+
 /// Addresses a web log may never ban: RFC 1918, CGNAT `100.64/10`, ULA
 /// `fc00::/7`, link-local (`169.254/16`, `fe80::/10`), plus everything
 /// that is never bannable at all (loopback, unspecified, multicast).

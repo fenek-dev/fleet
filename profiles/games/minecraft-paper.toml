@@ -1,0 +1,57 @@
+# Minecraft Java (Paper) in a container (design §9.6), image
+# itzg/minecraft-server with TYPE=PAPER. Needs the Docker role.
+# Embedded in fleet-agent at build time; reviewed with the agent release.
+# Placeholders: {name} (instance), {dir} (/srv/games/<name>).
+#
+# EULA: the template does not accept Mojang's EULA on the operator's
+# behalf. The container passes EULA through from the instance
+# environment file (/var/lib/fleet/games/<name>.env, root only); the
+# operator adds `EULA=TRUE` there after reading the EULA.
+
+id = "minecraft-paper"
+name = "Minecraft Java (Paper)"
+
+[install]
+method = "container"
+image = "docker.io/itzg/minecraft-server:java21"
+# Mounted from {dir}/data.
+data_dir = "/data"
+env = [
+    "TYPE=PAPER",
+    "MEMORY=3G",
+    "ENABLE_RCON=true",
+    "RCON_PORT=25575",
+    # Passed through from the instance environment when set.
+    "EULA",
+]
+
+[[ports]]
+proto = "tcp"
+port = 25565
+
+[limits]
+memory_max = "4G"
+tasks_max = 1024
+cpu_quota = "300%"
+
+[rcon]
+# Published on 127.0.0.1 only.
+port = 25575
+password_env = "RCON_PASSWORD"
+players_command = "list"
+# "There are 3 of a max of 20 players online: …"
+players_prefix = "There are "
+save_command = "save-all flush"
+say_command = "say"
+
+[backup]
+# Relative to {dir}.
+paths = ["data/world", "data/world_nether", "data/world_the_end", "data/server.properties"]
+keep = 7
+
+[schedule]
+restart_utc = "05:00"
+warnings_s = [600, 60, 10]
+
+[health]
+tcp_port = 25565
