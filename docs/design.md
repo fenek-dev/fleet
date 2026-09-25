@@ -166,6 +166,8 @@ Priorities: **P0** is required for the v1 launch, **P1** is part of v1 but can f
 | P1 | Fleet search: packages and versions, open ports, processes, users, files and logs across every server at once |
 | P1 | Unified timeline, per server and fleet-wide: metric spikes, logins, restarts, package changes, config changes and AI actions |
 
+Fleet search runs on the Mac (`fleet_core::fleetsearch`): the query goes out as `search.*` ops to every Ready server concurrently (kinds one after the other per server), and results are merged into groups (packages, ports, processes, users, files, logs) sorted by text; a server that fails or is not connected is listed, never fails the search. ⌘F opens it. The timeline (`fleet_core::timeline`) catches each server up with `events.query` from a per-server cursor kept in memory, verifies every event against the pinned agent signing key like a live one (failures are counted, never shown), adds the audit mirror's result entries with their actor (AI actions marked), and merges newest first; a live event for the server shown triggers an incremental catch-up.
+
 ### 2.8 Provisioning
 
 | Pri | Feature |
@@ -1140,7 +1142,7 @@ SQLite (`rusqlite`, WAL mode) holding:
 - pinned keys (host keys and agent keys)
 - a mirror of each server's audit log, with the last verified checkpoints
 - a metrics cache (the last 24 hours at 1-minute resolution, for instant charts)
-- the vulnerability database
+- the vulnerability database (its own file, `vulns.sqlite`; section 7.7)
 
 Schema v1 (tables; migrations are append-only, recorded in `schema_migrations`, and a database from a newer app version is refused):
 
@@ -1182,7 +1184,11 @@ Foreign keys are on: deleting a server removes its tags, pins, audit mirror and 
 ### 7.7 Vulnerability data
 
 - **Sources:** the Mac downloads the Debian Security Tracker JSON and Ubuntu security data (USN/OSV) daily while the app runs. Agents never contact the internet for this.
-- **Matching:** package inventories from each server are compared on the Mac, using a Rust implementation of dpkg's version comparison.
+  - Debian: `https://security-tracker.debian.org/tracker/data/json` (~12 MB gzip, ~80 MB JSON), per source package, CVE and release: status, fixed version, urgency.
+  - Ubuntu: the USN database `https://usn.ubuntu.com/usn-db/database.json.bz2` (~45 MB bzip2): every notice with the fixed version of each binary package per release, plus the CVEs it fixes. The OSV export (`Ubuntu/all.zip`) is ~740 MB, too large to fetch daily. USNs carry no priority, so Ubuntu findings are "unrated".
+- **Download:** `reqwest` on rustls with the `ring` provider and the macOS trust store (`rustls-platform-verifier`; no native-tls, no aws-lc), HTTPS only, conditional GET (`If-None-Match` / `If-Modified-Since`), 256 MiB download cap and 2 GiB decompressed cap, to a temporary file. Updates run on their own thread and runtime: a feed is checked when its last successful check is a day old, retried an hour after a failure, and "Update data" forces a check.
+- **Storage:** its own SQLite file, `vulns.sqlite` next to the cache (bulk public data, rebuilt daily; nothing in it decides trust, so no MACs and no sync). Tables `advisories` (distro, release, package, id, fixed version or NULL for no fix yet, severity), `aliases` (CVEs of a USN) and `feeds` (validators, attempt/check/update times, row count, last error). Feeds are stream-parsed one top-level entry at a time and a feed's rows are replaced in one transaction; a download or parse failure (or an empty feed) keeps the previous data. Only supported releases are kept (Debian 12+, Ubuntu 22.04+, by codename). Kept from Debian: `resolved` with a real fixed version (`0` means never affected) and `open` unless urgency is `unimportant`. Every field is checked (package name charset, id charset, versions must parse).
+- **Matching:** package inventories from each server are compared on the Mac, using a Rust implementation of dpkg's version comparison (`fleet-debver`, shared with the agent's package diffs). The release comes from `system.info` (`os-release` `ID` and `VERSION_ID` → codename). A package is affected when its installed version is older than the fixed version, or when no fix exists yet (shown separately). Debian rows are per source package; `pkg.list` reports binary packages only, so Debian matches by binary name until the inventory carries the source package (renamed binaries such as `libssl3` from `openssl` are missed). Ubuntu rows are per binary package already. The fleet table shows "vulnerable packages" (packages an upgrade fixes); the Security tab lists findings; the Vulnerabilities view shows every server and the most widespread advisories.
 
 ---
 

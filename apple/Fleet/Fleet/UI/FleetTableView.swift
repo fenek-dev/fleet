@@ -16,9 +16,12 @@ struct FleetRow: Identifiable, Equatable {
     let updates: Int
     let agent: String
     let lastSeen: Int64
+    /// Packages with an available security fix; -1 when not scanned.
+    let vulnerable: Int
     let row: ServerRow
 
-    init(_ r: ServerRow, groupName: String?) {
+    init(_ r: ServerRow, groupName: String?, vulnerable: Int = -1) {
+        self.vulnerable = vulnerable
         id = r.id
         name = r.name
         host = r.host
@@ -46,6 +49,7 @@ enum FleetFilter: String, CaseIterable, Identifiable {
 
 struct FleetTableView: View {
     @Environment(CoreBridge.self) private var core
+    @Environment(IntelStore.self) private var intel
     /// Restrict to one group.
     var groupId: String?
     @Binding var selection: NavItem?
@@ -59,7 +63,8 @@ struct FleetTableView: View {
         let names = Dictionary(uniqueKeysWithValues: core.groups.map { ($0.id, $0.name) })
         return core.servers
             .filter { groupId == nil || $0.groupId == groupId }
-            .map { FleetRow($0, groupName: $0.groupId.flatMap { names[$0] }) }
+            .map { FleetRow($0, groupName: $0.groupId.flatMap { names[$0] },
+                            vulnerable: intel.vulnerableCount($0.id)) }
             .filter { r in
                 switch filter {
                 case .all: true
@@ -129,39 +134,11 @@ struct FleetTableView: View {
     }
 
     private var table: some View {
+        // TableColumnBuilder takes at most 10 columns; typed halves also
+        // keep the type checker fast.
         Table(rows, selection: $selected, sortOrder: $sortOrder) {
-            TableColumn("Server", value: \.name) { r in
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(r.name).foregroundStyle(Color.text)
-                    Text(r.host).font(.mono(11)).foregroundStyle(Color.textMuted)
-                }
-            }
-            .width(min: 140, ideal: 180)
-            TableColumn("Status", value: \.health) { r in
-                StatusPill(label: r.state.label, tone: r.state.tone)
-            }
-            .width(min: 110, ideal: 130)
-            TableColumn("CPU", value: \.cpu) { r in metric(r.row.cpuPercent) }.width(56)
-            TableColumn("Memory", value: \.mem) { r in metric(r.row.memPercent) }.width(64)
-            TableColumn("Disk", value: \.disk) { r in metric(r.row.diskPercent) }.width(56)
-            TableColumn("Uptime", value: \.uptime) { r in
-                Text(Format.uptime(r.row.uptimeS)).monospacedDigit()
-            }
-            .width(64)
-            TableColumn("Kernel", value: \.kernel) { r in
-                Text(r.kernel.isEmpty ? "–" : r.kernel).font(.mono(11))
-            }
-            TableColumn("Updates", value: \.updates) { r in
-                Text(r.updates < 0 ? "–" : "\(r.updates)").monospacedDigit()
-            }
-            .width(64)
-            TableColumn("Agent", value: \.agent) { r in
-                Text(r.agent.isEmpty ? "–" : r.agent).font(.mono(11))
-            }
-            .width(64)
-            TableColumn("Last seen", value: \.lastSeen) { r in
-                Text(Format.lastSeen(r.row.lastSeenMs))
-            }
+            leadingColumns
+            trailingColumns
         }
         .contextMenu(forSelectionType: String.self) { ids in
             Button("Open") { if let id = ids.first { selection = .server(id) } }
@@ -176,6 +153,56 @@ struct FleetTableView: View {
         .scrollContentBackground(.hidden)
         .background(Color.card, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.border))
+    }
+
+    @TableColumnBuilder<FleetRow, KeyPathComparator<FleetRow>>
+    private var trailingColumns: some TableColumnContent<FleetRow, KeyPathComparator<FleetRow>> {
+        TableColumn("Updates", value: \.updates) { r in count(r.updates) }
+            .width(64)
+        TableColumn("Vulnerable", value: \.vulnerable) { r in vulnerable(r.vulnerable) }
+            .width(72)
+        TableColumn("Agent", value: \.agent) { r in
+            Text(r.agent.isEmpty ? "–" : r.agent).font(.mono(11))
+        }
+        .width(64)
+        TableColumn("Last seen", value: \.lastSeen) { r in
+            Text(Format.lastSeen(r.row.lastSeenMs))
+        }
+    }
+
+    @TableColumnBuilder<FleetRow, KeyPathComparator<FleetRow>>
+    private var leadingColumns: some TableColumnContent<FleetRow, KeyPathComparator<FleetRow>> {
+        TableColumn("Server", value: \.name) { r in
+            VStack(alignment: .leading, spacing: 1) {
+                Text(r.name).foregroundStyle(Color.text)
+                Text(r.host).font(.mono(11)).foregroundStyle(Color.textMuted)
+            }
+        }
+        .width(min: 140, ideal: 180)
+        TableColumn("Status", value: \.health) { r in
+            StatusPill(label: r.state.label, tone: r.state.tone)
+        }
+        .width(min: 110, ideal: 130)
+        TableColumn("CPU", value: \.cpu) { r in metric(r.row.cpuPercent) }.width(56)
+        TableColumn("Memory", value: \.mem) { r in metric(r.row.memPercent) }.width(64)
+        TableColumn("Disk", value: \.disk) { r in metric(r.row.diskPercent) }.width(56)
+        TableColumn("Uptime", value: \.uptime) { r in
+            Text(Format.uptime(r.row.uptimeS)).monospacedDigit()
+        }
+        .width(64)
+        TableColumn("Kernel", value: \.kernel) { r in
+            Text(r.kernel.isEmpty ? "–" : r.kernel).font(.mono(11))
+        }
+    }
+
+    private func count(_ n: Int) -> Text {
+        Text(n < 0 ? "–" : String(n)).monospacedDigit()
+    }
+
+    private func vulnerable(_ n: Int) -> some View {
+        count(n)
+            .foregroundStyle(n > 0 ? Tone.warn.text : Color.text)
+            .help("Packages with an available security fix")
     }
 
     private func metric(_ v: Float?) -> some View {

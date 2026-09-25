@@ -24,8 +24,9 @@ bindgen = ["uniffi/cli"]
 workspace = true
 
 [dependencies]
-fleet-core.workspace = true
+fleet-core = { workspace = true, features = ["fetch"] }
 fleet-proto.workspace = true
+futures-util.workspace = true
 fleet-crypto.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

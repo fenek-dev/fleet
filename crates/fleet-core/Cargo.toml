@@ -22,6 +22,20 @@ toml.workspace = true
 hex.workspace = true
 serde.workspace = true
 blake3.workspace = true
+# Vulnerability matching and feeds (design §7.7).
+fleet-debver.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+bzip2.workspace = true
+futures-util.workspace = true
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+[features]
+# The HTTPS feed downloader (`vuln::fetch`). The FFI crate enables it;
+# the agent's test harness and fleet-it don't need it.
+fetch = ["dep:reqwest", "dep:rustls"]
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest.workspace = true

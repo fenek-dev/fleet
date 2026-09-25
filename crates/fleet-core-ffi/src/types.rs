@@ -217,6 +217,9 @@ pub enum FleetError {
     /// A stream ended or failed verification.
     #[error("stream: {message}")]
     Stream { message: String },
+    /// Vulnerability feed download, parse or database failure.
+    #[error("vulnerability data: {message}")]
+    VulnData { message: String },
 }
 
 impl From<fleet_core::sftp::SftpError> for FleetError {

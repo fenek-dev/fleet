@@ -60,7 +60,8 @@ struct ServerDetailView: View {
             case .services: ServicesTab(server: s)
             case .firewall: FirewallTab(server: s)
             case .packages: PackagesTab(server: s)
-            case .docker, .cron, .config, .timeline: PlaceholderTab(name: tab.rawValue)
+            case .timeline: TimelineTab(server: s)
+            case .docker, .cron, .config: PlaceholderTab(name: tab.rawValue)
             }
         }
     }

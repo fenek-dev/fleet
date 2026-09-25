@@ -326,78 +326,10 @@ pub fn merge_history(
     all.split_off(skip)
 }
 
-// ---- Debian version comparison (dpkg `verrevcmp`) ----
-
-fn split_version(v: &str) -> (u64, &str, &str) {
-    let (epoch, rest) = match v.split_once(':') {
-        Some((e, r)) => (e.parse().unwrap_or(0), r),
-        None => (0, v),
-    };
-    match rest.rsplit_once('-') {
-        Some((u, r)) => (epoch, u, r),
-        None => (epoch, rest, ""),
-    }
-}
-
-fn order(c: Option<u8>) -> i32 {
-    match c {
-        None => 0,
-        Some(b'~') => -1,
-        Some(c) if c.is_ascii_digit() => 0,
-        Some(c) if c.is_ascii_alphabetic() => i32::from(c),
-        Some(c) => i32::from(c) + 256,
-    }
-}
-
-fn is_digit(c: Option<&u8>) -> bool {
-    c.is_some_and(u8::is_ascii_digit)
-}
-
-fn verrevcmp(a: &[u8], b: &[u8]) -> Ordering {
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() || j < b.len() {
-        while (i < a.len() && !a[i].is_ascii_digit()) || (j < b.len() && !b[j].is_ascii_digit()) {
-            let (ac, bc) = (order(a.get(i).copied()), order(b.get(j).copied()));
-            if ac != bc {
-                return ac.cmp(&bc);
-            }
-            i += 1;
-            j += 1;
-        }
-        while a.get(i) == Some(&b'0') {
-            i += 1;
-        }
-        while b.get(j) == Some(&b'0') {
-            j += 1;
-        }
-        let mut first_diff = Ordering::Equal;
-        while is_digit(a.get(i)) && is_digit(b.get(j)) {
-            if first_diff == Ordering::Equal {
-                first_diff = a[i].cmp(&b[j]);
-            }
-            i += 1;
-            j += 1;
-        }
-        if is_digit(a.get(i)) {
-            return Ordering::Greater;
-        }
-        if is_digit(b.get(j)) {
-            return Ordering::Less;
-        }
-        if first_diff != Ordering::Equal {
-            return first_diff;
-        }
-    }
-    Ordering::Equal
-}
-
-/// Debian version order (`dpkg --compare-versions`).
+/// Debian version order (`dpkg --compare-versions`); shared with the Mac's
+/// vulnerability matching (`fleet-debver`).
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    let (ea, ua, ra) = split_version(a);
-    let (eb, ub, rb) = split_version(b);
-    ea.cmp(&eb)
-        .then_with(|| verrevcmp(ua.as_bytes(), ub.as_bytes()))
-        .then_with(|| verrevcmp(ra.as_bytes(), rb.as_bytes()))
+    fleet_debver::compare(a, b)
 }
 
 /// Changes between two `dpkg-query` snapshots, sorted by name. Packages

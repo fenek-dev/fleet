@@ -12,10 +12,14 @@
 //!   per-server policy (§5.4).
 //! - [`sftp`]: file browser over the server's SSH connection (§2.3).
 //! - [`signer`]: the Secure Enclave signing interface Swift implements (§7.1).
+//! - [`vuln`]: vulnerability feeds and matching (§2.4, §7.7);
+//!   [`fleetsearch`]: fleet-wide `search.*` fan-out (§2.7); [`timeline`]:
+//!   the unified per-server and fleet timeline (§2.7).
 #![forbid(unsafe_code)]
 
 pub mod cache;
 pub mod enroll;
+pub mod fleetsearch;
 pub mod install;
 pub mod manager;
 pub mod policy;
@@ -23,6 +27,8 @@ pub mod session;
 pub mod sftp;
 pub mod signer;
 pub mod ssh;
+pub mod timeline;
+pub mod vuln;
 
 pub use session::{
     ClientError, CommandOpts, CommandSigner, HelloInfo, MAX_BUFFERED_EVENTS, PendingReply, Reply,
