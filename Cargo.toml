@@ -7,6 +7,7 @@ members = [
     "crates/fleet-core",
     "crates/fleet-core-ffi",
     "crates/fleet-ops",
+    "crates/fleet-hardening",
     "crates/fleet-it",
     "crates/fleetctl-proto",
     "crates/fleetctl",
@@ -36,6 +37,7 @@ fleet-core = { path = "crates/fleet-core" }
 fleet-ops = { path = "crates/fleet-ops" }
 fleetctl-proto = { path = "crates/fleetctl-proto" }
 fleet-debver = { path = "crates/fleet-debver" }
+fleet-hardening = { path = "crates/fleet-hardening" }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }

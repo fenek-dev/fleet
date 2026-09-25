@@ -125,8 +125,8 @@ pub trait Revert {
 pub struct RevertError(pub ChangeKind);
 
 /// Production reverter: dispatches by kind to the `fleet_ops::Revertible`
-/// modules in `Reverters::with_generic()` (the same set exec snapshots
-/// with). A kind without a module fails, so the revert is audited as
+/// modules in `fleet_hardening::reverters()` (generic ones plus the
+/// profile module; the same set exec snapshots with). A kind without a module fails, so the revert is audited as
 /// `Failed` rather than falsely claiming the snapshot was restored.
 pub struct RegistryRevert {
     pub reverters: fleet_ops::Reverters,
@@ -147,7 +147,7 @@ impl RegistryRevert {
 
     pub fn system() -> Self {
         Self {
-            reverters: fleet_ops::Reverters::with_generic(),
+            reverters: fleet_hardening::reverters(),
             ctx: SysCtx::system(),
             probe: true,
         }

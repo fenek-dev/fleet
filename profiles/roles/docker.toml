@@ -1,0 +1,36 @@
+# Docker / Compose role add-on (design §9.6).
+
+[role]
+id = "docker"
+description = "Docker Engine and the Compose plugin from Docker's apt repository"
+modules = ["role.docker"]
+packages = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"]
+# Tracked in config history (design §4.9).
+tracked_paths = ["/etc/docker/daemon.json", "/etc/apt/sources.list.d/fleet-docker.sources"]
+health_checks = ["docker.service"]
+
+[apt_repo]
+name = "docker"
+# `{os}` is `debian` or `ubuntu` (/etc/os-release ID).
+key_url = "https://download.docker.com/linux/{os}/gpg"
+# Docker Release (CE deb) <docker@docker.com>. The downloaded key must have
+# exactly this primary fingerprint or nothing is installed.
+fingerprint = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+uri = "https://download.docker.com/linux/{os}"
+components = ["stable"]
+# Pinned to one major version; bumping it is a profile change.
+pin_packages = ["docker-ce", "docker-ce-cli"]
+pin_version = "5:28.*"
+
+[sysctl]
+"net.ipv4.ip_forward" = "1"
+
+[kernel]
+load = ["br_netfilter"]
+
+[exceptions]
+"sysctl.net.ipv4.ip_forward" = "required by role: docker"
+"kernel.modules.br_netfilter" = "required by role: docker"
+
+# Published container ports are declared per project (forward chain,
+# design §4.8); the role itself opens nothing.

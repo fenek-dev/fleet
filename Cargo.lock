@@ -1166,6 +1166,7 @@ dependencies = [
  "blake3",
  "fleet-core",
  "fleet-crypto",
+ "fleet-hardening",
  "fleet-ops",
  "fleet-proto",
  "hex",
@@ -1258,6 +1259,20 @@ name = "fleet-debver"
 version = "0.1.0"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "fleet-hardening"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fleet-crypto",
+ "fleet-ops",
+ "fleet-proto",
+ "rustix",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

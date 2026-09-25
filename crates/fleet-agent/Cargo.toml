@@ -13,6 +13,7 @@ workspace = true
 fleet-proto.workspace = true
 fleet-crypto.workspace = true
 fleet-ops.workspace = true
+fleet-hardening.workspace = true
 serde.workspace = true
 postcard.workspace = true
 blake3.workspace = true
