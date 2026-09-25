@@ -199,7 +199,7 @@ pub fn list(
     let users: HashMap<u32, String> = ctx
         .procfs
         .read("/etc/passwd")
-        .map(|t| parse::passwd(&t).into_iter().collect())
+        .map(|t| crate::users::parse::uid_names(&t))
         .unwrap_or_default();
     let btime_ms = ctx
         .procfs

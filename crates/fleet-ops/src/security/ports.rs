@@ -115,18 +115,13 @@ pub fn socket_owners(ctx: &SysCtx, wanted: &BTreeSet<u64>) -> HashMap<u64, u32> 
 
 /// uid → name from `/etc/passwd`.
 fn users(ctx: &SysCtx) -> HashMap<u32, String> {
-    ctx.procfs
-        .read("/etc/passwd")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split(':').collect();
-            Some((
-                f.get(2)?.parse().ok()?,
-                (*f.first()?).chars().take(64).collect(),
-            ))
-        })
-        .collect()
+    let mut m = crate::users::parse::uid_names(&ctx.procfs.read("/etc/passwd").unwrap_or_default());
+    for name in m.values_mut() {
+        if name.chars().count() > 64 {
+            *name = name.chars().take(64).collect();
+        }
+    }
+    m
 }
 
 /// Socket owners of the last scan. The `/proc/*/fd` walk is by far the

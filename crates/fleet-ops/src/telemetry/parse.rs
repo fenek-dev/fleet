@@ -361,18 +361,6 @@ pub fn cmdline(raw: &[u8], max: usize) -> String {
     s
 }
 
-/// `/etc/passwd` uid → name.
-pub fn passwd(text: &str) -> Vec<(u32, String)> {
-    text.lines()
-        .filter_map(|l| {
-            let mut f = l.split(':');
-            let name = f.next()?;
-            let uid = f.nth(1)?.parse().ok()?;
-            Some((uid, name.to_owned()))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,8 +458,8 @@ mod tests {
         );
         assert_eq!(cmdline(b"abcdef", 3), "abc");
         assert_eq!(cmdline("é".as_bytes(), 1), "");
-        let p = passwd(&fixture("etc/passwd"));
-        assert!(p.contains(&(33, "www-data".to_owned())));
+        let p = crate::users::parse::uid_names(&fixture("etc/passwd"));
+        assert_eq!(p.get(&33).map(String::as_str), Some("www-data"));
     }
 
     #[test]
