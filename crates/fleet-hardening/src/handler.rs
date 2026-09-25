@@ -1,7 +1,9 @@
 //! `profile.check`, `profile.plan`, `profile.apply` and `audit.run`
-//! (design §4.2, §9). `profile.apply` runs under exec's auto-revert
-//! protocol (`ChangeKind::Profile`, [`crate::revert::ProfileRevert`]);
-//! the handler only applies and answers `ChangePending`.
+//! (design §4.2, §9). `profile.apply` answers `ProfileApplied` (per-module
+//! results, score before and after); when its phase may touch sshd or
+//! the firewall (`Op::auto_revert`), exec runs it under the auto-revert
+//! protocol (`ChangeKind::Profile`, [`crate::revert::ProfileRevert`]) and
+//! wraps that result in `ChangePending`.
 
 use crate::engine::{self, Report};
 use crate::module::Status;
@@ -11,7 +13,7 @@ use fleet_ops::handler::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput, R
 use fleet_proto::alert::Severity;
 use fleet_proto::op::tag;
 use fleet_proto::payload::{
-    AuditFinding, AuditReport, ChangeKind, ModuleCheck, ModuleStatus, PendingChange, PlannedChange,
+    AuditFinding, AuditReport, ModuleCheck, ModuleStatus, PlannedChange, ProfileApplied,
     ProfileCheck, ProfilePlan,
 };
 use fleet_proto::{ErrorCode, Op, Payload};
@@ -34,9 +36,7 @@ fn clip(s: &str) -> String {
     out
 }
 
-/// Wire status and detail. `PendingReboot` has no wire variant yet: it is
-/// reported as compliant with a "pending reboot" detail (the change is
-/// made; it takes effect at boot).
+/// Wire status and detail.
 pub fn wire_status(r: &Report) -> (ModuleStatus, String) {
     if let Some(reason) = &r.skipped {
         return (ModuleStatus::Skipped, clip(reason));
@@ -45,10 +45,7 @@ pub fn wire_status(r: &Report) -> (ModuleStatus, String) {
         Ok(Status::Compliant) => (ModuleStatus::Compliant, String::new()),
         Ok(Status::Drifted(d)) => (ModuleStatus::Drifted, clip(d)),
         Ok(Status::NotApplicable(d)) => (ModuleStatus::NotApplicable, clip(d)),
-        Ok(Status::PendingReboot(d)) => (
-            ModuleStatus::Compliant,
-            clip(&format!("pending reboot: {d}")),
-        ),
+        Ok(Status::PendingReboot(d)) => (ModuleStatus::PendingReboot, clip(d)),
         Err(d) => (ModuleStatus::Error, clip(d)),
     }
 }
@@ -100,7 +97,11 @@ pub fn audit_report(ctx: &crate::Ctx) -> AuditReport {
         findings.push(AuditFinding {
             module: r.id.to_owned(),
             status,
-            severity: if r.skipped.is_some() || status == ModuleStatus::Compliant {
+            severity: if r.skipped.is_some()
+                || matches!(
+                    status,
+                    ModuleStatus::Compliant | ModuleStatus::PendingReboot
+                ) {
                 Severity::Info
             } else {
                 r.severity
@@ -126,7 +127,7 @@ pub fn profile_plan(ctx: &crate::Ctx) -> Result<ProfilePlan, OpError> {
     let plan = engine::plan(ctx)?;
     let remote: Vec<&str> = engine::modules_of(&ctx.profile)
         .iter()
-        .filter(|m| m.phase() == crate::Phase::Remote)
+        .filter(|m| m.phase() == crate::Phase::Access)
         .map(|m| m.id())
         .collect();
     Ok(ProfilePlan {
@@ -157,18 +158,27 @@ impl ProfileHandler {
             Op::ProfilePlan(spec) => {
                 Payload::ProfilePlan(profile_plan(&engine::load(spec, ctx, op_id).await?)?)
             }
-            Op::ProfileApply { spec, plan_hash } => {
+            Op::ProfileApply {
+                spec,
+                plan_hash,
+                phase,
+                password_hash,
+            } => {
                 let mut c = engine::load(spec, ctx, op_id).await?;
-                engine::apply(&mut c, plan_hash).await?;
-                // Exec fills in id, deadline and origin. No version: a
-                // profile revert always restores (the lockout-safe side).
-                Payload::ChangePending(PendingChange {
-                    change_id: [0; 16],
-                    kind: ChangeKind::Profile,
-                    op_tag: tag::PROFILE_APPLY,
-                    created_ms: 0,
-                    deadline_ms: 0,
-                    new_version: None,
+                let score_before = engine::score(&engine::check(&c));
+                let modules =
+                    engine::apply(&mut c, plan_hash, *phase, password_hash.as_ref()).await?;
+                // Facts (packages, units, the firewall) changed: gather
+                // them again for the score after.
+                let after = engine::load(spec, ctx, op_id).await?;
+                // Exec wraps this in `ChangePending` when the phase armed
+                // auto-revert. No version: a profile revert always
+                // restores (the lockout-safe side).
+                Payload::ProfileApplied(ProfileApplied {
+                    modules,
+                    pending: None,
+                    score_before,
+                    score_after: engine::score(&engine::check(&after)),
                 })
             }
             Op::AuditRun { level } => {
@@ -187,8 +197,19 @@ impl ProfileHandler {
 impl OpHandler for ProfileHandler {
     fn validate(&self, ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<(), OpError> {
         match op {
-            Op::ProfileCheck(spec) | Op::ProfilePlan(spec) | Op::ProfileApply { spec, .. } => {
-                profile::resolve(spec, ctx).map(drop)
+            Op::ProfileCheck(spec) | Op::ProfilePlan(spec) => profile::resolve(spec, ctx).map(drop),
+            Op::ProfileApply {
+                spec,
+                phase,
+                password_hash,
+                ..
+            } => {
+                let mut p = profile::resolve(spec, ctx)?;
+                engine::check_phase(&p, *phase)?;
+                if let Some(h) = password_hash {
+                    p.set_password(h)?;
+                }
+                Ok(())
             }
             Op::AuditRun { .. } => Ok(()),
             _ => Err(ErrorCode::Unsupported.into()),

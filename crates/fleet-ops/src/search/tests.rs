@@ -18,7 +18,7 @@ fn q(term: &str, limit: u32) -> SearchQuery {
 
 const QUERY: [&str; 2] = [
     "-W",
-    "-f=${Package}\\t${Architecture}\\t${Version}\\t${db:Status-Want}\\t${db:Status-Status}\\n",
+    "-f=${Package}\\t${Architecture}\\t${Version}\\t${db:Status-Want}\\t${db:Status-Status}\\t${source:Package}\\t${source:Version}\\n",
 ];
 
 #[test]
@@ -29,9 +29,9 @@ fn packages_by_name() {
         DPKG_QUERY,
         &QUERY,
         Ok(CommandOutput::ok(
-            "nginx\tamd64\t1.22.1-9\tinstall\tinstalled\n\
-             nginx-common\tall\t1.22.1-9\tinstall\tinstalled\n\
-             openssl\tamd64\t3.0.11\tinstall\tinstalled\n",
+            "nginx\tamd64\t1.22.1-9\tinstall\tinstalled\tnginx\t1.22.1-9\n\
+             nginx-common\tall\t1.22.1-9\tinstall\tinstalled\tnginx\t1.22.1-9\n\
+             openssl\tamd64\t3.0.11\tinstall\tinstalled\topenssl\t3.0.11\n",
         )),
     );
     let c = ctx(d.path(), r);

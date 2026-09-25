@@ -410,7 +410,9 @@ fn get_and_set_never_touch_roster_section() {
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), orig);
 
-    let Payload::ChangePending(p) = run_set(&h, &c, op, Some(before.version)).unwrap() else {
+    let Payload::ChangePending { change: p, .. } =
+        run_set(&h, &c, op, Some(before.version)).unwrap()
+    else {
         panic!()
     };
     let text = std::fs::read_to_string(&path).unwrap();

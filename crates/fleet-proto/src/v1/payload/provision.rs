@@ -56,9 +56,13 @@ pub struct ModuleResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileApplied {
+    /// The phase's modules, in apply order.
     pub modules: Vec<ModuleResult>,
-    /// Set when an SSH/firewall step armed auto-revert.
+    /// Always `None` from the agent: when the phase armed auto-revert,
+    /// this result arrives as `Payload::ChangePending { inner }` and the
+    /// outer payload carries the pending change.
     pub pending: Option<PendingChange>,
+    /// Profile score (0..=100, every phase of the spec) before and after.
     pub score_before: u8,
     pub score_after: u8,
 }

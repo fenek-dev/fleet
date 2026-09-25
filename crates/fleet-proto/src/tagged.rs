@@ -60,7 +60,39 @@ pub(crate) fn serialize<T: Tagged, S: Serializer>(value: &T, s: S) -> Result<S::
     t.end()
 }
 
+/// Deepest nesting of tagged values (e.g. `Payload::ChangePending` holding
+/// a `Payload`, `SignedEvents` holding `Event`s). Decoding recurses, so
+/// without a bound a hostile frame of nested values could exhaust the
+/// stack.
+const MAX_NESTING: u8 = 8;
+
+thread_local! {
+    static DEPTH: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+}
+
+/// One level of tagged nesting, released on drop.
+struct Nesting;
+
+impl Nesting {
+    fn enter() -> Option<Nesting> {
+        DEPTH.with(|d| {
+            (d.get() < MAX_NESTING).then(|| {
+                d.set(d.get() + 1);
+                Nesting
+            })
+        })
+    }
+}
+
+impl Drop for Nesting {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 pub(crate) fn deserialize<'de, T: Tagged, D: Deserializer<'de>>(d: D) -> Result<T, D::Error> {
+    let _level =
+        Nesting::enter().ok_or_else(|| D::Error::custom("tagged values nested too deep"))?;
     struct V<T>(core::marker::PhantomData<T>);
     impl<'de, T: Tagged> Visitor<'de> for V<T> {
         type Value = T;

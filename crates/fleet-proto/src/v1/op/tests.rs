@@ -222,6 +222,7 @@ pub(super) fn samples() -> Vec<Op> {
             | Op::RosterUpdate { .. }
             | Op::RosterPending
             | Op::RosterVeto { .. }
+            | Op::RosterGet
             | Op::PolicyUpdate { .. }
             | Op::AgentUpdateStage { .. }
             | Op::AgentUpdateCommit { .. }
@@ -498,6 +499,8 @@ pub(super) fn samples() -> Vec<Op> {
         Op::ProfileApply {
             spec: spec(),
             plan_hash: [4; 32],
+            phase: ProfilePhase::Access,
+            password_hash: None,
         },
         Op::SearchPackages(search()),
         Op::SearchPorts(search()),
@@ -547,6 +550,7 @@ pub(super) fn samples() -> Vec<Op> {
         Op::RosterVeto {
             pending_hash: [7; 32],
         },
+        Op::RosterGet,
         Op::PolicyUpdate {
             policy_toml: "version = 1".into(),
         },
@@ -750,6 +754,7 @@ fn tier_table() {
         "game.backups.list",
         "agent.health",
         "roster.pending",
+        "roster.get",
         "alert_rules.get",
     ];
     const ELEVATED: &[&str] = &[
@@ -858,6 +863,8 @@ fn conditional_tiers() {
     let apply = |spec| Op::ProfileApply {
         spec,
         plan_hash: [0; 32],
+        phase: ProfilePhase::All,
+        password_hash: None,
     };
     assert_eq!(apply(spec()).tier(), Tier::Change);
     assert_eq!(apply(custom_spec()).tier(), Tier::Elevated);
@@ -979,6 +986,117 @@ fn check_args_rejects() {
 }
 
 #[test]
+fn profile_apply_phases() {
+    let only = |ids: &[&str]| ProfileSpec {
+        only: ids.iter().map(|i| ModuleId::new(*i).unwrap()).collect(),
+        ..spec()
+    };
+    let hash = SudoPasswordHash::crypt("$y$j9T$abcdefghijklmnop$ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+        .unwrap();
+    let apply = |spec: ProfileSpec, phase, pw: Option<SudoPasswordHash>| Op::ProfileApply {
+        spec,
+        plan_hash: [0; 32],
+        phase,
+        password_hash: pw,
+    };
+    use ProfilePhase::*;
+    // Auto-revert only when an SSH/firewall module may run.
+    assert!(apply(only(&[]), Access, None).auto_revert());
+    assert!(apply(only(&[]), All, None).auto_revert());
+    assert!(apply(only(&["sysctl", "firewall.baseline"]), All, None).auto_revert());
+    assert!(!apply(only(&["sysctl"]), All, None).auto_revert());
+    assert!(!apply(only(&[]), Accounts, None).auto_revert());
+    assert!(!apply(only(&[]), System, None).auto_revert());
+    for phase in [Accounts, Access, System, All] {
+        assert!(apply(only(&[]), phase, None).check_args().is_ok());
+    }
+    // `only` must fit the phase (as far as access modules go).
+    assert!(
+        apply(only(&["ssh.hardening"]), System, None)
+            .check_args()
+            .is_err()
+    );
+    assert!(
+        apply(only(&["firewall.baseline"]), Accounts, None)
+            .check_args()
+            .is_err()
+    );
+    assert!(apply(only(&["sysctl"]), Access, None).check_args().is_err());
+    assert!(apply(only(&["sysctl"]), System, None).check_args().is_ok());
+    // A password only where `admin.user` runs, never the audit form.
+    assert!(
+        apply(only(&[]), Accounts, Some(hash.clone()))
+            .check_args()
+            .is_ok()
+    );
+    assert!(
+        apply(only(&[]), All, Some(hash.clone()))
+            .check_args()
+            .is_ok()
+    );
+    assert!(
+        apply(only(&[]), Access, Some(hash.clone()))
+            .check_args()
+            .is_err()
+    );
+    assert!(
+        apply(only(&[]), System, Some(hash.clone()))
+            .check_args()
+            .is_err()
+    );
+    assert!(
+        apply(only(&[]), Accounts, Some(hash.redacted()))
+            .check_args()
+            .is_err()
+    );
+    // Tier doesn't depend on the phase.
+    assert_eq!(apply(only(&[]), System, None).tier(), Tier::Change);
+    assert_eq!(apply(custom_spec(), Accounts, None).tier(), Tier::Elevated);
+}
+
+#[test]
+fn audit_summary_redacts_the_password_hash() {
+    let crypt = "$6$saltsalt$0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ./";
+    let op = Op::ProfileApply {
+        spec: spec(),
+        plan_hash: [1; 32],
+        phase: ProfilePhase::Accounts,
+        password_hash: Some(SudoPasswordHash::crypt(crypt).unwrap()),
+    };
+    let s = crate::v1::OpSummary::from(&op);
+    assert_eq!(s.tag, tag::PROFILE_APPLY);
+    let hay = String::from_utf8_lossy(&s.args);
+    assert!(!hay.contains("saltsalt"), "crypt hash in the audit args");
+    assert!(
+        !format!("{op:?}").contains("saltsalt"),
+        "crypt hash in Debug"
+    );
+    // The audit args still decode, with the BLAKE3 in place of the hash.
+    let Op::ProfileApply {
+        password_hash: Some(h),
+        phase,
+        ..
+    } = <Op as crate::tagged::Tagged>::from_wire(s.tag, &s.args).unwrap()
+    else {
+        panic!("audit args don't decode");
+    };
+    assert!(h.is_redacted());
+    assert_eq!(phase, ProfilePhase::Accounts);
+    assert_eq!(
+        h.expose(),
+        format!(
+            "$blake3${}",
+            hex::encode(blake3::hash(crypt.as_bytes()).as_bytes())
+        )
+    );
+    // Everything else is the plain wire payload.
+    assert_eq!(
+        crate::v1::OpSummary::from(&Op::RosterGet).args,
+        Op::RosterGet.payload()
+    );
+}
+
+#[test]
 fn stream_and_session_sets() {
     let names = |f: fn(&Op) -> bool| -> Vec<&'static str> {
         samples().into_iter().filter(f).map(|o| o.name()).collect()
@@ -995,11 +1113,21 @@ fn stream_and_session_sets() {
     );
     assert_eq!(
         names(Op::monitor_allowed),
-        ["metrics.subscribe", "events.query", "agent.health"]
+        [
+            "metrics.subscribe",
+            "events.query",
+            "agent.health",
+            "roster.get"
+        ]
     );
     assert_eq!(
         names(Op::recovery_allowed),
-        ["system.info", "roster.update", "roster.pending"]
+        [
+            "system.info",
+            "roster.update",
+            "roster.pending",
+            "roster.get"
+        ]
     );
     assert_eq!(
         names(Op::auto_revert),

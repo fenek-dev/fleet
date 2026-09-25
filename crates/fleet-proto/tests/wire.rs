@@ -340,7 +340,9 @@ fn message() -> impl Strategy<Value = Message> {
             prop_oneof![
                 Just(Ok(Payload::Empty)),
                 prop::option::of(pending()).prop_map(|p| Ok(Payload::RosterPending(p))),
-                (4u16..).prop_map(|tag| Ok(Payload::Unknown { tag })),
+                any::<u16>()
+                    .prop_filter("unknown", |t| !Payload::is_known_tag(*t))
+                    .prop_map(|tag| Ok(Payload::Unknown { tag })),
                 error_code().prop_map(Err),
             ],
             prop::option::of(receipt)
@@ -605,6 +607,28 @@ fn golden_vectors_v1() {
     );
     check("op_agent_health", &Op::AgentHealth, &mut f);
     check("op_roster_pending", &Op::RosterPending, &mut f);
+    check("op_roster_get", &Op::RosterGet, &mut f);
+    check(
+        "op_profile_apply_accounts",
+        &Op::ProfileApply {
+            spec: op::ProfileSpec {
+                source: op::ProfileSource::Builtin {
+                    level: op::ProfileLevel::Baseline,
+                    roles: vec![op::ProfileRole::Docker],
+                },
+                only: vec![],
+            },
+            plan_hash: [0x7a; 32],
+            phase: op::ProfilePhase::Accounts,
+            password_hash: Some(
+                args::SudoPasswordHash::crypt(
+                    "$y$j9T$abcdefghijklmnop$ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+                )
+                .unwrap(),
+            ),
+        },
+        &mut f,
+    );
     check(
         "op_roster_update",
         &Op::RosterUpdate {
@@ -988,13 +1012,75 @@ fn catalog_vectors(body: &CommandBody, f: &mut Vec<String>) {
     );
     check(
         "payload_change_pending",
-        &Payload::ChangePending(payload::PendingChange {
-            change_id: [0xc4; 16],
-            kind: payload::ChangeKind::Firewall,
-            op_tag: op::tag::FIREWALL_APPLY,
-            created_ms: 1_750_000_000_000,
-            deadline_ms: 1_750_000_060_000,
-            new_version: Some(42),
+        &Payload::ChangePending {
+            change: payload::PendingChange {
+                change_id: [0xc4; 16],
+                kind: payload::ChangeKind::Firewall,
+                op_tag: op::tag::FIREWALL_APPLY,
+                created_ms: 1_750_000_000_000,
+                deadline_ms: 1_750_000_060_000,
+                new_version: Some(42),
+            },
+            inner: None,
+        },
+        f,
+    );
+    check(
+        "payload_change_pending_profile_applied",
+        &Payload::ChangePending {
+            change: payload::PendingChange {
+                change_id: [0xc5; 16],
+                kind: payload::ChangeKind::Profile,
+                op_tag: op::tag::PROFILE_APPLY,
+                created_ms: 1_750_000_000_000,
+                deadline_ms: 1_750_000_060_000,
+                new_version: None,
+            },
+            inner: Some(Box::new(Payload::ProfileApplied(payload::ProfileApplied {
+                modules: vec![payload::ModuleResult {
+                    id: "ssh.hardening".into(),
+                    outcome: payload::ModuleOutcome::Applied,
+                    detail: String::new(),
+                }],
+                pending: None,
+                score_before: 41,
+                score_after: 77,
+            }))),
+        },
+        f,
+    );
+    check(
+        "payload_roster_state",
+        &Payload::RosterState(Box::new(payload::RosterState {
+            roster: fixture_roster(),
+            epoch_hashes: vec![[0x5a; 32]],
+        })),
+        f,
+    );
+    check(
+        "payload_packages_with_source",
+        &Payload::Packages(payload::Packages {
+            packages: vec![payload::PackageInfo {
+                name: "libssl3".into(),
+                version: "3.0.11-1~deb12u2".into(),
+                arch: "amd64".into(),
+                held: false,
+                auto_installed: true,
+                source: Some("openssl".into()),
+                source_version: Some("3.0.11-1~deb12u2".into()),
+            }],
+        }),
+        f,
+    );
+    check(
+        "payload_profile_check_pending_reboot",
+        &Payload::ProfileCheck(payload::ProfileCheck {
+            score: 88,
+            modules: vec![payload::ModuleCheck {
+                id: "auditd".into(),
+                status: payload::ModuleStatus::PendingReboot,
+                detail: "immutable audit rules load at boot".into(),
+            }],
         }),
         f,
     );

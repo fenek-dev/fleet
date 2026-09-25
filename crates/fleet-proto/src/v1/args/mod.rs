@@ -16,6 +16,7 @@ mod net;
 mod path;
 mod query;
 mod sched;
+mod secret;
 mod ssh;
 mod text;
 
@@ -30,6 +31,7 @@ pub use net::{Cidr, Endpoint, Port, PortRange, Protocol, WgKey, WgPeer};
 pub use path::{AbsPath, AllowedPath};
 pub use query::{JournalQuery, Priority, SearchQuery, TimeRange};
 pub use sched::{CronSpec, Nice, Pid, Signal};
+pub use secret::SudoPasswordHash;
 pub use ssh::{SshKeyAlgo, SshPublicKey};
 pub use std::net::IpAddr;
 pub use text::{

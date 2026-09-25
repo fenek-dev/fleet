@@ -9,8 +9,9 @@ use fleet_ops::Revertible;
 use fleet_ops::handler::{Invocation, OpHandler, OpMeta, OpOutput};
 use fleet_ops::runner::CommandOutput;
 use fleet_proto::args::ModuleId;
-use fleet_proto::op::{ProfileLevel, ProfileSource, ProfileSpec};
-use fleet_proto::payload::{ChangeKind, ModuleStatus};
+use fleet_proto::args::SudoPasswordHash;
+use fleet_proto::op::{ProfileLevel, ProfilePhase, ProfileSource, ProfileSpec};
+use fleet_proto::payload::{ModuleOutcome, ModuleStatus};
 use fleet_proto::{
     Actor, CommandBody, DeviceId, ErrorCode, FleetId, KeyKind, Op, Payload, ServerId,
 };
@@ -50,6 +51,22 @@ fn run(env: &Env, op: Op) -> Result<Payload, fleet_ops::handler::OpError> {
         OpOutput::Payload(p) => Ok(p),
         OpOutput::Stream(_) => panic!("stream"),
     }
+}
+
+fn apply(spec: ProfileSpec, plan_hash: [u8; 32], phase: ProfilePhase) -> Op {
+    Op::ProfileApply {
+        spec,
+        plan_hash,
+        phase,
+        password_hash: None,
+    }
+}
+
+fn plan_of(env: &Env, spec: ProfileSpec) -> fleet_proto::payload::ProfilePlan {
+    let Payload::ProfilePlan(plan) = run(env, Op::ProfilePlan(spec)).unwrap() else {
+        panic!()
+    };
+    plan
 }
 
 fn spec(only: &[&str]) -> ProfileSpec {
@@ -137,10 +154,7 @@ fn plan_then_apply_through_the_handler() {
     // A stale hash: refused before anything runs.
     let e = run(
         &env,
-        Op::ProfileApply {
-            spec: spec(&["ssh.hardening"]),
-            plan_hash: [0; 32],
-        },
+        apply(spec(&["ssh.hardening"]), [0; 32], ProfilePhase::Access),
     )
     .unwrap_err();
     assert!(matches!(e.code(), ErrorCode::VersionConflict { .. }));
@@ -150,19 +164,22 @@ fn plan_then_apply_through_the_handler() {
         "/usr/bin/systemctl",
         &["try-reload-or-restart", "--", "ssh.service"],
     );
-    let p = run(
-        &env,
-        Op::ProfileApply {
-            spec: spec(&["ssh.hardening"]),
-            plan_hash: plan.plan_hash,
-        },
-    )
-    .unwrap();
-    let Payload::ChangePending(pc) = p else {
+    let op = apply(
+        spec(&["ssh.hardening"]),
+        plan.plan_hash,
+        ProfilePhase::Access,
+    );
+    assert!(op.auto_revert());
+    // The handler's real result (exec wraps it in `ChangePending`).
+    let Payload::ProfileApplied(pa) = run(&env, op).unwrap() else {
         panic!()
     };
-    assert_eq!(pc.kind, ChangeKind::Profile);
-    assert_eq!(pc.new_version, None);
+    assert_eq!(pa.modules.len(), 1);
+    assert_eq!(pa.modules[0].id, "ssh.hardening");
+    assert_eq!(pa.modules[0].outcome, ModuleOutcome::Applied);
+    assert!(pa.pending.is_none());
+    assert!(pa.score_after > pa.score_before, "{pa:?}");
+    assert_eq!(pa.score_after, 100);
     assert_done(&env);
     assert!(
         env.read(ssh::FLEET_CONF)
@@ -175,6 +192,154 @@ fn plan_then_apply_through_the_handler() {
         panic!()
     };
     assert!(again.changes.is_empty());
+}
+
+#[test]
+fn a_phase_applies_only_its_modules_of_the_hashed_plan() {
+    let env = Env::new().with_admin();
+    // A profile of two modules in different phases, `only` empty.
+    let mut p = baseline();
+    p.modules = vec!["ssh.hardening".into(), "sysctl".into()];
+    let mut c = ctx(&env, p, facts());
+    // One plan (both phases), hashed as the operator saw it.
+    let plan = engine::plan(&c).unwrap();
+    assert!(plan.iter().any(|ch| ch.module == "sysctl"));
+    let hash = engine::plan_hash(&plan);
+    env.ok(ssh::SSHD, &["-t"]);
+    env.ok(
+        "/usr/bin/systemctl",
+        &["try-reload-or-restart", "--", "ssh.service"],
+    );
+    let res = block(engine::apply(&mut c, &hash, ProfilePhase::Access, None)).unwrap();
+    assert_done(&env);
+    let ids: Vec<&str> = res.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["ssh.hardening"]);
+    assert!(env.read(ssh::FLEET_CONF).is_some());
+    assert!(env.read(crate::modules::kernel::SYSCTL_CONF).is_none());
+    // The System phase then runs sysctl, after re-planning: the plan
+    // changed, so the old hash is stale.
+    let stale = block(engine::apply(&mut c, &hash, ProfilePhase::System, None)).unwrap_err();
+    assert!(matches!(stale.code(), ErrorCode::VersionConflict { .. }));
+    let again = engine::plan_hash(&engine::plan(&c).unwrap());
+    env.ok("/usr/sbin/sysctl", &["--ignore", "--system"]);
+    let res = block(engine::apply(&mut c, &again, ProfilePhase::System, None)).unwrap();
+    assert_done(&env);
+    let ids: Vec<&str> = res.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["sysctl"]);
+    assert!(env.read(crate::modules::kernel::SYSCTL_CONF).is_some());
+}
+
+#[test]
+fn only_must_fit_the_phase() {
+    let env = Env::new().with_admin();
+    // sysctl isn't an Accounts module (the proto can't know that).
+    let op = apply(spec(&["sysctl"]), [0; 32], ProfilePhase::Accounts);
+    assert!(op.check_args().is_ok());
+    let e = run(&env, op).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert!(
+        run(
+            &env,
+            apply(spec(&["admin.user"]), [0; 32], ProfilePhase::System)
+        )
+        .is_err()
+    );
+    assert!(env.runner.calls().is_empty());
+}
+
+#[test]
+fn modules_phase_table_matches_the_wire_access_list() {
+    let p = crate::profile::builtin(
+        ProfileLevel::Strict,
+        &[
+            fleet_proto::op::ProfileRole::Docker,
+            fleet_proto::op::ProfileRole::Web,
+            fleet_proto::op::ProfileRole::Game,
+        ],
+    )
+    .unwrap();
+    let access: Vec<&str> = engine::modules_of(&p)
+        .iter()
+        .filter(|m| m.phase() == crate::Phase::Access)
+        .map(|m| m.id())
+        .collect();
+    assert_eq!(access, ProfilePhase::ACCESS_MODULES);
+    for m in engine::modules_of(&p) {
+        assert_eq!(
+            ProfilePhase::is_access_module(m.id()),
+            m.phase().runs_in(ProfilePhase::Access),
+            "{}",
+            m.id()
+        );
+    }
+}
+
+#[test]
+fn password_from_the_command_sets_the_sudo_password() {
+    let env = Env::new().with_admin();
+    let hash = "$y$j9T$abcdefghijklmnop$ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abc";
+    let s = spec(&["admin.user"]);
+    // The plan the operator saw has no password step (it isn't known yet).
+    let plan = plan_of(&env, s.clone());
+    assert!(plan.changes.is_empty(), "{:?}", plan.changes);
+    let op = Op::ProfileApply {
+        spec: s.clone(),
+        plan_hash: plan.plan_hash,
+        phase: ProfilePhase::Accounts,
+        password_hash: Some(SudoPasswordHash::crypt(hash).unwrap()),
+    };
+    assert!(!op.auto_revert());
+    env.ok(crate::modules::access::CHPASSWD, &["--encrypted"]);
+    let Payload::ProfileApplied(pa) = run(&env, op).unwrap() else {
+        panic!()
+    };
+    assert_done(&env);
+    assert_eq!(pa.modules[0].outcome, ModuleOutcome::Applied);
+    let calls = env.runner.calls();
+    let chpasswd = calls
+        .iter()
+        .find(|c| c.program == crate::modules::access::CHPASSWD)
+        .unwrap();
+    assert_eq!(
+        chpasswd.stdin.as_deref(),
+        Some(format!("ops:{hash}\n").as_bytes())
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.args.iter().all(|a| !a.to_string_lossy().contains("j9T")))
+    );
+    // The redacted audit form is refused even past check_args.
+    let redacted = Op::ProfileApply {
+        spec: s,
+        plan_hash: plan.plan_hash,
+        phase: ProfilePhase::Accounts,
+        password_hash: Some(SudoPasswordHash::crypt(hash).unwrap().redacted()),
+    };
+    assert_eq!(
+        run(&env, redacted).unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+}
+
+#[test]
+fn pending_reboot_is_its_own_wire_status() {
+    let r = engine::Report {
+        id: "auditd",
+        title: "audit rules",
+        weight: 5,
+        severity: fleet_proto::alert::Severity::Warning,
+        status: Ok(Status::PendingReboot("immutable rules load at boot".into())),
+        skipped: None,
+        fixable: false,
+    };
+    assert_eq!(
+        crate::handler::wire_status(&r),
+        (
+            ModuleStatus::PendingReboot,
+            "immutable rules load at boot".to_owned()
+        )
+    );
 }
 
 #[test]
@@ -230,10 +395,45 @@ fn custom_profile_exceptions_show_as_skipped() {
 #[test]
 fn revert_snapshot_restores_files_and_reloads() {
     let env = Env::new().with_admin();
-    let op = Op::ProfileApply {
-        spec: spec(&["ssh.hardening", "sysctl"]),
-        plan_hash: [0; 32],
-    };
+    // Access alone: only sshd's files, only its reloads.
+    let access = apply(spec(&[]), [0; 32], ProfilePhase::Access);
+    let env2 = Env::new().with_admin();
+    env2.runner.expect(
+        fleet_ops::firewall::NFT,
+        &["-j", "list", "table", "inet", "fleet"],
+        Ok(CommandOutput {
+            code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"Error: No such file or directory".to_vec(),
+            truncated: false,
+        }),
+    );
+    let only_access =
+        Snapshot::decode(&ProfileRevert.snapshot(&env2.sys, &access).unwrap()).unwrap();
+    assert!(only_access.firewall.is_some());
+    assert!(
+        only_access
+            .files
+            .iter()
+            .all(|f| f.path == ssh::FLEET_CONF || f.path == ssh::SSHD_CONFIG),
+        "{:?}",
+        only_access
+            .files
+            .iter()
+            .map(|f| &f.path)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        only_access
+            .reload
+            .iter()
+            .all(|(p, _)| p == ssh::SSHD || p == "/usr/bin/systemctl")
+    );
+    let op = apply(
+        spec(&["ssh.hardening", "sysctl"]),
+        [0; 32],
+        ProfilePhase::All,
+    );
     let bytes = ProfileRevert.snapshot(&env.sys, &op).unwrap();
     let snap = Snapshot::decode(&bytes).unwrap();
     assert!(snap.firewall.is_none());
@@ -277,10 +477,7 @@ fn revert_covers_the_firewall() {
         &["-j", "list", "table", "inet", "fleet"],
         absent(),
     );
-    let op = Op::ProfileApply {
-        spec: spec(&["firewall.baseline"]),
-        plan_hash: [0; 32],
-    };
+    let op = apply(spec(&["firewall.baseline"]), [0; 32], ProfilePhase::Access);
     let bytes = ProfileRevert.snapshot(&env.sys, &op).unwrap();
     assert!(Snapshot::decode(&bytes).unwrap().firewall.is_some());
     env.ok(fleet_ops::firewall::NFT, &["-f", "-"]);

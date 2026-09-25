@@ -223,14 +223,17 @@ impl AuthorizedKeysHandler {
             },
         });
         // Exec fills in id, deadline and tag (revertible.rs contract).
-        Ok(Payload::ChangePending(PendingChange {
-            change_id: [0; 16],
-            kind: ChangeKind::AuthorizedKeys,
-            op_tag: fleet_proto::op::tag::AUTHORIZED_KEYS_SET,
-            created_ms: meta.now_ms,
-            deadline_ms: 0,
-            new_version: Some(new_version),
-        }))
+        Ok(Payload::ChangePending {
+            change: PendingChange {
+                change_id: [0; 16],
+                kind: ChangeKind::AuthorizedKeys,
+                op_tag: fleet_proto::op::tag::AUTHORIZED_KEYS_SET,
+                created_ms: meta.now_ms,
+                deadline_ms: 0,
+                new_version: Some(new_version),
+            },
+            inner: None,
+        })
     }
 }
 

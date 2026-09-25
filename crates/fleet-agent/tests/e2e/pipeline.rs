@@ -48,15 +48,24 @@ impl OpHandler for TestOps {
             if self.fail {
                 return Err(OpError::new(ErrorCode::Internal));
             }
-            Ok(OpOutput::Payload(if op.auto_revert() {
-                Payload::ChangePending(payload::PendingChange {
-                    change_id: [0; 16],
-                    kind: WireKind::Network,
-                    op_tag: 0,
-                    created_ms: 0,
-                    deadline_ms: 0,
-                    new_version: Some(8),
-                })
+            Ok(OpOutput::Payload(if matches!(op, Op::MeshLeave) {
+                // A handler's own result: exec returns it inside the
+                // `ChangePending` (like `ProfileApplied`).
+                Payload::RconOutput {
+                    text: "left".into(),
+                }
+            } else if op.auto_revert() {
+                Payload::ChangePending {
+                    change: payload::PendingChange {
+                        change_id: [0; 16],
+                        kind: WireKind::Network,
+                        op_tag: 0,
+                        created_ms: 0,
+                        deadline_ms: 0,
+                        new_version: Some(8),
+                    },
+                    inner: None,
+                }
             } else {
                 Payload::Empty
             }))
@@ -124,7 +133,13 @@ fn env_with(groups: &'static str, fail: bool, delay: Duration, apply_timeout: Du
     fx.start_exec_with(move |cfg| {
         let h: Rc<dyn OpHandler> = Rc::new(TestOps { fail, delay });
         cfg.apply_timeout = apply_timeout;
-        for tag in [tag::COMPOSE_DEPLOY, tag::FIREWALL_APPLY, tag::MESH_LEAVE] {
+        cfg.profile_apply_timeout = apply_timeout;
+        for tag in [
+            tag::COMPOSE_DEPLOY,
+            tag::FIREWALL_APPLY,
+            tag::MESH_LEAVE,
+            tag::PROFILE_APPLY,
+        ] {
             cfg.handlers.push((tag, h.clone()));
         }
         let r: Rc<dyn Revertible> = Rc::new(TestRevertible(l.clone()));
@@ -241,7 +256,7 @@ fn pending_files(fx: &Fixture) -> usize {
 
 fn change_id(r: &Reply) -> [u8; 16] {
     match &r.result {
-        Ok(Payload::ChangePending(p)) => p.change_id,
+        Ok(Payload::ChangePending { change: p, .. }) => p.change_id,
         other => panic!("{other:?}"),
     }
 }
@@ -259,13 +274,14 @@ fn auto_revert_then_confirm_over_a_new_session() {
             .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(7)))
             .unwrap();
         let r = s.send(&cmd).await.unwrap();
-        let Ok(Payload::ChangePending(p)) = &r.result else {
+        let Ok(Payload::ChangePending { change: p, inner }) = &r.result else {
             panic!("{r:?}")
         };
         assert_eq!(
             (p.kind, p.op_tag, p.new_version),
             (WireKind::Firewall, tag::FIREWALL_APPLY, Some(8))
         );
+        assert_eq!(inner, &None);
         assert!(p.deadline_ms >= p.created_ms + 60_000);
         let id = p.change_id;
         assert_eq!(e.log.take(), ["snapshot firewall.apply"]);
@@ -362,6 +378,17 @@ fn confirm_allowed_for_the_device_that_made_the_change() {
             .request(Op::MeshLeave, &fx.server, Actor::Human, None)
             .await
             .unwrap();
+        // The handler's result comes back inside the pending change.
+        let Ok(Payload::ChangePending { change, inner }) = &r.result else {
+            panic!("{r:?}")
+        };
+        assert_eq!((change.kind, change.new_version), (WireKind::Mesh, None));
+        assert_eq!(
+            inner.as_deref(),
+            Some(&Payload::RconOutput {
+                text: "left".into()
+            })
+        );
         let id = change_id(&r);
         let confirm = Op::ChangeConfirm { change_id: id };
 
@@ -443,6 +470,82 @@ fn apply_timeout_restores() {
             e.log.take(),
             ["snapshot firewall.apply", "restore firewall.apply"]
         );
+        assert_eq!(pending_files(fx), 0);
+    });
+}
+
+fn profile_apply(phase: fleet_proto::op::ProfilePhase) -> Op {
+    Op::ProfileApply {
+        spec: fleet_proto::op::ProfileSpec {
+            source: fleet_proto::op::ProfileSource::Builtin {
+                level: fleet_proto::op::ProfileLevel::Baseline,
+                roles: vec![],
+            },
+            only: vec![],
+        },
+        plan_hash: [0; 32],
+        phase,
+        password_hash: None,
+    }
+}
+
+/// `profile.apply` phases: System runs without auto-revert (no snapshot,
+/// no pending change, the handler's own answer) under its own timeout;
+/// Access goes through auto-revert (here: no profile module, so
+/// `Unsupported` before anything runs).
+#[test]
+fn profile_phases_and_their_timeouts() {
+    use fleet_proto::op::ProfilePhase;
+    let e = env(r#""system", "profile""#, false);
+    let fx = &e.fx;
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
+        let r = s
+            .request(
+                profile_apply(ProfilePhase::System),
+                &fx.server,
+                Actor::Human,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        assert!(e.log.take().is_empty());
+        assert_eq!(pending_files(fx), 0);
+        let r = s
+            .request(
+                profile_apply(ProfilePhase::Access),
+                &fx.server,
+                Actor::Human,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(err(r), ErrorCode::Unsupported);
+        assert!(e.log.take().is_empty());
+    });
+    // A System phase that outlives its timeout is abandoned: `Timeout`,
+    // nothing to restore.
+    let e = env_with(
+        r#""system", "profile""#,
+        false,
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+    );
+    let fx = &e.fx;
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
+        let r = s
+            .request(
+                profile_apply(ProfilePhase::System),
+                &fx.server,
+                Actor::Human,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(err(r), ErrorCode::Timeout);
+        assert!(e.log.take().is_empty());
         assert_eq!(pending_files(fx), 0);
     });
 }

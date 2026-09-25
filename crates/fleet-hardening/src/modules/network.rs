@@ -122,7 +122,7 @@ impl Module for FirewallBaseline {
         "Firewall: drop inbound by default, rate-limited SSH"
     }
     fn phase(&self) -> Phase {
-        Phase::Remote
+        Phase::Access
     }
     fn weight(&self) -> u8 {
         15

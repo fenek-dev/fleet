@@ -98,6 +98,12 @@ pub struct PackageInfo {
     pub arch: String,
     pub held: bool,
     pub auto_installed: bool,
+    /// Source package (`${source:Package}`), for matching per-source
+    /// advisories (Debian security tracker, design §7.7).
+    pub source: Option<String>,
+    /// Source version (`${source:Version}`; differs from `version` for
+    /// binNMUs and separately versioned binaries).
+    pub source_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -442,6 +442,8 @@ async fn dry_run_plans_without_changing_anything() {
     let apply = Op::ProfileApply {
         spec: crate::opspec::profile_spec(fleetctl_proto::msg::ProfileLevelArg::Baseline, &[]),
         plan_hash: [0; 32],
+        phase: fleet_proto::op::ProfilePhase::All,
+        password_hash: None,
     };
     let opts = BulkOptions {
         dry_run: true,

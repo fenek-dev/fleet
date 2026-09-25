@@ -316,14 +316,17 @@ async fn is_active(ctx: &SysCtx) -> Result<bool, OpError> {
 
 fn pending(new_version: u64) -> Payload {
     // Exec fills in id, deadline and origin; only `new_version` is read.
-    Payload::ChangePending(PendingChange {
-        change_id: [0; 16],
-        kind: ChangeKind::Mesh,
-        op_tag: 0,
-        created_ms: 0,
-        deadline_ms: 0,
-        new_version: Some(new_version),
-    })
+    Payload::ChangePending {
+        change: PendingChange {
+            change_id: [0; 16],
+            kind: ChangeKind::Mesh,
+            op_tag: 0,
+            created_ms: 0,
+            deadline_ms: 0,
+            new_version: Some(new_version),
+        },
+        inner: None,
+    }
 }
 
 fn not_joined() -> OpError {

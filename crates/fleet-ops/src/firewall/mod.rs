@@ -233,14 +233,17 @@ impl FirewallHandler {
         }
         applied(ctx.runner.run(apply_spec(script)).await)?;
         // Exec fills in id, deadline and origin; only `new_version` is read.
-        Ok(OpOutput::Payload(Payload::ChangePending(PendingChange {
-            change_id: [0; 16],
-            kind: ChangeKind::Firewall,
-            op_tag: tag::FIREWALL_APPLY,
-            created_ms: 0,
-            deadline_ms: 0,
-            new_version: Some(model::version(&set)),
-        })))
+        Ok(OpOutput::Payload(Payload::ChangePending {
+            change: PendingChange {
+                change_id: [0; 16],
+                kind: ChangeKind::Firewall,
+                op_tag: tag::FIREWALL_APPLY,
+                created_ms: 0,
+                deadline_ms: 0,
+                new_version: Some(model::version(&set)),
+            },
+            inner: None,
+        }))
     }
 }
 

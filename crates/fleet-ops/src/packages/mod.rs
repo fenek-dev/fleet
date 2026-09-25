@@ -359,6 +359,8 @@ pub async fn list(ctx: &SysCtx, filter: Option<&str>) -> Result<Packages, OpErro
             version: p.version,
             arch: p.arch,
             held: p.held,
+            source: p.source,
+            source_version: p.source_version,
         })
         .collect();
     packages.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.arch.cmp(&b.arch)));

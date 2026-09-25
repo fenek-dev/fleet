@@ -115,7 +115,7 @@ impl Env {
 pub fn admin(p: &mut Resolved, hash: Option<&str>) {
     p.admin = Some(Admin {
         name: "ops".into(),
-        password_hash: hash.map(str::to_owned),
+        password_hash: hash.map(|h| fleet_proto::args::SudoPasswordHash::crypt(h).unwrap()),
     });
 }
 

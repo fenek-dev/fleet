@@ -26,6 +26,58 @@ fn tags_and_names_unique() {
     );
 }
 
+fn pending() -> PendingChange {
+    PendingChange {
+        change_id: [1; 16],
+        kind: ChangeKind::Firewall,
+        op_tag: crate::v1::op::tag::FIREWALL_APPLY,
+        created_ms: 1,
+        deadline_ms: 60_001,
+        new_version: Some(8),
+    }
+}
+
+fn profile_applied() -> ProfileApplied {
+    ProfileApplied {
+        modules: vec![ModuleResult {
+            id: "ssh.hardening".into(),
+            outcome: ModuleOutcome::Applied,
+            detail: String::new(),
+        }],
+        pending: None,
+        score_before: 40,
+        score_after: 70,
+    }
+}
+
+#[test]
+fn change_pending_result_and_nesting_bound() {
+    let applied = Payload::ProfileApplied(profile_applied());
+    let wrapped = Payload::ChangePending {
+        change: pending(),
+        inner: Some(Box::new(applied.clone())),
+    };
+    assert_eq!(wrapped.result(), &applied);
+    assert_eq!(applied.result(), &applied);
+    let bare = Payload::ChangePending {
+        change: pending(),
+        inner: None,
+    };
+    assert_eq!(bare.result(), &bare);
+    // A hostile chain of nested payloads is refused, not recursed into
+    // until the stack runs out.
+    let mut p = Payload::Empty;
+    for _ in 0..64 {
+        p = Payload::ChangePending {
+            change: pending(),
+            inner: Some(Box::new(p)),
+        };
+    }
+    assert!(decode::<Payload>(&encode(&p)).is_err());
+    // The bound resets after a failure.
+    assert_eq!(decode::<Payload>(&encode(&wrapped)).unwrap(), wrapped);
+}
+
 pub(crate) fn samples() -> Vec<Payload> {
     vec![
         Payload::Empty,
@@ -105,13 +157,36 @@ pub(crate) fn samples() -> Vec<Payload> {
                 reachable: Some(true),
             }],
         }),
-        Payload::ChangePending(PendingChange {
-            change_id: [1; 16],
-            kind: ChangeKind::Firewall,
-            op_tag: crate::v1::op::tag::FIREWALL_APPLY,
-            created_ms: 1,
-            deadline_ms: 60_001,
-            new_version: Some(8),
+        Payload::ChangePending {
+            change: pending(),
+            inner: None,
+        },
+        Payload::ChangePending {
+            change: pending(),
+            inner: Some(Box::new(Payload::ProfileApplied(profile_applied()))),
+        },
+        Payload::RosterState(Box::new(RosterState {
+            roster: crate::v1::test_support::signed_roster(),
+            epoch_hashes: vec![[1; 32], [2; 32]],
+        })),
+        Payload::ProfileCheck(ProfileCheck {
+            score: 90,
+            modules: vec![ModuleCheck {
+                id: "auditd".into(),
+                status: ModuleStatus::PendingReboot,
+                detail: "immutable rules load at boot".into(),
+            }],
+        }),
+        Payload::Packages(Packages {
+            packages: vec![PackageInfo {
+                name: "libssl3".into(),
+                version: "3.0.11-1~deb12u2".into(),
+                arch: "amd64".into(),
+                held: false,
+                auto_installed: true,
+                source: Some("openssl".into()),
+                source_version: Some("3.0.11-1~deb12u2".into()),
+            }],
         }),
         Payload::Upgradable(Upgradable {
             packages: vec![UpgradablePackage {

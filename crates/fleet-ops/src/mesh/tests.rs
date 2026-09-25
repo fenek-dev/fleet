@@ -150,7 +150,7 @@ fn join_generates_key_writes_conf_and_starts() {
         .validate(&c, &op, &meta(op.clone(), None))
         .unwrap();
     let out = block(MeshHandler.handle(&c, &op, &meta(op.clone(), Some(3)))).unwrap();
-    let OpOutput::Payload(Payload::ChangePending(p)) = out else {
+    let OpOutput::Payload(Payload::ChangePending { change: p, .. }) = out else {
         panic!()
     };
     assert_eq!(p.new_version, Some(fswrite::version_of(GOLDEN.as_bytes())));

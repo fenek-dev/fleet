@@ -13,7 +13,9 @@
 //! 4. rewrite the pending file (only if still pending: never resurrect a
 //!    claimed change) with the confirm deadline, `new_version`, and the
 //!    connection counter a confirm must exceed;
-//! 5. arm the confirm timer for the full window, stop the guard.
+//! 5. arm the confirm timer for the full window, stop the guard;
+//! 6. answer `ChangePending { change, inner }`, `inner` being the
+//!    handler's own result (e.g. `ProfileApplied`).
 //!
 //! While `applying`, maintenance doesn't revert it and `change.confirm` is
 //! refused; a crash mid-apply is reverted at startup.
@@ -41,6 +43,23 @@ pub(super) fn wire_pending(id: ChangeId, c: &PendingChange) -> fleet_proto::payl
     }
 }
 
+/// What the handler answered, split into the pending change's
+/// `new_version` and the result the `ChangePending` carries: a handler's
+/// own `ChangePending` gives its version and inner result; any other
+/// payload (`ProfileApplied`, …) is the inner result itself; `Empty`
+/// carries nothing.
+fn handler_result(change: &mut PendingChange, p: Payload) -> Option<Box<Payload>> {
+    match p {
+        Payload::ChangePending { change: c, inner } => {
+            change.origin.new_version = c.new_version;
+            // Never nest a pending change in a pending change.
+            inner.filter(|i| !matches!(**i, Payload::ChangePending { .. }))
+        }
+        Payload::Empty => None,
+        other => Some(Box::new(other)),
+    }
+}
+
 impl Exec {
     fn kind_lock(&self, kind: ChangeKind) -> Rc<tokio::sync::Mutex<()>> {
         self.kind_locks
@@ -65,7 +84,7 @@ impl Exec {
     }
 
     /// Runs `a` under the auto-revert protocol (module docs). Answers
-    /// `Payload::ChangePending`.
+    /// `Payload::ChangePending`, with the handler's own result inside.
     pub(super) async fn apply_reverting(
         &self,
         a: &Admitted,
@@ -139,14 +158,20 @@ impl Exec {
             Ok(Err(e)) => Err(fail(e)),
         };
         let res = match applied {
-            Ok(p) => self.finish_apply(id, &mut change, &p, window),
+            Ok(p) => {
+                let inner = handler_result(&mut change, p);
+                self.finish_apply(id, &mut change, window).map(|()| inner)
+            }
             Err(code) => {
                 self.abort_change(id);
                 Err(code)
             }
         };
         self.st.borrow_mut().applying.remove(&id);
-        res.map(|()| Payload::ChangePending(wire_pending(id, &change)))
+        res.map(|inner| Payload::ChangePending {
+            change: wire_pending(id, &change),
+            inner,
+        })
     }
 
     /// Steps 4–5: record the result, start the confirm window.
@@ -154,12 +179,8 @@ impl Exec {
         &self,
         id: ChangeId,
         change: &mut PendingChange,
-        payload: &Payload,
         window: u32,
     ) -> Result<(), ErrorCode> {
-        if let Payload::ChangePending(p) = payload {
-            change.origin.new_version = p.new_version;
-        }
         change.applying = false;
         change.origin.applied_conn = self.conns.get();
         change.deadline_ms = now_ms().saturating_add(u64::from(window) * 1000);

@@ -130,7 +130,7 @@ impl Module for SshHardening {
         "sshd: keys only, no root, modern algorithms, no forwarding"
     }
     fn phase(&self) -> Phase {
-        Phase::Remote
+        Phase::Access
     }
     fn weight(&self) -> u8 {
         15

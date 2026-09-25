@@ -61,16 +61,15 @@ fuzz/  tests/vm/
 - **Tests:** property tests for validation and parsing; `cargo-fuzz` for the decoder and parsers; Lima VMs for integration tests.
 - **Performance budgets:** agent idle memory under 5 MB (gate) and 20 MB (exec); CPU under 0.2% at idle; binary under 10 MB.
 
-## Where to start (Phase 0: security foundation)
+## Current state
 
-1. Cargo workspace plus `fleet-proto` (the `CommandBody`, `SignedCommand`, `Roster` and `Policy` types).
-2. `fleet-crypto`: signing and verification of envelopes, and recovery key derivation, with test vectors.
-3. `fleet-agent`: split into gate and exec, with the bridge, Noise handshake and signed `system.info` round-trip.
-4. Rejection tests: tampered, replayed, stale, wrong-server and revoked-device commands must all fail.
+All roadmap phases (design §14) have code; hardening against real VMs and the app UI are the open ends.
 
-Status: steps 1–4 are done (`crates/fleet-agent/tests/e2e.rs` runs Mac client → gate → exec over real sockets; `crates/fleet-core` holds the Mac session client). Streams are implemented (`StreamOpen` → sealed `StreamData`, types in `fleet_proto::stream`). Exec runs the full argument pipeline (`check_args`, `expected_version`, request/stream kind), conditional escalation (`OpHandler::requires_elevated`), and the generic auto-revert protocol with `change.confirm` over a new session; `fleet_ops::compose` validates Compose files. Ending `sshd` sessions of removed devices is `exec::SshdTerminator` (journal pid ↔ key fingerprint). Still stubbed: the per-kind snapshot/restore modules (`fleet_ops::Revertible`; none registered, so auto-revert ops answer `Unsupported`). Next work follows `docs/design.md` section 14.
+- **Agent** (`fleet-agent`, `fleet-ops`, `fleet-hardening`): gate/exec/bridge, full command pipeline, signed receipts/events, audit chain, auto-revert (firewall, mesh, authorized keys, profile), telemetry, logs, packages, Docker, cron, users, config history, bans, mesh, games, `shell.exec`, provisioning profiles (`profile.apply` phases Accounts/Access/System, results as `ProfileApplied`), hardening audit, cloud-init.
+- **Mac core** (`fleet-core`, `fleet-core-ffi`): SSH/Noise sessions, cache, bulk engine with canary, runbooks, search, timeline, vulnerability matching, roster management, E2EE sync, recovery flow, monitor sessions. `fleetctl mcp` is the MCP server. SwiftUI app in `apple/Fleet` (`project.yml`, XcodeGen).
+- **Wire catalog:** `fleet-proto` `op/mod.rs` (ops, tags) and `op/meta.rs` (tiers, session rules). Golden vectors: `crates/fleet-proto/tests/vectors/v1`; regenerate only for intended wire changes: `FLEET_REGEN_VECTORS=1 cargo test -p fleet-proto --test wire golden`.
 
-See `docs/design.md` section 14 for later phases.
+**Tests:** `cargo test -p <crate> --locked` (agent e2e over real sockets: `-p fleet-agent --test e2e`). Linux harness (real static agent under systemd in Docker, over SSH): `tests/vm/run.sh [debian12|ubuntu24] [filter]` (see `tests/vm/README.md`). Builds: `scripts/build-agent-linux.sh`, `scripts/build-core.sh`, `scripts/build-fleetctl.sh`.
 
 ## Working agreement
 

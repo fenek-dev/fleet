@@ -52,7 +52,7 @@ impl Module for AdminUser {
         "Admin user with sudo and Fleet-managed SSH keys"
     }
     fn phase(&self) -> Phase {
-        Phase::Access
+        Phase::Accounts
     }
     fn weight(&self) -> u8 {
         8
@@ -127,7 +127,7 @@ impl Module for AdminUser {
             }
         }
         if let Some(hash) = &admin.password_hash
-            && shadow_hash(&read_text(&ctx.sys, "/etc/shadow")?, name) != *hash
+            && shadow_hash(&read_text(&ctx.sys, "/etc/shadow")?, name) != hash.expose()
         {
             plan.push(Change {
                 module: self.id(),
@@ -135,7 +135,7 @@ impl Module for AdminUser {
                 diff: "~ password hash (redacted)\n".into(),
                 actions: vec![Action::Run(
                     Cmd::new(CHPASSWD, ["--encrypted"])
-                        .stdin(format!("{name}:{hash}\n").into_bytes()),
+                        .stdin(format!("{name}:{}\n", hash.expose()).into_bytes()),
                 )],
             });
         }
@@ -189,7 +189,7 @@ impl Module for AdminShell {
         "Admin shell startup files root-owned, safe PATH"
     }
     fn phase(&self) -> Phase {
-        Phase::Access
+        Phase::Accounts
     }
     fn weight(&self) -> u8 {
         4
@@ -271,7 +271,7 @@ impl Module for SudoPolicy {
         "sudo requires a password and logs with use_pty"
     }
     fn phase(&self) -> Phase {
-        Phase::Access
+        Phase::Accounts
     }
 
     fn plan(&self, ctx: &Ctx) -> Result<Vec<Change>, OpError> {

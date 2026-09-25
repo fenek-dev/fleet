@@ -151,6 +151,11 @@ pub struct ExecConfig {
     /// Longest an auto-revert handler may run; it is then abandoned and
     /// the snapshot restored (`Timeout`). Well below the confirm window.
     pub apply_timeout: Duration,
+    /// Longest a `profile.apply` without auto-revert (Accounts/System
+    /// phase: package installs, role repositories) may run. Its children
+    /// run in the op's scope and are killed when it is abandoned
+    /// (`Timeout`).
+    pub profile_apply_timeout: Duration,
     /// `change.confirm` also needs sshd's journal to show a login with the
     /// confirming device's SSH key since the change was made (§4.10 step
     /// 3), waiting up to this long for the journal to catch up. `None`
@@ -177,6 +182,7 @@ impl ExecConfig {
             compact_interval: Duration::from_secs(24 * 3600),
             compact_force_after: Duration::from_secs(3 * 24 * 3600),
             apply_timeout: Duration::from_secs(30),
+            profile_apply_timeout: Duration::from_secs(30 * 60),
             confirm_sshd_login: Some(Duration::from_secs(5)),
         }
     }
@@ -257,6 +263,7 @@ struct Exec {
     /// stored yet: an identical re-forward waits for the original answer.
     inflight: RefCell<HashMap<Hash32, watch::Sender<Option<Answer>>>>,
     apply_timeout: Duration,
+    profile_apply_timeout: Duration,
     confirm_sshd_login: Option<Duration>,
 }
 
@@ -458,7 +465,21 @@ impl Exec {
             Op::PkgInstall { .. } | Op::PkgUpgrade { .. } | Op::PkgRemove { .. }
         )
         .then(|| self.sources.fleet_pkg_op());
-        match a.handler.handle(&self.ctx, op, &a.meta).await {
+        let run = a.handler.handle(&self.ctx, op, &a.meta);
+        let out = if matches!(op, Op::ProfileApply { .. }) {
+            // Accounts/System phases (auto-revert ones never get here):
+            // long, but bounded; dropping the future kills its children.
+            match tokio::time::timeout(self.profile_apply_timeout, run).await {
+                Ok(r) => r,
+                Err(_) => {
+                    log(op.name(), "apply timed out");
+                    return Err(ErrorCode::Timeout);
+                }
+            }
+        } else {
+            run.await
+        };
+        match out {
             Ok(OpOutput::Payload(p)) => Ok(p),
             Ok(OpOutput::Stream(_)) => Err(ErrorCode::Internal),
             Err(e) => {
@@ -660,7 +681,11 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
             signaller: Box::new(Sigterm),
         })
     });
-    let (apply_timeout, confirm_sshd_login) = (cfg.apply_timeout, cfg.confirm_sshd_login);
+    let (apply_timeout, profile_apply_timeout, confirm_sshd_login) = (
+        cfg.apply_timeout,
+        cfg.profile_apply_timeout,
+        cfg.confirm_sshd_login,
+    );
     let mut state = State::load(StateParts {
         paths: cfg.paths,
         reverter: cfg.reverter,
@@ -708,6 +733,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         kind_locks: RefCell::default(),
         inflight: RefCell::default(),
         apply_timeout,
+        profile_apply_timeout,
         confirm_sshd_login,
     });
     let budget = Rc::new(Budget::default());

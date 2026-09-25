@@ -6,9 +6,10 @@ use fleet_proto::payload::{PackageChange, PackageHistoryEntry, PkgAction};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-/// `dpkg-query -W -f=` format: one tab-separated line per package.
-pub const DPKG_QUERY_FORMAT: &str =
-    "${Package}\\t${Architecture}\\t${Version}\\t${db:Status-Want}\\t${db:Status-Status}\\n";
+/// `dpkg-query -W -f=` format: one tab-separated line per package. The
+/// source package and version come last (dpkg fills them in from the
+/// package's own name and version when `Source:` is absent).
+pub const DPKG_QUERY_FORMAT: &str = "${Package}\\t${Architecture}\\t${Version}\\t${db:Status-Want}\\t${db:Status-Status}\\t${source:Package}\\t${source:Version}\\n";
 
 /// Most packages parsed from one listing (a frame is at most 1 MiB).
 pub const MAX_PACKAGES: usize = 8000;
@@ -28,16 +29,28 @@ pub struct Installed {
     pub version: String,
     /// Selection state `hold`.
     pub held: bool,
+    /// `${source:Package}`; `None` when dpkg printed nothing.
+    pub source: Option<String>,
+    /// `${source:Version}`; `None` when dpkg printed nothing.
+    pub source_version: Option<String>,
 }
 
 /// Rows of [`DPKG_QUERY_FORMAT`] whose status is `installed` (not
 /// `config-files`, `half-installed`, …).
 pub fn parse_dpkg_query(out: &str) -> Vec<Installed> {
+    let opt = |s: &str| (!s.is_empty()).then(|| clip(s));
     out.lines()
         .filter_map(|l| {
             let mut f = l.split('\t');
-            let (name, arch, version, want, status) =
-                (f.next()?, f.next()?, f.next()?, f.next()?, f.next()?);
+            let (name, arch, version, want, status, source, source_version) = (
+                f.next()?,
+                f.next()?,
+                f.next()?,
+                f.next()?,
+                f.next()?,
+                f.next()?,
+                f.next()?,
+            );
             if f.next().is_some() || name.is_empty() || status != "installed" {
                 return None;
             }
@@ -46,6 +59,8 @@ pub fn parse_dpkg_query(out: &str) -> Vec<Installed> {
                 arch: clip(arch),
                 version: clip(version),
                 held: want == "hold",
+                source: opt(source),
+                source_version: opt(source_version),
             })
         })
         .take(MAX_PACKAGES)

@@ -150,6 +150,9 @@ pub enum ModuleStatus {
     /// Turned off by the profile or an accepted exception.
     Skipped,
     Error,
+    /// Configured; takes effect at the next reboot (Strict's immutable
+    /// audit rules, `/tmp` mounts). Counts as compliant in the score.
+    PendingReboot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

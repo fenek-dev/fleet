@@ -1,5 +1,6 @@
 //! Operations bound to exec's own state (roster, policy, veto,
-//! `agent.health`, `roster.pending`, `events.query` over the event log;
+//! `agent.health`, `roster.pending`, `roster.get`, `events.query` over the
+//! event log;
 //! `change.confirm` and `changes.list`
 //! over the pending-change files), behind the `fleet_ops::OpHandler`
 //! trait so exec dispatches every op the same way.
@@ -15,7 +16,7 @@ use crate::revert;
 use fleet_crypto::roster::{self, RosterDecision, roster_hash};
 use fleet_ops::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput, SysCtx};
 use fleet_proto::op::tag;
-use fleet_proto::payload::PendingChanges;
+use fleet_proto::payload::{PendingChanges, RosterState};
 use fleet_proto::{
     AgentHealth, ErrorCode, Event, Hash32, Op, PROTO_VERSION, Payload, Policy, SignedRoster,
 };
@@ -23,11 +24,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 /// Tags handled by [`StateOps`].
-pub(super) const TAGS: [u16; 6] = [
+pub(super) const TAGS: [u16; 7] = [
     tag::AGENT_HEALTH,
     tag::EVENTS_QUERY,
     tag::ROSTER_UPDATE,
     tag::ROSTER_PENDING,
+    tag::ROSTER_GET,
     tag::ROSTER_VETO,
     tag::POLICY_UPDATE,
 ];
@@ -36,6 +38,7 @@ pub(super) const TAGS: [u16; 6] = [
 pub(super) enum Plan {
     Health,
     Pending,
+    RosterGet,
     Events(Option<[u8; 16]>, u64, u32),
     Roster(Box<SignedRoster>, RosterDecision),
     Veto(Hash32),
@@ -148,6 +151,7 @@ impl State {
         match op {
             Op::AgentHealth => Ok(Plan::Health),
             Op::RosterPending => Ok(Plan::Pending),
+            Op::RosterGet => Ok(Plan::RosterGet),
             Op::EventsQuery {
                 since_run_id,
                 since_seq,
@@ -210,6 +214,7 @@ impl State {
         match plan {
             Plan::Health => Ok(Payload::AgentHealth(self.health(ctx, now))),
             Plan::Pending => Ok(Payload::RosterPending(self.pending_wire(now))),
+            Plan::RosterGet => Ok(Payload::RosterState(Box::new(self.roster_state()))),
             Plan::Events(since, seq, limit) => self
                 .events_after(since, seq, limit)
                 .map(Payload::SignedEvents),
@@ -248,6 +253,18 @@ impl State {
                 self.emit(Event::PolicyChanged { version });
                 Ok(Payload::Empty)
             }
+        }
+    }
+
+    /// `roster.get`: the enforced roster and every hash a recovery
+    /// roster's `prev_hash` may name (the epoch's earlier rosters, then the
+    /// current one).
+    fn roster_state(&self) -> RosterState {
+        let mut epoch_hashes = self.epoch_hashes.clone();
+        epoch_hashes.push(roster_hash(&self.roster));
+        RosterState {
+            roster: self.roster.clone(),
+            epoch_hashes,
         }
     }
 

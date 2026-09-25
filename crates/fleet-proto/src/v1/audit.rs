@@ -56,7 +56,9 @@ pub enum Phase {
 }
 
 /// Operation plus arguments. `args` is the op's wire payload, so the entry
-/// keeps the full arguments (the full command text for `shell.exec`).
+/// keeps the full arguments (the full command text for `shell.exec`),
+/// except secrets: a sudo password hash is stored as its BLAKE3
+/// ([`Op::audit_payload`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpSummary {
     pub tag: u16,
@@ -67,7 +69,7 @@ impl From<&Op> for OpSummary {
     fn from(op: &Op) -> Self {
         Self {
             tag: op.tag(),
-            args: op.payload(),
+            args: op.audit_payload(),
         }
     }
 }

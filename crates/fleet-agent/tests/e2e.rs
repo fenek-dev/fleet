@@ -1027,6 +1027,12 @@ fn monitor_session_is_read_only() {
             .await
             .unwrap();
         assert!(matches!(r.result, Ok(Payload::AgentHealth(_))), "{r:?}");
+        // The roster is public: readable while the app is locked.
+        let r = s
+            .request(Op::RosterGet, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert!(matches!(r.result, Ok(Payload::RosterState(_))), "{r:?}");
         let op = fx.policy_op(2);
         let approval = fx.approve(m, &op);
         // Refused by the gate: unsigned, so only "outcome unknown".
@@ -1203,6 +1209,20 @@ fn recovery_session_immediate() {
             .await
             .unwrap();
         assert!(r.result.is_ok(), "{r:?}");
+        // The roster to chain a recovery roster to, without iCloud (receipted).
+        let r = s
+            .request(Op::RosterGet, &fx.server, Actor::Recovery, None)
+            .await
+            .unwrap();
+        let Ok(Payload::RosterState(state)) = &r.result else {
+            panic!("{r:?}")
+        };
+        assert_eq!(state.roster, fx.genesis);
+        assert_eq!(state.epoch_hashes, [roster_hash(&fx.genesis)]);
+        assert_eq!(
+            fx.recovery_roster(&new_mac).roster.prev_hash,
+            *state.epoch_hashes.last().unwrap()
+        );
         // Refused by the gate (not a recovery op): an unsigned read error.
         let e = s
             .request(Op::AgentHealth, &fx.server, Actor::Recovery, None)

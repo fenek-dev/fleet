@@ -19,7 +19,7 @@ pub use system::*;
 
 use super::alert::AlertRuleSet;
 use super::op::BanConfig;
-use super::{AgentHealth, PendingRecovery, SystemInfo};
+use super::{AgentHealth, Hash32, PendingRecovery, SignedRoster, SystemInfo};
 use crate::tagged::tagged_enum;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,31 @@ impl PartialEq for F32 {
 
 impl Eq for F32 {}
 
+/// `roster.get`: the roster the agent enforces and the BLAKE3 hashes
+/// (`fleet_crypto::roster::roster_hash`) of every roster it accepted in
+/// that epoch, which a recovery roster's `prev_hash` may name (design
+/// §5.3, §5.11). Signed by its Macs, so the receipt only proves which
+/// roster this agent holds; the Mac still verifies the roster itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterState {
+    pub roster: SignedRoster,
+    /// Oldest first; includes the current roster's own hash.
+    pub epoch_hashes: Vec<Hash32>,
+}
+
+impl Payload {
+    /// The handler's result inside a `ChangePending`, or the payload
+    /// itself for anything else.
+    pub fn result(&self) -> &Payload {
+        match self {
+            Payload::ChangePending {
+                inner: Some(inner), ..
+            } => inner,
+            p => p,
+        }
+    }
+}
+
 tagged_enum! {
     /// Successful response (and stream item) payloads.
     #[allow(clippy::large_enum_variant)]
@@ -45,6 +70,8 @@ tagged_enum! {
         SystemInfo(v: SystemInfo) = SYSTEM_INFO(1, "system_info"),
         AgentHealth(v: AgentHealth) = AGENT_HEALTH(2, "agent_health"),
         RosterPending(v: Option<PendingRecovery>) = ROSTER_PENDING(3, "roster_pending"),
+        /// `roster.get`.
+        RosterState(v: Box<RosterState>) = ROSTER_STATE(4, "roster_state"),
 
         // system
         /// First `metrics.subscribe` item, and again when series change.
@@ -84,8 +111,11 @@ tagged_enum! {
         // firewall and auto-revert
         Firewall(v: FirewallState) = FIREWALL(50, "firewall"),
         /// Result of every auto-revert op (`Op::auto_revert`) and of
-        /// `agent.update.commit`.
-        ChangePending(v: PendingChange) = CHANGE_PENDING(51, "change_pending"),
+        /// `agent.update.commit`. `inner` is the handler's own result when
+        /// it has one (`ProfileApplied` for `profile.apply`); never itself
+        /// a `ChangePending`.
+        ChangePending { change: PendingChange, inner: Option<Box<Payload>> }
+            = CHANGE_PENDING(51, "change_pending"),
         PendingChanges(v: PendingChanges) = PENDING_CHANGES(52, "pending_changes"),
 
         // packages

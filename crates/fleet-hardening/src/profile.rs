@@ -11,7 +11,7 @@ use fleet_ops::users::authorized_keys;
 use fleet_proto::ErrorCode;
 use fleet_proto::args::{
     Cidr, FirewallRule, FwAction, FwChain, FwComment, Port, PortRange, Protocol, RateLimit,
-    UserName,
+    SudoPasswordHash, UserName,
 };
 use fleet_proto::op::{ProfileLevel, ProfileRole, ProfileSource, ProfileSpec};
 use serde::Deserialize;
@@ -280,7 +280,7 @@ struct SkipSection {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Admin {
     pub name: String,
-    pub password_hash: Option<String>,
+    pub password_hash: Option<SudoPasswordHash>,
 }
 
 impl std::fmt::Debug for Admin {
@@ -406,6 +406,28 @@ impl Resolved {
     /// In scope of this request (`only`).
     pub fn in_scope(&self, id: &str) -> bool {
         self.only.is_empty() || self.only.iter().any(|o| o == id)
+    }
+
+    /// Sets the admin's sudo password hash from `profile.apply`
+    /// (`admin.user` then runs `chpasswd --encrypted`). Refused without an
+    /// admin, for the redacted audit form, and when the profile TOML
+    /// already names a different hash.
+    pub fn set_password(&mut self, h: &SudoPasswordHash) -> Result<(), ProfileError> {
+        if h.is_redacted() {
+            return err("password_hash: a crypt(3) hash, not the audit form");
+        }
+        let Some(admin) = self.admin.as_mut() else {
+            return err("password_hash needs an admin user");
+        };
+        match &admin.password_hash {
+            Some(cur) if cur != h => {
+                err("password_hash given both in the profile and in the command")
+            }
+            _ => {
+                admin.password_hash = Some(h.clone());
+                Ok(())
+            }
+        }
     }
 
     pub fn role(&self, r: ProfileRole) -> Option<&RoleManifest> {
@@ -622,15 +644,11 @@ fn valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-/// crypt(3) hash as `chpasswd -e` takes it: `$y$`, `$gy$`, `$7$` or `$6$`,
-/// nothing that could end the `user:hash` line.
+/// crypt(3) hash as `chpasswd -e` takes it: `$y$` or `$6$`, nothing that
+/// could end the `user:hash` line (`SudoPasswordHash::crypt`, the same
+/// rule `profile.apply`'s `password_hash` is held to).
 pub fn valid_hash(h: &str) -> bool {
-    (20..=256).contains(&h.len())
-        && ["$y$", "$gy$", "$7$", "$6$"]
-            .iter()
-            .any(|p| h.starts_with(p))
-        && h.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"./$=".contains(&b))
+    SudoPasswordHash::crypt(h).is_ok()
 }
 
 /// Ids an operator may skip or except: module ids, and single items of
@@ -698,14 +716,17 @@ pub fn parse_custom(text: &str) -> Result<Resolved, ProfileError> {
         if user.as_str() == "root" {
             return err("admin user can't be root");
         }
-        if let Some(h) = &a.password_hash
-            && !valid_hash(h)
-        {
-            return err("admin password_hash: a crypt(3) hash ($y$ or $6$), never plaintext");
-        }
+        let password_hash = match a.password_hash {
+            Some(h) => Some(SudoPasswordHash::crypt(h).map_err(|_| {
+                ProfileError(
+                    "admin password_hash: a crypt(3) hash ($y$ or $6$), never plaintext".into(),
+                )
+            })?),
+            None => None,
+        };
         p.admin = Some(Admin {
             name: user.as_str().to_owned(),
-            password_hash: a.password_hash,
+            password_hash,
         });
     }
     if let Some(ssh) = f.ssh {

@@ -1,7 +1,8 @@
 //! Auto-revert for `profile.apply` (`ChangeKind::Profile`, design §4.10).
 //!
 //! The snapshot, taken by exec before the handler runs, holds every file
-//! the in-scope modules may write (content and mode, or absence), the
+//! the in-scope modules of the op's phase may write (content and mode, or
+//! absence), the
 //! firewall table when `firewall.baseline` is in scope, and the reload
 //! commands that make restored files take effect (`sshd -t` + reload,
 //! `sysctl --system`, …). Restoring writes the files back, restores the
@@ -51,7 +52,7 @@ impl Snapshot {
 
 /// What a profile apply of `spec` may touch, as found now.
 pub fn take(sys: &SysCtx, op: &Op) -> Result<Snapshot, OpError> {
-    let Op::ProfileApply { spec, .. } = op else {
+    let Op::ProfileApply { spec, phase, .. } = op else {
         return Err(OpError::internal("profile snapshot of another op"));
     };
     let p = crate::profile::resolve(spec, sys)?;
@@ -59,7 +60,9 @@ pub fn take(sys: &SysCtx, op: &Op) -> Result<Snapshot, OpError> {
     let mut reload: Vec<(String, Vec<String>)> = Vec::new();
     let mut firewall = None;
     for m in engine::modules_of(&p) {
-        if !p.in_scope(m.id()) || p.is_skipped(m.id()) {
+        // Only what this phase runs: a revert must not roll back (or
+        // reload for) modules another phase applied meanwhile.
+        if !engine::runs(&p, m.as_ref(), *phase) || p.is_skipped(m.id()) {
             continue;
         }
         for path in m.paths(&p) {

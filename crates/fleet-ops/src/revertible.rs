@@ -10,8 +10,10 @@
 //! and can't be restored (audited as a failed revert).
 //!
 //! Handler contract for auto-revert ops: `handle` applies the change and
-//! returns `Payload::ChangePending` (only `new_version` is read; exec fills
-//! in id, kind, tag and deadline) or `Payload::Empty`.
+//! returns `Payload::ChangePending` (only `new_version` and `inner` are
+//! read; exec fills in id, kind, tag and deadline) or its own result
+//! payload (e.g. `ProfileApplied`), which exec returns as the
+//! `ChangePending`'s `inner` (`Empty` is dropped).
 
 use crate::ctx::SysCtx;
 use crate::handler::OpError;

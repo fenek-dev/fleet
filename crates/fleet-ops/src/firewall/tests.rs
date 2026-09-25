@@ -759,7 +759,8 @@ fn apply_checks_version_then_applies_atomically() {
     f.expect(NFT, &APPLY, out(""));
     let c = ctx(nowhere(), f.clone());
     let (op, m) = apply_meta(set.clone(), Some(current));
-    let Payload::ChangePending(p) = run(&FirewallHandler, &c, &op, &m).unwrap() else {
+    let Payload::ChangePending { change: p, .. } = run(&FirewallHandler, &c, &op, &m).unwrap()
+    else {
         panic!()
     };
     assert_eq!(p.new_version, Some(version(&set)));
@@ -999,7 +1000,7 @@ fn lockout_safety_restore_equals_snapshot() {
     f.expect(NFT, &APPLY, out(""));
     assert!(matches!(
         run(&FirewallHandler, &c, &op, &m),
-        Ok(Payload::ChangePending(_))
+        Ok(Payload::ChangePending { .. })
     ));
     // 3. No confirmation: `fleet-agent revert <id>` restores by kind.
     f.expect(NFT, &APPLY, out(""));

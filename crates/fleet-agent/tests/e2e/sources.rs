@@ -741,7 +741,7 @@ fn confirm_needs_sshd_login_after_the_change() {
         let mac = &fx.macs[0];
         let mut s = fx.connect(mac).await;
         let r = ask(&mut s, fx, Op::MeshLeave).await;
-        let Ok(Payload::ChangePending(p)) = r else {
+        let Ok(Payload::ChangePending { change: p, .. }) = r else {
             panic!("{r:?}")
         };
         let confirm = Op::ChangeConfirm {

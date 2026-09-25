@@ -28,13 +28,31 @@ pub enum Status {
     PendingReboot(String),
 }
 
-/// Provisioning phase (design §9.1): phase 2 (sshd and firewall) runs only
-/// after the Mac has proven admin login over a second connection.
+/// Provisioning phase of a module (design §9.1), in apply order; the wire
+/// `ProfilePhase` picks one (or all). Phase 2 (sshd and firewall) runs
+/// only after the Mac has proven admin login over a second connection,
+/// and only under auto-revert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum Phase {
-    Access = 1,
-    Remote = 2,
+    /// Admin user, shell files, sudo.
+    Accounts = 1,
+    /// sshd and the firewall (`ProfilePhase::ACCESS_MODULES`).
+    Access = 2,
     System = 3,
+}
+
+impl Phase {
+    /// Whether a `profile.apply` of wire phase `p` runs modules of this
+    /// phase.
+    pub fn runs_in(self, p: fleet_proto::op::ProfilePhase) -> bool {
+        use fleet_proto::op::ProfilePhase as W;
+        match p {
+            W::All => true,
+            W::Accounts => self == Phase::Accounts,
+            W::Access => self == Phase::Access,
+            W::System => self == Phase::System,
+        }
+    }
 }
 
 /// One command: a fixed absolute program and its argv. `stdin` may carry a

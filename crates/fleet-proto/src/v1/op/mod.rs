@@ -26,7 +26,7 @@ mod users;
 pub use cron::CronEntry;
 pub use mesh::MeshConfig;
 pub use packages::{PkgSpec, UpgradeScope};
-pub use profile::{ProfileLevel, ProfileRole, ProfileSource, ProfileSpec};
+pub use profile::{ProfileLevel, ProfilePhase, ProfileRole, ProfileSource, ProfileSpec};
 pub use security::BanConfig;
 pub use shell::ShellExec;
 pub use system::{ProcessSort, Resolution, SampleInterval};
@@ -36,7 +36,8 @@ use super::alert::{AlertRuleSet, HealthCheckSet};
 use super::args::{
     AbsPath, ComposeFile, ComposeProject, ContainerRef, DebPackageName, FirewallRuleSet, GameName,
     GameTemplateId, GroupName, ImageRef, JournalQuery, Label, Nice, Pid, RconCommand, SearchQuery,
-    SearchTerm, Signal, SshPublicKey, TimeRange, UnitName, UserName, VolumeName, WgPeer,
+    SearchTerm, Signal, SshPublicKey, SudoPasswordHash, TimeRange, UnitName, UserName, VolumeName,
+    WgPeer,
 };
 use super::{AgentVersion, Hash32, SignedReleaseManifest, SignedRoster};
 use crate::tagged::tagged_enum;
@@ -215,9 +216,18 @@ tagged_enum! {
         // ---- profile 1100–1199 ----
         ProfileCheck(spec: ProfileSpec) = PROFILE_CHECK(1100, "profile.check"),
         ProfilePlan(spec: ProfileSpec) = PROFILE_PLAN(1101, "profile.plan"),
-        /// Applies only if a fresh plan still hashes to `plan_hash` (the
-        /// operator saw it). SSH/firewall steps arm auto-revert.
-        ProfileApply { spec: ProfileSpec, plan_hash: Hash32 } = PROFILE_APPLY(1102, "profile.apply"),
+        /// Applies the modules of `phase` only if a fresh plan of `spec`
+        /// (every phase) still hashes to `plan_hash` (the operator saw it).
+        /// Answers `ProfileApplied`; wrapped in `ChangePending` when the
+        /// phase arms auto-revert (`ProfilePhase::arms_auto_revert`).
+        /// `password_hash` sets the admin's sudo password (`Accounts`/`All`
+        /// only); the audit log keeps only its BLAKE3.
+        ProfileApply {
+            spec: ProfileSpec,
+            plan_hash: Hash32,
+            phase: ProfilePhase,
+            password_hash: Option<SudoPasswordHash>,
+        } = PROFILE_APPLY(1102, "profile.apply"),
 
         // ---- search 1200–1299 ----
         SearchPackages(query: SearchQuery) = SEARCH_PACKAGES(1200, "search.packages"),
@@ -250,6 +260,11 @@ tagged_enum! {
         /// Reads the pending recovery state only, so it is tier Read.
         RosterPending = ROSTER_PENDING(1511, "roster.pending"),
         RosterVeto { pending_hash: Hash32 } = ROSTER_VETO(1512, "roster.veto"),
+        /// The current `SignedRoster` plus the hashes of its epoch
+        /// (`Payload::RosterState`): what a recovery roster chains to. The
+        /// roster is public, so this is Read and allowed in recovery and
+        /// monitor sessions (design §5.5, §5.11).
+        RosterGet = ROSTER_GET(1513, "roster.get"),
         PolicyUpdate { policy_toml: String } = POLICY_UPDATE(1520, "policy.update"),
         /// Checks `/var/lib/fleet/staging/<hex(staged_path_hash)>` against
         /// the root-signed manifest (design §10.2): the file's BLAKE3 must

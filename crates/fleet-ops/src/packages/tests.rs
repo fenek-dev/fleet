@@ -16,14 +16,15 @@ const HISTORY_LOG: &str = include_str!("fixtures/history.log");
 const DPKG_LOG_FIX: &str = include_str!("fixtures/dpkg.log");
 
 const DPKG_QUERY_OUT: &str = "\
-nginx\tamd64\t1.22.1-9\tinstall\tinstalled
-nginx-common\tall\t1.22.1-9\tinstall\tinstalled
-libssl3\tamd64\t3.0.11-1~deb12u2\tinstall\tinstalled
-openssl\tamd64\t3.0.11-1~deb12u2\thold\tinstalled
-telnet\tamd64\t0.17+2.4-2\tdeinstall\tconfig-files
-libc6\ti386\t2.36-9\tinstall\tinstalled
+nginx\tamd64\t1.22.1-9\tinstall\tinstalled\tnginx\t1.22.1-9
+nginx-common\tall\t1.22.1-9\tinstall\tinstalled\tnginx\t1.22.1-9
+libssl3\tamd64\t3.0.11-1~deb12u2\tinstall\tinstalled\topenssl\t3.0.11-1~deb12u2
+openssl\tamd64\t3.0.11-1~deb12u2\thold\tinstalled\topenssl\t3.0.11-1~deb12u2
+telnet\tamd64\t0.17+2.4-2\tdeinstall\tconfig-files\tnetkit-telnet\t0.17+2.4-2
+libc6\ti386\t2.36-9\tinstall\tinstalled\t\t
 broken line without tabs
-a\tb\tc\td\tinstalled\textra
+a\tb\tc\td\tinstalled\tf\tg\textra
+old\tamd64\t1\tinstall\tinstalled
 ";
 
 const EXTENDED: &str = "\
@@ -64,7 +65,7 @@ const APT: [&str; 9] = [
 const SIM: [&str; 4] = ["-s", "-q", "-o", "Debug::NoLocking=1"];
 const QUERY: [&str; 2] = [
     "-W",
-    "-f=${Package}\\t${Architecture}\\t${Version}\\t${db:Status-Want}\\t${db:Status-Status}\\n",
+    "-f=${Package}\\t${Architecture}\\t${Version}\\t${db:Status-Want}\\t${db:Status-Status}\\t${source:Package}\\t${source:Version}\\n",
 ];
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 
@@ -165,6 +166,9 @@ fn list_filters_and_marks_auto() {
         got,
         [("nginx", false, false), ("nginx-common", true, false)]
     );
+    // The source package is reported (nginx-common is built from nginx).
+    assert_eq!(p.packages[1].source.as_deref(), Some("nginx"));
+    assert_eq!(p.packages[1].source_version.as_deref(), Some("1.22.1-9"));
     assert_eq!(r.pending(), 0);
 }
 
@@ -274,9 +278,9 @@ fn history_merges_apt_and_dpkg_logs() {
 fn install_argv_and_changes() {
     let dir = root_with(&[]);
     let r = Rc::new(FakeRunner::new());
-    let before = "nginx\tamd64\t1.22.1-9\tinstall\tinstalled\n";
-    let after = "nginx\tamd64\t1.22.1-9\tinstall\tinstalled\n\
-                 htop\tamd64\t3.2.2-2\tinstall\tinstalled\n";
+    let before = "nginx\tamd64\t1.22.1-9\tinstall\tinstalled\tnginx\t1.22.1-9\n";
+    let after = "nginx\tamd64\t1.22.1-9\tinstall\tinstalled\tnginx\t1.22.1-9\n\
+                 htop\tamd64\t3.2.2-2\tinstall\tinstalled\thtop\t3.2.2-2\n";
     r.expect(DPKG_QUERY, &QUERY, ok(before))
         .expect(
             APT_GET,
@@ -347,7 +351,7 @@ fn remove_and_purge_argv() {
     ] {
         let dir = root_with(&[]);
         let r = Rc::new(FakeRunner::new());
-        let before = "nginx\tamd64\t1.22.1-9\tinstall\tinstalled\n";
+        let before = "nginx\tamd64\t1.22.1-9\tinstall\tinstalled\tnginx\t1.22.1-9\n";
         r.expect(DPKG_QUERY, &QUERY, ok(before))
             .expect(
                 APT_GET,
@@ -506,8 +510,9 @@ fn removal_fails_closed() {
 fn upgrade_all_argv() {
     let dir = root_with(&[(REBOOT_REQUIRED, "")]);
     let r = Rc::new(FakeRunner::new());
-    let before = "libssl3\tamd64\t3.0.11-1~deb12u2\tinstall\tinstalled\n";
-    let after = "libssl3\tamd64\t3.0.13-1~deb12u1\tinstall\tinstalled\n";
+    let before =
+        "libssl3\tamd64\t3.0.11-1~deb12u2\tinstall\tinstalled\topenssl\t3.0.11-1~deb12u2\n";
+    let after = "libssl3\tamd64\t3.0.13-1~deb12u1\tinstall\tinstalled\topenssl\t3.0.13-1~deb12u1\n";
     r.expect(DPKG_QUERY, &QUERY, ok(before))
         .expect(
             APT_GET,
@@ -612,13 +617,13 @@ fn hold_and_unhold_argv() {
         r.expect(
             DPKG_QUERY,
             &QUERY,
-            ok(&format!("nginx\tamd64\t1\t{b}\tinstalled\n")),
+            ok(&format!("nginx\tamd64\t1\t{b}\tinstalled\tnginx\t1\n")),
         )
         .expect(SYSTEMD_RUN, &scoped_mark(&[verb, "nginx", "curl"]), ok(""))
         .expect(
             DPKG_QUERY,
             &QUERY,
-            ok(&format!("nginx\tamd64\t1\t{a}\tinstalled\n")),
+            ok(&format!("nginx\tamd64\t1\t{a}\tinstalled\tnginx\t1\n")),
         );
         let op = Op::PkgHold {
             packages: vec![pkg("nginx"), pkg("curl")],
@@ -735,13 +740,23 @@ fn registry_routes_package_tags() {
 fn dpkg_query_parse() {
     let p = parse_dpkg_query(DPKG_QUERY_OUT);
     let names: Vec<&str> = p.iter().map(|p| p.name.as_str()).collect();
-    // config-files and malformed rows skipped.
+    // config-files and malformed rows (too many or too few fields, the
+    // old five-field layout included) skipped.
     assert_eq!(
         names,
         ["nginx", "nginx-common", "libssl3", "openssl", "libc6"]
     );
     assert!(p[3].held);
     assert_eq!(p[4].arch, "i386");
+    // The source package: renamed binaries map back to it.
+    assert_eq!(p[2].source.as_deref(), Some("openssl"));
+    assert_eq!(p[2].source_version.as_deref(), Some("3.0.11-1~deb12u2"));
+    assert_eq!(p[1].source.as_deref(), Some("nginx"));
+    // Empty fields are absent, not empty strings.
+    assert_eq!(
+        (p[4].source.as_deref(), p[4].source_version.as_deref()),
+        (None, None)
+    );
 }
 
 #[test]
@@ -843,6 +858,8 @@ fn diff_detects_every_kind() {
         arch: "amd64".into(),
         version: v.into(),
         held,
+        source: None,
+        source_version: None,
     };
     let before = [
         i("a", "1", false),

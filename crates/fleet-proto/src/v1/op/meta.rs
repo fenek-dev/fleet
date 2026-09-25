@@ -77,6 +77,7 @@ impl Op {
             | Op::GameBackupsList { .. }
             | Op::AgentHealth
             | Op::RosterPending
+            | Op::RosterGet
             | Op::AlertRulesGet => Tier::Read,
 
             Op::ProcessSignal { .. }
@@ -200,11 +201,11 @@ impl Op {
     }
 
     /// Accepted in a monitor session (design §5.2): telemetry subscriptions,
-    /// the event log and `agent.health` only.
+    /// the event log, `agent.health` and the (public) roster only.
     pub fn monitor_allowed(&self) -> bool {
         matches!(
             self,
-            Op::AgentHealth | Op::MetricsSubscribe { .. } | Op::EventsQuery { .. }
+            Op::AgentHealth | Op::MetricsSubscribe { .. } | Op::EventsQuery { .. } | Op::RosterGet
         )
     }
 
@@ -212,23 +213,46 @@ impl Op {
     pub fn recovery_allowed(&self) -> bool {
         matches!(
             self,
-            Op::SystemInfo | Op::RosterUpdate { .. } | Op::RosterPending
+            Op::SystemInfo | Op::RosterUpdate { .. } | Op::RosterPending | Op::RosterGet
         )
     }
 
-    /// Arms an auto-revert timer and answers `Payload::ChangePending`; the
-    /// change stays until `change.confirm` arrives over a fresh connection
-    /// (design §4.10).
+    /// Arms an auto-revert timer and answers `Payload::ChangePending`
+    /// (carrying the handler's own result); the change stays until
+    /// `change.confirm` arrives over a fresh connection (design §4.10).
+    /// `profile.apply` only when its phase may run an SSH or firewall
+    /// module ([`super::ProfilePhase::arms_auto_revert`]).
     pub fn auto_revert(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Op::FirewallApply(_)
-                | Op::AuthorizedKeysSet { .. }
-                | Op::MeshJoin(_)
-                | Op::MeshLeave
-                | Op::MeshPeersSet { .. }
-                | Op::ProfileApply { .. }
-        )
+            | Op::AuthorizedKeysSet { .. }
+            | Op::MeshJoin(_)
+            | Op::MeshLeave
+            | Op::MeshPeersSet { .. } => true,
+            Op::ProfileApply { spec, phase, .. } => phase.arms_auto_revert(spec),
+            _ => false,
+        }
+    }
+
+    /// Operation arguments as the audit log stores them
+    /// (`OpSummary::args`): the wire payload, except that a sudo password
+    /// hash is replaced by its BLAKE3 (`SudoPasswordHash::redacted`).
+    pub fn audit_payload(&self) -> Vec<u8> {
+        match self {
+            Op::ProfileApply {
+                spec,
+                plan_hash,
+                phase,
+                password_hash: Some(h),
+            } => Op::ProfileApply {
+                spec: spec.clone(),
+                plan_hash: *plan_hash,
+                phase: *phase,
+                password_hash: Some(h.redacted()),
+            }
+            .payload(),
+            _ => self.payload(),
+        }
     }
 
     /// Replaces versioned state wholesale, so exec rejects the command
@@ -327,8 +351,15 @@ impl Op {
                 at_most(secret, 256, "secret paths")?;
                 ensure(!tracked.iter().any(|p| p.is_fleet_owned()), "fleet path")
             }
-            Op::ProfileCheck(spec) | Op::ProfilePlan(spec) | Op::ProfileApply { spec, .. } => {
-                spec.validate()
+            Op::ProfileCheck(spec) | Op::ProfilePlan(spec) => spec.validate(),
+            Op::ProfileApply {
+                spec,
+                phase,
+                password_hash,
+                ..
+            } => {
+                spec.validate()?;
+                phase.validate(spec, password_hash.as_ref())
             }
             Op::SearchPackages(q)
             | Op::SearchPorts(q)
@@ -403,6 +434,7 @@ impl Op {
             | Op::AgentHealth
             | Op::RosterUpdate { .. }
             | Op::RosterPending
+            | Op::RosterGet
             | Op::RosterVeto { .. }
             | Op::PolicyUpdate { .. }
             | Op::AgentUpdateStage { .. }
