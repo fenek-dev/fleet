@@ -28,6 +28,8 @@ serde_json.workspace = true
 futures-util.workspace = true
 # Vulnerability matching and feeds (design §7.7).
 fleet-debver.workspace = true
+# `compose_check` (fleet-ops' pure Compose validator, included by path).
+yaml-rust2.workspace = true
 flate2.workspace = true
 bzip2.workspace = true
 reqwest = { workspace = true, optional = true }

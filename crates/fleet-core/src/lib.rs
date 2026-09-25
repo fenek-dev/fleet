@@ -25,16 +25,26 @@
 //!   encrypted iCloud sync (§7.6); [`recovery_flow`]: recovery and the
 //!   drill (§5.11); [`sudo`]: per-server sudo passwords (§5.9);
 //!   [`runner`]: the op-sending trait those flows share.
+//! - [`autorevert`]: confirming auto-revert changes from a fresh connection
+//!   (§4.10); [`mesh_orch`]: fleet-level WireGuard mesh (§2.5);
+//!   [`compose_check`]: the agent's pure Compose validator, compiled here
+//!   too so the Mac knows before signing whether a deploy needs Touch ID.
 #![forbid(unsafe_code)]
 
+pub mod autorevert;
 pub mod bulk;
 pub mod cache;
 pub mod catchup;
+/// `fleet_ops::compose` (pure: `fleet-proto` + `yaml-rust2`), shared by
+/// path so the Mac core doesn't pull in the agent's system dependencies.
+#[path = "../../fleet-ops/src/compose.rs"]
+pub mod compose_check;
 pub mod enroll;
 pub mod fleetsearch;
 pub mod install;
 pub mod manager;
 pub mod mcp_host;
+pub mod mesh_orch;
 pub mod opspec;
 pub mod policy;
 pub mod recovery_flow;

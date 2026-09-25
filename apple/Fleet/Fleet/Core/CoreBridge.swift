@@ -300,7 +300,8 @@ extension Error {
         case .NotReady(let state): return "Not connected (\(state.label))."
         case .Locked: return "Unlock Fleet first."
         case .Timeout: return "The server did not answer in time."
-        case .Agent(let code): return "The agent refused the request (\(code))."
+        case .Agent(let code): return agentCodeMessage(code)
+        case .UnexpectedReply: return "The agent sent an unexpected answer."
         case .UnknownServer: return "Server not managed yet (agent keys not pinned)."
         case .InvalidArgument(let field): return "Invalid \(field)."
         case .Cancelled: return "Cancelled."

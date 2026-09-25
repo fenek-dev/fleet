@@ -1207,6 +1207,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "yaml-rust2",
 ]
 
 [[package]]
