@@ -1142,6 +1142,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-it"
+version = "0.1.0"
+dependencies = [
+ "fleet-core",
+ "fleet-crypto",
+ "fleet-proto",
+ "hex",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "fleet-ops"
 version = "0.1.0"
 dependencies = [

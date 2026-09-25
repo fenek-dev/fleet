@@ -7,6 +7,7 @@ members = [
     "crates/fleet-core",
     "crates/fleet-core-ffi",
     "crates/fleet-ops",
+    "crates/fleet-it",
 ]
 
 [workspace.package]

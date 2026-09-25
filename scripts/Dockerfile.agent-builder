@@ -1,0 +1,10 @@
+# Build image for scripts/build-agent-linux.sh: the Rust toolchain plus a
+# musl C compiler (ring, pulled in by snow, compiles C and assembly).
+# Built per platform (linux/arm64 native, linux/amd64 emulated), so
+# `musl-gcc` always targets the container's own architecture.
+FROM rust:1.97
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools file \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*

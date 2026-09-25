@@ -1,0 +1,20 @@
+[package]
+name = "fleet-it"
+description = "Linux integration harness: real agent in a systemd Docker container, driven over SSH by fleet-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Every test is #[ignore]: they need Docker and a cross-built agent.
+# Run with tests/vm/run.sh (or `cargo test -p fleet-it -- --ignored`).
+[dependencies]
+fleet-core.workspace = true
+fleet-crypto.workspace = true
+fleet-proto.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+hex.workspace = true
+tempfile.workspace = true
