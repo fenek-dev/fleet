@@ -33,6 +33,7 @@ pub mod firewall;
 pub mod fswrite;
 pub mod handler;
 pub mod logs;
+pub mod nftlock;
 pub mod packages;
 pub mod procfs;
 pub mod revertible;
