@@ -13,6 +13,7 @@ workspace = true
 fleet-proto.workspace = true
 fleet-ops.workspace = true
 fleet-crypto.workspace = true
+fleet-cloudinit.workspace = true
 serde.workspace = true
 # Profile and role TOML (design §9.2), strict schema (deny_unknown_fields).
 toml.workspace = true

@@ -1,13 +1,14 @@
 //! Installed packages × advisories → findings.
 //!
 //! Lookup key: on Debian the tracker is per **source** package, so the
-//! key is the package's source name when the inventory has it, else the
-//! binary name (right for most packages; misses renamed binaries such as
-//! `libssl3` ← `openssl` until `pkg.list` reports sources). On Ubuntu the
-//! USN rows are per binary package already.
+//! key is the package's source name (`pkg.list` reports it as
+//! `PackageInfo::source`), else the binary name (older agents). On Ubuntu
+//! the USN rows are per binary package already.
 //!
 //! A package is affected by an advisory when the fixed version is newer
-//! than the installed one (dpkg order), or when no fix exists yet.
+//! than the installed one (dpkg order; on Debian the installed **source**
+//! version when known, since the tracker's fixed versions are source
+//! versions), or when no fix exists yet.
 
 use super::dpkgver::is_older;
 use super::release::Target;
@@ -21,6 +22,21 @@ pub struct Installed {
     pub version: String,
     /// Source package name, when known.
     pub source: Option<String>,
+    /// Source version (`${source:Version}`), when known; differs from
+    /// `version` for binNMUs and separately versioned binaries.
+    pub source_version: Option<String>,
+}
+
+impl Installed {
+    /// From `pkg.list` (`PackageInfo::source`/`source_version`).
+    pub fn from_info(p: fleet_proto::payload::PackageInfo) -> Self {
+        Self {
+            name: p.name,
+            version: p.version,
+            source: p.source,
+            source_version: p.source_version,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +78,15 @@ fn key<'a>(target: &Target, p: &'a Installed) -> &'a str {
     }
 }
 
+/// The version compared with the advisory's fixed version: Debian's are
+/// source versions, so the source version when the inventory has one.
+fn compared_version<'a>(target: &Target, p: &'a Installed) -> &'a str {
+    match (target.distro, &p.source, &p.source_version) {
+        (Distro::Debian, Some(_), Some(v)) => v,
+        _ => &p.version,
+    }
+}
+
 /// Matches `installed` against `lookup(package) -> advisories` for
 /// `target`'s release.
 pub fn match_packages<E>(
@@ -76,7 +101,7 @@ pub fn match_packages<E>(
                 continue;
             }
             let affected = match &a.fixed {
-                Some(f) => is_older(&p.version, f),
+                Some(f) => is_older(compared_version(target, p), f),
                 None => true,
             };
             if affected && findings.len() < MAX_FINDINGS {

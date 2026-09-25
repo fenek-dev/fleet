@@ -59,7 +59,11 @@ struct Fake {
     max_inflight: Cell<usize>,
     /// Senders of each live link's event feed; dropping one breaks the link.
     feeds: RefCell<HashMap<ServerId, mpsc::UnboundedSender<Event>>>,
+    sent: SentLog,
 }
+
+/// Requests sent with options: (connection attempt, op, expected_version).
+type SentLog = std::rc::Rc<RefCell<Vec<(u32, &'static str, Option<u64>)>>>;
 
 impl Fake {
     fn fail(&self, i: usize, n: u32, how: Fail) {
@@ -73,6 +77,8 @@ struct FakeLink {
     kind: SessionKind,
     events: mpsc::UnboundedReceiver<Event>,
     alive: std::rc::Rc<()>,
+    attempt: u32,
+    sent: SentLog,
 }
 
 fn reply(result: Result<fleet_proto::Payload, ErrorCode>) -> Reply {
@@ -124,6 +130,19 @@ impl AgentLink for FakeLink {
             }
         });
         Ok(rx)
+    }
+
+    async fn start_request_with(
+        &mut self,
+        op: Op,
+        actor: Actor,
+        approval: Option<RootApproval>,
+        expected_version: Option<u64>,
+    ) -> Result<PendingReply, ClientError> {
+        self.sent
+            .borrow_mut()
+            .push((self.attempt, op.name(), expected_version));
+        self.start_request(op, actor, approval).await
     }
 
     async fn next_event(&mut self) -> Result<(u64, Event), ClientError> {
@@ -182,6 +201,8 @@ impl Connector for FakeConnector {
             kind,
             events: rx,
             alive: std::rc::Rc::new(()),
+            attempt: n,
+            sent: self.sent.clone(),
         };
         ctx.serve(&mut link).await
     }
@@ -551,4 +572,53 @@ fn long_ops_get_the_long_timeout() {
     assert_eq!(c.timeout_for(&Op::SystemInfo), c.request_timeout);
     assert_eq!(c.timeout_for(&Op::PkgRefresh), c.long_request_timeout);
     assert!(c.long_request_timeout > c.request_timeout);
+}
+
+#[tokio::test]
+async fn request_with_carries_expected_version() {
+    LocalSet::new()
+        .run_until(async {
+            let fake = std::rc::Rc::new(Fake::default());
+            let h = start(fake.clone(), cfg(), SessionKind::Device);
+            h.add_server(spec(1));
+            let opts = fleet_core::manager::RequestOpts {
+                approval: None,
+                expected_version: Some(42),
+            };
+            h.request_with(&sid(1), Op::FirewallGet, Actor::Human, opts)
+                .await
+                .unwrap();
+            h.request(&sid(1), Op::SystemInfo, Actor::Human, None)
+                .await
+                .unwrap();
+            let sent = fake.sent.borrow().clone();
+            assert_eq!(
+                sent,
+                vec![(1, "firewall.get", Some(42)), (1, "system.info", None)]
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn confirm_goes_over_a_new_connection() {
+    LocalSet::new()
+        .run_until(async {
+            let fake = std::rc::Rc::new(Fake::default());
+            let h = start(fake.clone(), cfg(), SessionKind::Device);
+            h.add_server(spec(1));
+            wait_state(&h, &sid(1), ConnState::Ready).await;
+            let before = fake.attempts.borrow()[&sid(1)];
+            fleet_core::confirm::confirm_on_new_connection(&h, &sid(1), [7; 16], Actor::Human, T)
+                .await
+                .unwrap();
+            let sent = fake.sent.borrow().clone();
+            let (attempt, op, _) = *sent.last().unwrap();
+            assert_eq!(op, "change.confirm");
+            assert!(
+                attempt > before,
+                "confirm sent on connection {attempt}, applied on {before}"
+            );
+        })
+        .await;
 }

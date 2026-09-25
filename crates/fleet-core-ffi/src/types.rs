@@ -234,6 +234,9 @@ pub enum FleetError {
     /// Recovery code, escrow, recovery rosters (§5.11).
     #[error("recovery: {reason}")]
     Recovery { reason: String },
+    /// Provisioning step failed (§9.1); the wizard state holds the step.
+    #[error("provisioning: {reason}")]
+    Provision { reason: String },
 }
 
 impl From<fleet_core::sftp::SftpError> for FleetError {

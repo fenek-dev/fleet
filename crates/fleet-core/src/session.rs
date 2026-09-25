@@ -631,8 +631,20 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         actor: Actor,
         approval: Option<RootApproval>,
     ) -> Result<PendingReply, ClientError> {
+        self.start_request_with(op, actor, approval, &CommandOpts::default())
+            .await
+    }
+
+    /// [`Session::start_request`] with envelope options (`expected_version`).
+    pub async fn start_request_with(
+        &mut self,
+        op: Op,
+        actor: Actor,
+        approval: Option<RootApproval>,
+        opts: &CommandOpts,
+    ) -> Result<PendingReply, ClientError> {
         let server = self.cfg.server_id.clone();
-        let cmd = self.build_command(op, &server, actor, approval, &CommandOpts::default())?;
+        let cmd = self.build_command(op, &server, actor, approval, opts)?;
         self.start_send(cmd).await
     }
 

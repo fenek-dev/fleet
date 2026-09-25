@@ -31,6 +31,10 @@ fleet-debver.workspace = true
 flate2.workspace = true
 bzip2.workspace = true
 reqwest = { workspace = true, optional = true }
+# Provisioning: sudo password hashes (`$6$`, design §9.1).
+sha-crypt.workspace = true
+# cloud-init export (design §9.7): the pure renderer, shared with the agent.
+fleet-cloudinit.workspace = true
 rustls = { workspace = true, optional = true }
 
 [features]

@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod approvals;
 mod bulk;
 mod enrollment;
 mod files;
@@ -34,6 +35,7 @@ mod fleet_mgmt;
 mod install;
 mod mcp;
 mod ops;
+mod provision;
 mod recovery;
 mod rows;
 mod search;
@@ -53,6 +55,7 @@ pub use files::TransferListener;
 pub use fleet_mgmt::{FleetListener, SyncSecrets};
 pub use install::InstallListener;
 pub use mcp::{McpConnection, McpDelegate};
+pub use provision::*;
 pub use recovery::RecoverySession;
 pub use rows::*;
 pub use search::*;

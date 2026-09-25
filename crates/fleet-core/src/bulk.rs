@@ -22,15 +22,18 @@
 //! executor-agnostic ([`BulkExecutor`]): the app uses [`ManagerHandle`],
 //! tests use in-memory fakes, and SSH snippets plug in with [`run_with`].
 
-use crate::manager::{ManagerHandle, RequestError};
+use crate::escalate::{self, EscalationBatcher};
+use crate::manager::{ManagerHandle, RequestError, RequestOpts};
 use crate::session::ClientError;
 use crate::signer::{DeviceSigner, KeyRole, RoleSigner, root_reason};
+use crate::versions::{self, PROBE_VERSION, VersionSource};
 use fleet_crypto::approval::{ApprovalParams, build_approvals, op_digest};
 use fleet_proto::{
     Actor, ApprovalItem, DeviceId, ErrorCode, FleetId, Op, Payload, RootApproval, ServerId,
 };
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -165,6 +168,21 @@ pub trait BulkExecutor: Send + Sync {
         actor: Actor,
         approval: Option<RootApproval>,
     ) -> BoxFut<Result<Payload, Failure>>;
+
+    /// [`BulkExecutor::execute`] with envelope options. Executors that
+    /// can't carry `expected_version` refuse rather than drop it.
+    fn execute_with(
+        &self,
+        server: ServerId,
+        op: Op,
+        actor: Actor,
+        opts: RequestOpts,
+    ) -> BoxFut<Result<Payload, Failure>> {
+        if opts.expected_version.is_some() {
+            return Box::pin(async { Err(Failure::Agent(ErrorCode::Unsupported)) });
+        }
+        self.execute(server, op, actor, opts.approval)
+    }
 }
 
 impl From<RequestError> for Failure {
@@ -193,6 +211,20 @@ impl BulkExecutor for ManagerHandle {
         let h = self.clone();
         Box::pin(async move {
             let reply = h.request(&server, op, actor, approval).await?;
+            reply.result.map_err(Failure::Agent)
+        })
+    }
+
+    fn execute_with(
+        &self,
+        server: ServerId,
+        op: Op,
+        actor: Actor,
+        opts: RequestOpts,
+    ) -> BoxFut<Result<Payload, Failure>> {
+        let h = self.clone();
+        Box::pin(async move {
+            let reply = h.request_with(&server, op, actor, opts).await?;
             reply.result.map_err(Failure::Agent)
         })
     }
@@ -341,6 +373,10 @@ pub struct BulkRequest {
     pub targets: Vec<(ServerId, Op)>,
     pub actor: Actor,
     pub options: BulkOptions,
+    /// `expected_version` per server, as the caller saw it (e.g. the
+    /// firewall editor). Version-checked ops on servers not listed read
+    /// the current version before dispatch (`crate::versions`).
+    pub expected_versions: HashMap<ServerId, u64>,
 }
 
 impl BulkRequest {
@@ -351,6 +387,7 @@ impl BulkRequest {
             targets: targets.into_iter().map(|s| (s, op.clone())).collect(),
             actor,
             options,
+            expected_versions: HashMap::new(),
         }
     }
 
@@ -444,19 +481,28 @@ pub async fn run<E: FnMut(BulkEvent) + Send>(
         return Ok(report);
     }
 
+    // Versions first: an approval item covers `(op, expected_version)`.
+    let versions = resolve_versions(&*exec, &req, &cancel).await;
     let mut approvals: Vec<Option<RootApproval>> = vec![None; servers.len()];
+    let mut approval_items: Vec<Option<ApprovalItem>> = vec![None; servers.len()];
     if needs_approval {
         let idx: Vec<usize> = (0..req.targets.len())
-            .filter(|&i| crate::opspec::needs_approval(&req.targets[i].1))
+            .filter(|&i| {
+                crate::opspec::needs_approval(&req.targets[i].1)
+                    && !matches!(versions[i], Ver::Failed(_))
+            })
             .collect();
         let items: Vec<ApprovalItem> = idx
             .iter()
             .map(|&i| ApprovalItem {
                 server_id: req.targets[i].0.clone(),
-                op_digest: op_digest(&req.targets[i].1, None),
+                op_digest: op_digest(&req.targets[i].1, versions[i].initial()),
             })
             .collect();
-        let granted = match approver {
+        for (&i, item) in idx.iter().zip(&items) {
+            approval_items[i] = Some(item.clone());
+        }
+        let granted = match approver.clone() {
             None => Err("no approver".to_string()),
             Some(a) => {
                 let label = req.label.clone();
@@ -494,16 +540,220 @@ pub async fn run<E: FnMut(BulkEvent) + Send>(
         }
     }
 
-    let targets = req.targets;
-    let actor = req.actor;
+    let expires_at_ms = approvals
+        .iter()
+        .flatten()
+        .filter_map(approval_expiry)
+        .min()
+        .unwrap_or(u64::MAX);
+    let n = servers.len();
+    let dispatch = Arc::new(Dispatch {
+        escalation: EscalationBatcher::new(approver.clone(), &req.label, escalate::DEFAULT_WINDOW),
+        exec,
+        approver,
+        actor: req.actor,
+        targets: req.targets,
+        versions,
+        approvals: tokio::sync::Mutex::new(ApprovalState {
+            list: approvals,
+            items: approval_items,
+            dispatched: vec![false; n],
+            expires_at_ms,
+            refresh_failed: false,
+        }),
+        refresh_margin_ms: APPROVAL_REFRESH_MARGIN_MS,
+    });
     let work = move |i: usize| -> BoxFut<Result<Output, Failure>> {
-        let (server, op) = targets[i].clone();
-        let fut = exec.execute(server, op, actor.clone(), approvals[i].clone());
-        Box::pin(async move { fut.await.map(Output::Payload) })
+        let d = dispatch.clone();
+        Box::pin(async move { d.run(i).await.map(Output::Payload) })
     };
     let report = drive(servers, &req.options, &work, &cancel, false, &mut emit).await;
     emit(BulkEvent::Done(report.summary.clone()));
     Ok(report)
+}
+
+/// A long (canary) run asks for a fresh approval for the servers it
+/// hasn't dispatched yet once the current one has less than this left.
+pub const APPROVAL_REFRESH_MARGIN_MS: u64 = 5 * 60 * 1000;
+
+/// Touch ID reason of that refresh.
+pub const APPROVAL_REFRESH_LABEL: &str = "continue bulk run";
+
+fn approval_expiry(a: &RootApproval) -> Option<u64> {
+    a.decode_body().ok().map(|b| b.expires_at_ms)
+}
+
+/// Per-target `expected_version`.
+#[derive(Debug, Clone)]
+enum Ver {
+    /// The op isn't version-checked.
+    None,
+    Known(u64),
+    /// Send [`PROBE_VERSION`], retry once with the agent's current.
+    Probe,
+    /// Reading the version failed: the server fails with this.
+    Failed(Failure),
+}
+
+impl Ver {
+    fn initial(&self) -> Option<u64> {
+        match self {
+            Ver::Known(v) => Some(*v),
+            Ver::Probe => Some(PROBE_VERSION),
+            Ver::None | Ver::Failed(_) => None,
+        }
+    }
+}
+
+/// Explicit versions from the request, else a read per server (at most
+/// `concurrency` at a time).
+async fn resolve_versions(
+    exec: &dyn BulkExecutor,
+    req: &BulkRequest,
+    cancel: &CancelToken,
+) -> Vec<Ver> {
+    let mut out: Vec<Ver> = Vec::with_capacity(req.targets.len());
+    let mut reads = Vec::new();
+    for (i, (server, op)) in req.targets.iter().enumerate() {
+        let v = match (
+            req.expected_versions.get(server),
+            versions::version_source(op),
+        ) {
+            (_, None) => Ver::None,
+            (Some(v), Some(_)) => Ver::Known(*v),
+            (None, Some(VersionSource::Probe)) => Ver::Probe,
+            (None, Some(VersionSource::Read(read))) => {
+                let fut = exec.execute(server.clone(), read, req.actor.clone(), None);
+                reads.push(async move { (i, fut.await) });
+                Ver::None
+            }
+        };
+        out.push(v);
+    }
+    let conc = req.options.concurrency.clamp(1, MAX_CONCURRENCY);
+    let mut results = futures_util::stream::iter(reads).buffer_unordered(conc);
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            r = results.next() => r,
+        };
+        let Some((i, r)) = next else { break };
+        let op = &req.targets[i].1;
+        out[i] = match r {
+            Ok(p) => versions::version_from(op, &p).map_or_else(
+                || Ver::Failed(Failure::Transport("unexpected version read reply".into())),
+                Ver::Known,
+            ),
+            Err(f) => Ver::Failed(f),
+        };
+    }
+    // Cancelled before its read finished: dispatch never happens anyway,
+    // but never send a version-checked op without a version.
+    for (i, (_, op)) in req.targets.iter().enumerate() {
+        if matches!(out[i], Ver::None) && op.requires_expected_version() {
+            out[i] = Ver::Failed(Failure::Transport("version not read".into()));
+        }
+    }
+    out
+}
+
+struct ApprovalState {
+    list: Vec<Option<RootApproval>>,
+    items: Vec<Option<ApprovalItem>>,
+    dispatched: Vec<bool>,
+    expires_at_ms: u64,
+    /// The operator declined the refresh: don't ask on every dispatch.
+    refresh_failed: bool,
+}
+
+/// What each dispatched target needs: envelope options, the approval
+/// refresh, the version probe and escalation.
+struct Dispatch {
+    exec: Arc<dyn BulkExecutor>,
+    approver: Option<Arc<dyn Approver>>,
+    actor: Actor,
+    targets: Vec<(ServerId, Op)>,
+    versions: Vec<Ver>,
+    approvals: tokio::sync::Mutex<ApprovalState>,
+    escalation: Arc<EscalationBatcher>,
+    refresh_margin_ms: u64,
+}
+
+impl Dispatch {
+    async fn run(&self, i: usize) -> Result<Payload, Failure> {
+        if let Ver::Failed(f) = &self.versions[i] {
+            return Err(f.clone());
+        }
+        let (server, op) = self.targets[i].clone();
+        let mut version = self.versions[i].initial();
+        let approval = self.approval_for(i).await;
+        let send = |approval: Option<RootApproval>, expected_version: Option<u64>| {
+            self.exec.execute_with(
+                server.clone(),
+                op.clone(),
+                self.actor.clone(),
+                RequestOpts {
+                    approval,
+                    expected_version,
+                },
+            )
+        };
+        let mut r = send(approval.clone(), version).await;
+        if matches!(self.versions[i], Ver::Probe)
+            && let Err(Failure::Agent(ErrorCode::VersionConflict { current })) = r
+        {
+            version = Some(current);
+            r = send(approval.clone(), version).await;
+        }
+        if approval.is_none()
+            && op.may_escalate()
+            && matches!(r, Err(Failure::Agent(ErrorCode::ApprovalRequired)))
+            && let Ok(a) = self.escalation.approve(server.clone(), &op, version).await
+        {
+            r = send(Some(a), version).await;
+        }
+        r
+    }
+
+    /// This target's approval; first renews it (with every target not yet
+    /// dispatched) when it expires within the refresh margin.
+    async fn approval_for(&self, i: usize) -> Option<RootApproval> {
+        let mut st = self.approvals.lock().await;
+        st.dispatched[i] = true;
+        st.list[i].as_ref()?;
+        let due = crate::now_ms().saturating_add(self.refresh_margin_ms) >= st.expires_at_ms;
+        if due
+            && !st.refresh_failed
+            && let Some(approver) = self.approver.clone()
+        {
+            let idx: Vec<usize> = (0..st.list.len())
+                .filter(|&j| st.items[j].is_some() && (j == i || !st.dispatched[j]))
+                .collect();
+            let items: Vec<ApprovalItem> =
+                idx.iter().filter_map(|&j| st.items[j].clone()).collect();
+            let granted = tokio::task::spawn_blocking(move || {
+                approver.approve(APPROVAL_REFRESH_LABEL, &items)
+            })
+            .await;
+            match granted {
+                Ok(Ok(list)) if list.len() == idx.len() => {
+                    st.expires_at_ms = list.iter().filter_map(approval_expiry).min().unwrap_or(0);
+                    for (j, a) in idx.into_iter().zip(list) {
+                        st.list[j] = Some(a);
+                    }
+                    // A lifetime shorter than the margin would ask again
+                    // on every dispatch: once is enough.
+                    if crate::now_ms().saturating_add(self.refresh_margin_ms) >= st.expires_at_ms {
+                        st.refresh_failed = true;
+                    }
+                }
+                // The old approval stays; exec refuses it once expired.
+                _ => st.refresh_failed = true,
+            }
+        }
+        st.list[i].clone()
+    }
 }
 
 /// The scheduler alone, for work that isn't a signed op (SSH snippets).

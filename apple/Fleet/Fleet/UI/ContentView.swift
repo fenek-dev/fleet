@@ -75,7 +75,7 @@ struct ContentView: View {
         case .runbooks:
             RunbooksView()
         case .provision:
-            PlaceholderTab(name: "Provisioning")
+            ProvisionView(selection: $selection)
         }
     }
 }

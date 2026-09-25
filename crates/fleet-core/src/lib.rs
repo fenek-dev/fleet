@@ -25,18 +25,27 @@
 //!   encrypted iCloud sync (§7.6); [`recovery_flow`]: recovery and the
 //!   drill (§5.11); [`sudo`]: per-server sudo passwords (§5.9);
 //!   [`runner`]: the op-sending trait those flows share.
+//! - [`versions`]: `expected_version` reads for version-checked ops;
+//!   [`escalate`]: root approval on `ApprovalRequired` for may-escalate
+//!   ops; [`confirm`]: confirming an auto-revert change over a fresh
+//!   connection (§4.10); [`provision`]: the provisioning wizard's
+//!   orchestration (§9.1).
 #![forbid(unsafe_code)]
 
 pub mod bulk;
 pub mod cache;
 pub mod catchup;
+pub mod cloudinit_export;
+pub mod confirm;
 pub mod enroll;
+pub mod escalate;
 pub mod fleetsearch;
 pub mod install;
 pub mod manager;
 pub mod mcp_host;
 pub mod opspec;
 pub mod policy;
+pub mod provision;
 pub mod recovery_flow;
 pub mod roster_mgmt;
 pub mod runbook;
@@ -48,6 +57,7 @@ pub mod ssh;
 pub mod sudo;
 pub mod sync;
 pub mod timeline;
+pub mod versions;
 pub mod vuln;
 
 pub use session::{

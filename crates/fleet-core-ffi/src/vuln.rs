@@ -365,16 +365,9 @@ impl FleetCore {
             Payload::Packages(p) => p.packages,
             _ => return Err(FleetError::UnexpectedReply),
         };
-        // `pkg.list` has no source package yet: match by binary name
-        // (see `vuln::matcher`).
-        let installed: Vec<Installed> = packages
-            .into_iter()
-            .map(|p| Installed {
-                name: p.name,
-                version: p.version,
-                source: None,
-            })
-            .collect();
+        // Debian matches by source package and version when the agent
+        // reports them (see `vuln::matcher`).
+        let installed: Vec<Installed> = packages.into_iter().map(Installed::from_info).collect();
         vulns.match_report(&sid, &info.os_id, &info.os_version, &installed)
     }
 }
@@ -457,6 +450,7 @@ mod tests {
             name: "curl".into(),
             version: "7.88.1-10+deb12u3".into(),
             source: None,
+            source_version: None,
         }];
         let r = svc
             .match_report("srv_aaaaaaaaaaaa", "debian", "12", &installed)

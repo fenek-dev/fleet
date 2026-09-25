@@ -40,6 +40,28 @@ pub fn to_toml(p: &Policy) -> Result<String, String> {
     toml::to_string(p).map_err(|e| e.to_string())
 }
 
+/// Cache setting holding the policy this Mac last pushed to a server
+/// (MAC'd like every setting). There is no policy read op, so this copy
+/// is what the Mac knows the agent enforces (MCP limits, design §8).
+fn setting_key(server: &ServerId) -> String {
+    format!("policy/{server}")
+}
+
+/// Records `policy_toml` as pushed to `server` (install, `policy.update`).
+pub fn remember_pushed(
+    cache: &crate::cache::Cache,
+    server: &ServerId,
+    policy_toml: &str,
+) -> Result<(), crate::cache::CacheError> {
+    cache.set_setting(&setting_key(server), policy_toml.as_bytes())
+}
+
+/// The policy last pushed to `server`, if this Mac pushed one.
+pub fn pushed(cache: &crate::cache::Cache, server: &ServerId) -> Option<Policy> {
+    let raw = cache.setting(&setting_key(server)).ok().flatten()?;
+    Policy::from_toml(std::str::from_utf8(&raw).ok()?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +73,16 @@ mod tests {
         assert_eq!(Policy::from_toml(&text).unwrap(), p);
         assert!(text.contains("shell_exec = false"));
         assert!(!p.capabilities.allow.contains(&Group::Shell));
+    }
+
+    #[test]
+    fn pushed_copy_round_trips() {
+        let cache = crate::cache::Cache::open_in_memory().unwrap();
+        let s = ServerId::new("srv_abc123def456").unwrap();
+        assert!(pushed(&cache, &s).is_none());
+        let mut p = default_policy(FleetId([7; 16]), s.clone());
+        p.actors.ai_bulk_confirm_above = 2;
+        remember_pushed(&cache, &s, &to_toml(&p).unwrap()).unwrap();
+        assert_eq!(pushed(&cache, &s).unwrap().actors.ai_bulk_confirm_above, 2);
     }
 }

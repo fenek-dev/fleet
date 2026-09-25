@@ -15,11 +15,14 @@
 
 use crate::api::{FleetCore, lock};
 use crate::types::{FleetError, SessionKind};
-use fleet_core::bulk::{Approver, BulkExecutor};
+use fleet_core::bulk::{Approver, BoxFut, BulkExecutor};
 use fleet_core::cache::McpClientRecord;
+use fleet_core::confirm;
 use fleet_core::mcp_host::{
-    McpBackend, McpConfig, McpHost, McpSession, McpUi, PeerInfo, Prompt, PromptKind, ServerSummary,
+    AiLimits, McpBackend, McpConfig, McpHost, McpSession, McpUi, PeerInfo, Prompt, PromptKind,
+    ServerSummary,
 };
+use fleet_proto::{ChangeId, ServerId};
 use fleetctl_proto::{MAX_FRAME, PROTO_VERSION, ProtoError, Response, encode_frame};
 use std::sync::{Arc, Weak};
 
@@ -171,7 +174,37 @@ impl McpBackend for Backend {
             .put_mcp_client(&rec)
             .map_err(|_| ProtoError::Internal)
     }
+
+    fn ai_limits(&self, server: &ServerId) -> Option<AiLimits> {
+        let core = self.core().ok()?;
+        let p = fleet_core::policy::pushed(&lock(&core.cache), server)?;
+        Some(AiLimits::from_policy(&p))
+    }
+
+    fn confirm_change(&self, server: ServerId, change: ChangeId) -> BoxFut<Result<(), String>> {
+        let core = self.core();
+        Box::pin(async move {
+            let core = core.map_err(|e| format!("{e:?}"))?;
+            let (h, rt) = core.running().map_err(|e| e.to_string())?;
+            rt.spawn(async move {
+                confirm::confirm_on_new_connection(
+                    &h,
+                    &server,
+                    change,
+                    fleet_proto::Actor::Human,
+                    CONFIRM_TIMEOUT,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|_| "confirm task failed".to_string())?
+        })
+    }
 }
+
+/// Reconnect + `change.confirm`, well inside the policy's revert window.
+const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// One accepted socket connection.
 #[derive(uniffi::Object)]

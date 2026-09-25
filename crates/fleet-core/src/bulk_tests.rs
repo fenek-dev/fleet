@@ -18,6 +18,9 @@ pub(crate) enum Behave {
     Hang,
 }
 
+/// (server, op, expected_version, approved).
+pub(crate) type Sent = (ServerId, String, Option<u64>, bool);
+
 #[derive(Default)]
 pub(crate) struct FakeExec {
     pub behave: Mutex<HashMap<ServerId, Behave>>,
@@ -29,6 +32,13 @@ pub(crate) struct FakeExec {
     /// Canned replies by op name (default `Payload::Empty`).
     pub replies: Mutex<HashMap<&'static str, Payload>>,
     pub actors: Mutex<Vec<Actor>>,
+    /// `execute_with` calls: (server, op, expected_version, approved).
+    pub sent: Mutex<Vec<Sent>>,
+    /// Servers where may-escalate ops without approval answer
+    /// `ApprovalRequired` (exec's escalation).
+    pub escalates: Mutex<Vec<ServerId>>,
+    /// Version a probe (`PROBE_VERSION`) is told is current.
+    pub probe_current: Mutex<Option<u64>>,
 }
 
 impl FakeExec {
@@ -51,6 +61,38 @@ impl Drop for Guard<'_> {
 }
 
 impl BulkExecutor for Arc<FakeExec> {
+    fn execute_with(
+        &self,
+        server: ServerId,
+        op: Op,
+        actor: Actor,
+        opts: RequestOpts,
+    ) -> BoxFut<Result<Payload, Failure>> {
+        self.sent.lock().unwrap().push((
+            server.clone(),
+            op.name().to_string(),
+            opts.expected_version,
+            opts.approval.is_some(),
+        ));
+        if op.requires_expected_version() && opts.expected_version.is_none() {
+            return Box::pin(async { Err(Failure::Agent(ErrorCode::InvalidArgument)) });
+        }
+        if opts.expected_version == Some(PROBE_VERSION)
+            && let Some(current) = *self.probe_current.lock().unwrap()
+        {
+            return Box::pin(
+                async move { Err(Failure::Agent(ErrorCode::VersionConflict { current })) },
+            );
+        }
+        if op.may_escalate()
+            && opts.approval.is_none()
+            && self.escalates.lock().unwrap().contains(&server)
+        {
+            return Box::pin(async { Err(Failure::Agent(ErrorCode::ApprovalRequired)) });
+        }
+        self.execute(server, op, actor, opts.approval)
+    }
+
     fn execute(
         &self,
         server: ServerId,
@@ -124,14 +166,20 @@ pub(crate) struct SoftApprover {
     pub root: SoftwareP256Signer,
     pub deny: bool,
     pub asked: Mutex<Vec<(String, Vec<ApprovalItem>)>>,
+    pub lifetime_ms: u64,
 }
 
 impl SoftApprover {
     pub fn new(deny: bool) -> Arc<Self> {
+        Self::with_lifetime(deny, 30 * 60_000)
+    }
+
+    pub fn with_lifetime(deny: bool, lifetime_ms: u64) -> Arc<Self> {
         Arc::new(Self {
             root: SoftwareP256Signer::generate().unwrap(),
             deny,
             asked: Mutex::new(Vec::new()),
+            lifetime_ms,
         })
     }
 }
@@ -154,7 +202,7 @@ impl Approver for SoftApprover {
             fleet_id: FleetId([1; 16]),
             approval_id: [9; 16],
             issued_at_ms: now,
-            expires_at_ms: now + 60_000,
+            expires_at_ms: now + self.lifetime_ms,
         };
         Ok(build_approvals(&self.root, DeviceId([2; 16]), &params, items).unwrap())
     }
@@ -493,4 +541,214 @@ async fn rejects_bad_requests() {
     let req = BulkRequest::uniform(vec![], restart(), Actor::Human, BulkOptions::default());
     let r = run(Arc::new(exec), None, req, CancelToken::new(), |_| {}).await;
     assert_eq!(r.unwrap_err(), BulkError::NoTargets);
+}
+
+// ---- expected_version, escalation, approval refresh ----
+
+fn cron_set() -> Op {
+    Op::CronSet {
+        user: fleet_proto::args::UserName::new("ops").unwrap(),
+        entries: vec![],
+    }
+}
+
+fn cron_tabs(version: u64) -> Payload {
+    Payload::CronTabs(fleet_proto::payload::CronTabs {
+        tabs: vec![fleet_proto::payload::CronTab {
+            user: Some("ops".into()),
+            source: "/var/spool/cron/crontabs/ops".into(),
+            version,
+            entries: vec![],
+        }],
+    })
+}
+
+fn sent_for(exec: &FakeExec, op: &str) -> Vec<(ServerId, Option<u64>, bool)> {
+    exec.sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, o, _, _)| o == op)
+        .map(|(s, _, v, a)| (s.clone(), *v, *a))
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn version_checked_ops_read_the_version_before_dispatch() {
+    let exec = FakeExec::with(&[]);
+    exec.replies
+        .lock()
+        .unwrap()
+        .insert("cron.list", cron_tabs(5));
+    let opts = BulkOptions {
+        concurrency: 1,
+        ..Default::default()
+    };
+    let mut req = BulkRequest::uniform(targets(3), cron_set(), Actor::Human, opts);
+    // The caller saw server 2's version itself: no read for it.
+    req.expected_versions.insert(sid(2), 99);
+    let (report, _) = go(exec.clone(), None, req, CancelToken::new()).await;
+    assert_eq!(report.summary.succeeded, 3);
+    let reads: Vec<ServerId> = exec
+        .calls()
+        .into_iter()
+        .filter(|(_, op, _)| op == "cron.list")
+        .map(|(s, _, _)| s)
+        .collect();
+    assert_eq!(reads, vec![sid(0), sid(1)]);
+    assert_eq!(
+        sent_for(&exec, "cron.set"),
+        vec![
+            (sid(0), Some(5), false),
+            (sid(1), Some(5), false),
+            (sid(2), Some(99), false)
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_version_read_fails_only_that_server() {
+    let exec = FakeExec::with(&[(1, Behave::Fail(1))]);
+    exec.replies
+        .lock()
+        .unwrap()
+        .insert("cron.list", cron_tabs(5));
+    let opts = BulkOptions {
+        stop_on_failure: false,
+        ..Default::default()
+    };
+    let req = BulkRequest::uniform(targets(3), cron_set(), Actor::Human, opts);
+    let (report, _) = go(exec.clone(), None, req, CancelToken::new()).await;
+    assert_eq!(report.summary.succeeded, 2);
+    assert_eq!(
+        report.outcomes[1].1,
+        Outcome::Failed(Failure::Agent(ErrorCode::Internal))
+    );
+    assert!(
+        sent_for(&exec, "cron.set")
+            .iter()
+            .all(|(s, _, _)| *s != sid(1))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn probe_retries_once_with_the_current_version() {
+    let exec = FakeExec::with(&[]);
+    *exec.probe_current.lock().unwrap() = Some(77);
+    let op = Op::MeshPeersSet { peers: vec![] };
+    let req = BulkRequest::uniform(targets(1), op, Actor::Human, BulkOptions::default());
+    let (report, _) = go(exec.clone(), None, req, CancelToken::new()).await;
+    assert_eq!(report.summary.succeeded, 1);
+    assert_eq!(
+        sent_for(&exec, "mesh.peers.set"),
+        vec![
+            (sid(0), Some(crate::versions::PROBE_VERSION), false),
+            (sid(0), Some(77), false)
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn escalations_share_one_approval_and_retry_once() {
+    let exec = FakeExec::with(&[]);
+    exec.replies
+        .lock()
+        .unwrap()
+        .insert("cron.list", cron_tabs(5));
+    *exec.escalates.lock().unwrap() = vec![sid(1), sid(2), sid(3)];
+    let approver = SoftApprover::new(false);
+    let req = BulkRequest::uniform(targets(4), cron_set(), Actor::Human, BulkOptions::default());
+    assert!(!req.needs_approval(), "Change tier until exec escalates");
+    let (report, _) = go(
+        exec.clone(),
+        Some(approver.clone()),
+        req,
+        CancelToken::new(),
+    )
+    .await;
+    assert_eq!(report.summary.succeeded, 4);
+    let asked = approver.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "one Touch ID for every escalation");
+    assert!(asked[0].0.starts_with("cron.set on "), "{}", asked[0].0);
+    let mut servers: Vec<ServerId> = asked[0].1.iter().map(|i| i.server_id.clone()).collect();
+    servers.sort();
+    assert_eq!(servers, vec![sid(1), sid(2), sid(3)]);
+    // The approval covers the version the command carries.
+    assert!(
+        asked[0]
+            .1
+            .iter()
+            .all(|i| i.op_digest == op_digest(&cron_set(), Some(5)))
+    );
+    let sent = sent_for(&exec, "cron.set");
+    assert_eq!(sent.iter().filter(|(s, _, _)| *s == sid(0)).count(), 1);
+    for i in 1..4 {
+        let mine: Vec<bool> = sent
+            .iter()
+            .filter(|(s, _, _)| *s == sid(i))
+            .map(|(_, _, a)| *a)
+            .collect();
+        assert_eq!(
+            mine,
+            vec![false, true],
+            "server {i}: unapproved, then approved"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn declined_escalation_keeps_approval_required() {
+    let exec = FakeExec::with(&[]);
+    exec.replies
+        .lock()
+        .unwrap()
+        .insert("cron.list", cron_tabs(5));
+    *exec.escalates.lock().unwrap() = vec![sid(0)];
+    let req = BulkRequest::uniform(targets(1), cron_set(), Actor::Human, BulkOptions::default());
+    let (report, _) = go(
+        exec.clone(),
+        Some(SoftApprover::new(true)),
+        req,
+        CancelToken::new(),
+    )
+    .await;
+    assert_eq!(
+        report.outcomes[0].1,
+        Outcome::Failed(Failure::Agent(ErrorCode::ApprovalRequired))
+    );
+    assert_eq!(
+        sent_for(&exec, "cron.set").len(),
+        1,
+        "no retry without approval"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn approval_close_to_expiry_is_renewed_for_the_rest() {
+    let exec = FakeExec::with(&[]);
+    // Shorter than the 5-minute margin: due at the first dispatch.
+    let approver = SoftApprover::with_lifetime(false, 60_000);
+    let op = crate::opspec::shell_exec("deploy", "uptime", 30).unwrap();
+    let opts = BulkOptions {
+        concurrency: 1,
+        ..Default::default()
+    };
+    let req = BulkRequest::uniform(targets(3), op, Actor::Human, opts);
+    let (report, _) = go(
+        exec.clone(),
+        Some(approver.clone()),
+        req,
+        CancelToken::new(),
+    )
+    .await;
+    assert_eq!(report.summary.succeeded, 3);
+    let asked = approver.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "initial approval, then one refresh");
+    assert_eq!(asked[1].0, APPROVAL_REFRESH_LABEL);
+    assert_eq!(
+        asked[1].1.len(),
+        3,
+        "the refresh covers every server not yet run"
+    );
+    assert!(exec.calls().iter().all(|(_, _, approved)| *approved));
 }

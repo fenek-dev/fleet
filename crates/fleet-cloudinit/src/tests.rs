@@ -1,4 +1,4 @@
-use crate::cloudinit::*;
+use crate::*;
 use fleet_proto::args::{SshKeyAlgo, SshPublicKey, UserName};
 
 fn ed25519(seed: u8, comment: &str) -> SshPublicKey {
@@ -33,6 +33,7 @@ hostname: \"web-1\"
 users:
   - name: \"ops\"
     groups: \"sudo\"
+    sudo: \"ALL=(ALL) NOPASSWD:ALL\"
     shell: \"/bin/bash\"
     lock_passwd: true
     ssh_authorized_keys:

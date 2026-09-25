@@ -1182,12 +1182,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-cloudinit"
+version = "0.1.0"
+dependencies = [
+ "fleet-proto",
+]
+
+[[package]]
 name = "fleet-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "bzip2",
  "flate2",
+ "fleet-cloudinit",
  "fleet-crypto",
  "fleet-debver",
  "fleet-proto",
@@ -1202,6 +1210,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha-crypt",
  "sha2 0.11.0",
  "tempfile",
  "thiserror",
@@ -1266,6 +1275,7 @@ name = "fleet-hardening"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fleet-cloudinit",
  "fleet-crypto",
  "fleet-ops",
  "fleet-proto",
@@ -2150,6 +2160,15 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "mcf"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2044bdbade272ded4a1529324f4f30ca7b0c5b496541f2a9095bbd1c9d03cb06"
+dependencies = [
+ "base64ct",
+]
 
 [[package]]
 name = "md5"
@@ -3368,6 +3387,19 @@ checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
 dependencies = [
  "base16ct",
  "serde",
+]
+
+[[package]]
+name = "sha-crypt"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32ee31e0190f9dc366d26b032ac36a99328532f40a237a79385a20d2d7f29810"
+dependencies = [
+ "base64ct",
+ "ctutils",
+ "mcf",
+ "password-hash",
+ "sha2 0.11.0",
 ]
 
 [[package]]
