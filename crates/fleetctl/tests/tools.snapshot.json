@@ -1,0 +1,1068 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List managed servers with id, name, tags and connection state.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Lists servers known to the app (Mac-side data only).",
+      "properties": {
+        "tag": {
+          "default": null,
+          "description": "Only servers with this tag.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "ListServersArgs",
+      "type": "object"
+    },
+    "name": "fleet_list_servers"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Search packages, ports, processes, files, journal or users across servers. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$defs": {
+        "SearchKind": {
+          "enum": [
+            "packages",
+            "ports",
+            "processes",
+            "files",
+            "journal",
+            "users"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Fleet-wide search; each server searches locally.",
+      "properties": {
+        "case_sensitive": {
+          "default": false,
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/SearchKind"
+        },
+        "servers": {
+          "default": [],
+          "description": "Server ids; empty = every server.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "term": {
+          "description": "Literal text (no regex), 1–256 bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "term"
+      ],
+      "title": "SearchArgs",
+      "type": "object"
+    },
+    "name": "fleet_search"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Query stored metrics (7 days) of one server. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "minute_resolution": {
+          "default": true,
+          "description": "Minute rollups (default) or raw samples.",
+          "type": "boolean"
+        },
+        "series": {
+          "default": [],
+          "description": "Series ids; empty = all (≤ 256).",
+          "items": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "server": {
+          "type": "string"
+        },
+        "since_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "until_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "server"
+      ],
+      "title": "MetricsQueryArgs",
+      "type": "object"
+    },
+    "name": "metrics_query"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List processes on a server. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$defs": {
+        "ProcessSortArg": {
+          "enum": [
+            "cpu",
+            "memory",
+            "io",
+            "pid"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 50,
+          "description": "1–1000, default 50.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "server": {
+          "type": "string"
+        },
+        "sort": {
+          "$ref": "#/$defs/ProcessSortArg"
+        }
+      },
+      "required": [
+        "server",
+        "sort"
+      ],
+      "title": "ProcessesListArgs",
+      "type": "object"
+    },
+    "name": "processes_list"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Query the systemd journal of a server. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$defs": {
+        "LogPriorityArg": {
+          "enum": [
+            "emerg",
+            "alert",
+            "crit",
+            "err",
+            "warning",
+            "notice",
+            "info",
+            "debug"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "grep": {
+          "default": null,
+          "description": "Literal substring filter.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": 200,
+          "description": "1–1000, default 200.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "priority": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LogPriorityArg"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "server": {
+          "type": "string"
+        },
+        "since_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "units": {
+          "default": [],
+          "description": "systemd units (`nginx.service`); empty = all.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "until_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "server"
+      ],
+      "title": "LogsQueryArgs",
+      "type": "object"
+    },
+    "name": "logs_query"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Query SSH/console logins (optionally failed only) of a server. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "failed_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "limit": {
+          "default": 200,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "server": {
+          "type": "string"
+        },
+        "since_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "until_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "server"
+      ],
+      "title": "LoginsQueryArgs",
+      "type": "object"
+    },
+    "name": "logins_query"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Start, stop, restart, reload, enable or disable a systemd unit on one or more servers. More servers than the operator's threshold need their approval. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$defs": {
+        "ServiceActionKind": {
+          "enum": [
+            "start",
+            "stop",
+            "restart",
+            "reload",
+            "enable",
+            "disable"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ServiceActionKind"
+        },
+        "servers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "unit": {
+          "description": "`name.service`, `.timer` or `.socket`; never `fleet-*`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "servers",
+        "unit",
+        "action"
+      ],
+      "title": "ServiceActionArgs",
+      "type": "object"
+    },
+    "name": "service_action"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Get the Fleet-managed firewall ruleset and its version. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server"
+      ],
+      "title": "ServerArgs",
+      "type": "object"
+    },
+    "name": "firewall_get"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Replace the Fleet-managed firewall ruleset (auto-reverts unless confirmed). Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "expected_version": {
+          "description": "The version `firewall_get` reported.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ruleset": {
+          "description": "The ruleset as `firewall_get` returned it, edited."
+        },
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "ruleset",
+        "expected_version"
+      ],
+      "title": "FirewallApplyArgs",
+      "type": "object"
+    },
+    "name": "firewall_apply"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Upgrade packages (all or security only) on one or more servers. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "security_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "servers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "servers"
+      ],
+      "title": "PackagesUpgradeArgs",
+      "type": "object"
+    },
+    "name": "packages_upgrade"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Start, stop or restart a Docker container. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$defs": {
+        "ContainerActionKind": {
+          "enum": [
+            "start",
+            "stop",
+            "restart"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ContainerActionKind"
+        },
+        "container": {
+          "description": "Container name or id.",
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "container",
+        "action"
+      ],
+      "title": "DockerActionArgs",
+      "type": "object"
+    },
+    "name": "docker_action"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Deploy a Docker Compose project. Privileged features need the operator's approval. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "compose_yaml": {
+          "description": "Full `compose.yaml` text (≤ 256 KiB).",
+          "type": "string"
+        },
+        "project": {
+          "description": "`^[a-z0-9][a-z0-9_-]{0,62}$`; lives in `/srv/<project>/`.",
+          "type": "string"
+        },
+        "pull": {
+          "default": true,
+          "type": "boolean"
+        },
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "project",
+        "compose_yaml"
+      ],
+      "title": "ComposeDeployArgs",
+      "type": "object"
+    },
+    "name": "compose_deploy"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Diff two versions of a tracked config file. Secret files are never returned. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "Absolute path of a tracked config file.",
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        },
+        "to": {
+          "default": null,
+          "description": "Default: the current version.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "server",
+        "path",
+        "from"
+      ],
+      "title": "ConfigDiffArgs",
+      "type": "object"
+    },
+    "name": "config_diff"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Roll a tracked config file back to an earlier version. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        },
+        "version": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "server",
+        "path",
+        "version"
+      ],
+      "title": "ConfigRollbackArgs",
+      "type": "object"
+    },
+    "name": "config_rollback"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Run one typed operation on many servers. Canary mode is enforced: the first server runs alone and must pass a health check before the rest. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$defs": {
+        "ContainerActionKind": {
+          "enum": [
+            "start",
+            "stop",
+            "restart"
+          ],
+          "type": "string"
+        },
+        "OpSpec": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "description": "`agent.health`.",
+              "properties": {
+                "op": {
+                  "const": "agent_health",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "`system.info`.",
+              "properties": {
+                "op": {
+                  "const": "system_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "`unit.start|stop|restart|reload|enable|disable`.",
+              "properties": {
+                "action": {
+                  "$ref": "#/$defs/ServiceActionKind"
+                },
+                "op": {
+                  "const": "unit",
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "unit",
+                "action"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "`pkg.refresh` (`apt-get update`).",
+              "properties": {
+                "op": {
+                  "const": "pkg_refresh",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "`pkg.upgrade`.",
+              "properties": {
+                "op": {
+                  "const": "pkg_upgrade",
+                  "type": "string"
+                },
+                "security_only": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "op"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "`docker.containers.start|stop|restart`.",
+              "properties": {
+                "action": {
+                  "$ref": "#/$defs/ContainerActionKind"
+                },
+                "container": {
+                  "type": "string"
+                },
+                "op": {
+                  "const": "container",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "container",
+                "action"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "op": {
+                  "const": "compose_pull",
+                  "type": "string"
+                },
+                "project": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "project"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "op": {
+                  "const": "compose_restart",
+                  "type": "string"
+                },
+                "project": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "project"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "compose_yaml": {
+                  "type": "string"
+                },
+                "op": {
+                  "const": "compose_deploy",
+                  "type": "string"
+                },
+                "project": {
+                  "type": "string"
+                },
+                "pull": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "op",
+                "project",
+                "compose_yaml"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "op": {
+                  "const": "config_rollback",
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "version": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "op",
+                "path",
+                "version"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "level": {
+                  "$ref": "#/$defs/ProfileLevelArg"
+                },
+                "op": {
+                  "const": "profile_check",
+                  "type": "string"
+                },
+                "roles": {
+                  "default": [],
+                  "items": {
+                    "$ref": "#/$defs/ProfileRoleArg"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "op",
+                "level"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "`system.reboot` (Elevated).",
+              "properties": {
+                "delay_s": {
+                  "default": 0,
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "op": {
+                  "const": "system_reboot",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "description": "`shell.exec` (Elevated, policy-gated).",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "op": {
+                  "const": "shell_exec",
+                  "type": "string"
+                },
+                "timeout_s": {
+                  "default": 60,
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "user": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "user",
+                "command"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "ProfileLevelArg": {
+          "enum": [
+            "baseline",
+            "strict"
+          ],
+          "type": "string"
+        },
+        "ProfileRoleArg": {
+          "enum": [
+            "docker",
+            "web",
+            "game"
+          ],
+          "type": "string"
+        },
+        "ServiceActionKind": {
+          "enum": [
+            "start",
+            "stop",
+            "restart",
+            "reload",
+            "enable",
+            "disable"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Runs one typed operation on many servers. Canary mode is always on:\nthe first server runs alone and must pass a health check.",
+      "properties": {
+        "concurrency": {
+          "default": null,
+          "description": "1–16, default 16.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "op": {
+          "$ref": "#/$defs/OpSpec"
+        },
+        "servers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "stop_on_failure": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "servers",
+        "op"
+      ],
+      "title": "BulkRunArgs",
+      "type": "object"
+    },
+    "name": "bulk_run"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Run a shell command where the server policy allows shell.exec (off by default). Always needs the operator's Touch ID. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Policy-gated (`shell.exec`, off by default); always needs approval.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "servers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "timeout_s": {
+          "default": 60,
+          "description": "1–3600, default 60.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "user": {
+          "description": "Local user to run as (must be allowed by the server policy).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "servers",
+        "user",
+        "command"
+      ],
+      "title": "ShellExecArgs",
+      "type": "object"
+    },
+    "name": "shell_exec"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Check a server against a hardening profile (read-only). Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$defs": {
+        "ProfileLevelArg": {
+          "enum": [
+            "baseline",
+            "strict"
+          ],
+          "type": "string"
+        },
+        "ProfileRoleArg": {
+          "enum": [
+            "docker",
+            "web",
+            "game"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/ProfileLevelArg"
+        },
+        "roles": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ProfileRoleArg"
+          },
+          "type": "array"
+        },
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "level"
+      ],
+      "title": "ProfileCheckArgs",
+      "type": "object"
+    },
+    "name": "profile_check"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Fetch an event and the events around it, for explaining what happened. Server-derived text in the result is marked as untrusted content.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "description": "Returns an event and its surrounding events for explanation.",
+      "properties": {
+        "seq": {
+          "description": "Event sequence number from the server's event log.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "server": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "seq"
+      ],
+      "title": "ExplainEventArgs",
+      "type": "object"
+    },
+    "name": "explain_event"
+  }
+]

@@ -27,9 +27,11 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod bulk;
 mod enrollment;
 mod files;
 mod install;
+mod mcp;
 mod ops;
 mod rows;
 mod signer;
@@ -40,9 +42,11 @@ mod types;
 mod validate;
 
 pub use api::FleetCore;
+pub use bulk::{BulkListener, BulkRunHandle};
 pub use enrollment::Enrollment;
 pub use files::TransferListener;
 pub use install::InstallListener;
+pub use mcp::{McpConnection, McpDelegate};
 pub use rows::*;
 pub use signer::{CoreListener, DeviceSigner, KeyStore, SignerAdapter};
 pub use streams::{JournalSink, MetricsSink, StreamHandle};

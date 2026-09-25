@@ -54,7 +54,7 @@ struct SidebarView: View {
                     }
                     .tag(NavItem.alerts)
                     Label("Timeline", systemImage: "clock").tag(NavItem.timeline)
-                    Label("Runbooks", systemImage: "list.bullet").tag(NavItem.runbooks)
+                    Label("Snippets & Runbooks", systemImage: "list.bullet").tag(NavItem.runbooks)
                     Label("Provision", systemImage: "plus.square").tag(NavItem.provision)
                 }
                 Section("Groups") {

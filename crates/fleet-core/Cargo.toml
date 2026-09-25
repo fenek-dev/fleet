@@ -22,6 +22,10 @@ toml.workspace = true
 hex.workspace = true
 serde.workspace = true
 blake3.workspace = true
+# Bulk engine (§7.3), runbooks (§2.3) and the app side of the MCP socket (§8).
+fleetctl-proto.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

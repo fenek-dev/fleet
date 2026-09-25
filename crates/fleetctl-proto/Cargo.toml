@@ -1,0 +1,20 @@
+[package]
+name = "fleetctl-proto"
+description = "fleetctl <-> Fleet app socket protocol, MCP tool arguments, untrusted-content handling (design §5.10, §8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# JSON Schemas for the MCP tool list (fleetctl only; the app doesn't need them).
+schema = ["dep:schemars"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+schemars = { workspace = true, optional = true }

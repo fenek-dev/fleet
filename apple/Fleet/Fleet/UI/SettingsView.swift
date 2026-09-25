@@ -15,11 +15,7 @@ struct SettingsView: View {
                     title: "Recovery",
                     detail: "Recovery code, passphrase and the recovery drill.")
             }
-            Tab("AI", systemImage: "sparkles") {
-                SettingsPlaceholder(
-                    title: "AI agents",
-                    detail: "Approved MCP clients and the pause switch.")
-            }
+            Tab("AI", systemImage: "sparkles") { AISettings() }
             Tab("Sync", systemImage: "icloud") {
                 SettingsPlaceholder(
                     title: "Sync",

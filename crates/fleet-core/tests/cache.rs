@@ -35,7 +35,7 @@ fn record(i: usize) -> ServerRecord {
 #[test]
 fn servers_groups_tags_and_jump_chain_roundtrip() {
     let mut c = Cache::open_in_memory().unwrap();
-    assert_eq!(c.schema_version().unwrap(), 2);
+    assert_eq!(c.schema_version().unwrap(), 3);
     c.upsert_group(&GroupRecord {
         id: "g1".into(),
         name: "Web".into(),
@@ -237,7 +237,7 @@ fn v1_database_is_upgraded_and_sealed() {
     }
     let c = Cache::open(&path, key(3)).unwrap();
     assert!(c.upgraded());
-    assert_eq!(c.schema_version().unwrap(), 2);
+    assert_eq!(c.schema_version().unwrap(), 3);
     assert_eq!(c.server(&sid(1)).unwrap().unwrap().target.host, "h");
     assert_eq!(c.setting("fleet_id").unwrap(), Some(vec![1]));
     assert!(c.pins(&sid(1)).unwrap().is_some());
@@ -258,7 +258,7 @@ fn file_database_migrates_once_and_refuses_newer_schema() {
         c.upsert_server(&record(1)).unwrap();
     }
     let c = Cache::open(&path, key(1)).unwrap();
-    assert_eq!(c.schema_version().unwrap(), 2);
+    assert_eq!(c.schema_version().unwrap(), 3);
     assert_eq!(c.servers().unwrap().len(), 1);
     drop(c);
     {
@@ -277,7 +277,7 @@ fn file_database_migrates_once_and_refuses_newer_schema() {
         Cache::open(&path, key(1)),
         Err(CacheError::TooNew {
             found: 99,
-            supported: 2
+            supported: 3
         })
     ));
 }

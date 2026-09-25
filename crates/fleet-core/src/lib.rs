@@ -12,13 +12,22 @@
 //!   per-server policy (§5.4).
 //! - [`sftp`]: file browser over the server's SSH connection (§2.3).
 //! - [`signer`]: the Secure Enclave signing interface Swift implements (§7.1).
+//! - [`bulk`]: bulk action engine — concurrency, canary, one root approval
+//!   per run, dry runs (§7.3); [`opspec`]: typed op descriptions to `Op`.
+//! - [`runbook`]: snippets and runbooks (§2.3); [`mcp_host`]: the app side
+//!   of the `fleetctl` socket — pairing, pause, lock, rate limit, approvals,
+//!   untrusted results (§5.10, §8).
 #![forbid(unsafe_code)]
 
+pub mod bulk;
 pub mod cache;
 pub mod enroll;
 pub mod install;
 pub mod manager;
+pub mod mcp_host;
+pub mod opspec;
 pub mod policy;
+pub mod runbook;
 pub mod session;
 pub mod sftp;
 pub mod signer;

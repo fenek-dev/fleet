@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(CoreBridge.self) private var core
+    @Environment(AIModel.self) private var ai
     @Binding var paletteShown: Bool
     @State private var selection: NavItem? = .fleet
 
@@ -22,6 +23,11 @@ struct ContentView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(core.securityAlert ?? "")
+        }
+        // AI pairing / approval prompts; answered only by their buttons.
+        .sheet(item: Binding(get: { ai.current }, set: { _ in })) { prompt in
+            AIPromptSheet(prompt: prompt)
+                .interactiveDismissDisabled()
         }
     }
 
@@ -60,7 +66,7 @@ struct ContentView: View {
         case .timeline:
             PlaceholderTab(name: "Timeline")
         case .runbooks:
-            PlaceholderTab(name: "Runbooks")
+            RunbooksView()
         case .provision:
             PlaceholderTab(name: "Provisioning")
         }

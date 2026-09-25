@@ -66,6 +66,12 @@ targets:
           - $(SRCROOT)/Generated/fleet_core.swift
           - $(SRCROOT)/Generated/include/fleet_coreFFI.h
           - $(SRCROOT)/../../target/aarch64-apple-darwin/release/libfleet_core_ffi.a
+    postBuildScripts:
+      # `fleetctl mcp` ships inside the app (Contents/MacOS/fleetctl).
+      - name: Build and embed fleetctl
+        script: |
+          "${SRCROOT}/../../scripts/build-fleetctl.sh"
+        basedOnDependencyAnalysis: false
 
   FleetTests:
     type: bundle.unit-test

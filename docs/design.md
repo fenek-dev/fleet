@@ -1078,7 +1078,19 @@ object FleetCore {
   [Async, Throws] open_terminal(id, u32 slot, boolean tmux, u32 cols, u32 rows, TerminalSink) -> TerminalSession;
   [Async, Throws] file_home / file_list / file_stat / file_read / file_write(expected size+mtime) /
                   file_rename / file_mkdir / file_remove / file_chmod / file_download / file_upload;
+  // bulk runs, snippets, runbooks (§7.3, §2.3); ops as BulkOpRow, validated in Rust
+  [Throws] bulk_preview(BulkOpRow) -> BulkPreviewRow;
+  [Throws] bulk_run(targets, BulkOpRow, BulkOptionsRow, BulkListener) -> BulkRunHandle;
+  list_snippets / save_snippet / delete_snippet / run_snippet(id, targets, SnippetModeRow, options, listener);
+  list_runbooks / save_runbook / delete_runbook / due_runbooks(now_ms) / run_runbook(id, params, listener);
+  // MCP socket host (§5.10, §8): Swift verifies the peer, Rust does the rest
+  mcp_connect(McpPeerRow) -> McpConnection; mcp_set_delegate(McpDelegate?);
+  mcp_set_paused / mcp_paused / mcp_resolve_prompt(id, approved) / mcp_clients / mcp_revoke_client(key);
 };
+object McpConnection { [Async] handle(bytes frame_body) -> bytes /* response frame */; };
+object BulkRunHandle { cancel(); };
+callback interface BulkListener { on_event(BulkEventRow); };
+callback interface McpDelegate { on_prompt(McpPromptRow); on_prompt_closed(u64 id); };
 object Enrollment { recovery_words() /* once */; challenge() -> sequence<u32>; confirm_words(answers) -> boolean;
                     [Async] finish(passphrase) -> EnrollmentResult; cancel(); };
 object TerminalSession { write(bytes); resize(cols, rows); close(); };
@@ -1130,6 +1142,10 @@ callback interface TransferListener { on_progress(u64 done, u64 total); };
 - **Signing:** each server's command is signed when it's dispatched, not up front. An Elevated run gets one root-key approval covering every target server before it starts (section 6.4).
 - Results stream back per server. Each server has its own timeout, and the run can be cancelled.
 
+Implementation (`fleet_core::bulk`): executor-agnostic (`BulkExecutor`; the app passes `ManagerHandle`). Canary: target 1 runs alone, then a `HealthProbe` (`agent.health` answers, no pending recovery); a canary or health failure always stops the run. Stop-on-failure stops dispatching; servers in flight finish. Cancel drops in-flight requests and reports them `Cancelled` (outcome unknown, never success); the rest are `Skipped`. Dry runs fetch `profile.plan` for `profile.apply` and `firewall.get` for `firewall.apply`; other ops show the command. Approvals: `RootApprover` builds the `ApprovalItem`s (`op_digest(op, None)`) for every Elevated target and signs once through `build_approvals` (Touch ID reason names the op and server count), 30-minute lifetime; a canary run longer than that fails later servers with `ApprovalInvalid`. Operations cross the FFI and MCP as `OpSpec` (plain data) and are validated into `Op` (`fleet_core::opspec`) before signing. Not yet: `expected_version` in the envelope (so `firewall.apply` and other version-checked ops can't run in bulk or from MCP), Mac-side escalation checks for `may_escalate` ops (exec answers `ApprovalRequired`).
+
+**Snippets and runbooks** (`fleet_core::runbook`, cache v3 tables `snippets`, `runbooks`, MAC'd JSON bodies): a snippet runs via `shell.exec` (Elevated, one approval) or SSH exec as the admin user after the UI shows the exact text; non-zero exit is a failure. A runbook is ordered `OpSpec` steps with `{{param}}` substitution into typed fields only (never into shell text; values `[A-Za-z0-9._:/@+=,-]`, re-validated), a condition on the previous step (`always`, `previous_succeeded`, `previous_failed`), per-step canary and stop-on-failure, and an optional schedule (5 min–7 days) that the app's minute timer runs while unlocked. Scheduled runbooks can't contain Elevated steps. Commands carry `Actor::Runbook { id }`.
+
 ### 7.4 Local cache
 
 SQLite (`rusqlite`, WAL mode) holding:
@@ -1157,7 +1173,7 @@ Schema v1 (tables; migrations are append-only, recorded in `schema_migrations`, 
 | `settings` | key → bytes |
 | `roster_chain` | every roster copy by epoch and version, with its hash (a cache: servers are authoritative) |
 
-Foreign keys are on: deleting a server removes its tags, pins, audit mirror and metrics. Snippets, runbooks, profiles, alert rules and vulnerability data get their own migrations when those features land. The audit mirror and metrics tables exist but are unused until the offline audit mirror lands.
+Foreign keys are on: deleting a server removes its tags, pins, audit mirror and metrics. Schema v3 adds `snippets`, `runbooks` (plus unMAC'd `last_run_ms`) and `mcp_clients`: JSON bodies with a MAC over `(key, body)`. Profiles, alert rules and vulnerability data get their own migrations when those features land. The audit mirror and metrics tables exist but are unused until the offline audit mirror lands.
 
 **Integrity (schema v2).** Rows that decide whom the Mac trusts carry a keyed BLAKE3 MAC (`mac` column): server address rows (id, host, port, user, jump chain), `pinned_keys`, `jump_pins`, `settings` and `roster_chain`. The 32-byte key lives in the Keychain (this device only) via the `KeyStore` callback and is generated on first launch. Every read of such a row checks the MAC; a mismatch, a missing MAC, or an enrolled cache whose key is gone is a hard error the app shows as a security alert. Deleting rows can't be detected but only leads back to first-use confirmation. A v1 database is sealed once on upgrade (trust on upgrade); its jump host pins are dropped because they can't be attributed to a route.
 
@@ -1200,6 +1216,12 @@ Foreign keys are on: deleting a server removes its tags, pins, audit mirror and 
 - **"Explain" buttons:** the app sends the selected event, log lines or config file to an LLM provider the operator configures in Settings → AI (off by default; the API key is kept in the Keychain). The same redaction applies, and the app shows exactly what will be sent the first time.
 - **Pause switch:** a global toggle, in the app and the menu bar, that instantly rejects all MCP calls.
 - **Tools:** `fleet_list_servers`, `fleet_search`, `metrics_query`, `processes_list`, `logs_query`, `logins_query`, `service_action`, `firewall_get`, `firewall_apply`, `packages_upgrade`, `docker_action`, `compose_deploy`, `config_diff`, `config_rollback`, `bulk_run` (canary mode enforced), `shell_exec` (where the policy allows it), `profile_check`, `explain_event`.
+
+**Implementation.**
+
+- `crates/fleetctl-proto`: frames are a 4-byte big-endian length plus a JSON body (≤ 4 MiB). `Request { v, id, body: Hello | Call }`, `Response { v, id, body: Result<Welcome | Tool(ToolOutput), ProtoError> }`. `Call` has one variant per tool (`{"tool": name, "args": {...}}`, unknown fields refused); `ToolOutput` is `summary` (Mac-side JSON) plus `untrusted` items `{ server, source, text, truncated, redactions }`. Errors: `not_running`, `locked`, `paused`, `pairing_required`, `pairing_denied`, `approval_required`, `approval_denied`, `rate_limited`, `invalid_argument`, `unknown_server`, `unsupported`, `version`, `agent`, `internal`.
+- `crates/fleetctl` (`fleetctl mcp`, `rmcp` stdio server, hand-written tool list with schemars input schemas, snapshot-tested): forwards each call on one lazily opened connection (`Hello` carries the MCP `clientInfo.name` and a random session id), wraps every untrusted item in `<untrusted_content nonce=…>` markers with a per-result nonce (marker text inside content is neutralized), redacts again and caps results at 256 KiB.
+- App side (`fleet_core::mcp_host`, FFI `McpConnection`): Swift owns the socket (POSIX, `umask` 0177 before `bind`), verifies the peer from its audit token (`LOCAL_PEERTOKEN` → `SecCodeCopyGuestWithAttributes`; requirement: our team and identifier `dev.fleet.fleetctl`; unsigned debug builds: the bundled `Contents/MacOS/fleetctl` path) and reads the parent process's signature by pid. Per request: version → pause → pairing (identity = parent team + signing id + client name, stored MAC'd in `mcp_clients`, Touch ID in the app, revocation effective on the next call) → lock → per-client token bucket (`ai_commands_per_minute`) → tool. Elevated ops and changes on more than `ai_bulk_confirm_above` servers wait up to 2 minutes for the operator's prompt (pausing declines open prompts); Elevated ones then get the root key's Touch ID. Multi-server changes from AI always run canary-first with the health probe. Server payloads are rendered, control characters escaped, secrets redacted (private key blocks, `password=`/`token=`/… values, bearer tokens, URL passwords, known token formats) and cut to 32 KiB per server. `config_diff` checks the server's secret list (`config.paths.get`) first and refuses matches. `firewall_apply` validates and then answers `unsupported` until envelopes carry `expected_version`.
 
 ---
 
