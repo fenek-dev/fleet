@@ -36,21 +36,27 @@ A native macOS app for managing a personal fleet of 10–100 Debian/Ubuntu serve
 6. Anything that comes from a server (logs, file contents) is untrusted data, including in MCP tool results.
 7. Private keys never leave the Secure Enclave. Rust asks Swift to sign through a UniFFI callback.
 
-## Repository layout (target)
+## Repository layout
 
 ```
 crates/
   fleet-proto/       # messages, Op enum, CommandBody, roster/policy types
   fleet-crypto/      # Noise, envelope signing/verification, recovery derivation
-  fleet-agent/       # one binary: gate | exec | bridge | install
+  fleet-agent/       # one binary: gate | exec | bridge | install | revert
   fleet-ops/         # typed operation implementations
   fleet-hardening/   # provisioning modules (check/plan/apply/revert)
+  fleet-compose/     # compose.deploy validator (agent + Mac)
+  fleet-cloudinit/   # cloud-init generation (Mac, via fleet-hardening re-export)
+  fleet-debver/      # dpkg version ordering
   fleet-core/        # Mac core: connections, bulk actions, cache, sync merging
   fleet-core-ffi/    # UniFFI bindings
+  fleetctl-proto/    # fleetctl <-> app socket protocol
   fleetctl/          # MCP server and command-line tool
+  fleet-it/          # Linux integration tests (Docker harness)
 apple/Fleet/         # SwiftUI app
-profiles/            # baseline.toml, strict.toml, roles/*.toml
-fuzz/  tests/vm/
+packaging/           # systemd units, tmpfiles, needrestart
+profiles/            # baseline.toml, strict.toml, roles/*.toml, games/*.toml
+scripts/  tests/vm/  # fuzz/ planned, not present
 ```
 
 ## Conventions
@@ -58,14 +64,14 @@ fuzz/  tests/vm/
 - **Rust:** stable toolchain pinned in `rust-toolchain.toml`; builds use `--locked`. The agent is built as a static musl binary. `tokio` runs on a single thread in the agent.
 - **Serialization:** `postcard` on the wire, TOML for profiles and policies.
 - **Errors:** fixed protocol error codes. Human-readable messages are generated on the Mac only.
-- **Tests:** property tests for validation and parsing; `cargo-fuzz` for the decoder and parsers; Lima VMs for integration tests.
+- **Tests:** property tests for validation and parsing; `cargo-fuzz` for the decoder and parsers (planned); Docker harness now, Lima VMs later, for integration tests.
 - **Performance budgets:** agent idle memory under 5 MB (gate) and 20 MB (exec); CPU under 0.2% at idle; binary under 10 MB.
 
 ## Current state
 
-All roadmap phases (design §14) have code; hardening against real VMs and the app UI are the open ends.
+All roadmap phases (design §14) have code; nothing is validated on real Macs or VMs yet. Remaining work: design §14 "Status".
 
-- **Agent** (`fleet-agent`, `fleet-ops`, `fleet-hardening`): gate/exec/bridge, full command pipeline, signed receipts/events, audit chain, auto-revert (firewall, mesh, authorized keys, profile), telemetry, logs, packages, Docker, cron, users, config history, bans, mesh, games, `shell.exec`, provisioning profiles (`profile.apply` phases Accounts/Access/System, results as `ProfileApplied`), hardening audit, cloud-init.
+- **Agent** (`fleet-agent`, `fleet-ops`, `fleet-hardening`): gate/exec/bridge, full command pipeline, signed receipts/events, audit chain, auto-revert (firewall, mesh, authorized keys, profile), telemetry, logs, packages, Docker, cron, users, config history, bans, mesh, games, `shell.exec`, provisioning profiles (`profile.apply` phases Accounts/Access/System), hardening audit, cloud-init. Not built: `agent.update.*`, `uninstall`, audit archiving/mirroring, a few catalog ops without handlers (design §4.2).
 - **Mac core** (`fleet-core`, `fleet-core-ffi`): SSH/Noise sessions, cache, bulk engine with canary, runbooks, search, timeline, vulnerability matching, roster management, E2EE sync, recovery flow, monitor sessions. `fleetctl mcp` is the MCP server. SwiftUI app in `apple/Fleet` (`project.yml`, XcodeGen).
 - **Wire catalog:** `fleet-proto` `op/mod.rs` (ops, tags) and `op/meta.rs` (tiers, session rules). Golden vectors: `crates/fleet-proto/tests/vectors/v1`; regenerate only for intended wire changes: `FLEET_REGEN_VECTORS=1 cargo test -p fleet-proto --test wire golden`.
 
