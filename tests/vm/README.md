@@ -18,9 +18,20 @@ FLEET_IT_KEEP=1 tests/vm/run.sh    # keep the container for debugging
    Silicon through emulation, slowly.
 2. Builds `fleet-it:<distro>` from `docker/Dockerfile.<distro>`: systemd as
    PID 1, sshd (key-only), D-Bus, journald (volatile), sudo, nftables, tmux,
-   and an `ops` user in `sudo` (password `fleet-it-password`, never used for
-   SSH).
+   cron, the OpenSSH client, and an `ops` user in `sudo` (password
+   `fleet-it-password`, never used for SSH).
 3. `cargo test -p fleet-it --test linux -- --ignored --test-threads=1`.
+
+Tests run in name order in one container, and several change it: `bans_*`
+creates `table inet fleet` and bans a sibling container (started from the
+same image) after real sshd failures; `firewall_*` applies a Managed
+ruleset, confirms it over a new session and waits out an unconfirmed
+second apply (the fixture policy sets `auto_revert_seconds = 20`);
+`provision_*` applies Baseline phase by phase (Accounts, Access, System),
+which hardens sshd for every later test. Container limits: `/etc/hosts`
+is a bind mount (inotify on `/etc` doesn't see it; the config history
+test edits a regular file), and there is no kernel audit, so System runs
+without the `auditd` module; `sysctl` and `apparmor` stay partly drifted.
 
 The tests start one container (`--privileged --cgroupns=private`, tmpfs
 `/run`, `/run/lock`, `/tmp`, SSH on a random `127.0.0.1` port), generate two

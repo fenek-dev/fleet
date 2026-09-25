@@ -42,10 +42,8 @@ ProtectHostname=yes
 RestrictRealtime=yes
 LockPersonality=yes
 SystemCallArchitectures=native
-# authorized_keys live under /etc/fleet, so home directories are never
-# written today; read-only keeps a bug from touching them. Must be relaxed
-# when user-management ops (useradd -m) land.
-ProtectHome=read-only
+# No ProtectHome=: users.create (useradd -m), users.delete and the
+# profile's admin.shell module write home directories.
 # apt and friends get a private /tmp; nothing is shared through /tmp.
 PrivateTmp=yes
 # RestrictNamespaces is deliberately NOT set: the Docker role add-on will
