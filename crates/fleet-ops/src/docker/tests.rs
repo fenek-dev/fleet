@@ -593,11 +593,24 @@ fn deploy_refuses_symlinks_and_compose_env() {
         Err(ErrorCode::PolicyDenied)
     );
     assert!(r.calls().is_empty());
-    assert_eq!(project::env_file_refused("A=1\n# COMPOSE_X=1\n"), None);
-    assert_eq!(
-        project::env_file_refused("docker_host=tcp://x\n").as_deref(),
-        Some("docker_host")
-    );
+}
+
+#[test]
+fn env_file_refused_keys() {
+    for (text, want) in [
+        ("A=1\n# COMPOSE_X=1\n", None),
+        ("A=1\nB: 2\nexport C=3\nexportX=1\n", None),
+        ("docker_host=tcp://x\n", Some("docker_host")),
+        ("export COMPOSE_FILE=/x\n", Some("COMPOSE_FILE")),
+        ("export\tCOMPOSE_FILE=/x\n", Some("COMPOSE_FILE")),
+        ("COMPOSE_PROFILES: debug\n", Some("COMPOSE_PROFILES")),
+        ("\u{feff}DOCKER_HOST=tcp://x\n", Some("DOCKER_HOST")),
+        ("  BUILDX_BUILDER = remote\n", Some("BUILDX_BUILDER")),
+        ("buildkit_progress=plain\n", Some("buildkit_progress")),
+        ("A=COMPOSE_X=1\n", None),
+    ] {
+        assert_eq!(project::env_file_refused(text).as_deref(), want, "{text:?}");
+    }
 }
 
 #[test]
