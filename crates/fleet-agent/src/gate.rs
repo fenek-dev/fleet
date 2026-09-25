@@ -440,6 +440,13 @@ impl Relay {
             let ok = hdr.last && decode::<Message>(data).is_ok_and(|m| m == Message::Rekey);
             return if ok { Verdict::Rekey } else { Verdict::Close };
         }
+        // Cancelling a stream only frees resources: never rate limited, so
+        // a client that hit the limit can still stop what it started.
+        if Message::kind_tag(data) == Some(MessageKind::StreamCancel) {
+            let ok = hdr.last
+                && decode::<Message>(data).is_ok_and(|m| matches!(m, Message::StreamCancel { .. }));
+            return if ok { Verdict::Forward } else { Verdict::Close };
+        }
         let limited = !self.rate.take();
         if !hdr.last {
             if limited || self.partial.len() >= MAX_PARTIAL {
@@ -482,7 +489,6 @@ impl Relay {
                     None => Verdict::Forward,
                 }
             }
-            Message::StreamCancel { .. } if !limited => Verdict::Forward,
             _ => Verdict::Close,
         }
     }
@@ -712,7 +718,10 @@ async fn setup(
         remote_static: *t.remote_static(),
         recovery,
     };
-    if !auth.verify(&roster, seen) {
+    // A monitor bridge (the restricted monitor SSH key) carries monitor
+    // sessions only; a normal bridge takes device or monitor sessions.
+    let mode_ok = mode != BridgeMode::Monitor || key == KeyKind::Monitor;
+    if !mode_ok || !auth.verify(&roster, seen) {
         // Session-level refusal: request id 0 (design §5.3 "Removed from
         // the roster").
         send_own(bw, &mut t, sh, &response(0, ErrorCode::Unauthorized)).await;

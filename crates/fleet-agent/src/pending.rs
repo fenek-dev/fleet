@@ -71,6 +71,11 @@ pub struct ChangeOrigin {
     pub created_ms: u64,
     /// `ChangePending::new_version` as the handler reported it.
     pub new_version: Option<u64>,
+    /// Exec run (`run_id`) that applied it.
+    pub run_id: [u8; 16],
+    /// Exec's connection counter when the apply finished: in the same run,
+    /// `change.confirm` must come over a connection opened later.
+    pub applied_conn: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +88,10 @@ pub struct PendingChange {
     pub deadline_ms: u64,
     /// Audit seq of the intent that made the change.
     pub audit_seq: u64,
+    /// The handler is still running (or exec crashed while it ran):
+    /// `deadline_ms` is the guard deadline, confirming is refused, and exec
+    /// reverts it at startup.
+    pub applying: bool,
 }
 
 /// Left by `revert <id>` for exec to audit.
@@ -91,9 +100,12 @@ pub struct RevertedMarker {
     pub kind: ChangeKind,
     /// Audit seq of the intent that made the change.
     pub origin_audit_seq: u64,
-    /// `false` if restoring the snapshot failed.
+    /// `false` if restoring the snapshot failed or was skipped.
     pub restored: bool,
     pub time_ms: u64,
+    /// Skipped: the state's version is now this, not the change's
+    /// `new_version` (changed again since); kept as it is.
+    pub conflict: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,6 +195,54 @@ impl PendingDir {
 
     pub fn get(&self, id: ChangeId) -> Result<Option<PendingChange>> {
         read(&Self::file(&self.pending, id))
+    }
+
+    fn updating_file(&self, id: ChangeId) -> PathBuf {
+        self.pending.join(format!("{id}.updating"))
+    }
+
+    /// Replaces a change only while it is still pending, never resurrecting
+    /// one a revert claimed meanwhile: `<id>.bin` is first renamed to
+    /// `<id>.updating` (atomic, like a claim; `Ok(false)` if it was gone),
+    /// the new content is written as `<id>.bin`, then the old copy removed.
+    /// A crash in between is repaired by [`Self::repair_updates`].
+    pub fn update(&self, id: ChangeId, change: &PendingChange) -> Result<bool> {
+        let tmp = self.updating_file(id);
+        match std::fs::rename(Self::file(&self.pending, id), &tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        self.insert(id, change)?;
+        remove(&tmp)?;
+        Ok(true)
+    }
+
+    /// Startup: an interrupted [`Self::update`] left `<id>.updating`. Keeps
+    /// the new `<id>.bin` if it was written, else puts the old one back.
+    pub fn repair_updates(&self) -> std::io::Result<()> {
+        let entries = match std::fs::read_dir(&self.pending) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".updating"))
+                .and_then(ChangeId::parse)
+            else {
+                continue;
+            };
+            let bin = Self::file(&self.pending, id);
+            if bin.exists() {
+                std::fs::remove_file(entry.path())?;
+            } else {
+                std::fs::rename(entry.path(), bin)?;
+            }
+        }
+        Ok(())
     }
 
     /// Removes the pending file. `Ok(false)` if it was already gone.

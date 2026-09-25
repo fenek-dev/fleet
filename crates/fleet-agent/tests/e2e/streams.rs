@@ -503,3 +503,110 @@ fn stream_through_gate_verified() {
         assert_eq!(log.fin.map(|f| f.0), Some(Outcome::Ok));
     });
 }
+
+/// Opens stream `id` for `mac`'s signed `metrics.subscribe`.
+async fn open_stream(c: &mut ExecConn, fx: &Fixture, mac: &Mac, id: u32) -> SignedCommand {
+    let cmd = signed(fx, mac, sub());
+    c.send(&Message::StreamOpen {
+        id,
+        cmd: cmd.clone(),
+    })
+    .await;
+    cmd
+}
+
+/// Reads until stream `id` ends; its final outcome.
+async fn outcome_of(c: &mut ExecConn, fx: &Fixture, cmd: &SignedCommand, id: u32) -> Outcome {
+    let mut log = StreamLog::new(fx, cmd, id);
+    while !log.on(&c.recv().await) {}
+    log.fin.expect("final seal").0
+}
+
+/// Per-device (8) and per-connection (16) stream caps, below the global
+/// `max_stream_sessions`.
+#[test]
+fn stream_caps_per_device_and_connection() {
+    let mut fx = Fixture::new(3, 0);
+    fx.exec = None;
+    fx.start_exec_with(|cfg| {
+        let h: Rc<dyn OpHandler> = Rc::new(TestStream {
+            interval: Some(Duration::from_secs(5)),
+            ..TestStream::finite(10_000)
+        });
+        cfg.handlers.push((tag::METRICS_SUBSCRIBE, h));
+    });
+    run(async {
+        let (m0, m1, m2) = (&fx.macs[0], &fx.macs[1], &fx.macs[2]);
+        let mut c = ExecConn::open(&fx, m0).await;
+        for id in 1..=8 {
+            open_stream(&mut c, &fx, m0, id).await;
+        }
+        let ninth = open_stream(&mut c, &fx, m0, 9).await;
+        assert_eq!(
+            outcome_of(&mut c, &fx, &ninth, 9).await,
+            Outcome::Failed(ErrorCode::Busy)
+        );
+        for id in 10..=17 {
+            open_stream(&mut c, &fx, m1, id).await;
+        }
+        // 16 on this connection: a third device's stream is refused here…
+        let extra = open_stream(&mut c, &fx, m2, 18).await;
+        assert_eq!(
+            outcome_of(&mut c, &fx, &extra, 18).await,
+            Outcome::Failed(ErrorCode::Busy)
+        );
+        // …but admitted on another connection (cancelled: signed `Ok`).
+        let mut c2 = ExecConn::open(&fx, m2).await;
+        let cmd = open_stream(&mut c2, &fx, m2, 1).await;
+        c2.send(&Message::StreamCancel { id: 1 }).await;
+        assert_eq!(outcome_of(&mut c2, &fx, &cmd, 1).await, Outcome::Ok);
+    });
+}
+
+/// A `StreamCancel` past the gate's rate limit still gets through, and the
+/// session stays up.
+#[test]
+fn stream_cancel_not_rate_limited() {
+    let pol = Pol {
+        commands_per_minute: 2,
+        ..Pol::default()
+    };
+    let fx = fixture(pol, || TestStream {
+        interval: Some(Duration::from_millis(20)),
+        ..TestStream::finite(10_000)
+    });
+    run(async {
+        let m = &fx.macs[0];
+        let mut c = GateConn::open(&fx, m).await;
+        let cmd = signed(&fx, m, sub());
+        c.send(&Message::StreamOpen {
+            id: 1,
+            cmd: cmd.clone(),
+        })
+        .await;
+        // Spend the rest of the budget; the next request is refused.
+        for id in [2, 3] {
+            c.send(&Message::Request {
+                id,
+                cmd: signed(&fx, m, Op::SystemInfo),
+            })
+            .await;
+        }
+        let mut log = StreamLog::new(&fx, &cmd, 1);
+        let mut busy = false;
+        while !busy {
+            match c.recv().await {
+                Message::Response {
+                    id: 3,
+                    result: Err(ErrorCode::Busy),
+                    receipt: None,
+                } => busy = true,
+                other => assert!(!log.on(&other)),
+            }
+        }
+        c.send(&Message::StreamCancel { id: 1 }).await;
+        while !log.on(&c.recv().await) {}
+        assert_eq!(log.fin.map(|f| f.0), Some(Outcome::Ok));
+        assert_eq!(log.end, Some(Ok(())));
+    });
+}

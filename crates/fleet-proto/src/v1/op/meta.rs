@@ -4,7 +4,7 @@
 
 use super::mesh::validate_peers;
 use super::{Authorization, Group, NAMES, Op, Tier};
-use crate::v1::args::{ArgError, at_most, ensure};
+use crate::v1::args::{AbsPath, ArgError, at_most, ensure};
 
 impl Op {
     /// Group by tag range. Unknown tags beyond every range map to `Shell`,
@@ -114,8 +114,6 @@ impl Op {
             | Op::UsersLock { .. }
             | Op::UsersDelete { .. }
             | Op::GroupsCreate { .. }
-            | Op::ConfigPathsSet { .. }
-            | Op::ProfileApply { .. }
             | Op::MeshJoin(_)
             | Op::MeshLeave
             | Op::MeshPeersSet { .. }
@@ -131,7 +129,22 @@ impl Op {
             Op::UsersCreate { groups, .. } | Op::UsersGroupsSet { groups, .. } => {
                 elevated_if(groups.iter().any(|g| g.is_privileged()))
             }
-            Op::ConfigRollback { path, .. } => elevated_if(path.is_protected_config()),
+            // Change only below `/srv` and for unprotected `/etc` files.
+            Op::ConfigRollback { path, .. } => elevated_if(
+                !(under_any(path, &["/srv"])
+                    || (under_any(path, &["/etc"]) && !path.is_protected_config())),
+            ),
+            // Tracking a path outside the config roots exposes (and lets
+            // `config.rollback` rewrite) arbitrary files.
+            Op::ConfigPathsSet { tracked, secret } => elevated_if(
+                tracked
+                    .iter()
+                    .chain(secret)
+                    .any(|p| !under_any(p, &CONFIG_ROOTS)),
+            ),
+            // A custom profile can configure anything; built-ins are
+            // reviewed with the agent release.
+            Op::ProfileApply { spec, .. } => elevated_if(spec.is_custom()),
 
             Op::AuthorizedKeysSet { .. }
             | Op::RosterUpdate { .. }
@@ -148,11 +161,19 @@ impl Op {
 
     /// Whether exec may raise the tier to Elevated from facts the arguments
     /// don't carry: `cron.set` for a user in `sudo` or another privileged
-    /// group, and `compose.deploy` whose parsed file uses a deny-listed
-    /// feature (design §4.2). The Mac runs the same checks to know whether
-    /// to attach a root approval; exec answers `ApprovalRequired` otherwise.
+    /// group, `users.create`/`users.groups.set` whose groups grant privilege
+    /// through sudoers, and `compose.deploy` whose parsed file uses a
+    /// deny-listed feature (design §4.2). The Mac runs the same checks to
+    /// know whether to attach a root approval; exec answers
+    /// `ApprovalRequired` otherwise.
     pub fn may_escalate(&self) -> bool {
-        matches!(self, Op::CronSet { .. } | Op::ComposeDeploy { .. })
+        matches!(
+            self,
+            Op::CronSet { .. }
+                | Op::ComposeDeploy { .. }
+                | Op::UsersCreate { .. }
+                | Op::UsersGroupsSet { .. }
+        )
     }
 
     /// Derived from the tier: Elevated needs a root approval unless the
@@ -178,10 +199,13 @@ impl Op {
         )
     }
 
-    /// Accepted in a monitor session (design §5.2): telemetry subscriptions
-    /// and `agent.health` only.
+    /// Accepted in a monitor session (design §5.2): telemetry subscriptions,
+    /// the event log and `agent.health` only.
     pub fn monitor_allowed(&self) -> bool {
-        matches!(self, Op::AgentHealth | Op::MetricsSubscribe { .. })
+        matches!(
+            self,
+            Op::AgentHealth | Op::MetricsSubscribe { .. } | Op::EventsQuery { .. }
+        )
     }
 
     /// Accepted in a recovery session (design §5.5).
@@ -242,7 +266,8 @@ impl Op {
             Op::ProcessesHistory { range }
             | Op::LoginsQuery { range, .. }
             | Op::WeblogQuery { range, .. } => range.validate(),
-            Op::EventsQuery { range, limit } | Op::PkgHistory { range, limit } => {
+            Op::EventsQuery { limit, .. } => ensure((1..=1000).contains(limit), "limit"),
+            Op::PkgHistory { range, limit } => {
                 range.validate()?;
                 ensure((1..=10_000).contains(limit), "limit")
             }
@@ -391,4 +416,14 @@ impl Op {
 
 fn elevated_if(cond: bool) -> Tier {
     if cond { Tier::Elevated } else { Tier::Change }
+}
+
+/// Roots whose files `config.paths.set` may track at tier Change; anything
+/// else is Elevated (the handler enforces the same allow-list).
+pub const CONFIG_ROOTS: [&str; 4] = ["/etc", "/srv", "/opt", "/usr/local/etc"];
+
+fn under_any(p: &AbsPath, roots: &[&str]) -> bool {
+    roots
+        .iter()
+        .any(|r| AbsPath::new(*r).is_ok_and(|r| p.is_under(&r)))
 }

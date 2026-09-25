@@ -59,8 +59,19 @@ fn journal() -> JournalQuery {
 }
 fn spec() -> ProfileSpec {
     ProfileSpec {
-        toml: ProfileToml::new("[profile]\nextends = \"baseline\"\n").unwrap(),
+        source: ProfileSource::Builtin {
+            level: ProfileLevel::Baseline,
+            roles: vec![ProfileRole::Docker],
+        },
         only: vec![ModuleId::new("ssh.hardening").unwrap()],
+    }
+}
+fn custom_spec() -> ProfileSpec {
+    ProfileSpec {
+        source: ProfileSource::Custom(
+            ProfileToml::new("[profile]\nextends = \"baseline\"\n").unwrap(),
+        ),
+        only: vec![],
     }
 }
 fn peer() -> WgPeer {
@@ -252,7 +263,8 @@ pub(super) fn samples() -> Vec<Op> {
         Op::ProcessesHistory { range: range() },
         Op::ConnectionsList,
         Op::EventsQuery {
-            range: range(),
+            since_run_id: Some([7; 16]),
+            since_seq: 41,
             limit: 500,
         },
         Op::HealthChecksList,
@@ -807,20 +819,54 @@ fn conditional_tiers() {
         groups: vec![GroupName::new("sudo").unwrap()],
     };
     assert_eq!(set_groups.tier(), Tier::Elevated);
+    // Sudoers-granted privilege is only known on the server.
+    assert!(create(&["users"]).may_escalate());
+    assert!(set_groups.may_escalate());
 
     let rollback = |p: &str| Op::ConfigRollback {
         path: path(p),
         version: 1,
     };
     assert_eq!(rollback("/etc/nginx/nginx.conf").tier(), Tier::Change);
+    assert_eq!(rollback("/srv/app/compose.yaml").tier(), Tier::Change);
     for p in [
         "/etc/sudoers.d/ops",
         "/etc/ssh/sshd_config",
         "/etc/fleet/x",
         "/etc/shadow",
+        // Outside `/srv` and `/etc`: Elevated by default.
+        "/opt/app/config.yml",
+        "/usr/local/etc/x.conf",
+        "/root/.bashrc",
+        "/etcetera/x",
     ] {
         assert_eq!(rollback(p).tier(), Tier::Elevated, "{p}");
     }
+
+    let paths_set = |t: &[&str], s: &[&str]| Op::ConfigPathsSet {
+        tracked: t.iter().map(|p| path(p)).collect(),
+        secret: s.iter().map(|p| path(p)).collect(),
+    };
+    assert_eq!(
+        paths_set(&["/etc/x", "/srv/a", "/opt/b", "/usr/local/etc/c"], &[]).tier(),
+        Tier::Change
+    );
+    assert_eq!(paths_set(&["/root/x"], &[]).tier(), Tier::Elevated);
+    assert_eq!(paths_set(&[], &["/home/u/.env"]).tier(), Tier::Elevated);
+    assert_eq!(paths_set(&["/usr/local/bin/x"], &[]).tier(), Tier::Elevated);
+
+    let apply = |spec| Op::ProfileApply {
+        spec,
+        plan_hash: [0; 32],
+    };
+    assert_eq!(apply(spec()).tier(), Tier::Change);
+    assert_eq!(apply(custom_spec()).tier(), Tier::Elevated);
+    assert_eq!(
+        apply(custom_spec()).authorization(),
+        Authorization::RootApproval
+    );
+    // Checking or planning a custom profile changes nothing.
+    assert_eq!(Op::ProfilePlan(custom_spec()).tier(), Tier::Read);
     assert!(
         rollback("/etc/systemd/system/fleet-exec.service")
             .check_args()
@@ -878,6 +924,38 @@ fn check_args_rejects() {
         .check_args()
         .is_err()
     );
+    let mesh = |ips: &[&str]| {
+        Op::MeshJoin(MeshConfig {
+            address: "10.9.0.1".parse().unwrap(),
+            network: "10.9.0.0/16".parse().unwrap(),
+            listen_port: Port::new(51820).unwrap(),
+            peers: vec![WgPeer {
+                allowed_ips: ips.iter().map(|c| c.parse().unwrap()).collect(),
+                ..peer()
+            }],
+        })
+    };
+    assert!(mesh(&["10.9.0.2/32", "10.9.4.0/24"]).check_args().is_ok());
+    assert!(mesh(&["10.9.0.0/16"]).check_args().is_ok());
+    // Outside the mesh network, wider than it, or a default route.
+    assert!(mesh(&["10.10.0.2/32"]).check_args().is_err());
+    assert!(mesh(&["10.0.0.0/8"]).check_args().is_err());
+    assert!(mesh(&["0.0.0.0/0"]).check_args().is_err());
+    assert!(mesh(&["fd00::1/128"]).check_args().is_err());
+    let peers = |ips: &[&str]| Op::MeshPeersSet {
+        peers: vec![WgPeer {
+            allowed_ips: ips.iter().map(|c| c.parse().unwrap()).collect(),
+            ..peer()
+        }],
+    };
+    assert!(
+        peers(&["10.9.0.0/16", "fd00:1:2::/48"])
+            .check_args()
+            .is_ok()
+    );
+    for bad in ["0.0.0.0/0", "::/0", "10.0.0.0/15", "fd00::/47"] {
+        assert!(peers(&[bad]).check_args().is_err(), "{bad}");
+    }
     assert!(Op::SystemReboot { delay_s: 3601 }.check_args().is_err());
     assert!(
         Op::ProcessesList {
@@ -917,7 +995,7 @@ fn stream_and_session_sets() {
     );
     assert_eq!(
         names(Op::monitor_allowed),
-        ["metrics.subscribe", "agent.health"]
+        ["metrics.subscribe", "events.query", "agent.health"]
     );
     assert_eq!(
         names(Op::recovery_allowed),

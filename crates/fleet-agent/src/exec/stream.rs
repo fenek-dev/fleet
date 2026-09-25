@@ -16,13 +16,17 @@
 //! connection closing ends it with `Ok`. Every admitted stream gets its
 //! audit result.
 
-use super::{ActiveStreams, Exec, Out, Session, log, log_op_error};
+use super::conn::{ActiveStreams, Out};
+use super::{Exec, Session, log, log_op_error};
 use crate::now_ms;
 use fleet_crypto::stream::StreamSealer;
 use fleet_crypto::verify;
 use fleet_ops::{Invocation, OpOutput, OpStream};
 use fleet_proto::stream::{CHECKPOINT_EVERY, StreamChunk};
-use fleet_proto::{ErrorCode, MAX_FRAME, Message, Outcome, RequestId, SignedCommand, encode};
+use fleet_proto::{
+    DeviceId, ErrorCode, MAX_FRAME, Message, Outcome, RequestId, SignedCommand, encode,
+};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Instant;
 use tokio::sync::mpsc::error::TrySendError;
@@ -38,6 +42,8 @@ pub(super) struct Handle {
     pub(super) id: RequestId,
     /// Fires (or is dropped) on `StreamCancel` / connection end.
     pub(super) cancel: oneshot::Receiver<()>,
+    /// Streams running on this connection.
+    pub(super) conn_streams: Rc<Cell<u32>>,
 }
 
 impl Drop for Handle {
@@ -49,19 +55,33 @@ impl Drop for Handle {
     }
 }
 
-/// Holds one of `Exec::streams`.
-struct Slot<'a>(&'a Exec);
+/// Holds one stream slot: global, the device's and the connection's.
+struct Slot<'a> {
+    ex: &'a Exec,
+    device: DeviceId,
+    conn: Rc<Cell<u32>>,
+}
 
 impl<'a> Slot<'a> {
-    fn take(ex: &'a Exec) -> Self {
+    fn take(ex: &'a Exec, device: DeviceId, conn: Rc<Cell<u32>>) -> Self {
         ex.streams.set(ex.streams.get() + 1);
-        Self(ex)
+        *ex.device_streams.borrow_mut().entry(device).or_insert(0) += 1;
+        conn.set(conn.get() + 1);
+        Self { ex, device, conn }
     }
 }
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        self.0.streams.set(self.0.streams.get() - 1);
+        self.ex.streams.set(self.ex.streams.get() - 1);
+        let mut per = self.ex.device_streams.borrow_mut();
+        if let Some(n) = per.get_mut(&self.device) {
+            *n -= 1;
+            if *n == 0 {
+                per.remove(&self.device);
+            }
+        }
+        self.conn.set(self.conn.get().saturating_sub(1));
     }
 }
 
@@ -233,11 +253,13 @@ pub(super) async fn run(
         seq: 0,
         sealer: StreamSealer::new(server_id, hash),
     };
-    let a = match ex.admit(session, &cmd, Invocation::Stream, now_ms()) {
+    let conn = handle.conn_streams.clone();
+    let a = match ex.admit(session, &cmd, Invocation::Stream, now_ms(), conn.get()) {
         Ok(a) => a,
         Err(r) => return pump.finish(None, Err(r.code)).await,
     };
-    let _slot = Slot::take(&ex);
+    // No await since `admit` checked the caps.
+    let _slot = Slot::take(&ex, a.meta.command.device_id, conn);
     let op = &a.meta.command.body.op;
     pump.op_name = op.name();
     let stop = match a.handler.handle(&ex.ctx, op, &a.meta).await {

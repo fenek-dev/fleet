@@ -21,6 +21,10 @@ redb.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 thiserror.workspace = true
 hex.workspace = true
+# kill(2) for ending sshd sessions of removed devices (no unsafe, no libc).
+rustix.workspace = true
+# Trusted journal fields of sshd entries (`_UID`, `_COMM`, `CONTAINER_ID`).
+serde_json.workspace = true
 
 [dev-dependencies]
 fleet-core.workspace = true

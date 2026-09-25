@@ -229,6 +229,7 @@ fn recovery_signed_roster_hash() {
             device_key: key,
             monitor_key: key,
             ssh_key: key,
+            monitor_ssh_key: key,
             noise_static: X25519Public([3; 32]),
             added_at: 1_700_000_000_000,
             added_by: DeviceId([2; 16]),

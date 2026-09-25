@@ -196,6 +196,7 @@ fn pending_changes_expiry() {
         snapshot: vec![1, 2, 3],
         deadline_ms,
         audit_seq: 1,
+        applying: false,
     };
     p.insert(ChangeId([1; 16]), &mk(100)).unwrap();
     p.insert(ChangeId([2; 16]), &mk(200)).unwrap();
@@ -212,6 +213,49 @@ fn pending_changes_expiry() {
         .path()
         .join(format!("pending/{}.bin", ChangeId([2; 16])));
     assert_eq!(std::fs::metadata(f).unwrap().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn event_log_orders_runs_pages_and_prunes() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(&dir);
+    let ev = s.events();
+    let (r0, r1) = ([1u8; 16], [0u8; 16]);
+    // Run ordinals, not the random ids, order the log.
+    let o0 = ev.begin_run(&r0).unwrap();
+    let o1 = ev.begin_run(&r1).unwrap();
+    assert!(o1 > o0);
+    for seq in 1..=3 {
+        ev.append(o0, seq, 100 + seq, &[seq as u8]).unwrap();
+    }
+    ev.append(o1, 1, 500, b"b1").unwrap();
+    let keys = |v: Vec<fleet_agent::store::StoredEvent>| -> Vec<(u64, u64)> {
+        v.into_iter().map(|e| (e.run, e.seq)).collect()
+    };
+    let (all, more) = ev.after(None, 0, 10, 1 << 20).unwrap();
+    assert!(!more);
+    assert_eq!(keys(all), [(o0, 1), (o0, 2), (o0, 3), (o1, 1)]);
+    let (page, more) = ev.after(Some(&r0), 1, 2, 1 << 20).unwrap();
+    assert!(more);
+    assert_eq!(keys(page), [(o0, 2), (o0, 3)]);
+    let (page, _) = ev.after(Some(&r0), 3, 10, 1 << 20).unwrap();
+    assert_eq!(keys(page), [(o1, 1)]);
+    // Unknown run: from the oldest kept.
+    let (page, _) = ev.after(Some(&[9; 16]), 0, 1, 1 << 20).unwrap();
+    assert_eq!(keys(page), [(o0, 1)]);
+    assert_eq!(
+        keys(ev.in_run_after(o0, 1, 10).unwrap()),
+        [(o0, 2), (o0, 3)]
+    );
+    // Age: everything before 103 goes; count: at most 2 rows.
+    assert_eq!(ev.prune(103, 100, o1).unwrap(), 2);
+    assert_eq!(ev.prune(0, 1, o1).unwrap(), 1);
+    assert_eq!(ev.len().unwrap(), 1);
+    let (left, _) = ev.after(None, 0, 10, 1 << 20).unwrap();
+    assert_eq!(keys(left), [(o1, 1)]);
+    // Run r0 has no events left: a query for it starts at the oldest.
+    let (page, _) = ev.after(Some(&r0), 0, 10, 1 << 20).unwrap();
+    assert_eq!(keys(page), [(o1, 1)]);
 }
 
 #[test]

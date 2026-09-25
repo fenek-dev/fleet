@@ -122,6 +122,17 @@ impl<'a> AuditLog<'a> {
         } else {
             Outcome::Failed(fleet_proto::ErrorCode::Internal)
         };
+        self.append_revert_outcome(origin_seq, time_ms, outcome)
+    }
+
+    /// [`Self::append_revert`] with any outcome, e.g. a revert skipped
+    /// because the state changed again since (`Failed(VersionConflict)`).
+    pub fn append_revert_outcome(
+        &self,
+        origin_seq: u64,
+        time_ms: u64,
+        outcome: Outcome,
+    ) -> Result<u64> {
         let tx = self.db.begin_write()?;
         let origin = {
             let t = tx.open_table(ENTRIES)?;

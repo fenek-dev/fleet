@@ -1,4 +1,4 @@
-//! `fleet-agent bridge [--recovery]` (design §6.1): runs as the SSH login
+//! `fleet-agent bridge [--recovery | --monitor]` (design §6.1): runs as the SSH login
 //! user, one per SSH exec channel. Connects to the gate socket, sends a
 //! mode header, then copies bytes in both directions until either side
 //! closes. Holds no keys and parses nothing after the header.
@@ -59,13 +59,18 @@ pub fn ssh_client_ip(ssh_connection: &str) -> Option<IpAddr> {
     ssh_connection.split(' ').next()?.parse().ok()
 }
 
-/// First byte sent to the gate on every bridge connection.
+/// First byte sent to the gate on every bridge connection (also bound into
+/// the Noise prologue).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BridgeMode {
+    /// Device or monitor sessions.
     Normal = 0,
     /// Started by the restricted recovery SSH key (design §5.9).
     Recovery = 1,
+    /// Started by a Mac's restricted monitor SSH key (design §5.9): the
+    /// gate accepts only a monitor-key `DeviceAuth` on it.
+    Monitor = 2,
 }
 
 impl BridgeMode {
@@ -77,6 +82,7 @@ impl BridgeMode {
         match b {
             0 => Some(Self::Normal),
             1 => Some(Self::Recovery),
+            2 => Some(Self::Monitor),
             _ => None,
         }
     }

@@ -60,6 +60,17 @@ pub(crate) fn samples() -> Vec<Payload> {
             run_id: [10; 16],
         }),
         Payload::RosterPending(None),
+        Payload::SignedEvents(SignedEventPage {
+            events: vec![crate::v1::SignedEvent {
+                server_id: crate::v1::ServerId::new("srv_test01").unwrap(),
+                run_id: [3; 16],
+                seq: 4,
+                time_ms: 5,
+                event: crate::v1::Event::PolicyChanged { version: 6 },
+                sig: crate::v1::Signature([7; 64]),
+            }],
+            more: true,
+        }),
         Payload::MetricsCatalog(MetricsCatalog {
             series: vec![MetricSeries {
                 id: 1,

@@ -6,12 +6,17 @@
 //!
 //! - **sshd follower**: `journalctl --follow -o json _UID=0
 //!   SYSLOG_IDENTIFIER=sshd SYSLOG_IDENTIFIER=sshd-session` (resuming after
-//!   the persisted cursor) → `parse_sshd` → [`BanService`], `login` events,
-//!   `BruteForce` observations, and the accepted-publickey side of the
-//!   learned-address correlation ([`Correlator`]). `_UID=0` is a trusted
-//!   journal field: a local user can log with `SYSLOG_IDENTIFIER=sshd`
-//!   (`logger -t sshd`) but not as uid 0, so forged lines can neither ban
-//!   an address nor vouch for a Mac's.
+//!   the persisted cursor, saved at most every second) → `parse_sshd` →
+//!   [`BanService`], `login` events, `BruteForce` observations, the
+//!   accepted-publickey side of the learned-address correlation
+//!   ([`Correlator`]) and the pid ↔ key table ([`sshd::Logins`]) used by
+//!   `change.confirm` and session termination. Each line must also pass
+//!   [`sshd::trusted_entry`]: `_UID=0`, `_COMM` sshd/sshd-session or unit
+//!   ssh(d).service, and no `CONTAINER_ID`. These are trusted journal
+//!   fields: a local user can log with `SYSLOG_IDENTIFIER=sshd` (`logger -t
+//!   sshd`) but not as uid 0 or as sshd, and dockerd (root) forwarding a
+//!   container's `sshd` output adds `CONTAINER_ID`, so forged lines can
+//!   neither ban an address nor vouch for a Mac's.
 //! - **systemd signals**: [`ServiceEvents`] over the lazily connected bus
 //!   ([`LazySystemd`]); `ServiceDown` rules are seeded with each watched
 //!   unit's current state on every (re)subscribe.
@@ -24,6 +29,7 @@
 //! await point loses nothing but the work in flight.
 
 use super::events::{EventBus, unit_down};
+use super::sshd::{self, KeyRole, Login, Logins};
 use super::{State, log};
 use crate::authorized_keys::ecdsa_blob;
 use crate::store::{SecurityDb, SecurityKey};
@@ -73,6 +79,8 @@ const WEB_MAX_READ: u64 = 1 << 20;
 const WEB_MAX_PARTIAL: usize = 64 * 1024;
 /// A follower that ran this long restarts with the minimum backoff.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
+/// The sshd journal cursor is saved at most this often.
+const CURSOR_SAVE_EVERY: Duration = Duration::from_secs(1);
 
 /// Background sources and their inputs (production defaults from
 /// [`SourcesConfig::system`]).
@@ -209,12 +217,39 @@ impl SystemdApi for LazySystemd {
 
 // ---- roster fingerprints ----
 
-/// `SHA256:` fingerprints of the roster's device SSH keys → device
-/// (`logins.query`, correlation). Rebuilt when the roster changes. The
-/// recovery SSH key has no device id and resolves to nothing.
+/// `SHA256:` fingerprints of the roster's device and monitor SSH keys →
+/// device and key (`logins.query`, correlation, `change.confirm`). Rebuilt
+/// when the roster changes. The recovery SSH key has no device id and
+/// resolves to nothing.
 pub(super) struct RosterResolver {
     st: Weak<RefCell<State>>,
-    cache: RefCell<((u32, u64), HashMap<String, DeviceId>)>,
+    cache: RefCell<RosterFps>,
+}
+
+type RosterFps = ((u32, u64), HashMap<String, (DeviceId, KeyRole)>);
+
+impl RosterResolver {
+    pub(super) fn role_for(&self, fingerprint: &str) -> Option<(DeviceId, KeyRole)> {
+        let st = self.st.upgrade()?;
+        let st = st.try_borrow().ok()?;
+        let r = &st.roster.roster;
+        let mut c = self.cache.borrow_mut();
+        if c.0 != (r.epoch, r.version) {
+            let fp = |k| Some(ssh_fingerprint(&ecdsa_blob(k)?));
+            let mut m = HashMap::new();
+            for d in &r.devices {
+                // The device key wins if both are the same key.
+                if let Some(f) = fp(&d.monitor_ssh_key) {
+                    m.insert(f, (d.id, KeyRole::Monitor));
+                }
+                if let Some(f) = fp(&d.ssh_key) {
+                    m.insert(f, (d.id, KeyRole::Device));
+                }
+            }
+            *c = ((r.epoch, r.version), m);
+        }
+        c.1.get(fingerprint).copied()
+    }
 }
 
 impl RosterResolver {
@@ -228,19 +263,7 @@ impl RosterResolver {
 
 impl FingerprintResolver for RosterResolver {
     fn device_for(&self, fingerprint: &str) -> Option<DeviceId> {
-        let st = self.st.upgrade()?;
-        let st = st.try_borrow().ok()?;
-        let r = &st.roster.roster;
-        let mut c = self.cache.borrow_mut();
-        if c.0 != (r.epoch, r.version) {
-            c.1 = r
-                .devices
-                .iter()
-                .filter_map(|d| Some((ssh_fingerprint(&ecdsa_blob(&d.ssh_key)?), d.id)))
-                .collect();
-            c.0 = (r.epoch, r.version);
-        }
-        c.1.get(fingerprint).copied()
+        self.role_for(fingerprint).map(|(d, _)| d)
     }
 }
 
@@ -467,7 +490,12 @@ pub(super) struct Sources {
     /// (minute, failed-login events sent in it).
     failed_events: Cell<(u64, u32)>,
     saved_ban_rev: Cell<u64>,
+    /// (cursor, not yet saved).
     cursor: RefCell<(Option<String>, bool)>,
+    cursor_saved: Cell<Option<Instant>>,
+    /// Public-key logins by sshd pid (shared with the session terminator
+    /// and `change.confirm`).
+    pub(super) ssh_logins: Rc<RefCell<Logins>>,
     systemd: Rc<dyn SystemdApi>,
     lazy: Option<Rc<LazySystemd>>,
 }
@@ -492,6 +520,7 @@ impl Sources {
         ctx: &SysCtx,
         bus: Rc<EventBus>,
         cfg: SourcesConfig,
+        ssh_logins: Rc<RefCell<Logins>>,
     ) -> Rc<Self> {
         let db = st.borrow().store.security();
         let now = ctx.clock.now_ms();
@@ -539,6 +568,8 @@ impl Sources {
             logins: RefCell::new(KnownSources::load(&db)),
             failed_events: Cell::new((0, 0)),
             cursor: RefCell::new((cursor, false)),
+            cursor_saved: Cell::new(None),
+            ssh_logins,
             db,
             systemd,
             lazy,
@@ -638,17 +669,17 @@ impl Sources {
     // -- sshd --
 
     fn follow_args(cursor: Option<&str>) -> Vec<OsString> {
-        let mut a: Vec<OsString> = [
-            "-o",
-            "json",
-            "--no-pager",
-            "--quiet",
-            "--follow",
-            "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_PID",
-        ]
-        .into_iter()
-        .map(Into::into)
-        .collect();
+        let mut a: Vec<OsString> = ["-o", "json", "--no-pager", "--quiet", "--follow"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        a.push(
+            format!(
+                "--output-fields=MESSAGE,SYSLOG_IDENTIFIER,_PID,{}",
+                sshd::TRUST_FIELDS
+            )
+            .into(),
+        );
         a.push(match cursor {
             Some(c) => format!("--after-cursor={c}").into(),
             None => "--lines=0".into(),
@@ -678,8 +709,17 @@ impl Sources {
                         if let Some(c) = p.cursor {
                             *self.cursor.borrow_mut() = (Some(c), true);
                         }
+                        if !sshd::trusted_entry(&line) {
+                            continue;
+                        }
+                        let pid = p.entry.pid;
                         if let Some(ev) = parse_sshd(&p.entry.message) {
-                            self.on_auth(&ev, p.entry.time_us / 1000).await;
+                            self.on_auth(&ev, pid, p.entry.time_us / 1000).await;
+                            self.save_cursor(false);
+                        } else if let Some(pid) = pid
+                            && sshd::is_disconnect(&p.entry.message)
+                        {
+                            self.ssh_logins.borrow_mut().closed(pid);
                         }
                     }
                     log("sshd journal follow", "ended; restarting");
@@ -694,17 +734,28 @@ impl Sources {
         }
     }
 
-    /// One sshd auth event logged at `t` (journal time).
-    pub(super) async fn on_auth(&self, ev: &AuthEvent, t: u64) {
+    /// One sshd auth event logged at `t` (journal time) by process `pid`.
+    pub(super) async fn on_auth(&self, ev: &AuthEvent, pid: Option<u32>, t: u64) {
         let now = self.now();
         match &ev.kind {
             AuthKind::Accepted {
                 method,
                 fingerprint,
             } => {
-                let device = fingerprint
+                let role = fingerprint
                     .as_deref()
-                    .and_then(|f| self.resolver.device_for(f));
+                    .and_then(|f| self.resolver.role_for(f));
+                let device = role.map(|(d, _)| d);
+                if *method == LoginMethod::PublicKey
+                    && let (Some(pid), Some(fp)) = (pid, fingerprint)
+                {
+                    self.ssh_logins.borrow_mut().accepted(Login {
+                        pid,
+                        fingerprint: fp.clone(),
+                        device: role,
+                        t,
+                    });
+                }
                 let new_source = self.logins.borrow_mut().record(ev.addr, t);
                 self.emit(Event::Login {
                     user: ev.user.clone().unwrap_or_default(),
@@ -713,8 +764,10 @@ impl Sources {
                     new_source,
                     device_id: device,
                 });
+                // Only the device key vouches for an address: the monitor
+                // key opens nothing but read-only sessions.
                 if *method == LoginMethod::PublicKey
-                    && let Some(d) = device
+                    && let Some((d, KeyRole::Device)) = role
                 {
                     let hit = self.correlator.borrow_mut().accepted(ev.addr, d, t);
                     if let Some(ip) = hit {
@@ -909,14 +962,33 @@ impl Sources {
                 Err(e) => log("persist login sources", e),
             }
         }
+        drop(l);
+        self.save_cursor(true);
+        self.bus.flush();
+    }
+
+    /// Saves the sshd journal cursor if it moved: after each auth event at
+    /// most every [`CURSOR_SAVE_EVERY`] (so a restart doesn't replay much
+    /// and can't count a failure twice), and on every persist tick.
+    fn save_cursor(&self, force: bool) {
+        if !force
+            && self
+                .cursor_saved
+                .get()
+                .is_some_and(|t| t.elapsed() < CURSOR_SAVE_EVERY)
+        {
+            return;
+        }
         let mut c = self.cursor.borrow_mut();
         if let (Some(cur), true) = (&c.0, c.1) {
             match self.db.set(SecurityKey::SshdCursor, cur.as_bytes()) {
-                Ok(()) => c.1 = false,
+                Ok(()) => {
+                    c.1 = false;
+                    self.cursor_saved.set(Some(Instant::now()));
+                }
                 Err(e) => log("persist sshd cursor", e),
             }
         }
-        self.bus.flush();
     }
 }
 
@@ -983,6 +1055,14 @@ mod tests {
         assert!(a.contains(&"--after-cursor=s=abc;i=1".to_owned()));
         assert!(a.contains(&"_UID=0".to_owned()));
         assert!(a.contains(&"--follow".to_owned()));
+        // The fields `sshd::trusted_entry` checks are requested.
+        let fields = a
+            .iter()
+            .find(|s| s.starts_with("--output-fields="))
+            .unwrap();
+        for f in ["_UID", "_COMM", "_SYSTEMD_UNIT", "CONTAINER_ID", "_PID"] {
+            assert!(fields.contains(f), "{f}");
+        }
         let a = Sources::follow_args(None);
         assert!(a.iter().any(|s| s == "--lines=0"));
     }

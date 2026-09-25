@@ -105,6 +105,7 @@ impl Fixture {
                     device_key: m.device.public(),
                     monitor_key: m.monitor.public(),
                     ssh_key: m.device.public(),
+                    monitor_ssh_key: m.monitor.public(),
                     noise_static: m.noise.public(),
                     added_at: NOW,
                     added_by: macs_first_id(),

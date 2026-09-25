@@ -57,6 +57,8 @@ tagged_enum! {
         Connections(v: Connections) = CONNECTIONS(15, "connections"),
         Timeline(v: Timeline) = TIMELINE(16, "timeline"),
         HealthChecks(v: HealthChecks) = HEALTH_CHECKS(17, "health_checks"),
+        /// `events.query`: the persisted signed event log.
+        SignedEvents(v: SignedEventPage) = SIGNED_EVENTS(18, "signed_events"),
 
         // logs
         /// `journal.query` page and `journal.follow` item.

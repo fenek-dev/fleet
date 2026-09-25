@@ -16,7 +16,8 @@
 //! 5 B ≈ 4.6 MB; rollups 168 h × 256 blocks × ≤ 1.1 KB ≈ 20–45 MB (typical
 //! ≈ 15 MB, most series are flat); top processes 10 080 minutes × ≤ 1 KB ≈
 //! 7 MB. Within the 64 MB budget before redb page overhead; free pages are
-//! reused after hourly pruning (no compaction while exec runs).
+//! reused after hourly pruning, and exec compacts the file about daily
+//! when much of it is unused (`Store::compactor`).
 
 use super::StoreError;
 use fleet_ops::telemetry::series::SeriesEntry;

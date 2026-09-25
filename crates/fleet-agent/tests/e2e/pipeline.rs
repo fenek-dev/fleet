@@ -25,9 +25,11 @@ fn compose(yaml: &str) -> Op {
 }
 
 /// Test handler: `compose.deploy` escalates via the real validator;
-/// auto-revert ops report `new_version: 8`, or fail if `fail` is set.
+/// auto-revert ops report `new_version: 8` after `delay`, or fail if
+/// `fail` is set.
 struct TestOps {
     fail: bool,
+    delay: Duration,
 }
 
 impl OpHandler for TestOps {
@@ -42,6 +44,7 @@ impl OpHandler for TestOps {
         _: &'a OpMeta,
     ) -> LocalBoxFuture<'a, Result<OpOutput, OpError>> {
         Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
             if self.fail {
                 return Err(OpError::new(ErrorCode::Internal));
             }
@@ -93,12 +96,16 @@ impl Revertible for TestRevertible {
 struct Env {
     fx: Fixture,
     log: Log,
-    timers: Arc<Mutex<Vec<FixedCommand>>>,
+    timers: Timers,
 }
 
 /// Exec with [`TestOps`] on compose/firewall/mesh tags and
 /// [`TestRevertible`] for the firewall and mesh kinds.
 fn env(groups: &'static str, fail: bool) -> Env {
+    env_with(groups, fail, Duration::ZERO, Duration::from_secs(30))
+}
+
+fn env_with(groups: &'static str, fail: bool, delay: Duration, apply_timeout: Duration) -> Env {
     let mut fx = Fixture::with(
         2,
         0,
@@ -115,7 +122,8 @@ fn env(groups: &'static str, fail: bool) -> Env {
     let (l, t) = (log.clone(), timers.clone());
     fx.exec = None;
     fx.start_exec_with(move |cfg| {
-        let h: Rc<dyn OpHandler> = Rc::new(TestOps { fail });
+        let h: Rc<dyn OpHandler> = Rc::new(TestOps { fail, delay });
+        cfg.apply_timeout = apply_timeout;
         for tag in [tag::COMPOSE_DEPLOY, tag::FIREWALL_APPLY, tag::MESH_LEAVE] {
             cfg.handlers.push((tag, h.clone()));
         }
@@ -127,11 +135,11 @@ fn env(groups: &'static str, fail: bool) -> Env {
         let mut restore = fleet_ops::Reverters::new();
         restore.register(WireKind::Firewall, r.clone());
         restore.register(WireKind::Mesh, r);
-        cfg.reverter = Box::new(fleet_agent::revert::RegistryRevert {
-            reverters: restore,
-            ctx: fleet_ops::SysCtx::system(),
-        });
-        cfg.runner = Box::new(SharedRecorder(t));
+        cfg.reverter = Box::new(fleet_agent::revert::RegistryRevert::new(
+            restore,
+            fleet_ops::SysCtx::system(),
+        ));
+        cfg.timers = Rc::new(SharedRecorder(t));
     });
     Env { fx, log, timers }
 }
@@ -245,6 +253,8 @@ fn auto_revert_then_confirm_over_a_new_session() {
     run(async {
         let m = &fx.macs[0];
         let mut s = fx.connect(m).await;
+        // Opened before the change was applied: can't prove anything.
+        let mut early = fx.connect(m).await;
         let cmd = s
             .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(7)))
             .unwrap();
@@ -260,11 +270,32 @@ fn auto_revert_then_confirm_over_a_new_session() {
         let id = p.change_id;
         assert_eq!(e.log.take(), ["snapshot firewall.apply"]);
         let hex_id = hex::encode(id);
+        // Guard timer before the apply, the confirm timer (full window)
+        // after it, then the guard stopped.
         let armed = e.timers.lock().unwrap().clone();
-        assert_eq!(armed.len(), 1);
-        assert!(armed[0].args.iter().any(|a| a == &hex_id));
-        assert!(armed[0].args.contains(&"--on-active=60".to_owned()));
+        assert_eq!(armed.len(), 3, "{armed:?}");
+        assert!(armed[0].contains(&format!("--unit=fleet-revert-{hex_id}-guard")));
+        assert!(armed[1].contains(&format!("--unit=fleet-revert-{hex_id}")));
+        assert!(armed[1].contains(&"--on-active=60".to_owned()));
+        assert!(armed[1].contains(&"--timer-property=AccuracySec=1s".to_owned()));
+        assert_eq!(
+            armed[2],
+            [
+                "/usr/bin/systemctl",
+                "stop",
+                &format!("fleet-revert-{hex_id}-guard.timer")
+            ]
+        );
         assert_eq!(pending_files(fx), 1);
+
+        // One pending change per kind: a second firewall change is `Busy`
+        // (refused before its nonce is consumed).
+        let cmd2 = s
+            .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(8)))
+            .unwrap();
+        let r2 = s.send(&cmd2).await.unwrap();
+        assert_eq!(r2.receipt.receipt.audit_seq, None);
+        assert_eq!(err(r2), ErrorCode::Busy);
 
         let r = s
             .request(Op::ChangesList, &fx.server, Actor::Human, None)
@@ -282,9 +313,15 @@ fn auto_revert_then_confirm_over_a_new_session() {
             .await
             .unwrap();
         assert_eq!(err(r), ErrorCode::PolicyDenied);
+        // A session opened before the apply finished: refused too.
+        let r = early
+            .request(confirm.clone(), &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(err(r), ErrorCode::PolicyDenied);
         assert_eq!(pending_files(fx), 1);
 
-        // A fresh session confirms; the timer is stopped.
+        // A fresh session confirms; both timers are stopped.
         let mut s2 = fx.connect(m).await;
         let r = s2
             .request(confirm.clone(), &fx.server, Actor::Human, None)
@@ -293,7 +330,15 @@ fn auto_revert_then_confirm_over_a_new_session() {
         assert_eq!(r.result, Ok(Payload::Empty));
         assert_eq!(pending_files(fx), 0);
         let stop = e.timers.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(stop.args, ["stop", &format!("fleet-revert-{hex_id}.timer")]);
+        assert_eq!(
+            stop,
+            [
+                "/usr/bin/systemctl",
+                "stop",
+                &format!("fleet-revert-{hex_id}.timer"),
+                &format!("fleet-revert-{hex_id}-guard.timer")
+            ]
+        );
         let r = s2
             .request(confirm, &fx.server, Actor::Human, None)
             .await
@@ -356,7 +401,7 @@ fn failed_apply_restores_and_missing_module_is_unsupported() {
         );
         assert_eq!(pending_files(fx), 0);
         let cmds = e.timers.lock().unwrap().clone();
-        assert_eq!(cmds.len(), 2, "armed, then stopped: {cmds:?}");
+        assert_eq!(cmds.len(), 2, "guard armed, then stopped: {cmds:?}");
 
         // No snapshot module for authorized keys (and no handler either).
         let op = Op::AuthorizedKeysSet {
@@ -375,5 +420,89 @@ fn failed_apply_restores_and_missing_module_is_unsupported() {
             .unwrap();
         assert_eq!(err(s.send(&cmd).await.unwrap()), ErrorCode::Unsupported);
         assert_eq!(pending_files(fx), 0);
+    });
+}
+
+/// An apply that outlives `apply_timeout` is abandoned and restored.
+#[test]
+fn apply_timeout_restores() {
+    let e = env_with(
+        r#""system", "firewall""#,
+        false,
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+    );
+    let fx = &e.fx;
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
+        let cmd = s
+            .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(1)))
+            .unwrap();
+        assert_eq!(err(s.send(&cmd).await.unwrap()), ErrorCode::Timeout);
+        assert_eq!(
+            e.log.take(),
+            ["snapshot firewall.apply", "restore firewall.apply"]
+        );
+        assert_eq!(pending_files(fx), 0);
+    });
+}
+
+/// While a change is applying: confirming it is `Busy`, another change of
+/// its kind is `Busy`, and an identical
+/// re-forward of the command waits for the original answer instead of a
+/// signed `Replay`.
+#[test]
+fn in_flight_change_is_protected() {
+    let e = env_with(
+        r#""system", "firewall""#,
+        false,
+        Duration::from_millis(1500),
+        Duration::from_secs(30),
+    );
+    let fx = &e.fx;
+    run(async {
+        let m = &fx.macs[0];
+        let (mut s, mut s2, mut s3) = (
+            fx.connect(m).await,
+            fx.connect(m).await,
+            fx.connect(m).await,
+        );
+        let cmd = s
+            .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(1)))
+            .unwrap();
+        let apply = s.send(&cmd);
+        let again = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            s3.send(&cmd).await.unwrap()
+        };
+        let other = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let r = s2
+                .request(Op::ChangesList, &fx.server, Actor::Human, None)
+                .await
+                .unwrap();
+            let Ok(Payload::PendingChanges(l)) = r.result else {
+                panic!("{r:?}")
+            };
+            let id = l.changes[0].change_id;
+            let confirm = Op::ChangeConfirm { change_id: id };
+            let r = s2
+                .request(confirm, &fx.server, Actor::Human, None)
+                .await
+                .unwrap();
+            assert_eq!(err(r), ErrorCode::Busy);
+            let cmd2 = s2
+                .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(2)))
+                .unwrap();
+            assert_eq!(err(s2.send(&cmd2).await.unwrap()), ErrorCode::Busy);
+            id
+        };
+        let (first, second, id) = tokio::join!(apply, again, other);
+        let first = first.unwrap();
+        assert_eq!(change_id(&first), id);
+        // The re-forward got the very same answer and receipt.
+        assert_eq!(second.result, first.result);
+        assert_eq!(second.receipt, first.receipt);
+        assert_eq!(pending_files(fx), 1);
     });
 }

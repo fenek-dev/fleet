@@ -86,6 +86,9 @@ pub fn build_genesis(
         device_key: keys.public_key(KeyRole::Device)?,
         monitor_key: keys.public_key(KeyRole::Monitor)?,
         ssh_key: keys.public_key(KeyRole::Ssh)?,
+        // Placeholder until the Mac generates a monitor SSH key (the agent
+        // skips a monitor line identical to the device SSH key).
+        monitor_ssh_key: keys.public_key(KeyRole::Ssh)?,
         noise_static: input.noise_static,
         added_at: input.now_ms,
         added_by: input.device_id,
