@@ -45,7 +45,10 @@ hex = "0.4.3"
 
 # Crypto
 blake3 = "1.8.7"
-p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "ecdh", "std"] }
+# Sync record encryption and HPKE's AEAD (design §7.6, RFC 9180). Already in
+# the tree via russh; pure Rust (RustCrypto), no C.
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 ecdsa = { version = "0.17.0", features = ["std"] }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core", "zeroize"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }

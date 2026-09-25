@@ -89,9 +89,9 @@ pub fn build_genesis(
         device_key: keys.public_key(KeyRole::Device)?,
         monitor_key: keys.public_key(KeyRole::Monitor)?,
         ssh_key: keys.public_key(KeyRole::Ssh)?,
-        // Placeholder until the Mac generates a monitor SSH key (the agent
-        // skips a monitor line identical to the device SSH key).
-        monitor_ssh_key: keys.public_key(KeyRole::Ssh)?,
+        // Its own enclave key (no user presence), forced to
+        // `bridge --monitor` in `authorized_keys` (design §5.9).
+        monitor_ssh_key: keys.public_key(KeyRole::MonitorSsh)?,
         noise_static: input.noise_static,
         added_at: input.now_ms,
         added_by: input.device_id,
@@ -149,6 +149,13 @@ pub fn check_genesis_is_ours(
             "monitor key",
         ),
         (d.ssh_key == keys.public_key(KeyRole::Ssh)?, "ssh key"),
+        // Genesis rosters from before the monitor SSH key existed carry the
+        // SSH key as a placeholder.
+        (
+            d.monitor_ssh_key == d.ssh_key
+                || d.monitor_ssh_key == keys.public_key(KeyRole::MonitorSsh)?,
+            "monitor ssh key",
+        ),
         (d.noise_static == noise_static, "noise key"),
         (genesis.signer == KeyRef::Root(device_id), "signer"),
     ];
@@ -293,6 +300,11 @@ mod tests {
         assert_eq!(g.signer, KeyRef::Root(DeviceId([2; 16])));
         assert_eq!(g.roster.recovery_delay_s, 0);
         assert_eq!(g.roster.devices[0].root_key, keys.root.public());
+        assert_eq!(
+            g.roster.devices[0].monitor_ssh_key,
+            keys.monitor_ssh.public()
+        );
+        assert_ne!(g.roster.devices[0].monitor_ssh_key, keys.ssh.public());
         verify_genesis(&g, crate::now_ms()).unwrap();
 
         let cache = Cache::open_in_memory().unwrap();

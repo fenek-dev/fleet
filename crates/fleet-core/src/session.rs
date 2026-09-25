@@ -133,6 +133,8 @@ pub type PendingReply = oneshot::Receiver<Result<Reply, ClientError>>;
 pub enum SessionMode {
     Normal = 0,
     Recovery = 1,
+    /// `bridge --monitor` (the Mac's monitor SSH key): monitor sessions only.
+    Monitor = 2,
 }
 
 /// Signs `DeviceAuth` and commands. On a Mac the P-256 keys are Secure

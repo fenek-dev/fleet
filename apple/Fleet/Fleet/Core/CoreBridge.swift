@@ -32,6 +32,13 @@ final class CoreBridge {
     /// server (the timeline catches up on it).
     private(set) var eventTick = 0
     private(set) var lastEventServer: String?
+    /// Fleet-level alerts: Mac added/revoked, recovery pending, removed
+    /// from the fleet, pin changes, sync conflicts (design §5.10, §7.6).
+    private(set) var fleetAlerts: [FleetAlertRow] = []
+    /// Bumped when synced data or the roster changed (views reload).
+    private(set) var fleetRevision = 0
+    /// iCloud sync (created on open).
+    @ObservationIgnored private(set) var sync: SyncCoordinator?
 
     @ObservationIgnored private var core: FleetCore?
     @ObservationIgnored private var keys: SecureEnclaveKeys?
@@ -53,6 +60,9 @@ final class CoreBridge {
             let path = try Self.cachePath()
             let core = try FleetCore.open(cachePath: path, signer: keys, keyStore: keyStore)
             self.core = core
+            core.setSyncSecrets(secrets: SyncKeychain(software: keys.usesSoftwareKeys))
+            core.setFleetListener(listener: FleetEvents(bridge: self))
+            sync = SyncCoordinator(bridge: self)
             // Keys may be generated only before enrollment; afterwards a
             // missing key is an error, never a silent replacement.
             keys.creationAllowed = !core.isEnrolled()
@@ -72,10 +82,12 @@ final class CoreBridge {
             try core.start(listener: Listener(bridge: self))
             keys?.creationAllowed = false
             status = .running
+            sync?.start()
         } catch FleetError.NotEnrolled {
             status = .notEnrolled
         } catch FleetError.AlreadyStarted {
             status = .running
+            sync?.start()
         } catch {
             report(error)
             status = .failed(String(describing: error))
@@ -168,6 +180,28 @@ final class CoreBridge {
         return try await core.agentHealth(serverId: id)
     }
 
+    // MARK: multi-Mac
+
+    /// New enclave keys may be created (joining or recovering a fleet).
+    func allowKeyCreation(_ allowed: Bool) {
+        keys?.creationAllowed = allowed
+    }
+
+    var usesSoftwareEnclave: Bool { keys?.usesSoftwareKeys ?? false }
+
+    func dismissFleetAlert(_ a: FleetAlertRow) {
+        fleetAlerts.removeAll { $0 == a }
+    }
+
+    fileprivate func apply(_ a: FleetAlertRow) {
+        if !fleetAlerts.contains(a) { fleetAlerts.append(a) }
+    }
+
+    fileprivate func syncChanged() {
+        fleetRevision += 1
+        reload()
+    }
+
     // MARK: listener updates
 
     fileprivate func apply(_ change: StateChange) {
@@ -242,6 +276,21 @@ private final class Listener: CoreListener {
     }
 }
 
+/// Fleet alerts and sync changes, on the core thread; hops to main.
+private final class FleetEvents: FleetListener {
+    private let bridge: CoreBridge
+
+    init(bridge: CoreBridge) { self.bridge = bridge }
+
+    func onFleetAlert(alert: FleetAlertRow) {
+        Task { @MainActor [bridge] in bridge.apply(alert) }
+    }
+
+    func onSyncChanged() {
+        Task { @MainActor [bridge] in bridge.syncChanged() }
+    }
+}
+
 extension Error {
     /// Operator-facing wording for core errors (Rust sends fixed codes).
     var fleetMessage: String {
@@ -280,6 +329,9 @@ extension Error {
         case .Keys(error: .Invalidated):
             return "The root key was invalidated (Touch ID fingerprints changed). Create a new root key and have another Mac or the recovery code approve it."
         case .Keys: return "Key store unavailable."
+        case .Roster(let reason): return "Roster: \(reason)."
+        case .Sync(let reason): return "Sync: \(reason)."
+        case .Recovery(let reason): return "Recovery: \(reason)."
         default: return "Request failed."
         }
     }

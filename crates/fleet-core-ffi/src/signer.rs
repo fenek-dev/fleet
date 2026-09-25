@@ -126,6 +126,7 @@ mod tests {
             KeyRole::Device => signer::KeyRole::Device,
             KeyRole::Monitor => signer::KeyRole::Monitor,
             KeyRole::Ssh => signer::KeyRole::Ssh,
+            KeyRole::MonitorSsh => signer::KeyRole::MonitorSsh,
         }
     }
 

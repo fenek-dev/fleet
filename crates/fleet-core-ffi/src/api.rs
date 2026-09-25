@@ -59,6 +59,8 @@ pub struct FleetCore {
     pub(crate) sftp: SftpCache,
     /// App side of the `fleetctl` socket, created on first use (`mcp`).
     pub(crate) mcp: std::sync::OnceLock<Arc<fleet_core::mcp_host::McpHost>>,
+    /// Multi-Mac state: roster management, sync, catch-up (`fleet_mgmt`).
+    pub(crate) fleet: crate::fleet_mgmt::FleetState,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -285,6 +287,7 @@ impl FleetCore {
             live: Arc::default(),
             sftp: Mutex::default(),
             mcp: std::sync::OnceLock::new(),
+            fleet: crate::fleet_mgmt::FleetState::new(*key_bytes, &cache_path),
         }))
     }
 
@@ -419,7 +422,7 @@ impl FleetCore {
     /// Starts the connection manager and connects every server with pinned
     /// agent keys. `listener` receives state changes, events and live
     /// fleet-table metrics.
-    pub fn start(&self, listener: Box<dyn CoreListener>) -> Result<(), FleetError> {
+    pub fn start(self: Arc<Self>, listener: Box<dyn CoreListener>) -> Result<(), FleetError> {
         let mut running = lock(&self.running);
         if running.is_some() {
             return Err(FleetError::AlreadyStarted);
@@ -436,14 +439,14 @@ impl FleetCore {
             }
             (fleet_id, device_id, specs)
         };
-        let connector = SshConnector {
-            keys: self.keys.clone(),
-            noise: Arc::new(self.noise_key()?),
+        let connector = SshConnector::new(
+            self.keys.clone(),
+            Arc::new(self.noise_key()?),
             fleet_id,
             device_id,
-            ssh: SshOptions::default(),
-            session_timeout: SESSION_TIMEOUT,
-        };
+            SshOptions::default(),
+            SESSION_TIMEOUT,
+        );
         let kind = *lock(&self.kind);
         let pending = self.pending_host_keys.clone();
         let listener: Arc<dyn CoreListener> = Arc::from(listener);
@@ -464,6 +467,13 @@ impl FleetCore {
         rt.spawn(crate::streams::fleet_telemetry(
             handle.clone(),
             self.live.clone(),
+            listener.clone(),
+        ));
+        // Agent events (catch-up + deduped live feed), roster pushes and
+        // fleet alerts.
+        rt.spawn(crate::fleet_mgmt::fleet_events(
+            Arc::downgrade(&self),
+            handle.clone(),
             listener,
         ));
         for s in specs {
@@ -718,9 +728,9 @@ fn dispatch(ev: ManagerEvent, listener: &dyn CoreListener, pending: &PendingKeys
             fatal: failure.as_ref().is_some_and(|f| f.fatal),
             failure: failure.map(|f| f.message),
         }),
-        ManagerEvent::Event { server, seq, event } => {
-            listener.on_event(AgentEventRow::new(server.to_string(), seq, &event));
-        }
+        // Delivered by `fleet_mgmt::fleet_events`, deduped against the
+        // `events.query` catch-up; removal alerts go there too.
+        ManagerEvent::Event { .. } | ManagerEvent::RemovedFromFleet { .. } => {}
         ManagerEvent::HostKeyFirstUse {
             server,
             observation,
@@ -939,7 +949,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = core(&dir);
         assert!(!c.is_enrolled());
-        assert_eq!(c.start(Box::new(Quiet)), Err(FleetError::NotEnrolled));
+        assert_eq!(
+            c.clone().start(Box::new(Quiet)),
+            Err(FleetError::NotEnrolled)
+        );
         assert_eq!(
             c.reconnect("srv_abcdef".into()),
             Err(FleetError::NotStarted)
@@ -956,8 +969,11 @@ mod tests {
             cache.set_setting(SETTING_DEVICE_ID, &[2; 16]).unwrap();
         }
         c.add_server(web(None)).unwrap();
-        c.start(Box::new(Quiet)).unwrap();
-        assert_eq!(c.start(Box::new(Quiet)), Err(FleetError::AlreadyStarted));
+        c.clone().start(Box::new(Quiet)).unwrap();
+        assert_eq!(
+            c.clone().start(Box::new(Quiet)),
+            Err(FleetError::AlreadyStarted)
+        );
         assert_eq!(c.session_kind(), SessionKind::Monitor);
         c.set_session_kind(SessionKind::Device);
         assert_eq!(c.session_kind(), SessionKind::Device);

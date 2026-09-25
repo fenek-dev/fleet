@@ -5,24 +5,12 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             Tab("General", systemImage: "gearshape") { GeneralSettings() }
-            Tab("Devices", systemImage: "laptopcomputer") {
-                SettingsPlaceholder(
-                    title: "Devices",
-                    detail: "Macs in the roster with their Secure Enclave keys, roster status and revoke.")
-            }
-            Tab("Recovery", systemImage: "key") {
-                SettingsPlaceholder(
-                    title: "Recovery",
-                    detail: "Recovery code, passphrase and the recovery drill.")
-            }
+            Tab("Devices", systemImage: "laptopcomputer") { DevicesSettings() }
+            Tab("Recovery", systemImage: "key") { RecoverySettings() }
             Tab("AI", systemImage: "sparkles") { AISettings() }
-            Tab("Sync", systemImage: "icloud") {
-                SettingsPlaceholder(
-                    title: "Sync",
-                    detail: "End-to-end encrypted iCloud sync between your Macs.")
-            }
+            Tab("Sync", systemImage: "icloud") { SyncSettings() }
         }
-        .frame(width: 560, height: 380)
+        .frame(width: 640, height: 520)
         .preferredColorScheme(.dark)
     }
 }

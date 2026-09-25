@@ -20,10 +20,16 @@
 //! - [`vuln`]: vulnerability feeds and matching (§2.4, §7.7);
 //!   [`fleetsearch`]: fleet-wide `search.*` fan-out (§2.7); [`timeline`]:
 //!   the unified per-server and fleet timeline (§2.7).
+//! - [`roster_mgmt`]: adding/revoking Macs, chain pushes, veto (§5.12);
+//!   [`catchup`]: `events.query` catch-up on connect; [`sync`]: end-to-end
+//!   encrypted iCloud sync (§7.6); [`recovery_flow`]: recovery and the
+//!   drill (§5.11); [`sudo`]: per-server sudo passwords (§5.9);
+//!   [`runner`]: the op-sending trait those flows share.
 #![forbid(unsafe_code)]
 
 pub mod bulk;
 pub mod cache;
+pub mod catchup;
 pub mod enroll;
 pub mod fleetsearch;
 pub mod install;
@@ -31,11 +37,16 @@ pub mod manager;
 pub mod mcp_host;
 pub mod opspec;
 pub mod policy;
+pub mod recovery_flow;
+pub mod roster_mgmt;
 pub mod runbook;
+pub mod runner;
 pub mod session;
 pub mod sftp;
 pub mod signer;
 pub mod ssh;
+pub mod sudo;
+pub mod sync;
 pub mod timeline;
 pub mod vuln;
 

@@ -26,6 +26,8 @@
 	<true/>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Fleet uses the camera only to scan the pairing QR code shown by a Mac you are adding to your fleet.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
 </dict>

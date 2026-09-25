@@ -208,6 +208,24 @@ pub enum ManagerEvent {
         server: ServerId,
         observation: HostKeyObservation,
     },
+    /// The server refused this Mac as a roster device (design §5.3
+    /// "Removed from the roster"): `signed` when exec's receipted status
+    /// read said `Unauthorized`; unsigned for a `DeviceAuth` refusal by the
+    /// gate or the device SSH key being refused (a hint only). The app
+    /// shows "this Mac may have been removed from the fleet".
+    RemovedFromFleet { server: ServerId, signed: bool },
+}
+
+/// Whether `err` (on a `kind` session) says this Mac is no longer in the
+/// server's roster, and whether that verdict is signed.
+pub fn removal_verdict(err: &LinkError, kind: SessionKind) -> Option<bool> {
+    match err {
+        LinkError::Client(ClientError::StatusRejected(ErrorCode::Unauthorized)) => Some(true),
+        LinkError::Client(ClientError::Rejected(ErrorCode::Unauthorized)) => Some(false),
+        // A refused monitor SSH key may just be a roster that predates it.
+        LinkError::Ssh(SshError::AuthRejected) if kind == SessionKind::Device => Some(false),
+        _ => None,
+    }
 }
 
 /// What a connector needs to reach one server.
@@ -710,6 +728,12 @@ async fn worker_loop<C: Connector>(
             Err(e) => e,
         };
         w.failures = w.failures.saturating_add(1);
+        if let Some(signed) = removal_verdict(&err, kind) {
+            let _ = w.events.send(ManagerEvent::RemovedFromFleet {
+                server: w.id.clone(),
+                signed,
+            });
+        }
         let fatal = err.is_fatal();
         let state = if fatal || w.failures >= cfg.offline_after {
             ConnState::Offline
@@ -740,6 +764,16 @@ async fn worker_loop<C: Connector>(
                     if r.is_err() || w.ctl.borrow().stop { break 'outer; }
                     w.failures = 0;
                     break;
+                }
+                // Lock/unlock retries at once with the other key: a monitor
+                // SSH key the server doesn't know yet (fatal while locked)
+                // is no reason to stay Offline after unlocking.
+                r = w.kind.changed() => {
+                    if r.is_err() { break 'outer; }
+                    if *w.kind.borrow() != kind {
+                        w.failures = 0;
+                        break;
+                    }
                 }
                 req = w.requests.recv() => match req {
                     Some(work) => work.fail(RequestError::NotReady(state)),
@@ -987,8 +1021,24 @@ impl ManagerHandle {
     }
 }
 
-/// The app's connector: SSH with the enclave SSH key, the agent exec
-/// channel, then a Noise session signed by the device or monitor key.
+/// The app's connector: SSH, the agent exec channel, then a Noise session
+/// signed by the device or monitor key (design §5.5, §5.10).
+///
+/// - **Device** sessions authenticate SSH with the enclave SSH key (needs
+///   the unlock context), open `bridge` and publish the SSH connection for
+///   terminals and SFTP.
+/// - **Monitor** sessions (app locked) authenticate SSH with the monitor
+///   SSH key, which works while locked and which `authorized_keys` forces
+///   to `bridge --monitor` (Noise prologue mode 2). That connection is
+///   **never published**: it can't run anything but the monitor bridge,
+///   and nothing may use it for terminals or files.
+/// - **Lock/unlock:** a connection authenticated with the device SSH key is
+///   kept across a session-kind change and reused (locking: a monitor
+///   session on the normal bridge, unpublished; unlocking again: a device
+///   session on the same connection). A monitor-SSH connection can't be
+///   upgraded (every channel is forced to the monitor bridge, and SSH has
+///   no re-authentication), so unlocking reconnects with the device SSH
+///   key, without backoff.
 pub struct SshConnector {
     pub keys: Arc<dyn DeviceSigner>,
     pub noise: Arc<StaticKeypair>,
@@ -997,6 +1047,68 @@ pub struct SshConnector {
     pub ssh: SshOptions,
     /// Noise handshake + `DeviceAuth` + signed status read.
     pub session_timeout: Duration,
+    /// Device-key SSH connections kept across a session-kind change.
+    kept: std::cell::RefCell<HashMap<ServerId, KeptConn>>,
+}
+
+struct KeptConn {
+    spec: ServerSpec,
+    conn: Arc<SshConnection>,
+    at: std::time::Instant,
+}
+
+/// A kept connection not picked up again within this time is closed.
+const KEEP_FOR: Duration = Duration::from_secs(60);
+
+impl SshConnector {
+    pub fn new(
+        keys: Arc<dyn DeviceSigner>,
+        noise: Arc<StaticKeypair>,
+        fleet_id: FleetId,
+        device_id: DeviceId,
+        ssh: SshOptions,
+        session_timeout: Duration,
+    ) -> Self {
+        Self {
+            keys,
+            noise,
+            fleet_id,
+            device_id,
+            ssh,
+            session_timeout,
+            kept: Default::default(),
+        }
+    }
+
+    /// SSH key and bridge for a fresh connection of `kind`.
+    pub fn plan(kind: SessionKind) -> (KeyRole, SessionMode) {
+        match kind {
+            SessionKind::Device => (KeyRole::Ssh, SessionMode::Normal),
+            SessionKind::Monitor => (KeyRole::MonitorSsh, SessionMode::Monitor),
+        }
+    }
+
+    /// A kept device-key connection for `server`, if still usable.
+    fn take_kept(&self, server: &ServerSpec) -> Option<Arc<SshConnection>> {
+        let mut kept = self.kept.borrow_mut();
+        let stale: Vec<ServerId> = kept
+            .iter()
+            .filter(|(_, k)| k.at.elapsed() > KEEP_FOR || k.conn.is_closed())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Some(k) = kept.remove(&id) {
+                tokio::task::spawn_local(async move { k.conn.disconnect().await });
+            }
+        }
+        let k = kept.remove(&server.id)?;
+        if k.spec == *server {
+            Some(k.conn)
+        } else {
+            tokio::task::spawn_local(async move { k.conn.disconnect().await });
+            None
+        }
+    }
 }
 
 impl Connector for SshConnector {
@@ -1006,23 +1118,37 @@ impl Connector for SshConnector {
         kind: SessionKind,
         mut ctx: LinkCtx<'_>,
     ) -> Result<ServeEnd, LinkError> {
-        let ssh_key = P256SshSigner(RoleSigner::new(&*self.keys, KeyRole::Ssh)?);
-        let (conn, observation) = SshConnection::connect_with(
-            &server.target,
-            &ssh_key,
-            server.host_key.clone(),
-            &self.ssh,
-        )
-        .await?;
-        // A first-use key (any hop) blocks the connection: nothing but the
-        // fingerprint prompt happens until the operator pins it. Only an
-        // all-Matched connection is used or published.
-        if !observation.all_matched() {
-            conn.disconnect().await;
-            ctx.host_key_first_use(observation);
-            return Err(LinkError::Ssh(SshError::HostKeyUnconfirmed));
-        }
-        let conn = Arc::new(conn);
+        let (conn, ssh_role) = match self.take_kept(server) {
+            Some(conn) => (conn, KeyRole::Ssh),
+            None => {
+                let (ssh_role, _) = Self::plan(kind);
+                let ssh_key = P256SshSigner(RoleSigner::new(&*self.keys, ssh_role)?);
+                let (conn, observation) = SshConnection::connect_with(
+                    &server.target,
+                    &ssh_key,
+                    server.host_key.clone(),
+                    &self.ssh,
+                )
+                .await?;
+                // A first-use key (any hop) blocks the connection: nothing
+                // but the fingerprint prompt happens until the operator
+                // pins it. Only an all-Matched connection is used or
+                // published.
+                if !observation.all_matched() {
+                    conn.disconnect().await;
+                    ctx.host_key_first_use(observation);
+                    return Err(LinkError::Ssh(SshError::HostKeyUnconfirmed));
+                }
+                (Arc::new(conn), ssh_role)
+            }
+        };
+        // A device-key connection runs the normal bridge for either kind;
+        // a monitor-key connection only the monitor bridge.
+        let mode = if ssh_role == KeyRole::MonitorSsh {
+            SessionMode::Monitor
+        } else {
+            SessionMode::Normal
+        };
         ctx.authenticating();
         let role = match kind {
             SessionKind::Monitor => KeyRole::Monitor,
@@ -1030,9 +1156,9 @@ impl Connector for SshConnector {
         };
         let signer = RoleSigner::new(&*self.keys, role)?;
         let result = async {
-            let stream = conn.open_agent_channel(false).await?;
+            let stream = conn.open_agent_channel_mode(mode).await?;
             let cfg = SessionConfig {
-                mode: SessionMode::Normal,
+                mode,
                 noise: &self.noise,
                 pinned_agent_noise: server.agent_noise,
                 pinned_agent_signing: server.agent_signing,
@@ -1046,11 +1172,29 @@ impl Connector for SshConnector {
                 tokio::time::timeout(self.session_timeout, Session::connect_bridged(stream, cfg))
                     .await
                     .map_err(|_| LinkError::Timeout)??;
-            ctx.publish_ssh(conn.clone());
+            // Terminals and SFTP only over a device-key connection while
+            // unlocked (design §5.10: terminals are hidden while locked).
+            if kind == SessionKind::Device && ssh_role == KeyRole::Ssh {
+                ctx.publish_ssh(conn.clone());
+            }
             ctx.serve(&mut session).await
         }
         .await;
-        conn.disconnect().await;
+        if matches!(result, Ok(ServeEnd::KindChanged))
+            && ssh_role == KeyRole::Ssh
+            && !conn.is_closed()
+        {
+            self.kept.borrow_mut().insert(
+                server.id.clone(),
+                KeptConn {
+                    spec: server.clone(),
+                    conn,
+                    at: std::time::Instant::now(),
+                },
+            );
+        } else {
+            conn.disconnect().await;
+        }
         result
     }
 }

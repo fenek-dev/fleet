@@ -19,6 +19,10 @@ pub enum KeyRole {
     Monitor,
     /// `ecdsa-sha2-nistp256` SSH client key.
     Ssh,
+    /// SSH key usable while locked; forced to `bridge --monitor`. No user
+    /// presence; created on first use (existing Macs get it lazily and
+    /// need a roster update before servers accept it).
+    MonitorSsh,
 }
 
 impl From<signer::KeyRole> for KeyRole {
@@ -28,6 +32,7 @@ impl From<signer::KeyRole> for KeyRole {
             signer::KeyRole::Device => Self::Device,
             signer::KeyRole::Monitor => Self::Monitor,
             signer::KeyRole::Ssh => Self::Ssh,
+            signer::KeyRole::MonitorSsh => Self::MonitorSsh,
         }
     }
 }
@@ -220,6 +225,15 @@ pub enum FleetError {
     /// Vulnerability feed download, parse or database failure.
     #[error("vulnerability data: {message}")]
     VulnData { message: String },
+    /// Adding/revoking a Mac, pairing, roster push (design §5.12).
+    #[error("roster: {reason}")]
+    Roster { reason: String },
+    /// iCloud sync: no sync key yet, a record that doesn't open (§7.6).
+    #[error("sync: {reason}")]
+    Sync { reason: String },
+    /// Recovery code, escrow, recovery rosters (§5.11).
+    #[error("recovery: {reason}")]
+    Recovery { reason: String },
 }
 
 impl From<fleet_core::sftp::SftpError> for FleetError {
