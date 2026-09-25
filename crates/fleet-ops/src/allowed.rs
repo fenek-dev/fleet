@@ -2,36 +2,34 @@
 //! (`logfile.tail`, `du.scan`, config reads; design §4.2), without following
 //! symlinks out of the root.
 //!
-//! `std` has no `openat`, so there's no component-by-component walk on
-//! directory handles. Instead, [`open_allowed`]:
+//! [`open_allowed`]:
 //!
 //! 1. picks the longest allowed root the path is lexically under
 //!    (`AllowedPath`), and canonicalizes that root: roots are Fleet's own
 //!    configuration, so a symlinked root (`/var/run` → `/run`) is trusted;
-//! 2. `lstat`s every component below the root and refuses any symlink, and
-//!    requires the last one to be a regular file;
-//! 3. opens the file with `O_NOFOLLOW | O_NONBLOCK` (a FIFO swapped in can't
-//!    block exec) and checks that `fstat` is the same regular file (`dev`,
-//!    `ino`) that step 2 saw;
-//! 4. on Linux, reads `/proc/self/fd/<fd>` and requires the file actually
-//!    opened to lie under the canonical root.
-//!
-//! **Residual TOCTOU.** A writer inside the root can swap an intermediate
-//! directory for a symlink between steps 2 and 3. Step 4 catches that on
-//! Linux (the only target), so the result is always a file under the root;
-//! without `/proc` (macOS test builds) that window stays open. Hard links
-//! are not symlinks: a file hard-linked into the root from elsewhere is
-//! opened (Debian's default `fs.protected_hardlinks = 1` stops unprivileged
-//! users from linking files they don't own).
+//! 2. opens the root, then every directory below it from the previous
+//!    directory fd with `openat(O_NOFOLLOW | O_DIRECTORY)`
+//!    ([`crate::files::walk`]), so no symlink below the root is followed
+//!    and nothing swapped in mid-walk can redirect the open;
+//! 3. opens the file itself from its parent fd with `O_NOFOLLOW |
+//!    O_NONBLOCK` (a FIFO swapped in can't block exec) and requires `fstat`
+//!    to say regular file;
+//! 4. refuses a file with more than one hard link when any directory from
+//!    the root down is writable by a non-root user: a hard link is not a
+//!    symlink, so such a user could otherwise link a file from outside the
+//!    root (`/etc/shadow`) into it;
+//! 5. on Linux, reads `/proc/self/fd/<fd>` and requires it to name exactly
+//!    the expected path under the canonical root.
 
 use crate::ctx::SysCtx;
+use crate::files::walk::{self, FileMeta, Kind};
 use crate::handler::OpError;
 use fleet_proto::ErrorCode;
 use fleet_proto::args::{AbsPath, AllowedPath};
+use rustix::fs::{self as rfs, Mode, OFlags};
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::fd::OwnedFd;
 
 fn io_err(e: io::Error, what: &'static str) -> OpError {
     let code = match e.kind() {
@@ -47,10 +45,22 @@ fn refused(detail: &'static str) -> OpError {
     OpError::new(ErrorCode::InvalidArgument).with_detail(detail)
 }
 
+/// A user other than root can add entries (hard links) to this directory.
+fn writable_by_non_root(m: &FileMeta) -> bool {
+    (m.uid != 0 && m.mode & 0o200 != 0) || m.mode & 0o022 != 0
+}
+
+fn fstat_meta(fd: &OwnedFd) -> Result<FileMeta, OpError> {
+    rfs::fstat(fd)
+        .map(|st| walk::meta_of(&st))
+        .map_err(|e| io_err(e.into(), "fstat"))
+}
+
 /// Opens `path` read-only if it's a regular file under one of `roots`
 /// with no symlink below the root (see the module docs).
-/// `InvalidArgument` for a path outside the roots, a symlink, or anything
-/// but a regular file; `NotFound` if it doesn't exist.
+/// `InvalidArgument` for a path outside the roots, a symlink, a refused
+/// hard link or anything but a regular file; `NotFound` if it doesn't
+/// exist.
 pub fn open_allowed<'a>(
     ctx: &SysCtx,
     path: &AbsPath,
@@ -72,51 +82,52 @@ pub fn open_allowed<'a>(
     let Some((last, dirs)) = comps.split_last() else {
         return Err(refused("the root itself is not a file"));
     };
-    let mut cur = root_real.clone();
+    let mut dir = rfs::open(
+        &root_real,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| io_err(e.into(), "allowed root"))?;
+    let mut writable = writable_by_non_root(&fstat_meta(&dir)?);
     for c in dirs {
-        cur.push(c);
-        let m = std::fs::symlink_metadata(&cur).map_err(|e| io_err(e, "lstat"))?;
-        if m.file_type().is_symlink() {
-            return Err(refused("symlink in path"));
-        }
-        if !m.is_dir() {
-            return Err(OpError::new(ErrorCode::NotFound).with_detail("not a directory"));
-        }
+        dir = match walk::open_dir_at(&dir, *c) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(io_err(e, "open")),
+            Err(e) => {
+                return Err(match walk::stat_at(&dir, *c) {
+                    Ok(m) if m.kind == Kind::Symlink => refused("symlink in path"),
+                    Ok(m) if m.kind != Kind::Dir => {
+                        OpError::new(ErrorCode::NotFound).with_detail("not a directory")
+                    }
+                    _ => io_err(e, "open"),
+                });
+            }
+        };
+        writable |= writable_by_non_root(&fstat_meta(&dir)?);
     }
-    cur.push(last);
-    let before = std::fs::symlink_metadata(&cur).map_err(|e| io_err(e, "lstat"))?;
-    if !before.file_type().is_file() {
+    let fd = rfs::openat(
+        &dir,
+        *last,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| io_err(e.into(), "open"))?;
+    let meta = fstat_meta(&fd)?;
+    if meta.kind != Kind::File {
         return Err(refused("not a regular file"));
     }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&cur)
-        .map_err(|e| io_err(e, "open"))?;
-    let after = file.metadata().map_err(|e| io_err(e, "fstat"))?;
-    if !after.is_file() || after.dev() != before.dev() || after.ino() != before.ino() {
-        return Err(refused("file changed while opening"));
+    if meta.nlink > 1 && writable {
+        return Err(refused(
+            "hard-linked file under a non-root-writable directory",
+        ));
     }
-    check_opened_under(&file, &root_real)?;
-    Ok((allowed, file))
-}
-
-#[cfg(target_os = "linux")]
-fn check_opened_under(file: &File, root: &Path) -> Result<(), OpError> {
-    use std::os::fd::AsRawFd;
-    let real = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-        .map_err(|e| io_err(e, "/proc/self/fd"))?;
-    if real.starts_with(root) {
-        Ok(())
-    } else {
-        Err(refused("opened file is outside the root"))
-    }
-}
-
-/// No `/proc` here (tests on macOS): see the residual TOCTOU note.
-#[cfg(not(target_os = "linux"))]
-fn check_opened_under(_: &File, _: &Path) -> Result<(), OpError> {
-    Ok(())
+    let mut expected = root_real;
+    expected.extend(&comps);
+    walk::check_fd_path(&fd, &expected).map_err(|e| match e.kind() {
+        io::ErrorKind::PermissionDenied => refused("opened file is not at the expected path"),
+        _ => io_err(e, "/proc/self/fd"),
+    })?;
+    Ok((allowed, File::from(fd)))
 }
 
 #[cfg(test)]
@@ -191,6 +202,45 @@ mod tests {
             open(&ctx, "/srv/logs/evil", &roots),
             Err(ErrorCode::InvalidArgument)
         );
+    }
+
+    /// Test directories are owned by the (non-root) test user, so they
+    /// count as non-root-writable: hard-linked files are refused.
+    #[test]
+    fn refuses_hard_links_under_user_writable_roots() {
+        let (d, ctx) = setup();
+        let roots = [p("/var/log")];
+        std::fs::hard_link(d.path().join("etc/shadow"), d.path().join("var/log/hl")).unwrap();
+        assert_eq!(
+            open(&ctx, "/var/log/hl", &roots),
+            Err(ErrorCode::InvalidArgument)
+        );
+        // The original is now nlink 2 as well.
+        assert_eq!(
+            open(&ctx, "/etc/shadow", &[p("/etc")]),
+            Err(ErrorCode::InvalidArgument)
+        );
+        let meta = |uid, mode| FileMeta {
+            kind: Kind::Dir,
+            dev: 0,
+            ino: 0,
+            size: 0,
+            alloc: 0,
+            mode,
+            uid,
+            gid: 0,
+            mtime_ns: 0,
+            nlink: 2,
+        };
+        for (uid, mode, w) in [
+            (0, 0o755, false),
+            (0, 0o775, true),
+            (0, 0o1777, true),
+            (1000, 0o755, true),
+            (1000, 0o555, false),
+        ] {
+            assert_eq!(writable_by_non_root(&meta(uid, mode)), w, "{uid} {mode:o}");
+        }
     }
 
     #[test]

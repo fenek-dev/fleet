@@ -206,6 +206,39 @@ pub fn open_file(ctx: &SysCtx, abs: &str) -> io::Result<(std::fs::File, FileMeta
     open_file_at(&dir, name)
 }
 
+/// The host path `abs` names once the context root is canonicalized (the
+/// root is trusted; `/` in production). What `/proc/self/fd` reports for a
+/// file opened through the fd-relative helpers.
+pub fn host_path(ctx: &SysCtx, abs: &str) -> io::Result<std::path::PathBuf> {
+    let comps = components(abs).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut p = ctx.root().canonicalize()?;
+    p.extend(comps);
+    Ok(p)
+}
+
+/// Post-open check: `/proc/self/fd/<fd>` must name exactly `expected` (a
+/// canonical host path), so a file reached through a raced rename or a
+/// swapped directory is refused (`PermissionDenied`).
+#[cfg(target_os = "linux")]
+pub fn check_fd_path(fd: impl AsFd, expected: &std::path::Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let real = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd()))?;
+    if real == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "opened file is not at the expected path",
+        ))
+    }
+}
+
+/// No `/proc` here (macOS test builds): nothing to compare against.
+#[cfg(not(target_os = "linux"))]
+pub fn check_fd_path(_: impl AsFd, _: &std::path::Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Joins a directory path and a child name.
 pub fn join(dir: &str, name: &str) -> String {
     if dir == "/" {
