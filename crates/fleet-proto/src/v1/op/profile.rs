@@ -48,8 +48,11 @@ pub enum ProfilePhase {
     /// Phase 3: everything else (packages, sysctl, roles, …). No
     /// auto-revert; exec allows it a long timeout.
     System,
-    /// Every module in apply order; auto-revert when an access module is
-    /// in scope.
+    /// The modules named in `only`, in apply order: a one-click audit
+    /// fix. `only` must be non-empty and either all access modules (run
+    /// under auto-revert) or none of them, so a revert of an access
+    /// change never also rolls back unrelated modules and a long System
+    /// module never runs inside the auto-revert apply timeout.
     All,
 }
 
@@ -94,7 +97,11 @@ impl ProfilePhase {
             ProfilePhase::Accounts | ProfilePhase::System => {
                 ensure(!spec.only.iter().any(access), "phase modules")?;
             }
-            ProfilePhase::All => {}
+            ProfilePhase::All => {
+                ensure(!spec.only.is_empty(), "phase All needs modules")?;
+                let n = spec.only.iter().filter(|m| access(m)).count();
+                ensure(n == 0 || n == spec.only.len(), "phase modules")?;
+            }
         }
         if let Some(h) = password_hash {
             ensure(self.sets_password(), "password phase")?;

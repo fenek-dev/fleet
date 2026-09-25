@@ -208,7 +208,7 @@ auto_revert_seconds = 60
 /// Always restores successfully (tests only).
 struct NoopRevert;
 impl Revert for NoopRevert {
-    fn revert(&self, _: ChangeKind, _: &[u8]) -> Result<(), RevertError> {
+    fn revert(&self, _: ChangeKind, _: &[u8], _: Option<u64>) -> Result<(), RevertError> {
         Ok(())
     }
 }
@@ -332,6 +332,9 @@ impl Fixture {
                 // check it turn it back on.
                 cfg.confirm_sshd_login = None;
                 cfg.terminator = Some(Box::new(exec::NoopTerminator));
+                // Snapshots/restores through the configured (fake) modules,
+                // not the system reverter on the blocking pool.
+                cfg.offload = None;
                 tweak(&mut cfg);
                 exec::run(cfg, async {
                     let _ = rx.await;

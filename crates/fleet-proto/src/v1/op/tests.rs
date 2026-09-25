@@ -949,6 +949,28 @@ fn check_args_rejects() {
     assert!(mesh(&["10.0.0.0/8"]).check_args().is_err());
     assert!(mesh(&["0.0.0.0/0"]).check_args().is_err());
     assert!(mesh(&["fd00::1/128"]).check_args().is_err());
+    // The network itself: private, and no wider than /16 or /48.
+    let net = |n: &str, a: &str| {
+        Op::MeshJoin(MeshConfig {
+            address: a.parse().unwrap(),
+            network: n.parse().unwrap(),
+            listen_port: Port::new(51820).unwrap(),
+            peers: vec![],
+        })
+        .check_args()
+        .is_ok()
+    };
+    assert!(net("10.9.0.0/16", "10.9.0.1"));
+    assert!(net("172.20.0.0/24", "172.20.0.1"));
+    assert!(net("192.168.50.0/24", "192.168.50.1"));
+    assert!(net("100.100.0.0/16", "100.100.0.1"));
+    assert!(net("fd12:3456:789a::/48", "fd12:3456:789a::1"));
+    assert!(!net("10.0.0.0/8", "10.0.0.1"));
+    assert!(!net("8.8.0.0/16", "8.8.0.1"));
+    assert!(!net("172.32.0.0/16", "172.32.0.1"));
+    assert!(!net("100.128.0.0/16", "100.128.0.1"));
+    assert!(!net("fd00::/32", "fd00::1"));
+    assert!(!net("2001:db8::/48", "2001:db8::1"));
     let peers = |ips: &[&str]| Op::MeshPeersSet {
         peers: vec![WgPeer {
             allowed_ips: ips.iter().map(|c| c.parse().unwrap()).collect(),
@@ -1002,14 +1024,30 @@ fn profile_apply_phases() {
     use ProfilePhase::*;
     // Auto-revert only when an SSH/firewall module may run.
     assert!(apply(only(&[]), Access, None).auto_revert());
-    assert!(apply(only(&[]), All, None).auto_revert());
-    assert!(apply(only(&["sysctl", "firewall.baseline"]), All, None).auto_revert());
+    assert!(apply(only(&["firewall.baseline"]), All, None).auto_revert());
     assert!(!apply(only(&["sysctl"]), All, None).auto_revert());
     assert!(!apply(only(&[]), Accounts, None).auto_revert());
     assert!(!apply(only(&[]), System, None).auto_revert());
-    for phase in [Accounts, Access, System, All] {
+    for phase in [Accounts, Access, System] {
         assert!(apply(only(&[]), phase, None).check_args().is_ok());
     }
+    // `All` names its modules, and never mixes access and other modules.
+    assert!(apply(only(&[]), All, None).check_args().is_err());
+    assert!(
+        apply(only(&["sysctl", "firewall.baseline"]), All, None)
+            .check_args()
+            .is_err()
+    );
+    assert!(
+        apply(only(&["ssh.hardening", "firewall.baseline"]), All, None)
+            .check_args()
+            .is_ok()
+    );
+    assert!(
+        apply(only(&["sysctl", "auditd"]), All, None)
+            .check_args()
+            .is_ok()
+    );
     // `only` must fit the phase (as far as access modules go).
     assert!(
         apply(only(&["ssh.hardening"]), System, None)
@@ -1030,7 +1068,7 @@ fn profile_apply_phases() {
             .is_ok()
     );
     assert!(
-        apply(only(&[]), All, Some(hash.clone()))
+        apply(only(&["admin.user"]), All, Some(hash.clone()))
             .check_args()
             .is_ok()
     );
@@ -1052,6 +1090,11 @@ fn profile_apply_phases() {
     // Tier doesn't depend on the phase.
     assert_eq!(apply(only(&[]), System, None).tier(), Tier::Change);
     assert_eq!(apply(custom_spec(), Accounts, None).tier(), Tier::Elevated);
+    // Setting the sudo password is Elevated even for a built-in profile.
+    assert_eq!(
+        apply(only(&[]), Accounts, Some(hash.clone())).tier(),
+        Tier::Elevated
+    );
 }
 
 #[test]

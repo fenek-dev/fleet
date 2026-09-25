@@ -40,7 +40,16 @@ pub fn units_of(p: &Resolved) -> Vec<String> {
 }
 
 pub async fn load_resolved(profile: Resolved, sys: &SysCtx, op_id: u64) -> Ctx {
-    let facts = facts::gather(sys, &units_of(&profile)).await;
+    let want = facts::Wanted {
+        units: units_of(&profile),
+        sshd_user: profile
+            .admin
+            .as_ref()
+            .filter(|_| profile.modules.iter().any(|m| m == "ssh.hardening"))
+            .map(|a| a.name.clone()),
+        key_files: modules::roles::key_files(&profile),
+    };
+    let facts = facts::gather(sys, &want).await;
     Ctx {
         sys: sys.clone(),
         profile,

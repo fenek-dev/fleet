@@ -164,6 +164,7 @@ fn plan_then_apply_through_the_handler() {
         "/usr/bin/systemctl",
         &["try-reload-or-restart", "--", "ssh.service"],
     );
+    env.expect_sshd_t(&super::baseline());
     let op = apply(
         spec(&["ssh.hardening"]),
         plan.plan_hash,
@@ -210,6 +211,7 @@ fn a_phase_applies_only_its_modules_of_the_hashed_plan() {
         "/usr/bin/systemctl",
         &["try-reload-or-restart", "--", "ssh.service"],
     );
+    env.expect_sshd_t(&super::baseline());
     let res = block(engine::apply(&mut c, &hash, ProfilePhase::Access, None)).unwrap();
     assert_done(&env);
     let ids: Vec<&str> = res.iter().map(|m| m.id.as_str()).collect();
@@ -415,7 +417,8 @@ fn revert_snapshot_restores_files_and_reloads() {
         only_access
             .files
             .iter()
-            .all(|f| f.path == ssh::FLEET_CONF || f.path == ssh::SSHD_CONFIG),
+            .all(|f| [ssh::FLEET_CONF, ssh::OLD_FLEET_CONF, ssh::SSHD_CONFIG]
+                .contains(&f.path.as_str())),
         "{:?}",
         only_access
             .files
@@ -423,17 +426,11 @@ fn revert_snapshot_restores_files_and_reloads() {
             .map(|f| &f.path)
             .collect::<Vec<_>>()
     );
-    assert!(
-        only_access
-            .reload
-            .iter()
-            .all(|(p, _)| p == ssh::SSHD || p == "/usr/bin/systemctl")
-    );
-    let op = apply(
-        spec(&["ssh.hardening", "sysctl"]),
-        [0; 32],
-        ProfilePhase::All,
-    );
+    // One group: `sshd -t` validates before the reload.
+    assert_eq!(only_access.reload.len(), 1);
+    assert_eq!(only_access.reload[0][0].0, ssh::SSHD);
+    assert_eq!(only_access.reload[0][1].0, "/usr/bin/systemctl");
+    let op = apply(spec(&["ssh.hardening"]), [0; 32], ProfilePhase::All);
     let bytes = ProfileRevert.snapshot(&env.sys, &op).unwrap();
     let snap = Snapshot::decode(&bytes).unwrap();
     assert!(snap.firewall.is_none());
@@ -442,23 +439,87 @@ fn revert_snapshot_restores_files_and_reloads() {
             .iter()
             .any(|f| f.path == ssh::FLEET_CONF && f.prior.is_none())
     );
+    // A phase-System module isn't part of an access snapshot.
+    assert!(
+        !snap
+            .files
+            .iter()
+            .any(|f| f.path == crate::modules::kernel::SYSCTL_CONF)
+    );
     env.put(ssh::FLEET_CONF, "AllowUsers nobody\n");
     env.put(ssh::SSHD_CONFIG, "broken\n");
-    env.put(crate::modules::kernel::SYSCTL_CONF, "x = 1\n");
     env.ok(ssh::SSHD, &["-t"]);
     env.ok(
         "/usr/bin/systemctl",
         &["try-reload-or-restart", "--", "ssh.service"],
     );
-    env.ok("/usr/sbin/sysctl", &["--ignore", "--system"]);
     ProfileRevert.restore(&env.sys, &bytes).unwrap();
     assert_done(&env);
     assert!(env.read(ssh::FLEET_CONF).is_none());
-    assert!(env.read(crate::modules::kernel::SYSCTL_CONF).is_none());
     assert_eq!(
         env.read(ssh::SSHD_CONFIG).unwrap(),
         "Include /etc/ssh/sshd_config.d/*.conf\nUsePAM yes\n"
     );
+}
+
+#[test]
+fn revert_skips_reload_when_restored_sshd_config_is_invalid() {
+    let env = Env::new().with_admin();
+    let op = apply(spec(&["ssh.hardening"]), [0; 32], ProfilePhase::Access);
+    let bytes = ProfileRevert.snapshot(&env.sys, &op).unwrap();
+    env.put(ssh::FLEET_CONF, "AllowUsers ops\n");
+    env.runner
+        .expect(ssh::SSHD, &["-t"], Ok(CommandOutput::exit(255)));
+    let e = ProfileRevert.restore(&env.sys, &bytes).unwrap_err();
+    assert!(e.detail().unwrap().contains("reload skipped"), "{e:?}");
+    // The files are back; no reload was attempted.
+    assert!(env.read(ssh::FLEET_CONF).is_none());
+    assert_done(&env);
+    assert_eq!(env.runner.calls().len(), 1);
+}
+
+#[test]
+fn revert_restores_the_firewall_only_while_unchanged() {
+    use crate::revert::restore_firewall;
+    let snap = Snapshot {
+        files: vec![],
+        firewall: Some(vec![]),
+        firewall_version: Some(5),
+        reload: vec![],
+    };
+    // Still what the apply left (7): restore.
+    assert!(restore_firewall(&snap, Some(7), Some(7)));
+    // Changed since (8): keep the newer table.
+    assert!(!restore_firewall(&snap, Some(7), Some(8)));
+    // Already the snapshotted table: nothing to do.
+    assert!(!restore_firewall(&snap, Some(7), Some(5)));
+    // Unknown current version or no recorded apply: restore.
+    assert!(restore_firewall(&snap, Some(7), None));
+    assert!(restore_firewall(&snap, None, Some(8)));
+}
+
+#[test]
+fn v1_snapshots_still_decode() {
+    #[derive(serde::Serialize)]
+    struct V1 {
+        files: Vec<crate::module::FileSnap>,
+        firewall: Option<Vec<u8>>,
+        reload: Vec<(String, Vec<String>)>,
+    }
+    let v1 = V1 {
+        files: vec![],
+        firewall: None,
+        reload: vec![
+            (ssh::SSHD.into(), vec!["-t".into()]),
+            ("/usr/bin/systemctl".into(), vec!["x".into()]),
+            ("/usr/sbin/sysctl".into(), vec!["--system".into()]),
+        ],
+    };
+    let mut b = vec![1u8];
+    b.extend(fleet_proto::encode(&v1));
+    let s = Snapshot::decode(&b).unwrap();
+    assert_eq!(s.reload.len(), 2);
+    assert_eq!(s.reload[0].len(), 2);
 }
 
 #[test]
@@ -483,7 +544,12 @@ fn revert_covers_the_firewall() {
     env.ok(fleet_ops::firewall::NFT, &["-f", "-"]);
     ProfileRevert.restore(&env.sys, &bytes).unwrap();
     assert_done(&env);
-    let script = String::from_utf8(env.runner.calls()[1].stdin.clone().unwrap()).unwrap();
+    let calls = env.runner.calls();
+    let apply = calls
+        .iter()
+        .find(|c| c.args.first().is_some_and(|a| a == "-f"))
+        .unwrap();
+    let script = String::from_utf8(apply.stdin.clone().unwrap()).unwrap();
     assert!(script.contains("delete table inet fleet"));
 }
 
@@ -493,8 +559,9 @@ fn restore_refuses_foreign_programs() {
     let snap = Snapshot {
         files: vec![],
         firewall: None,
-        reload: vec![("/bin/sh".into(), vec!["-c".into(), "x".into()])],
+        firewall_version: None,
+        reload: vec![vec![("/bin/sh".into(), vec!["-c".into(), "x".into()])]],
     };
-    assert!(crate::revert::restore(&env.sys, &snap).is_err());
+    assert!(crate::revert::restore(&env.sys, &snap, None).is_err());
     assert!(env.runner.calls().is_empty());
 }

@@ -99,11 +99,18 @@ pub(crate) fn slug_ok(s: &str, max: usize) -> bool {
 }
 
 /// Declares a `String` newtype validated by `check` in `new`, `FromStr` and
-/// `Deserialize`.
+/// `Deserialize`. A leading `@no_debug` leaves `Debug` to the caller (for
+/// content that must not end up in logs).
 macro_rules! validated_string {
     ($(#[$m:meta])* $name:ident, $what:literal, $check:expr) => {
+        $crate::v1::args::validated_string!(@impl [Debug] $(#[$m])* $name, $what, $check);
+    };
+    (@no_debug $(#[$m:meta])* $name:ident, $what:literal, $check:expr) => {
+        $crate::v1::args::validated_string!(@impl [] $(#[$m])* $name, $what, $check);
+    };
+    (@impl [$($d:ident)?] $(#[$m:meta])* $name:ident, $what:literal, $check:expr) => {
         $(#[$m])*
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+        #[derive($($d,)? Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
         #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
 

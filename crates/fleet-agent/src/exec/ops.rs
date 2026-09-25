@@ -85,22 +85,26 @@ impl OpHandler for ChangeOps {
         _meta: &'a OpMeta,
     ) -> LocalBoxFuture<'a, Result<OpOutput, OpError>> {
         Box::pin(async move {
-            let st = self.0.borrow();
-            match op {
-                Op::ChangeConfirm { change_id } => {
-                    let id = ChangeId(*change_id);
-                    // Unlinking is the race with the timer's claim (a
-                    // rename): exactly one wins. Once gone, `revert <id>`
-                    // finds nothing and does nothing.
+            if let Op::ChangeConfirm { change_id } = op {
+                let id = ChangeId(*change_id);
+                // Unlinking is the race with the timer's claim (a rename):
+                // exactly one wins. Once gone, `revert <id>` finds nothing
+                // and does nothing.
+                let timers = {
+                    let st = self.0.borrow();
                     if !st.pending_dir.remove(id).map_err(pending_err)? {
                         return Err(ErrorCode::NotFound.into());
                     }
-                    if let Err(e) = revert::disarm_timer(st.timers.as_ref(), id) {
-                        // Harmless: the timer's revert is now a no-op.
-                        log("disarm revert timer", e);
-                    }
-                    Ok(OpOutput::Payload(Payload::Empty))
+                    st.timers.clone()
+                };
+                if let Err(e) = revert::disarm_timer_async(timers.as_ref(), id).await {
+                    // Harmless: the timer's revert is now a no-op.
+                    log("disarm revert timer", e);
                 }
+                return Ok(OpOutput::Payload(Payload::Empty));
+            }
+            let st = self.0.borrow();
+            match op {
                 Op::ChangesList => {
                     let changes = st
                         .pending_dir

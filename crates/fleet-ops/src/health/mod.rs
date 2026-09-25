@@ -19,6 +19,13 @@
 //!
 //! `https` probes (`tls: true`) report a failure (`tls unsupported`): the
 //! agent carries no TLS stack.
+//!
+//! **Accepted risk:** probes run inside `fleet-exec` (root), not as an
+//! unprivileged user. They are kept inert instead: a fixed `GET <path>`
+//! with no body, no cookies, no `Authorization` or other credential
+//! headers (the request is exactly [`http_request`]), to loopback only, and
+//! only the status line is read. A local service can't be made to act on
+//! root's behalf beyond what an anonymous local GET already can.
 
 use crate::ctx::SysCtx;
 use crate::handler::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput, Registry};
@@ -46,6 +53,14 @@ const MAX_STORED: u64 = 64 * 1024;
 pub const TICK: Duration = Duration::from_secs(1);
 
 /// The loopback address a probe connects to.
+/// The only request an HTTP probe sends: `GET`, no body, no credentials.
+pub fn http_request(path: &fleet_proto::args::HttpPath) -> String {
+    format!(
+        "GET {} HTTP/1.1\r\nHost: localhost\r\nUser-Agent: fleet-health\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        path.as_str()
+    )
+}
+
 pub fn target(p: &Probe) -> SocketAddr {
     let (port, ipv6) = match p {
         Probe::Tcp { port, ipv6 } | Probe::Http { port, ipv6, .. } => (port.get(), *ipv6),
@@ -134,10 +149,7 @@ pub async fn probe(p: &Probe, timeout: Duration) -> Outcome {
         else {
             return Ok((None, true));
         };
-        let req = format!(
-            "GET {} HTTP/1.1\r\nHost: localhost\r\nUser-Agent: fleet-health\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-            path.as_str()
-        );
+        let req = http_request(path);
         s.write_all(req.as_bytes())
             .await
             .map_err(|_| "write failed")?;

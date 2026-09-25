@@ -41,10 +41,97 @@ pub fn scoped(op_id: u64, inner: CommandSpec) -> CommandSpec {
     }
 }
 
+/// Resource limits of a transient scope that runs operator- or
+/// template-supplied code (`shell.exec`, SteamCMD, game backup tar):
+/// systemd `MemoryMax`, `TasksMax` and `CPUQuota` properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeLimits {
+    pub memory_max_mb: u32,
+    pub tasks_max: u32,
+    /// Percent of one CPU (200 = two CPUs).
+    pub cpu_quota_pct: u32,
+}
+
+impl ScopeLimits {
+    /// `shell.exec` default: 2 GiB, 512 tasks, two CPUs.
+    pub const SHELL: Self = Self {
+        memory_max_mb: 2048,
+        tasks_max: 512,
+        cpu_quota_pct: 200,
+    };
+    /// SteamCMD / archive tools of `game.*`: 4 GiB, 1024 tasks, two CPUs.
+    pub const GAME_TOOL: Self = Self {
+        memory_max_mb: 4096,
+        tasks_max: 1024,
+        cpu_quota_pct: 200,
+    };
+
+    fn properties(self) -> [String; 6] {
+        [
+            "-p".into(),
+            format!("MemoryMax={}M", self.memory_max_mb.max(64)),
+            "-p".into(),
+            format!("TasksMax={}", self.tasks_max.max(16)),
+            "-p".into(),
+            format!("CPUQuota={}%", self.cpu_quota_pct.max(10)),
+        ]
+    }
+}
+
+/// [`scoped`] with resource limits, and the scope stopped as soon as the
+/// main process exits ([`CommandSpec::stop_scope_on_exit`]): background
+/// processes it started don't outlive the op.
+pub fn scoped_limited(op_id: u64, inner: CommandSpec, limits: ScopeLimits) -> CommandSpec {
+    let mut s = scoped(op_id, inner);
+    // Properties go before `--`, after `--unit <name>`.
+    let at = s
+        .args
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(s.args.len());
+    let props = limits.properties();
+    s.args.splice(at..at, props.into_iter().map(OsString::from));
+    s.stop_scope_on_exit = true;
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn limited_scope_argv_and_stop() {
+        let s = scoped_limited(
+            9,
+            CommandSpec::new("/usr/bin/setpriv").arg("--"),
+            ScopeLimits::SHELL,
+        );
+        let argv: Vec<&str> = s.args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            argv,
+            [
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--unit",
+                "fleet-op-9",
+                "-p",
+                "MemoryMax=2048M",
+                "-p",
+                "TasksMax=512",
+                "-p",
+                "CPUQuota=200%",
+                "--",
+                "/usr/bin/setpriv",
+                "--"
+            ]
+        );
+        let stop = crate::runner::scope_stop_spec(&s).unwrap();
+        let argv: Vec<&str> = stop.args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(argv, ["stop", "fleet-op-9.scope"]);
+        assert!(crate::runner::scope_stop_spec(&scoped(9, CommandSpec::new("/x"))).is_none());
+    }
 
     #[test]
     fn scoped_argv() {

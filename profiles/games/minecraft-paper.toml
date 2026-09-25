@@ -14,6 +14,11 @@ name = "Minecraft Java (Paper)"
 [install]
 method = "container"
 image = "docker.io/itzg/minecraft-server:java21"
+# No `digest` is shipped: `game.install` refuses a container image not
+# pinned by digest (`digest = "sha256:<64 hex>"`, or `image = "repo@sha256:…"`),
+# because a tag can be repointed. The digest is set when the template is
+# reviewed for a release (the Mac will fill it from a registry lookup);
+# until then this template can't be installed.
 # Mounted from {dir}/data.
 data_dir = "/data"
 env = [

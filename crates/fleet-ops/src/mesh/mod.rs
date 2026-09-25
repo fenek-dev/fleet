@@ -329,6 +329,74 @@ fn pending(new_version: u64) -> Payload {
     }
 }
 
+/// Routes in the kernel's tables: `(destination, interface)`, from
+/// `/proc/net/route` (IPv4: little-endian hex destination and mask) and
+/// `/proc/net/ipv6_route` (hex destination, hex prefix length). Default
+/// routes are left out (every mesh network overlaps them by design).
+pub fn parse_routes(v4: &str, v6: &str) -> Vec<(Cidr, String)> {
+    let mut out = Vec::new();
+    for l in v4.lines().skip(1) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (Some(iface), Some(dst), Some(mask)) = (f.first(), f.get(1), f.get(7)) else {
+            continue;
+        };
+        let (Ok(d), Ok(m)) = (u32::from_str_radix(dst, 16), u32::from_str_radix(mask, 16)) else {
+            continue;
+        };
+        let prefix = u8::try_from(m.count_ones()).unwrap_or(0);
+        // The kernel prints the raw network-order word in host order.
+        let addr = IpAddr::V4(std::net::Ipv4Addr::from(d.to_ne_bytes()));
+        if prefix > 0
+            && let Some(c) = network_of(addr, prefix)
+        {
+            out.push((c, (*iface).to_owned()));
+        }
+    }
+    for l in v6.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (Some(dst), Some(plen), Some(iface)) = (f.first(), f.get(1), f.get(9)) else {
+            continue;
+        };
+        let (Ok(d), Ok(p)) = (u128::from_str_radix(dst, 16), u8::from_str_radix(plen, 16)) else {
+            continue;
+        };
+        // Link-local and multicast routes exist on every interface.
+        let addr = std::net::Ipv6Addr::from(d);
+        if p == 0 || (addr.segments()[0] & 0xffc0) == 0xfe80 || addr.segments()[0] >> 8 == 0xff {
+            continue;
+        }
+        if let Some(c) = network_of(IpAddr::V6(addr), p) {
+            out.push((c, (*iface).to_owned()));
+        }
+    }
+    out
+}
+
+/// Two prefixes share addresses (one contains the other).
+pub fn overlaps(a: Cidr, b: Cidr) -> bool {
+    a.contains(b.addr()) || b.contains(a.addr())
+}
+
+/// `mesh.join` refuses a network overlapping any route of another
+/// interface (a LAN, a Docker bridge, a provider's private network):
+/// the tunnel would capture or break that traffic.
+fn check_routes(ctx: &SysCtx, net: Cidr) -> Result<(), OpError> {
+    let read = |p: &str| {
+        ctx.path(p)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default()
+    };
+    let routes = parse_routes(&read("/proc/net/route"), &read("/proc/net/ipv6_route"));
+    match routes
+        .iter()
+        .find(|(c, iface)| iface != IFACE && overlaps(*c, net))
+    {
+        Some((c, iface)) => Err(OpError::new(ErrorCode::InvalidArgument)
+            .with_detail(format!("mesh network {net} overlaps route {c} on {iface}"))),
+        None => Ok(()),
+    }
+}
+
 fn not_joined() -> OpError {
     OpError::new(ErrorCode::NotFound).with_detail("mesh not joined")
 }
@@ -438,9 +506,11 @@ impl OpHandler for MeshHandler {
 
     fn validate(&self, ctx: &SysCtx, op: &Op, meta: &OpMeta) -> Result<(), OpError> {
         match op {
-            Op::MeshJoin(c) => c
-                .validate()
-                .map_err(|_| OpError::new(ErrorCode::InvalidArgument)),
+            Op::MeshJoin(c) => {
+                c.validate()
+                    .map_err(|_| OpError::new(ErrorCode::InvalidArgument))?;
+                check_routes(ctx, c.network)
+            }
             Op::MeshPeersSet { peers } => check_peers(ctx, peers, meta).map(|_| ()),
             _ => Ok(()),
         }

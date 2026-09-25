@@ -76,7 +76,6 @@ roles = ["docker", "web"]
 
 [admin]
 user = "ops"
-password_hash = "$y$j9T$abcdefghijklmnop$ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abc"
 
 [ssh]
 allow_from = ["203.0.113.0/24", "2001:db8::/32"]
@@ -108,8 +107,7 @@ fn custom_profile_parses() {
     assert!(!p.settings.disable.iter().any(|d| d == "cups.service"));
     // The role's exception stays.
     assert!(p.exceptions.contains_key("sysctl.net.ipv4.ip_forward"));
-    // Debug never shows the hash.
-    assert!(!format!("{p:?}").contains("$y$"));
+    assert!(p.admin.as_ref().unwrap().password_hash.is_none());
 }
 
 #[test]
@@ -138,7 +136,12 @@ fn custom_profile_rejects() {
         ),
         (
             "[profile]\nextends = \"baseline\"\n[admin]\nuser = \"ops\"\npassword_hash = \"hunter2hunter2hunter2\"\n",
-            "hash",
+            "unknown field",
+        ),
+        // Only the op field carries the hash (Elevated, redacted in audit).
+        (
+            "[profile]\nextends = \"baseline\"\n[admin]\nuser = \"ops\"\npassword_hash = \"$y$j9T$abcdefghijklmnop$ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abc\"\n",
+            "unknown field",
         ),
         (
             "[profile]\nextends = \"baseline\"\n[ssh]\nallow_from = [\"10.0.0.1/8\"]\n",

@@ -128,6 +128,57 @@ fn mode(d: &tempfile::TempDir, p: &str) -> u32 {
         & 0o777
 }
 
+const ROUTE_V4: &str = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+eth0\t0000A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n\
+docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n\
+fleet0\t00004D0A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+const ROUTE_V6: &str = "fd000000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0\n\
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0\n\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00200200       lo\n";
+
+#[test]
+fn routes_parse_and_overlap() {
+    let r = parse_routes(ROUTE_V4, ROUTE_V6);
+    let got: Vec<String> = r.iter().map(|(c, i)| format!("{c} {i}")).collect();
+    assert_eq!(
+        got,
+        [
+            "192.168.0.0/24 eth0",
+            "172.17.0.0/16 docker0",
+            "10.77.0.0/24 fleet0",
+            "fd00::/64 eth0"
+        ]
+    );
+    assert!(overlaps(cidr("172.17.0.0/16"), cidr("172.17.5.0/24")));
+    assert!(overlaps(cidr("172.17.5.0/24"), cidr("172.16.0.0/12")));
+    assert!(!overlaps(cidr("172.18.0.0/16"), cidr("172.17.0.0/16")));
+}
+
+#[test]
+fn join_refuses_a_network_overlapping_other_routes() {
+    let d = root();
+    std::fs::create_dir_all(d.path().join("proc/net")).unwrap();
+    std::fs::write(d.path().join("proc/net/route"), ROUTE_V4).unwrap();
+    std::fs::write(d.path().join("proc/net/ipv6_route"), ROUTE_V6).unwrap();
+    let c = ctx(d.path(), Rc::new(FakeRunner::new()));
+    let join = |net: &str, addr: &str| {
+        let op = Op::MeshJoin(MeshConfig {
+            address: addr.parse().unwrap(),
+            network: cidr(net),
+            listen_port: Port::new(51820).unwrap(),
+            peers: vec![],
+        });
+        MeshHandler.validate(&c, &op, &meta(op.clone(), None))
+    };
+    let e = join("172.17.0.0/24", "172.17.0.1").unwrap_err();
+    assert!(e.detail().unwrap().contains("docker0"), "{e:?}");
+    assert!(join("192.168.0.0/16", "192.168.9.1").is_err());
+    // Its own interface (a re-join) and unrelated ranges are fine.
+    assert!(join("10.77.0.0/24", "10.77.0.1").is_ok());
+    assert!(join("10.78.0.0/24", "10.78.0.1").is_ok());
+}
+
 #[test]
 fn join_generates_key_writes_conf_and_starts() {
     let d = root();

@@ -120,9 +120,88 @@ pub fn disarm_guard(runner: &dyn CommandRunner, id: ChangeId) -> Result<(), Time
     stop_units(runner, disarm_guard_command(id))
 }
 
+/// [`run_fixed`] through the async runner: exec's single-threaded runtime
+/// keeps serving while `systemd-run`/`systemctl` run.
+pub async fn run_fixed_async(
+    runner: &dyn CommandRunner,
+    spec: CommandSpec,
+) -> Result<(), TimerError> {
+    let program = spec.program;
+    let out = runner
+        .run(spec)
+        .await
+        .map_err(|e| TimerError::Run(program, e))?;
+    if out.success() {
+        Ok(())
+    } else {
+        Err(TimerError::Status(program, out.code))
+    }
+}
+
+async fn stop_units_async(runner: &dyn CommandRunner, spec: CommandSpec) -> Result<(), TimerError> {
+    match run_fixed_async(runner, spec).await {
+        Err(TimerError::Status(_, Some(SYSTEMCTL_NOT_LOADED))) => Ok(()),
+        r => r,
+    }
+}
+
+/// Async [`arm_timer`] (exec).
+pub async fn arm_timer_async(
+    runner: &dyn CommandRunner,
+    id: ChangeId,
+    secs: u32,
+) -> Result<(), TimerError> {
+    run_fixed_async(runner, timer_command(id, secs)).await
+}
+
+/// Async [`arm_guard`] (exec).
+pub async fn arm_guard_async(
+    runner: &dyn CommandRunner,
+    id: ChangeId,
+    secs: u32,
+) -> Result<(), TimerError> {
+    run_fixed_async(runner, guard_command(id, secs)).await
+}
+
+/// Async [`disarm_timer`] (exec).
+pub async fn disarm_timer_async(
+    runner: &dyn CommandRunner,
+    id: ChangeId,
+) -> Result<(), TimerError> {
+    stop_units_async(runner, disarm_command(id)).await
+}
+
+/// Async [`disarm_guard`] (exec).
+pub async fn disarm_guard_async(
+    runner: &dyn CommandRunner,
+    id: ChangeId,
+) -> Result<(), TimerError> {
+    stop_units_async(runner, disarm_guard_command(id)).await
+}
+
+/// Builds the production reverter on a blocking-pool thread. Snapshot
+/// modules touch files and run `nft`/`sshd -t`/`systemctl` synchronously
+/// (the `Revertible` contract), so exec runs them there, each with its own
+/// `SysCtx` and `SystemRunner` (neither is `Send`), instead of blocking its
+/// single-threaded runtime.
+pub type OffloadReverter = std::sync::Arc<dyn Fn() -> RegistryRevert + Send + Sync>;
+
+/// The production [`OffloadReverter`]: [`RegistryRevert::system`].
+pub fn system_offload() -> OffloadReverter {
+    std::sync::Arc::new(RegistryRevert::system)
+}
+
 /// Restores a snapshot.
 pub trait Revert {
-    fn revert(&self, kind: ChangeKind, snapshot: &[u8]) -> Result<(), RevertError>;
+    /// `new_version` is what the change's handler reported after applying
+    /// (`None`: failed or none), for modules that restore a part only while
+    /// it is unchanged (`Revertible::restore_versioned`).
+    fn revert(
+        &self,
+        kind: ChangeKind,
+        snapshot: &[u8],
+        new_version: Option<u64>,
+    ) -> Result<(), RevertError>;
 
     /// The version the state of `kind` has now, if it can be read (the
     /// snapshot tells which object, e.g. the user for authorized keys).
@@ -168,9 +247,14 @@ impl RegistryRevert {
 }
 
 impl Revert for RegistryRevert {
-    fn revert(&self, kind: ChangeKind, snapshot: &[u8]) -> Result<(), RevertError> {
+    fn revert(
+        &self,
+        kind: ChangeKind,
+        snapshot: &[u8],
+        new_version: Option<u64>,
+    ) -> Result<(), RevertError> {
         self.reverters
-            .restore(&self.ctx, kind, snapshot)
+            .restore_versioned(&self.ctx, kind, snapshot, new_version)
             .map_err(|e| {
                 if e.detail().is_some() {
                     eprintln!("fleet-agent revert {kind:?}: {e}");
@@ -214,7 +298,7 @@ pub fn probe_version(ctx: &SysCtx, kind: ChangeKind, snapshot: &[u8]) -> Option<
 pub struct UnavailableRevert;
 
 impl Revert for UnavailableRevert {
-    fn revert(&self, kind: ChangeKind, _: &[u8]) -> Result<(), RevertError> {
+    fn revert(&self, kind: ChangeKind, _: &[u8], _: Option<u64>) -> Result<(), RevertError> {
         Err(RevertError(kind))
     }
 }
@@ -225,7 +309,7 @@ pub struct NoopRevert;
 
 #[cfg(test)]
 impl Revert for NoopRevert {
-    fn revert(&self, _: ChangeKind, _: &[u8]) -> Result<(), RevertError> {
+    fn revert(&self, _: ChangeKind, _: &[u8], _: Option<u64>) -> Result<(), RevertError> {
         Ok(())
     }
 }
@@ -279,7 +363,10 @@ pub fn finish_claimed(
         (Some(want), Some(now)) if want != now => Some(now),
         _ => None,
     };
-    let restored = conflict.is_none() && reverter.revert(change.kind, &change.snapshot).is_ok();
+    let restored = conflict.is_none()
+        && reverter
+            .revert(change.kind, &change.snapshot, change.origin.new_version)
+            .is_ok();
     // Marker first, then delete: a crash in between leaves both, and exec
     // at startup skips re-reverting a change that already has a marker.
     dir.write_marker(

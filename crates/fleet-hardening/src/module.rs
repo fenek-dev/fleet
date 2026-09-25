@@ -121,6 +121,8 @@ pub enum Action {
         user: String,
         name: String,
         content: Option<Vec<u8>>,
+        /// Also `chattr +i` (Strict).
+        immutable: bool,
     },
     /// Run a command; failure fails the module.
     Run(Cmd),
@@ -142,6 +144,10 @@ pub enum Action {
     AptUpdate,
     /// Replace `table inet fleet` with this model (lockout checks first).
     Firewall(FirewallRuleSet),
+    /// Check an `fstab` text before it is written: saved to a root-only
+    /// temp file and verified with `findmnt --verify --tab-file <tmp>`;
+    /// failure fails the module before anything is written.
+    VerifyFstab(Vec<u8>),
 }
 
 /// One planned change: what the operator reviews (design §9.1).

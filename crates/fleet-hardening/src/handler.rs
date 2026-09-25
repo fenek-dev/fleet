@@ -171,15 +171,44 @@ impl ProfileHandler {
                 // Facts (packages, units, the firewall) changed: gather
                 // them again for the score after.
                 let after = engine::load(spec, ctx, op_id).await?;
-                // Exec wraps this in `ChangePending` when the phase armed
-                // auto-revert. No version: a profile revert always
-                // restores (the lockout-safe side).
-                Payload::ProfileApplied(ProfileApplied {
+                let applied = Payload::ProfileApplied(ProfileApplied {
                     modules,
                     pending: None,
                     score_before,
                     score_after: engine::score(&engine::check(&after)),
-                })
+                });
+                // Exec wraps the result in `ChangePending` when the phase
+                // armed auto-revert. With `firewall.baseline` in the
+                // phase, the table's version after the apply becomes the
+                // change's `new_version`: a revert restores the table
+                // only while it is still that one (files always restore).
+                let fw_ran = op.auto_revert()
+                    && fleet_ops::revertible::profile_touches_firewall(spec, *phase)
+                    && after
+                        .profile
+                        .modules
+                        .iter()
+                        .any(|m| m == "firewall.baseline");
+                let fw_version = after
+                    .facts
+                    .firewall
+                    .as_ref()
+                    .and_then(|t| t.as_ref().ok())
+                    .and_then(fleet_ops::firewall::FirewallRevert::version_of);
+                match fw_version.filter(|_| fw_ran) {
+                    Some(v) => Payload::ChangePending {
+                        change: fleet_proto::payload::PendingChange {
+                            change_id: [0; 16],
+                            kind: fleet_proto::payload::ChangeKind::Profile,
+                            op_tag: tag::PROFILE_APPLY,
+                            created_ms: 0,
+                            deadline_ms: 0,
+                            new_version: Some(v),
+                        },
+                        inner: Some(Box::new(applied)),
+                    },
+                    None => applied,
+                }
             }
             Op::AuditRun { level } => {
                 let mut p = profile::builtin(*level, &[])?;

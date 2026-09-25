@@ -19,6 +19,7 @@ impl MeshConfig {
     pub const MAX_PEERS: usize = 256;
 
     pub fn validate(&self) -> Result<(), ArgError> {
+        ensure(mesh_network_ok(&self.network), "mesh network")?;
         ensure(self.network.contains(self.address), "mesh address")?;
         validate_peers(&self.peers)?;
         // Peers route only mesh addresses: never hijack other traffic.
@@ -31,6 +32,31 @@ impl MeshConfig {
             "allowed ips outside mesh network",
         )
     }
+}
+
+/// Private ranges a mesh network must lie in: RFC 1918, shared address
+/// space (100.64.0.0/10, RFC 6598), unique local IPv6 (fc00::/7).
+pub const MESH_RANGES: [(&str, u8); 5] = [
+    ("10.0.0.0", 8),
+    ("172.16.0.0", 12),
+    ("192.168.0.0", 16),
+    ("100.64.0.0", 10),
+    ("fc00::", 7),
+];
+
+/// A mesh `network`: at least /16 (IPv4) or /48 (IPv6) long, and
+/// entirely inside one of [`MESH_RANGES`], so joining can't route public
+/// or unrelated address space into the tunnel.
+pub fn mesh_network_ok(n: &Cidr) -> bool {
+    if !allowed_ip_ok(n) {
+        return false;
+    }
+    MESH_RANGES.iter().any(|(a, p)| {
+        let Ok(addr) = a.parse::<IpAddr>() else {
+            return false;
+        };
+        Cidr::new(addr, *p).is_ok_and(|r| n.prefix() >= r.prefix() && r.contains(n.addr()))
+    })
 }
 
 /// Shortest `allowed_ips` prefix: a default route (`/0`) or a wide prefix

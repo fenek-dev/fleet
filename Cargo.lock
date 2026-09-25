@@ -1318,7 +1318,6 @@ dependencies = [
  "fleet-debver",
  "fleet-proto",
  "futures-util",
- "libc",
  "miniz_oxide",
  "proptest",
  "rustix",

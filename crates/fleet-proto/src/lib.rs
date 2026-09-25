@@ -11,6 +11,7 @@ pub mod domain;
 mod fixed;
 mod tagged;
 pub mod v1;
+pub mod version;
 
 pub use codec::{DecodeError, MAX_FRAME, decode, encode};
 pub use v1::*;

@@ -35,7 +35,9 @@ fn io_err(e: io::Error, what: &'static str) -> OpError {
     let code = match e.kind() {
         io::ErrorKind::NotFound => ErrorCode::NotFound,
         // ELOOP from O_NOFOLLOW: a symlink appeared in the last component.
-        _ if e.raw_os_error() == Some(libc::ELOOP) => ErrorCode::InvalidArgument,
+        _ if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            ErrorCode::InvalidArgument
+        }
         _ => ErrorCode::Internal,
     };
     OpError::new(code).with_detail(format!("{what}: {e}"))

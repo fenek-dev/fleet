@@ -32,6 +32,17 @@ EnvironmentFile=/var/lib/fleet/games/vh.env
 Environment=SteamAppId=892970
 Environment=LD_LIBRARY_PATH=/srv/games/vh/server/linux64
 ExecStart=/srv/games/vh/server/valheim_server.x86_64 -nographics -batchmode -name vh -port 2456 -world vh -password ${{FLEET_GAME_PASSWORD}} -public 0
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ProtectProc=invisible
+ProtectKernelLogs=yes
+ProtectClock=yes
+UMask=0027
 {HARDENING}ReadWritePaths=/srv/games/vh
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
@@ -61,7 +72,7 @@ Requires=docker.service
 Type=simple
 WorkingDirectory=/srv/games/mc
 EnvironmentFile=/var/lib/fleet/games/mc.env
-ExecStart=/usr/bin/docker run --rm --name game-mc --user 998:997 --cap-drop ALL --security-opt no-new-privileges --memory 4G --pids-limit 1024 -p 25565:25565/tcp -p 127.0.0.1:25575:25575/tcp -v /srv/games/mc/data:/data -e TYPE=PAPER -e MEMORY=3G -e ENABLE_RCON=true -e RCON_PORT=25575 -e EULA -e RCON_PASSWORD docker.io/itzg/minecraft-server:java21
+ExecStart=/usr/bin/docker run --rm --name game-mc --user 998:997 --cap-drop ALL --security-opt no-new-privileges --memory 4G --pids-limit 1024 --cpus 3 -p 0.0.0.0:25565:25565/tcp -p [::]:25565:25565/tcp -p 127.0.0.1:27100:25575/tcp -v /srv/games/mc/data:/data -e TYPE=PAPER -e MEMORY=3G -e ENABLE_RCON=true -e RCON_PORT=25575 -e EULA -e RCON_PASSWORD docker.io/itzg/minecraft-server:java21@{DIGEST}
 ExecStop=/usr/bin/docker stop --time 30 game-mc
 {HARDENING}ReadWritePaths=/srv/games/mc
 ProtectKernelTunables=yes
@@ -77,6 +88,19 @@ CPUQuota=300%
 WantedBy=multi-user.target
 "
     )
+}
+
+/// A made-up digest for tests (the shipped template has none).
+const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// The Minecraft template with a digest set.
+fn pinned_minecraft() -> Template {
+    let text = template::BUILTIN[0].replacen(
+        "image = \"docker.io/itzg/minecraft-server:java21\"",
+        &format!("image = \"docker.io/itzg/minecraft-server:java21\"\ndigest = \"{DIGEST}\""),
+        1,
+    );
+    Template::parse(&text).unwrap()
 }
 
 fn gn(s: &str) -> GameName {
@@ -101,16 +125,85 @@ fn builtin_templates_parse_and_render_golden_units() {
     ));
     assert!(v.rcon.is_none());
     assert_eq!(
-        template::render_unit(&v, &gn("vh"), 999, 999),
+        template::render_unit(&v, &gn("vh"), 999, 999, None).unwrap(),
         valheim_unit()
     );
     let m = tpl("minecraft-paper");
     assert!(m.is_container());
+    // Shipped without a digest: no unit (and no install) until pinned.
+    assert!(m.pinned_image().is_none());
     assert_eq!(
-        template::render_unit(&m, &gn("mc"), 998, 997),
+        template::render_unit(&m, &gn("mc"), 998, 997, Some(27100))
+            .unwrap_err()
+            .code(),
+        ErrorCode::PolicyDenied
+    );
+    assert_eq!(
+        template::render_unit(&pinned_minecraft(), &gn("mc"), 998, 997, Some(27100)).unwrap(),
         minecraft_unit()
     );
     assert_eq!(m.schedule.as_ref().unwrap().minute_of_day(), Some(300));
+    assert_eq!(template::cpus_of("300%").as_deref(), Some("3"));
+    assert_eq!(template::cpus_of("150%").as_deref(), Some("1.5"));
+    assert_eq!(template::cpus_of("25%").as_deref(), Some("0.25"));
+}
+
+#[test]
+fn image_digests() {
+    let base = template::BUILTIN[0];
+    let img = "image = \"docker.io/itzg/minecraft-server:java21\"";
+    let with = |line: &str| Template::parse(&base.replacen(img, line, 1));
+    assert!(
+        with(&format!(
+            "image = \"docker.io/itzg/minecraft-server@{DIGEST}\""
+        ))
+        .is_ok()
+    );
+    assert!(with("image = \"docker.io/x@sha256:abc\"").is_err());
+    assert!(with(&format!("{img}\ndigest = \"sha256:XYZ\"")).is_err());
+    assert!(
+        with(&format!("image = \"x@{DIGEST}\"\ndigest = \"{DIGEST}\"")).is_err(),
+        "both forms"
+    );
+    let t = with(&format!("image = \"docker.io/x@{DIGEST}\"")).unwrap();
+    assert_eq!(t.pinned_image().unwrap(), format!("docker.io/x@{DIGEST}"));
+    // An unpinned container template can't be installed.
+    let d = root_dir(PASSWD);
+    let c = ctx(d.path(), Rc::new(FakeRunner::new()));
+    let op = Op::GameInstall {
+        name: gn("new"),
+        template: GameTemplateId::new("minecraft-paper").unwrap(),
+    };
+    assert_eq!(
+        GameOps(svc())
+            .validate(&c, &op, &meta(op.clone(), None))
+            .unwrap_err()
+            .code(),
+        ErrorCode::PolicyDenied
+    );
+}
+
+#[test]
+fn restore_listing_checks() {
+    let ok = "-rw-r----- game-vh/game-vh 5 2024-01-01 00:00 \"data/world/level.dat\"\n\
+drwxr-x--- game-vh/game-vh 0 2024-01-01 00:00 \"data/with space/\"\n\
+lrwxrwxrwx game-vh/game-vh 0 2024-01-01 00:00 \"data/link\" -> \"world/level.dat\"\n\
+hrw-r----- game-vh/game-vh 0 2024-01-01 00:00 \"data/hard\" link to \"data/world/level.dat\"\n";
+    assert_eq!(check_listing(ok, false), Ok(()));
+    assert!(check_listing(ok, true).is_err());
+    for bad in [
+        "-rw-r--r-- a/a 1 2024-01-01 00:00 \"/etc/passwd\"\n",
+        "-rw-r--r-- a/a 1 2024-01-01 00:00 \"data/../../etc/cron.d/x\"\n",
+        "-rw-r--r-- a/a 1 2024-01-01 00:00 \"..\"\n",
+        "lrwxrwxrwx a/a 0 2024-01-01 00:00 \"data/l\" -> \"/etc\"\n",
+        "lrwxrwxrwx a/a 0 2024-01-01 00:00 \"data/l\" -> \"../../../etc\"\n",
+        "hrw-r--r-- a/a 0 2024-01-01 00:00 \"data/h\" link to \"/etc/shadow\"\n",
+        // Escaped: `\057` is `/`.
+        "-rw-r--r-- a/a 1 2024-01-01 00:00 \"\\057etc/x\"\n",
+        "garbage\n",
+    ] {
+        assert!(check_listing(bad, false).is_err(), "{bad}");
+    }
 }
 
 #[test]
@@ -172,11 +265,20 @@ fn scope_user(seq: u64, uid: u32, program: &str, rest: &[&str]) -> Vec<String> {
         "--collect",
         "--unit",
         &format!("fleet-op-{seq}"),
+        "-p",
+        "MemoryMax=4096M",
+        "-p",
+        "TasksMax=1024",
+        "-p",
+        "CPUQuota=200%",
         "--",
         crate::shell::SETPRIV,
         &format!("--reuid={uid}"),
         &format!("--regid={uid}"),
-        "--init-groups",
+        &format!("--groups={uid}"),
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
         "--reset-env",
         "--",
         program,
@@ -308,7 +410,8 @@ fn install_argv_files_and_modes() {
             template: "valheim".into(),
             uid: 999,
             gid: 999,
-            installed_ms: 1_000
+            installed_ms: 1_000,
+            rcon_port: None,
         }
     );
     assert_eq!(s.instances(&c).len(), 1);
@@ -421,8 +524,27 @@ fn backup_copies_out_and_keeps_retention_then_restore() {
     assert!(!bdir.join("50000.tar.zst.tmp").exists());
     assert_eq!(r2.pending(), 0);
 
-    // Restore: stop, extract as the game user, start.
+    // Restore: list and check, stop, extract as the game user, start.
     let r3 = Rc::new(FakeRunner::new());
+    let list = scope_user(
+        10,
+        999,
+        TAR,
+        &[
+            "--zstd",
+            "--list",
+            "--verbose",
+            "--quoting-style=c",
+            "-f",
+            "/var/backups/fleet-games/vh/3.tar.zst",
+        ],
+    );
+    expect(
+        &r3,
+        SYSTEMD_RUN,
+        &list,
+        CommandOutput::ok("-rw-r----- game-vh/game-vh 5 2024-01-01 00:00 \"data/x\"\n"),
+    );
     expect(
         &r3,
         SYSTEMCTL,
@@ -440,6 +562,9 @@ fn backup_copies_out_and_keeps_retention_then_restore() {
                 "--zstd",
                 "-xf",
                 "/var/backups/fleet-games/vh/3.tar.zst",
+                "--no-same-owner",
+                "--no-same-permissions",
+                "--delay-directory-restore",
                 "-C",
                 "/srv/games/vh",
             ],
@@ -460,6 +585,20 @@ fn backup_copies_out_and_keeps_retention_then_restore() {
     h.validate(&c3, &op, &meta(op.clone(), None)).unwrap();
     block(h.handle(&c3, &op, &meta(op.clone(), Some(10)))).unwrap();
     assert_eq!(r3.pending(), 0);
+    assert_eq!(r3.calls()[0].output_cap, LIST_CAP);
+    // A listing with a member outside the directory: nothing is stopped
+    // or extracted.
+    let r4 = Rc::new(FakeRunner::new());
+    expect(
+        &r4,
+        SYSTEMD_RUN,
+        &list,
+        CommandOutput::ok("-rw-r--r-- a/a 1 2024-01-01 00:00 \"../../etc/cron.d/x\"\n"),
+    );
+    let c4 = ctx(d.path(), r4.clone());
+    let e = block(h.handle(&c4, &op, &meta(op.clone(), Some(10)))).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::PolicyDenied);
+    assert_eq!(r4.calls().len(), 1);
     let missing = Op::GameRestore {
         name: gn("vh"),
         backup_id: 1,
@@ -714,6 +853,74 @@ fn rcon_op_players_and_scheduled_restart() {
         assert_eq!(r.pending(), 0);
         assert_eq!(says(&seen.borrow()), 1);
     });
+}
+
+/// `/proc/net/tcp` with listeners `(port, uid)` on 127.0.0.1.
+fn proc_tcp(d: &tempfile::TempDir, socks: &[(u16, u32)]) {
+    let mut t = String::from(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+    );
+    for (i, (port, uid)) in socks.iter().enumerate() {
+        t.push_str(&format!(
+            "   {i}: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  {uid}        0 {} 1 0000000000000000 100 0 0 10 0\n",
+            1000 + i
+        ));
+    }
+    std::fs::create_dir_all(d.path().join("proc/net")).unwrap();
+    std::fs::write(d.path().join("proc/net/tcp"), t).unwrap();
+}
+
+#[test]
+fn rcon_ports_and_listener_owner() {
+    let d = root_dir(PASSWD);
+    let c = ctx(d.path(), Rc::new(FakeRunner::new()));
+    proc_tcp(&d, &[(27100, 0), (27102, 1000)]);
+    // Taken by another instance (27101) or listening (27100, 27102).
+    assert_eq!(allocate_rcon_port(&c, &[27101]), Some(27103));
+    let inst = Instance {
+        template: "x".into(),
+        uid: 998,
+        gid: 997,
+        installed_ms: 0,
+        rcon_port: Some(27104),
+    };
+    let mut native = tpl("valheim");
+    native.rcon = Some(Rcon {
+        port: 25575,
+        password_env: "RCON_PASSWORD".into(),
+        players_command: None,
+        players_prefix: None,
+        save_command: None,
+        say_command: None,
+    });
+    assert_eq!(rcon_port(&inst, native.rcon.as_ref().unwrap()), 27104);
+    // Native: the game user must own the listener.
+    assert_eq!(
+        check_rcon_listener(&c, &native, &inst, 27104)
+            .unwrap_err()
+            .code(),
+        ErrorCode::NotFound
+    );
+    proc_tcp(&d, &[(27104, 1000)]);
+    assert_eq!(
+        check_rcon_listener(&c, &native, &inst, 27104)
+            .unwrap_err()
+            .code(),
+        ErrorCode::PolicyDenied
+    );
+    proc_tcp(&d, &[(27104, 998)]);
+    assert!(check_rcon_listener(&c, &native, &inst, 27104).is_ok());
+    // Container: DNAT (no listener) is fine; a non-root listener isn't.
+    let mc = pinned_minecraft();
+    proc_tcp(&d, &[]);
+    assert!(check_rcon_listener(&c, &mc, &inst, 27104).is_ok());
+    proc_tcp(&d, &[(27104, 1000)]);
+    assert_eq!(
+        check_rcon_listener(&c, &mc, &inst, 27104)
+            .unwrap_err()
+            .code(),
+        ErrorCode::PolicyDenied
+    );
 }
 
 #[test]

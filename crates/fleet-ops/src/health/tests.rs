@@ -314,3 +314,14 @@ fn file_store_roundtrip() {
         .mode();
     assert_eq!(mode & 0o777, 0o600);
 }
+
+#[test]
+fn http_probe_is_a_bare_get() {
+    let r = http_request(&HttpPath::new("/health?x=1").unwrap());
+    assert!(r.starts_with("GET /health?x=1 HTTP/1.1\r\n"));
+    assert!(r.ends_with("\r\n\r\n"));
+    let lower = r.to_ascii_lowercase();
+    for h in ["authorization", "cookie", "content-length", "proxy-"] {
+        assert!(!lower.contains(h), "{h}");
+    }
+}

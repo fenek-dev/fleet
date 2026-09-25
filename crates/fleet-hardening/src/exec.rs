@@ -84,6 +84,7 @@ async fn run_action(ctx: &mut Ctx, action: &Action, applied: &mut Applied) -> Re
             user,
             name,
             content,
+            immutable,
         } => {
             let pw = fleet_ops::users::passwd(sys)?;
             let e = fleet_ops::users::parse::lookup(&pw, user).ok_or_else(|| {
@@ -93,7 +94,7 @@ async fn run_action(ctx: &mut Ctx, action: &Action, applied: &mut Applied) -> Re
                 return Err(OpError::new(ErrorCode::PolicyDenied)
                     .with_detail(format!("{user}: home outside /home")));
             }
-            root_own(sys, &e.home, name, e.uid, content.as_deref())
+            root_own(sys, &e.home, name, e.uid, content.as_deref(), *immutable)
         }
         Action::Run(c) => run_checked(sys, c).await.map(drop),
         Action::Purge(names) => {
@@ -122,7 +123,31 @@ async fn run_action(ctx: &mut Ctx, action: &Action, applied: &mut Applied) -> Re
             apt(ctx, &verb, T_APT_INSTALL).await
         }
         Action::Firewall(set) => apply_firewall(sys, set).await,
+        Action::VerifyFstab(text) => verify_fstab(sys, text).await,
     }
+}
+
+pub const FINDMNT: &str = "/usr/bin/findmnt";
+/// Scratch copy of a planned `/etc/fstab` (root-only directory).
+pub const FSTAB_CHECK: &str = "/var/lib/fleet/hardening/fstab.check";
+
+/// `findmnt --verify --tab-file <tmp>` of `text`; the temp file is removed
+/// either way.
+pub async fn verify_fstab(sys: &SysCtx, text: &[u8]) -> Result<(), OpError> {
+    fswrite::ensure_dir(sys, "/var/lib/fleet/hardening", 0o700)?;
+    write_file(sys, FSTAB_CHECK, text, 0o600)?;
+    let out = run_checked(
+        sys,
+        &Cmd::new(FINDMNT, ["--verify", "--tab-file", FSTAB_CHECK]),
+    )
+    .await;
+    let _ = remove_file(sys, FSTAB_CHECK);
+    out.map(drop).map_err(|e| {
+        OpError::new(ErrorCode::InvalidArgument).with_detail(format!(
+            "fstab verification failed, nothing written: {}",
+            e.detail().unwrap_or("")
+        ))
+    })
 }
 
 /// Records `path`'s prior state once per module.
@@ -374,16 +399,20 @@ fn io_err(what: &str, e: impl std::fmt::Display) -> OpError {
 /// opened `O_NOFOLLOW` and must be a regular file with one link owned by
 /// the user or root, so a planted symlink or hard link can't redirect the
 /// `fchown` (and `fs.protected_hardlinks` keeps the user from linking
-/// files they don't own).
+/// files they don't own). An existing `chattr +i` is cleared first (an
+/// immutable file can't be replaced or re-owned); `immutable` sets it
+/// again at the end (Strict, design §9.5).
 pub fn root_own(
     sys: &SysCtx,
     home: &str,
     name: &str,
     uid: u32,
     content: Option<&[u8]>,
+    immutable: bool,
 ) -> Result<(), OpError> {
     let dir = walk::open_dir(sys, home).map_err(|e| io_err(home, e))?;
     let what = format!("{home}/{name}");
+    clear_immutable_at(&dir, name);
     let finish = |fd: &rustix::fd::OwnedFd| -> Result<(), OpError> {
         rfs::fchmod(fd, Mode::from_raw_mode(0o644)).map_err(|e| io_err(&what, e))?;
         if rustix::process::geteuid().is_root() {
@@ -393,6 +422,12 @@ pub fn root_own(
                 Some(rustix::process::Gid::ROOT),
             )
             .map_err(|e| io_err(&what, e))?;
+        }
+        Ok(())
+    };
+    let seal = |fd: rustix::fd::BorrowedFd<'_>| -> Result<(), OpError> {
+        if immutable {
+            set_immutable(fd, true).map_err(|e| io_err(&what, e))?;
         }
         Ok(())
     };
@@ -415,7 +450,9 @@ pub fn root_own(
             let mut f = std::fs::File::from(fd);
             f.write_all(bytes).map_err(|e| io_err(&what, e))?;
             f.sync_all().map_err(|e| io_err(&what, e))?;
-            rfs::renameat(&dir, tmp.as_str(), &dir, name).map_err(|e| io_err(&what, e))
+            rfs::renameat(&dir, tmp.as_str(), &dir, name).map_err(|e| io_err(&what, e))?;
+            // After the rename: an immutable file can't be renamed.
+            seal(rustix::fd::AsFd::as_fd(&f))
         })();
         if res.is_err() {
             let _ = rfs::unlinkat(&dir, tmp.as_str(), AtFlags::empty());
@@ -443,7 +480,60 @@ pub fn root_own(
             "{what}: not a single-link regular file of the user"
         )));
     }
-    finish(&fd)
+    finish(&fd)?;
+    seal(rustix::fd::AsFd::as_fd(&fd))
+}
+
+/// Sets or clears the immutable inode flag (`chattr ±i`) through the fd
+/// (`FS_IOC_{GET,SET}FLAGS`). Linux only; a no-op elsewhere (tests).
+#[cfg(target_os = "linux")]
+pub fn set_immutable<Fd: rustix::fd::AsFd>(fd: Fd, on: bool) -> rustix::io::Result<()> {
+    let f = rfs::ioctl_getflags(&fd)?;
+    let want = if on {
+        f | rfs::IFlags::IMMUTABLE
+    } else {
+        f - rfs::IFlags::IMMUTABLE
+    };
+    if want != f {
+        rfs::ioctl_setflags(fd, want)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_immutable<Fd: rustix::fd::AsFd>(_fd: Fd, _on: bool) -> rustix::io::Result<()> {
+    Ok(())
+}
+
+/// Whether the file behind `fd` is immutable (always `false` off Linux).
+#[cfg(target_os = "linux")]
+pub fn is_immutable(fd: &rustix::fd::OwnedFd) -> bool {
+    rfs::ioctl_getflags(fd).is_ok_and(|f| f.contains(rfs::IFlags::IMMUTABLE))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_immutable(_fd: &rustix::fd::OwnedFd) -> bool {
+    false
+}
+
+/// Clears `chattr +i` on an existing `name` in `dir` (opened without
+/// following symlinks) so it can be replaced or re-owned.
+fn clear_immutable_at(dir: &rustix::fd::OwnedFd, name: &str) {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if let Ok(fd) = rfs::openat(dir, name, flags, Mode::empty())
+        && is_immutable(&fd)
+    {
+        let _ = set_immutable(&fd, false);
+    }
+}
+
+/// Whether `home/name` is immutable (`chattr +i`); `false` when missing.
+pub fn home_file_immutable(sys: &SysCtx, home: &str, name: &str) -> bool {
+    let Ok(dir) = walk::open_dir(sys, home) else {
+        return false;
+    };
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    rfs::openat(&dir, name, flags, Mode::empty()).is_ok_and(|fd| is_immutable(&fd))
 }
 
 /// Whether `home/name` is already root-owned 0644 (and has `content`).

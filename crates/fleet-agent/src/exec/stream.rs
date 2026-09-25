@@ -134,7 +134,12 @@ impl Pump<'_> {
     }
 
     async fn data(&mut self, data: Vec<u8>, latest_only: bool) -> Result<(), Stop> {
-        let chunk = encode(&StreamChunk::Data(data.clone()));
+        // Encode without copying the item: wrap, encode, unwrap.
+        let wrapped = StreamChunk::Data(data);
+        let chunk = encode(&wrapped);
+        let StreamChunk::Data(data) = wrapped else {
+            return Err(Stop::Status(Err(ErrorCode::Internal)));
+        };
         if latest_only {
             let msg = Message::StreamData {
                 id: self.id,
@@ -262,10 +267,20 @@ pub(super) async fn run(
     let _slot = Slot::take(&ex, a.meta.command.device_id, conn);
     let op = &a.meta.command.body.op;
     pump.op_name = op.name();
-    let stop = match a.handler.handle(&ex.ctx, op, &a.meta).await {
-        Ok(OpOutput::Stream(mut s)) => pump.run(s.as_mut(), a.intent_seq, &mut handle.cancel).await,
-        Ok(OpOutput::Payload(_)) => Stop::Status(Err(ErrorCode::Internal)),
-        Err(e) => {
+    // Setup (e.g. spawning `journalctl`, connecting to Docker) may take a
+    // while: a cancel meanwhile ends the stream without waiting for it.
+    let handled = tokio::select! {
+        biased;
+        _ = &mut handle.cancel => None,
+        r = a.handler.handle(&ex.ctx, op, &a.meta) => Some(r),
+    };
+    let stop = match handled {
+        None => Stop::Status(Ok(())),
+        Some(Ok(OpOutput::Stream(mut s))) => {
+            pump.run(s.as_mut(), a.intent_seq, &mut handle.cancel).await
+        }
+        Some(Ok(OpOutput::Payload(_))) => Stop::Status(Err(ErrorCode::Internal)),
+        Some(Err(e)) => {
             log_op_error(op.name(), &e);
             Stop::Status(Err(e.code()))
         }

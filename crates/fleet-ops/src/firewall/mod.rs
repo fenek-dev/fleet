@@ -401,6 +401,29 @@ impl FirewallRevert {
     }
 }
 
+impl FirewallRevert {
+    /// The model version `firewall.get` reports now: `ABSENT_VERSION` for
+    /// no table; `None` when unknown (nft failed, a table Fleet can't
+    /// model).
+    pub fn current_version(ctx: &SysCtx) -> Option<u64> {
+        match Self::take_snapshot(ctx).ok()? {
+            Snapshot::Model(set) => Some(model::version(&set)),
+            Snapshot::Absent => Some(model::ABSENT_VERSION),
+            Snapshot::Raw(_) => None,
+        }
+    }
+
+    /// Same as [`FirewallRevert::current_version`] from a table already
+    /// listed.
+    pub fn version_of(t: &Table) -> Option<u64> {
+        match t {
+            Table::Absent => Some(model::ABSENT_VERSION),
+            Table::Present(Parsed { model: Some(m), .. }) => Some(model::version(m)),
+            Table::Present(_) => None,
+        }
+    }
+}
+
 impl Revertible for FirewallRevert {
     fn snapshot(&self, ctx: &SysCtx, _op: &Op) -> Result<Vec<u8>, OpError> {
         Ok(Self::take_snapshot(ctx)?.encode())

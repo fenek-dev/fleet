@@ -40,28 +40,70 @@ fn req(user: &str, cmd: &str) -> ShellExec {
 }
 
 fn setpriv_argv(uid: u32, dir: &str, cmd: &str) -> Vec<String> {
-    [
+    let mut v: Vec<String> = [
         "--scope",
         "--quiet",
         "--collect",
         "--unit",
         "fleet-op-9",
+        "-p",
+        "MemoryMax=2048M",
+        "-p",
+        "TasksMax=512",
+        "-p",
+        "CPUQuota=200%",
         "--",
         SETPRIV,
         &format!("--reuid={uid}"),
         &format!("--regid={uid}"),
-        "--init-groups",
-        "--reset-env",
-        "--",
-        ENV,
-        "-C",
-        dir,
-        SH,
-        "-c",
-        cmd,
+        &format!("--groups={uid}"),
     ]
     .map(String::from)
-    .to_vec()
+    .to_vec();
+    if uid != 0 {
+        v.extend(
+            [
+                "--inh-caps=-all",
+                "--ambient-caps=-all",
+                "--bounding-set=-all",
+            ]
+            .map(String::from),
+        );
+    }
+    v.extend(["--reset-env", "--", ENV, "-C", dir, SH, "-c", cmd].map(String::from));
+    v
+}
+
+#[test]
+fn explicit_groups_and_unique_uids() {
+    let d = root();
+    std::fs::write(
+        d.path().join("etc/group"),
+        "ops:x:1000:\nadm:x:4:ops\nsudo:x:27:ops\nweb:x:1001:\n",
+    )
+    .unwrap();
+    let c = ctx(d.path(), Rc::new(FakeRunner::new()));
+    let pw = crate::users::passwd(&c).unwrap();
+    let ops = crate::users::parse::lookup(&pw, "ops").unwrap().clone();
+    assert_eq!(group_ids(&c, &ops).unwrap(), [1000, 4, 27]);
+    let args = setpriv_args(ops.uid, ops.gid, &[1000, 4, 27]);
+    assert!(args.contains(&"--groups=1000,4,27".to_owned()));
+    assert!(args.contains(&"--bounding-set=-all".to_owned()));
+    assert!(!args.iter().any(|a| a == "--init-groups"));
+    // A second account with ops's uid: refused.
+    std::fs::write(
+        d.path().join("etc/passwd"),
+        format!("{PASSWD}ops2:x:1000:1000::/home/ops2:/bin/bash\n"),
+    )
+    .unwrap();
+    let h = ShellHandler::new(allow(&["ops"]));
+    let op = Op::ShellExec(req("ops", "id"));
+    assert_eq!(
+        h.validate(&c, &op, &meta(op.clone(), None))
+            .unwrap_err()
+            .code(),
+        ErrorCode::PolicyDenied
+    );
 }
 
 #[test]

@@ -41,6 +41,10 @@ pub struct CommandSpec {
     /// the child runs in. On timeout the whole unit is SIGKILLed too
     /// (catches processes that left the child's process group).
     pub scope_unit: Option<String>,
+    /// Set by [`crate::scope::scoped_limited`]: once the main process
+    /// exits, `systemctl stop <scope_unit>.scope` ends whatever it left
+    /// behind (background jobs, daemons), so nothing outlives the op.
+    pub stop_scope_on_exit: bool,
 }
 
 impl CommandSpec {
@@ -53,6 +57,7 @@ impl CommandSpec {
             output_cap: DEFAULT_OUTPUT_CAP,
             stdin: None,
             scope_unit: None,
+            stop_scope_on_exit: false,
         }
     }
 
@@ -175,6 +180,23 @@ pub fn scope_kill_spec(spec: &CommandSpec) -> Option<CommandSpec> {
     )
 }
 
+/// What to run once a [`CommandSpec::stop_scope_on_exit`] child exited:
+/// `systemctl stop <unit>.scope` (exit 5, "not loaded", means nothing was
+/// left).
+pub fn scope_stop_spec(spec: &CommandSpec) -> Option<CommandSpec> {
+    let unit = spec
+        .scope_unit
+        .as_ref()
+        .filter(|_| spec.stop_scope_on_exit)?;
+    Some(
+        CommandSpec::new(SYSTEMCTL)
+            .arg("stop")
+            .arg(format!("{unit}.scope"))
+            .timeout(SCOPE_KILL_TIMEOUT)
+            .output_cap(4096),
+    )
+}
+
 /// SIGKILL the child's whole process group (the child leads it:
 /// `process_group(0)`). Called before the child is reaped, so the group id
 /// can't have been reused.
@@ -233,6 +255,7 @@ fn run_system_blocking(spec: CommandSpec) -> Result<CommandOutput, RunError> {
     let t_out = reader(Box::new(out));
     let t_err = reader(Box::new(err));
     let scope_kill = scope_kill_spec(&spec);
+    let scope_stop = scope_stop_spec(&spec);
     let t_in = match (child.stdin.take(), spec.stdin) {
         (Some(mut w), Some(bytes)) => Some(std::thread::spawn(move || {
             // A child that exits without reading gets EPIPE; its exit
@@ -258,6 +281,9 @@ fn run_system_blocking(spec: CommandSpec) -> Result<CommandOutput, RunError> {
             Err(e) => return Err(RunError::Io(e.kind())),
         }
     };
+    if let Some(stop) = scope_stop {
+        let _ = run_system_blocking(stop);
+    }
     if let Some(t) = t_in {
         let _ = t.join();
     }
@@ -302,6 +328,7 @@ async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
         return Err(RunError::Io(std::io::ErrorKind::BrokenPipe));
     };
     let scope_kill = scope_kill_spec(&spec);
+    let scope_stop = scope_stop_spec(&spec);
     let stdin = child.stdin.take().zip(spec.stdin);
     let feed = async move {
         use tokio::io::AsyncWriteExt;
@@ -313,12 +340,17 @@ async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
     };
     let cap = spec.output_cap;
     let res = tokio::time::timeout(spec.timeout, async {
-        let (o, e, (), s) = tokio::join!(
-            read_capped(out, cap),
-            read_capped(err, cap),
-            feed,
-            child.wait()
-        );
+        // Leftovers of a stopped-on-exit scope may hold the pipes open:
+        // stopping the scope once the main process exits lets the reads
+        // reach EOF.
+        let wait = async {
+            let s = child.wait().await;
+            if let Some(stop) = scope_stop {
+                let _ = Box::pin(run_system(stop)).await;
+            }
+            s
+        };
+        let (o, e, (), s) = tokio::join!(read_capped(out, cap), read_capped(err, cap), feed, wait);
         (o, e, s)
     })
     .await;

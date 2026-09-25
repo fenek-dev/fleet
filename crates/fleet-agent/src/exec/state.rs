@@ -187,6 +187,9 @@ pub(super) struct State {
     /// Auto-revert changes whose handler is still running: maintenance
     /// never reverts these, and confirming them is refused.
     pub(super) applying: HashSet<ChangeId>,
+    /// Expired changes whose revert maintenance handed to a task (off the
+    /// main loop); not handed out again while it runs.
+    pub(super) reverting: HashSet<ChangeId>,
     /// Admission times of AI commands in the last minute, per (device,
     /// AI client) (`actors.ai_commands_per_minute`).
     ai_calls: HashMap<(DeviceId, String), VecDeque<u64>>,
@@ -293,6 +296,7 @@ impl State {
             timers: parts.timers,
             terminator: parts.terminator,
             applying: HashSet::new(),
+            reverting: HashSet::new(),
             ai_calls: HashMap::new(),
         })
     }
@@ -407,24 +411,29 @@ impl State {
     /// Startup: close interrupted intents, recover `pending/` (§4.10 step
     /// 5), audit revert markers, prune replay, refresh authorized_keys.
     /// Per-entry problems are logged and quarantined, never fatal.
-    pub(super) fn startup(&mut self, now: u64) -> Result<(), ExecError> {
+    /// Returns the confirm timers exec must re-arm (a reboot drops
+    /// transient timers).
+    pub(super) fn startup(&mut self, now: u64) -> Result<Vec<(ChangeId, u32)>, ExecError> {
         self.store.audit().mark_interrupted_on_start(now)?;
         self.pending_dir.create()?;
         self.pending_dir.repair_updates()?;
-        self.recover_pending(now);
+        let rearm = self.recover_pending(now);
         self.process_markers(now);
         self.prune(true);
         self.sync_authorized_keys(now);
-        Ok(())
+        Ok(rearm)
     }
 
-    pub(super) fn maintenance(&mut self, now: u64) {
-        self.revert_expired(now);
+    /// Periodic work; returns expired changes exec must revert (off the
+    /// main loop).
+    pub(super) fn maintenance(&mut self, now: u64) -> Vec<ChangeId> {
+        let due = self.expired(now);
         self.process_markers(now);
         self.tick_pending(now);
         self.tick_grace();
         self.prune(false);
         self.sync_authorized_keys(now);
+        due
     }
 
     fn prune(&mut self, force: bool) {
@@ -506,10 +515,15 @@ impl State {
     /// revert what expired while exec was down or whose apply was cut off
     /// by a crash (`applying`), re-arm confirm timers for the rest (a reboot
     /// drops transient timers), quarantine unreadable files.
-    fn recover_pending(&mut self, now: u64) {
+    /// Returns the confirm timers to re-arm `(id, seconds)`.
+    fn recover_pending(&mut self, now: u64) -> Vec<(ChangeId, u32)> {
+        let mut rearm = Vec::new();
         let entries = match self.pending_dir.scan() {
             Ok(e) => e,
-            Err(e) => return log("scan pending", e),
+            Err(e) => {
+                log("scan pending", e);
+                return rearm;
+            }
         };
         for e in entries {
             let Some(change) = &e.value else {
@@ -535,43 +549,47 @@ impl State {
             } else {
                 let secs = (change.deadline_ms - now).div_ceil(1000);
                 let secs = u32::try_from(secs).unwrap_or(u32::MAX).max(1);
-                // Fails harmlessly if the timer survived (exec restart, no
-                // reboot); maintenance reverts on the deadline regardless.
-                if let Err(err) = revert::arm_timer(self.timers.as_ref(), e.id, secs) {
-                    log(&format!("re-arm revert timer {}", e.id), err);
-                }
+                // Armed by exec once its runtime runs (async runner).
+                rearm.push((e.id, secs));
                 Ok(())
             };
             if let Err(err) = res {
                 log(&format!("pending change {}", e.id), err);
             }
         }
+        rearm
     }
 
-    /// Belt and braces for lost timers: reverts unclaimed changes whose
-    /// deadline passed. Claiming makes this safe against a concurrent timer.
-    /// Changes still being applied are skipped (their apply timeout
-    /// restores them).
-    fn revert_expired(&mut self, now: u64) {
+    /// Belt and braces for lost timers: unclaimed changes whose deadline
+    /// passed, for exec to revert off the main loop (`Exec::revert_change`;
+    /// claiming makes that safe against a concurrent timer). Changes still
+    /// being applied are skipped (their apply timeout restores them), and
+    /// so are reverts already handed out; the returned ids are marked
+    /// `reverting` until [`State::reverted`].
+    fn expired(&mut self, now: u64) -> Vec<ChangeId> {
         let Ok(entries) = self.pending_dir.scan() else {
-            return;
+            return Vec::new();
         };
+        let mut due = Vec::new();
         for e in entries.into_iter().filter(|e| !e.claimed) {
-            if self.applying.contains(&e.id) {
+            if self.applying.contains(&e.id) || self.reverting.contains(&e.id) {
                 continue;
             }
             match &e.value {
                 None => self.quarantine(&e.path, now),
                 Some(c) if c.deadline_ms <= now => {
-                    if let Err(err) =
-                        revert::run_revert(&self.pending_dir, e.id, self.reverter.as_ref(), now)
-                    {
-                        log(&format!("revert {}", e.id), err);
-                    }
+                    self.reverting.insert(e.id);
+                    due.push(e.id);
                 }
                 Some(_) => {}
             }
         }
+        due
+    }
+
+    /// A revert handed out by [`State::maintenance`] finished.
+    pub(super) fn reverted(&mut self, id: ChangeId) {
+        self.reverting.remove(&id);
     }
 
     /// Audits markers left by `revert <id>` and emits `ChangeReverted`. A

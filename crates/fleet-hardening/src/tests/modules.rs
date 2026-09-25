@@ -15,11 +15,16 @@ fn ssh_plan_apply_idempotent() {
     let mut c = ctx(&env, baseline(), facts());
     let m = ssh::SshHardening;
     assert!(matches!(m.check(&c).unwrap(), Status::Drifted(_)));
+    // An old drop-in of an earlier agent is removed.
+    env.put(ssh::OLD_FLEET_CONF, "PermitRootLogin yes\n");
     env.ok(ssh::SSHD, &["-t"]);
     env.ok(SYSTEMCTL, &["try-reload-or-restart", "--", "ssh.service"]);
+    env.expect_sshd_t(&baseline());
     let plan = plan_apply(&m, &mut c);
-    assert_eq!(plan.len(), 1);
+    assert_eq!(plan.len(), 2);
     assert_done(&env);
+    assert!(env.read(ssh::OLD_FLEET_CONF).is_none());
+    assert!(ssh::FLEET_CONF.ends_with("/00-fleet.conf"));
     let conf = env.read(ssh::FLEET_CONF).unwrap();
     for line in [
         "PermitRootLogin no",
@@ -44,6 +49,49 @@ fn ssh_plan_apply_idempotent() {
     assert_eq!(env.mode(ssh::FLEET_CONF), 0o644);
     assert!(m.plan(&c).unwrap().is_empty());
     assert_eq!(m.check(&c).unwrap(), Status::Compliant);
+    // Files in place but sshd's effective value differs (e.g. a Match
+    // block or an earlier drop-in): drifted.
+    let mut eff = crate::facts::parse_sshd_t(&sshd_t_output(&baseline()));
+    eff.retain(|(k, _)| k != "permitrootlogin");
+    eff.push(("permitrootlogin".into(), "yes".into()));
+    c.facts.sshd_effective = Some(eff);
+    assert!(matches!(m.check(&c).unwrap(), Status::Drifted(d) if d.contains("permitrootlogin")));
+}
+
+#[test]
+fn ssh_apply_fails_when_effective_config_differs() {
+    let env = Env::new().with_admin();
+    let mut c = ctx(&env, baseline(), facts());
+    let m = ssh::SshHardening;
+    env.ok(ssh::SSHD, &["-t"]);
+    env.ok(SYSTEMCTL, &["try-reload-or-restart", "--", "ssh.service"]);
+    env.runner.expect(
+        ssh::SSHD,
+        &["-T", "-C", "user=ops,host=localhost,addr=127.0.0.1"],
+        Ok(CommandOutput::ok(sshd_t_output(&baseline()).replace(
+            "allowusers ops\n",
+            "allowusers ops\nallowusers eve\n",
+        ))),
+    );
+    let plan = m.plan(&c).unwrap();
+    let e = block(m.apply(&mut c, &plan)).unwrap_err();
+    assert!(e.detail().unwrap().contains("allowusers"), "{e:?}");
+    assert_done(&env);
+}
+
+#[test]
+fn ssh_include_moves_before_first_directive() {
+    let main = "# comment\nPort 2222\nInclude /etc/ssh/sshd_config.d/*.conf\nUsePAM yes\nMatch User x\n  Include /etc/ssh/sshd_config.d/*.conf\n";
+    assert!(!ssh::include_first(main));
+    let new = ssh::with_include_first(main);
+    assert_eq!(
+        new,
+        "Include /etc/ssh/sshd_config.d/*.conf\n# comment\nPort 2222\nUsePAM yes\nMatch User x\n  Include /etc/ssh/sshd_config.d/*.conf\n"
+    );
+    assert!(ssh::include_first(&new));
+    assert!(ssh::include_first(
+        "# x\n\nInclude /etc/ssh/sshd_config.d/*.conf\nPort 22\n"
+    ));
 }
 
 #[test]
@@ -112,6 +160,7 @@ fn module_revert_restores_files() {
     let m = ssh::SshHardening;
     env.ok(ssh::SSHD, &["-t"]);
     env.ok(SYSTEMCTL, &["try-reload-or-restart", "--", "ssh.service"]);
+    env.expect_sshd_t(&baseline());
     let plan = m.plan(&c).unwrap();
     let applied = block(m.apply(&mut c, &plan)).unwrap();
     assert!(env.read(ssh::FLEET_CONF).is_some());
@@ -214,6 +263,30 @@ fn admin_shell_files_root_owned() {
 }
 
 #[test]
+fn admin_shell_immutable_in_strict_only() {
+    let env = Env::new().with_admin();
+    let imm = |p| {
+        let c = ctx(&env, p, facts());
+        access::AdminShell
+            .plan(&c)
+            .unwrap()
+            .iter()
+            .flat_map(|ch| ch.actions.clone())
+            .all(|a| {
+                matches!(
+                    a,
+                    Action::RootOwn {
+                        immutable: true,
+                        ..
+                    }
+                )
+            })
+    };
+    assert!(imm(strict()));
+    assert!(!imm(baseline()));
+}
+
+#[test]
 fn admin_shell_refuses_symlink() {
     let env = Env::new().with_admin();
     env.put("/etc/secret", "s\n");
@@ -248,6 +321,40 @@ fn sudo_policy_validates_and_drops_cloud_init_grant() {
     assert_eq!(env.mode(access::SUDOERS_FLEET), 0o440);
     assert!(env.read(access::SUDOERS_CLOUD_INIT).is_none());
     assert!(m.plan(&c).unwrap().is_empty());
+    assert_eq!(m.check(&c).unwrap(), Status::Compliant);
+    // Someone else's passwordless grant for the admin's group: reported,
+    // never removed. One for another user: fine.
+    env.put("/etc/sudoers.d/50-ops", "%sudo ALL=(ALL) NOPASSWD: ALL\n");
+    env.put("/etc/sudoers.d/60-web", "web ALL=(ALL) NOPASSWD: ALL\n");
+    env.put("/etc/sudoers.d/70-x.bak", "ops ALL=(ALL) NOPASSWD: ALL\n");
+    assert!(m.plan(&c).unwrap().is_empty());
+    assert!(matches!(m.check(&c).unwrap(),
+        Status::Drifted(d) if d.contains("/etc/sudoers.d/50-ops") && !d.contains("60-web") && !d.contains("70-x")));
+}
+
+#[test]
+fn sudo_policy_keeps_cloud_grant_until_a_password_is_set() {
+    let env = Env::new().with_admin();
+    env.put(
+        "/etc/sudoers.d/google_sudoers",
+        "ops ALL=(ALL:ALL) NOPASSWD:ALL\n",
+    );
+    let c = ctx(&env, baseline(), facts());
+    let plan = access::SudoPolicy.plan(&c).unwrap();
+    assert!(
+        !plan
+            .iter()
+            .any(|ch| ch.description.contains("google_sudoers"))
+    );
+    let mut p = baseline();
+    admin(&mut p, Some("$6$saltsalt$abcdefghijklmnopqrstuv"));
+    let c = ctx(&env, p, facts());
+    let plan = access::SudoPolicy.plan(&c).unwrap();
+    assert!(
+        plan.iter()
+            .any(|ch| ch.description.contains("google_sudoers")),
+        "{plan:?}"
+    );
 }
 
 #[test]
@@ -268,6 +375,78 @@ fn accounts_lock_system_accounts() {
     let plan = plan_apply(&access::AccountsLock, &mut c);
     assert_eq!(plan.len(), 2);
     assert_done(&env);
+}
+
+#[test]
+fn accounts_lock_skips_admin_and_roster_users() {
+    let env = Env::new().with_admin();
+    env.put("/etc/login.defs", "UID_MIN 1000\n");
+    // A (misconfigured) admin and a roster user below UID_MIN.
+    env.put(
+        "/etc/passwd",
+        "root:x:0:0::/root:/bin/bash\nops:x:999:999::/home/ops:/bin/bash\ndeploy:x:998:998::/home/deploy:/bin/bash\n",
+    );
+    env.put("/etc/shadow", "ops:$6$x$y:1::::::\ndeploy:$6$x$y:1::::::\n");
+    env.put(
+        "/etc/fleet/authorized_keys/deploy",
+        &format!(
+            "{}\necdsa-sha2-nistp256 AAAA fleet-device-x\n{}\n",
+            fleet_ops::users::authorized_keys::BEGIN,
+            fleet_ops::users::authorized_keys::END
+        ),
+    );
+    let c = ctx(&env, baseline(), facts());
+    assert!(access::AccountsLock.plan(&c).unwrap().is_empty());
+}
+
+#[test]
+fn admin_must_be_a_regular_login_account() {
+    let cases = [
+        // (passwd line, /etc/shells, reason)
+        ("ops:x:999:999::/home/ops:/bin/bash", "", "uid"),
+        ("ops:x:0:0::/home/ops:/bin/bash", "", "uid"),
+        (
+            "ops:x:1000:1000::/home/ops:/usr/sbin/nologin",
+            "",
+            "login shell",
+        ),
+        (
+            "ops:x:1000:1000::/home/ops:/bin/zsh",
+            "/bin/sh\n/bin/bash\n",
+            "login shell",
+        ),
+    ];
+    for (line, shells, want) in cases {
+        let env = Env::new().with_admin();
+        env.put("/etc/login.defs", "UID_MIN 1000\n");
+        env.put(
+            "/etc/passwd",
+            &format!("root:x:0:0::/root:/bin/bash\n{line}\n"),
+        );
+        if !shells.is_empty() {
+            env.put("/etc/shells", shells);
+        }
+        let c = ctx(&env, baseline(), facts());
+        let e = access::AdminUser.plan(&c).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::PolicyDenied, "{line}");
+        assert!(e.detail().unwrap().contains(want), "{line}: {e:?}");
+        assert!(matches!(
+            access::AdminUser.check(&c).unwrap(),
+            Status::Drifted(_)
+        ));
+        assert!(access::AdminShell.plan(&c).is_err());
+    }
+    // A fleet* account is never the admin.
+    let env = Env::new().with_admin();
+    let mut p = baseline();
+    p.admin.as_mut().unwrap().name = "fleet-exec".into();
+    let c = ctx(&env, p, facts());
+    assert!(access::AdminUser.plan(&c).is_err());
+    // /etc/shells listing the shell is fine.
+    let env = Env::new().with_admin();
+    env.put("/etc/shells", "/bin/sh\n/bin/bash\n");
+    let c = ctx(&env, baseline(), facts());
+    assert!(access::admin_problem(&c, "ops").unwrap().is_none());
 }
 
 // ---- kernel ----
@@ -322,6 +501,10 @@ fn file_only_modules_idempotent() {
     let mut c = ctx(&env, strict(), facts());
     env.ok(SYSTEMCTL, &["restart", "--", "systemd-journald.service"]);
     env.ok(
+        crate::exec::FINDMNT,
+        &["--verify", "--tab-file", crate::exec::FSTAB_CHECK],
+    );
+    env.ok(
         "/usr/bin/mount",
         &["-o", "remount,nosuid,nodev,noexec", "/dev/shm"],
     );
@@ -359,6 +542,41 @@ fn file_only_modules_idempotent() {
         "tmpfs /tmp tmpfs rw,nosuid,nodev,noexec 0 0\ntmpfs /dev/shm tmpfs rw,nosuid,nodev,noexec 0 0\n/dev/sda1 /var/tmp ext4 rw,nosuid,nodev,noexec 0 0\n",
     );
     assert_eq!(system::MountsTmp.check(&c).unwrap(), Status::Compliant);
+}
+
+#[test]
+fn mounts_tmp_keeps_separate_filesystems_and_verifies_first() {
+    let env = Env::new();
+    let fstab = "UUID=1 / ext4 defaults 0 1\nUUID=2 /var/tmp ext4 defaults 0 2\n";
+    env.put(system::FSTAB, fstab);
+    let mut c = ctx(&env, strict(), facts());
+    // A failing `findmnt --verify`: nothing written.
+    env.runner.expect(
+        crate::exec::FINDMNT,
+        &["--verify", "--tab-file", crate::exec::FSTAB_CHECK],
+        Ok(CommandOutput::exit(1)),
+    );
+    let plan = system::MountsTmp.plan(&c).unwrap();
+    let e = block(system::MountsTmp.apply(&mut c, &plan)).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(env.read(system::FSTAB).unwrap(), fstab);
+    env.ok(
+        crate::exec::FINDMNT,
+        &["--verify", "--tab-file", crate::exec::FSTAB_CHECK],
+    );
+    env.ok(
+        "/usr/bin/mount",
+        &["-o", "remount,nosuid,nodev,noexec", "/dev/shm"],
+    );
+    plan_apply(&system::MountsTmp, &mut c);
+    assert_done(&env);
+    let out = env.read(system::FSTAB).unwrap();
+    // The /var/tmp partition stays; /tmp and /dev/shm are added.
+    assert!(out.contains("UUID=2 /var/tmp ext4 defaults 0 2\n"));
+    assert!(!out.contains("/tmp /var/tmp none"));
+    assert!(out.contains("tmpfs /tmp tmpfs"));
+    assert!(matches!(system::MountsTmp.check(&c).unwrap(),
+        Status::Drifted(d) if d.contains("/var/tmp")));
 }
 
 #[test]
@@ -512,8 +730,13 @@ fn swap_file_created() {
     env.ok(system::CHMOD, &["0600", "/swapfile"]);
     env.ok(system::MKSWAP, &["/swapfile"]);
     env.ok(system::SWAPON, &["/swapfile"]);
+    env.ok(
+        crate::exec::FINDMNT,
+        &["--verify", "--tab-file", crate::exec::FSTAB_CHECK],
+    );
     plan_apply(&system::Swap, &mut c);
     assert_done(&env);
+    assert!(env.read(crate::exec::FSTAB_CHECK).is_none());
     assert!(
         env.read(system::FSTAB)
             .unwrap()
@@ -696,16 +919,64 @@ fn docker_fetches_pinned_key_then_configures() {
         .unwrap();
     assert!(src.contains("URIs: https://download.docker.com/linux/debian\nSuites: bookworm\n"));
     assert!(src.contains("Signed-By: /etc/apt/keyrings/fleet-docker.asc"));
-    assert!(
-        env.read("/etc/apt/preferences.d/fleet-docker")
-            .unwrap()
-            .contains("Pin: version 5:28.*")
-    );
+    let pin = env.read("/etc/apt/preferences.d/fleet-docker").unwrap();
+    assert!(pin.contains("Pin: version 5:28.*"));
+    // Only the role's packages come from Docker's origin; everything
+    // else from it is never installed. Package-specific records first.
+    assert!(pin.contains(
+        "Package: containerd.io docker-buildx-plugin docker-ce docker-ce-cli docker-compose-plugin\nPin: origin \"download.docker.com\"\nPin-Priority: 500\n"
+    ));
+    assert!(pin.ends_with("Package: *\nPin: origin \"download.docker.com\"\nPin-Priority: -1\n"));
     assert_eq!(
         env.read(roles::DAEMON_JSON).unwrap(),
         roles::DAEMON_JSON_TEXT
     );
     assert!(roles::Docker.plan(&c).unwrap().is_empty());
+    // Fingerprint of the existing key read as a fact: the pinned one is
+    // compliant, any other is drift and the key is fetched again.
+    let key = "/etc/apt/keyrings/fleet-docker.asc".to_owned();
+    c.facts.key_fingerprints.insert(
+        key.clone(),
+        vec!["9DC858229FC7DD38854AE2D88D81803C0EBFCD88".into()],
+    );
+    assert!(roles::Docker.plan(&c).unwrap().is_empty());
+    c.facts
+        .key_fingerprints
+        .insert(key, vec!["0000000000000000000000000000000000000000".into()]);
+    assert!(matches!(
+        roles::Docker.check(&c).unwrap(),
+        Status::Drifted(_)
+    ));
+    let plan = roles::Docker.plan(&c).unwrap();
+    assert!(plan.iter().any(|ch| {
+        ch.actions
+            .iter()
+            .any(|a| matches!(a, Action::FetchKey { .. }))
+            && ch.description.contains("mismatch")
+    }));
+}
+
+#[test]
+fn gathered_key_fingerprints() {
+    let env = Env::new();
+    env.put("/etc/apt/keyrings/fleet-docker.asc", "key\n");
+    env.expect_spec(
+        &crate::exec::gpg_show_spec(b"key\n".to_vec()),
+        Ok(CommandOutput::ok(COLONS)),
+    );
+    let want = crate::facts::Wanted {
+        key_files: vec![
+            "/etc/apt/keyrings/fleet-docker.asc".into(),
+            "/etc/apt/keyrings/fleet-absent.asc".into(),
+        ],
+        ..Default::default()
+    };
+    let f = block(crate::facts::gather(&env.sys, &want));
+    assert_eq!(f.key_fingerprints.len(), 1);
+    assert_eq!(
+        f.key_fingerprints["/etc/apt/keyrings/fleet-docker.asc"],
+        crate::exec::primary_fingerprints(COLONS)
+    );
 }
 
 #[test]

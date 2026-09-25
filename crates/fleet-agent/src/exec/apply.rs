@@ -19,13 +19,18 @@
 //!
 //! While `applying`, maintenance doesn't revert it and `change.confirm` is
 //! refused; a crash mid-apply is reverted at startup.
+//!
+//! Nothing here blocks exec's single-threaded runtime: timers go through
+//! the async runner, and snapshots and restores (synchronous `Revertible`
+//! code: files, `nft`, `sshd -t`, `systemctl`) run on the blocking pool
+//! with their own `SysCtx` when `ExecConfig::offload` is set.
 
 use super::{Admitted, Exec, Session, log, log_op_error};
 use crate::now_ms;
-use crate::pending::{ChangeId, ChangeKind, ChangeOrigin, PendingChange};
-use crate::revert;
+use crate::pending::{ChangeId, ChangeKind, ChangeOrigin, PendingChange, PendingError};
+use crate::revert::{self, RevertOutcome};
 use fleet_ops::{OpOutput, Revertible};
-use fleet_proto::{ErrorCode, Payload};
+use fleet_proto::{ErrorCode, Op, Payload};
 use std::rc::Rc;
 
 /// Guard timer margin beyond apply timeout + confirm window.
@@ -69,13 +74,53 @@ impl Exec {
             .clone()
     }
 
+    /// `Revertible::snapshot` of `op`: on the blocking pool with the
+    /// offload reverter's own modules and context, or inline with `r`.
+    async fn snapshot(
+        &self,
+        kind: ChangeKind,
+        r: &dyn Revertible,
+        op: &Op,
+    ) -> Result<Vec<u8>, fleet_ops::OpError> {
+        let Some(f) = self.offload.clone() else {
+            return r.snapshot(&self.ctx, op);
+        };
+        let op = op.clone();
+        tokio::task::spawn_blocking(move || {
+            let rr = f();
+            rr.reverters
+                .get(kind)
+                .ok_or(fleet_ops::OpError::new(ErrorCode::Unsupported))?
+                .snapshot(&rr.ctx, &op)
+        })
+        .await
+        .map_err(|_| fleet_ops::OpError::internal("snapshot task failed"))?
+    }
+
+    /// Claims and restores change `id` (`revert::run_revert`) off the
+    /// runtime when offloading, else inline with the configured reverter.
+    pub(super) async fn revert_change(&self, id: ChangeId) -> Result<RevertOutcome, PendingError> {
+        let dir = self.st.borrow().pending_dir.clone();
+        match self.offload.clone() {
+            Some(f) => {
+                tokio::task::spawn_blocking(move || revert::run_revert(&dir, id, &f(), now_ms()))
+                    .await
+                    .unwrap_or_else(|_| Err(PendingError::Io(std::io::ErrorKind::Other.into())))
+            }
+            None => {
+                let st = self.st.borrow();
+                revert::run_revert(&dir, id, st.reverter.as_ref(), now_ms())
+            }
+        }
+    }
+
     /// Restores a change whose apply failed and stops its timers. If the
     /// restore itself fails, the guard timer still reverts it later.
-    fn abort_change(&self, id: ChangeId) {
-        let st = self.st.borrow();
-        match revert::run_revert(&st.pending_dir, id, st.reverter.as_ref(), now_ms()) {
+    async fn abort_change(&self, id: ChangeId) {
+        match self.revert_change(id).await {
             Ok(_) => {
-                if let Err(e) = revert::disarm_timer(st.timers.as_ref(), id) {
+                let timers = self.st.borrow().timers.clone();
+                if let Err(e) = revert::disarm_timer_async(timers.as_ref(), id).await {
                     log("disarm revert timers", e);
                 }
             }
@@ -99,7 +144,7 @@ impl Exec {
             log_op_error(op.name(), &e);
             e.code()
         };
-        let snapshot = r.snapshot(&self.ctx, op).map_err(fail)?;
+        let snapshot = self.snapshot(kind, r, op).await.map_err(fail)?;
         let mut raw = [0u8; 16];
         fleet_crypto::random_bytes(&mut raw).map_err(|_| ErrorCode::Internal)?;
         let id = ChangeId(raw);
@@ -127,22 +172,23 @@ impl Exec {
             audit_seq: a.intent_seq,
             applying: true,
         };
-        {
-            let mut st = self.st.borrow_mut();
+        let timers = {
+            let st = self.st.borrow();
             st.pending_dir.insert(id, &change).map_err(|e| {
                 log("write pending change", e);
                 ErrorCode::Internal
             })?;
-            // Never apply without an independent timer.
-            if let Err(e) = revert::arm_guard(st.timers.as_ref(), id, guard_secs) {
-                log("arm revert guard timer", e);
-                if let Err(e) = st.pending_dir.remove(id) {
-                    log("remove pending change", e);
-                }
-                return Err(ErrorCode::Internal);
+            st.timers.clone()
+        };
+        // Never apply without an independent timer.
+        if let Err(e) = revert::arm_guard_async(timers.as_ref(), id, guard_secs).await {
+            log("arm revert guard timer", e);
+            if let Err(e) = self.st.borrow().pending_dir.remove(id) {
+                log("remove pending change", e);
             }
-            st.applying.insert(id);
+            return Err(ErrorCode::Internal);
         }
+        self.st.borrow_mut().applying.insert(id);
         let applied = match tokio::time::timeout(
             self.apply_timeout,
             a.handler.handle(&self.ctx, op, &a.meta),
@@ -160,10 +206,12 @@ impl Exec {
         let res = match applied {
             Ok(p) => {
                 let inner = handler_result(&mut change, p);
-                self.finish_apply(id, &mut change, window).map(|()| inner)
+                self.finish_apply(id, &mut change, window)
+                    .await
+                    .map(|()| inner)
             }
             Err(code) => {
-                self.abort_change(id);
+                self.abort_change(id).await;
                 Err(code)
             }
         };
@@ -175,7 +223,7 @@ impl Exec {
     }
 
     /// Steps 4–5: record the result, start the confirm window.
-    fn finish_apply(
+    async fn finish_apply(
         &self,
         id: ChangeId,
         change: &mut PendingChange,
@@ -184,27 +232,26 @@ impl Exec {
         change.applying = false;
         change.origin.applied_conn = self.conns.get();
         change.deadline_ms = now_ms().saturating_add(u64::from(window) * 1000);
-        let st = self.st.borrow();
-        match st.pending_dir.update(id, change) {
+        let updated = self.st.borrow().pending_dir.update(id, change);
+        match updated {
             Ok(true) => {}
             // Claimed meanwhile (only a lost race with the guard): it was
             // reverted, so the change didn't stick.
             Ok(false) => return Err(ErrorCode::Internal),
             Err(e) => {
                 log("update pending change", e);
-                drop(st);
-                self.abort_change(id);
+                self.abort_change(id).await;
                 return Err(ErrorCode::Internal);
             }
         }
-        if let Err(e) = revert::arm_timer(st.timers.as_ref(), id, window) {
+        let timers = self.st.borrow().timers.clone();
+        if let Err(e) = revert::arm_timer_async(timers.as_ref(), id, window).await {
             log("arm revert timer", e);
-            drop(st);
-            self.abort_change(id);
+            self.abort_change(id).await;
             return Err(ErrorCode::Internal);
         }
         // Harmless if it fails: the guard fires after the confirm deadline.
-        if let Err(e) = revert::disarm_guard(st.timers.as_ref(), id) {
+        if let Err(e) = revert::disarm_guard_async(timers.as_ref(), id).await {
             log("stop revert guard timer", e);
         }
         Ok(())

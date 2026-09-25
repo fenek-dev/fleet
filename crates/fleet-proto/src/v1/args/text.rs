@@ -66,8 +66,10 @@ validated_string!(
 );
 
 validated_string!(
+    @no_debug
     /// Provisioning profile TOML (design §9.2): at most 64 KiB, no control
     /// characters but `\n`, `\r` and `\t`. Parsed by `fleet-hardening`.
+    /// `Debug` prints only its length and BLAKE3, never the content.
     ProfileToml,
     "profile toml",
     |s| s.len() <= 64 * 1024
@@ -75,6 +77,16 @@ validated_string!(
             .chars()
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 );
+
+impl core::fmt::Debug for ProfileToml {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let h = blake3::hash(self.0.as_bytes());
+        f.debug_struct("ProfileToml")
+            .field("len", &self.0.len())
+            .field("blake3", &hex::encode(&h.as_bytes()[..8]))
+            .finish()
+    }
+}
 
 validated_string!(
     /// HTTP probe path: starts with `/`, 1–256 printable ASCII bytes, no
@@ -126,7 +138,9 @@ mod tests {
         assert!(CronCommand::new(" leading").is_err());
         assert!(ShellCommand::new("echo a\necho b").is_ok());
         assert!(ShellCommand::new("a\0b").is_err());
-        assert!(ProfileToml::new("[profile]\r\nname = \"x\"\n").is_ok());
+        let toml = ProfileToml::new("[profile]\r\nname = \"secret-x\"\n").unwrap();
+        let dbg = format!("{toml:?}");
+        assert!(!dbg.contains("secret-x") && dbg.contains("len"), "{dbg}");
         assert!(HttpPath::new("/health?x=1").is_ok());
         assert!(HttpPath::new("health").is_err());
         assert!(HttpPath::new("/a b").is_err());

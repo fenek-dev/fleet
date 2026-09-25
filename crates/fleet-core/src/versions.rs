@@ -59,14 +59,8 @@ pub fn version_source(op: &Op) -> Option<VersionSource> {
     })
 }
 
-/// The agent's content version of a file (`fleet_ops::fswrite::version_of`):
-/// the first 8 bytes (little-endian) of its BLAKE3.
-pub fn content_version(bytes: &[u8]) -> u64 {
-    let h = blake3::hash(bytes);
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&h.as_bytes()[..8]);
-    u64::from_le_bytes(b)
-}
+/// The agent's content version of a file (shared definition).
+pub use fleet_proto::version::content_version;
 
 /// The current version of `op`'s state in the answer to its
 /// [`VersionSource::Read`] op.

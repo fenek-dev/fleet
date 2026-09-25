@@ -250,7 +250,7 @@ pub fn document(c: &CloudInit) -> Result<Yaml, CloudInitError> {
                 ("permissions", s("0644")),
                 (
                     "content",
-                    s("# Fleet bootstrap (design §9.7); replaced by the profile's 10-fleet.conf.\n\
+                    s("# Fleet bootstrap (design §9.7); overridden by the profile's 00-fleet.conf.\n\
                        PermitRootLogin no\n\
                        PasswordAuthentication no\n\
                        KbdInteractiveAuthentication no\n"),

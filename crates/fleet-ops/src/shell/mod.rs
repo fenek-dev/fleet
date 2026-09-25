@@ -15,10 +15,14 @@
 //!   data, and the full command goes into the audit log (the intent's
 //!   `OpSummary::args` is the op's wire payload, command text included);
 //! - it runs as the named user through `setpriv` (uid, gid, the user's
-//!   supplementary groups, environment reset); `root` only when the policy
-//!   lists `root` explicitly; never a `fleet*` account;
-//! - in the op's transient scope (`fleet-op-<id>.scope`) with the op's
-//!   timeout (the scope is killed with it) and output cap.
+//!   groups passed explicitly with `--groups`, environment reset, and for
+//!   non-root no inheritable, ambient or bounding capabilities); `root`
+//!   only when the policy lists `root` explicitly; never a `fleet*`
+//!   account, nor an account sharing its uid with another;
+//! - in the op's transient scope (`fleet-op-<id>.scope`, `MemoryMax`,
+//!   `TasksMax`, `CPUQuota` from [`ShellPolicy::limits`]) with the op's
+//!   timeout (the scope is killed with it) and output cap; the scope is
+//!   stopped when the shell exits, so background jobs don't outlive it.
 //!
 //! No other module may call [`SH`].
 
@@ -42,6 +46,11 @@ pub const SH: &str = "/bin/sh";
 pub trait ShellPolicy {
     /// `capabilities.shell_exec` and `user` in `shell_exec_users`.
     fn may_run_as(&self, user: &str) -> bool;
+
+    /// Resource limits of the command's scope.
+    fn limits(&self) -> crate::scope::ScopeLimits {
+        crate::scope::ScopeLimits::SHELL
+    }
 }
 
 /// Refuses everyone (the generic registry; exec re-registers with its
@@ -80,23 +89,81 @@ pub fn check(
     if entry.uid == 0 && !user.is_root() {
         return Err(denied("uid 0 alias"));
     }
+    check_unique_uid(ctx, &entry)?;
     Ok(entry)
 }
 
-/// `systemd-run --scope … -- setpriv --reuid=U --regid=G --init-groups
-/// --reset-env -- env -C <dir> /bin/sh -c <command>`. `<dir>` is `cwd`
-/// or the user's home.
-pub fn exec_spec(op_id: u64, entry: &PasswdEntry, req: &ShellExec) -> CommandSpec {
+/// Refuses an account whose uid another passwd entry shares: the policy
+/// names accounts, and the kernel only knows uids. uid 0 is exempt: it is
+/// `root` whatever else aliases it (aliases are refused by name).
+pub fn check_unique_uid(ctx: &SysCtx, entry: &PasswdEntry) -> Result<(), OpError> {
+    if entry.uid == 0 {
+        return Ok(());
+    }
+    let n = crate::users::passwd(ctx)?
+        .iter()
+        .filter(|e| e.uid == entry.uid)
+        .count();
+    if n > 1 {
+        return Err(denied("uid shared with another account"));
+    }
+    Ok(())
+}
+
+/// The user's groups as `setpriv` sets them: primary gid first, then
+/// every supplementary group from `/etc/group`, deduplicated.
+pub fn group_ids(ctx: &SysCtx, entry: &PasswdEntry) -> Result<Vec<u32>, OpError> {
+    let gr = crate::users::groups(ctx)?;
+    let mut v = vec![entry.gid];
+    for g in entry.groups_in(&gr) {
+        if !v.contains(&g.gid) {
+            v.push(g.gid);
+        }
+    }
+    Ok(v)
+}
+
+/// `setpriv` arguments dropping to `entry` with exactly `groups`, the
+/// environment reset, and (for anyone but uid 0) no capabilities in the
+/// inheritable, ambient or bounding sets, so no file capability or
+/// ambient set can hand privilege back.
+pub fn setpriv_args(uid: u32, gid: u32, groups: &[u32]) -> Vec<String> {
+    let mut a = vec![format!("--reuid={uid}"), format!("--regid={gid}")];
+    if groups.is_empty() {
+        a.push("--clear-groups".into());
+    } else {
+        let list: Vec<String> = groups.iter().map(u32::to_string).collect();
+        a.push(format!("--groups={}", list.join(",")));
+    }
+    if uid != 0 {
+        a.extend([
+            "--inh-caps=-all".to_owned(),
+            "--ambient-caps=-all".to_owned(),
+            "--bounding-set=-all".to_owned(),
+        ]);
+    }
+    a.push("--reset-env".into());
+    a
+}
+
+/// `systemd-run --scope -p MemoryMax=… -p TasksMax=… -p CPUQuota=… --
+/// setpriv <setpriv_args> -- env -C <dir> /bin/sh -c <command>`. `<dir>`
+/// is `cwd` or the user's home. The scope is stopped once the shell
+/// exits, so background jobs die with the op.
+pub fn exec_spec(
+    op_id: u64,
+    entry: &PasswdEntry,
+    groups: &[u32],
+    req: &ShellExec,
+    limits: crate::scope::ScopeLimits,
+) -> CommandSpec {
     let dir = req
         .cwd
         .as_ref()
         .map_or(entry.home.as_str(), |c| c.as_str())
         .to_owned();
     let inner = CommandSpec::new(SETPRIV)
-        .arg(format!("--reuid={}", entry.uid))
-        .arg(format!("--regid={}", entry.gid))
-        .arg("--init-groups")
-        .arg("--reset-env")
+        .args(setpriv_args(entry.uid, entry.gid, groups))
         .arg("--")
         .arg(ENV)
         .arg("-C")
@@ -106,7 +173,7 @@ pub fn exec_spec(op_id: u64, entry: &PasswdEntry, req: &ShellExec) -> CommandSpe
         .arg(req.command.as_str())
         .timeout(Duration::from_secs(u64::from(req.timeout_s)))
         .output_cap(req.output_cap as usize);
-    crate::scope::scoped(op_id, inner)
+    crate::scope::scoped_limited(op_id, inner, limits)
 }
 
 /// Combined cap: stdout first, stderr gets what is left.
@@ -168,7 +235,9 @@ impl OpHandler for ShellHandler {
             let id = meta
                 .op_id()
                 .ok_or_else(|| OpError::internal("shell.exec without an audit seq"))?;
-            let r = match ctx.runner.run(exec_spec(id, &entry, req)).await {
+            let groups = group_ids(ctx, &entry)?;
+            let spec = exec_spec(id, &entry, &groups, req, self.policy.limits());
+            let r = match ctx.runner.run(spec).await {
                 Ok(o) => {
                     let mut r =
                         cap_combined(o.stdout, o.stderr, req.output_cap as usize, o.truncated);

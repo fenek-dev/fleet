@@ -327,6 +327,53 @@ fn add_all_words(g: &mut SudoersGrants, l: &str) {
     }
 }
 
+/// Who one sudoers file lets run commands **without a password**: rules
+/// with a `NOPASSWD` tag, and `Defaults[:users] !authenticate` (a bare
+/// `Defaults` counts as everyone). Same user-list rules as
+/// [`parse_sudoers`]; includes are not followed.
+pub fn nopasswd_grants(text: &str) -> SudoersGrants {
+    let mut g = SudoersGrants::default();
+    for raw in logical_lines(text) {
+        let t = raw.trim();
+        if directive(t).is_some() {
+            continue;
+        }
+        let l = strip_comment(t).trim();
+        let Some(first) = l.split_whitespace().next() else {
+            continue;
+        };
+        if let Some(rest) = first.strip_prefix("Defaults") {
+            if !l.contains("!authenticate") {
+                continue;
+            }
+            match rest.strip_prefix(':') {
+                Some(users) => users.split(',').for_each(|u| add_item(&mut g, u)),
+                // `Defaults !authenticate`, or host/command/runas scoped
+                // (`@`, `!`, `>`): conservatively everyone.
+                None => g.everyone = true,
+            }
+            continue;
+        }
+        if l.contains("NOPASSWD") {
+            parse_sudoers(l, &mut g);
+        }
+    }
+    g
+}
+
+impl SudoersGrants {
+    /// Whether these grants cover `user` (uid `uid`, groups `groups` by
+    /// name and gid).
+    pub fn covers(&self, user: &str, uid: u32, groups: &[(String, u32)]) -> bool {
+        self.everyone
+            || self.users.contains(user)
+            || self.uids.contains(&uid)
+            || groups
+                .iter()
+                .any(|(n, gid)| self.groups.contains(n) || self.gids.contains(gid))
+    }
+}
+
 /// Parses one sudoers file into `g`; returns its include directives in
 /// order. Rule lines are `users hosts = …`: only the user list matters
 /// (any grant counts). `Defaults` and host/command/runas aliases are
@@ -597,5 +644,23 @@ mod tests {
             compose_deploy(&op("a: &x 1\n")).unwrap_err().code(),
             ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn nopasswd_rules() {
+        let groups = [("ops".to_owned(), 1000), ("sudo".to_owned(), 27)];
+        let covers = |t: &str| nopasswd_grants(t).covers("ops", 1000, &groups);
+        assert!(covers("ops ALL=(ALL) NOPASSWD:ALL\n"));
+        assert!(covers("%sudo ALL=(ALL:ALL) NOPASSWD: ALL\n"));
+        assert!(covers("#1000 ALL=(ALL) NOPASSWD:ALL\n"));
+        assert!(covers("ALL ALL=NOPASSWD: /usr/bin/apt\n"));
+        assert!(covers("Defaults:ops !authenticate\n"));
+        assert!(covers("Defaults !authenticate\n"));
+        assert!(covers("ops ALL=(ALL) \\\n  NOPASSWD:ALL\n"));
+        // With a password, or for someone else: fine.
+        assert!(!covers("ops ALL=(ALL) ALL\n"));
+        assert!(!covers("%sudo ALL=(ALL:ALL) ALL\n"));
+        assert!(!covers("web ALL=(ALL) NOPASSWD:ALL\n"));
+        assert!(!covers("Defaults use_pty\n# ops ALL=NOPASSWD:ALL\n"));
     }
 }

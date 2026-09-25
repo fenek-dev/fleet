@@ -83,6 +83,30 @@ impl Env {
         self.runner.expect(program, args, Ok(CommandOutput::ok("")));
     }
 
+    /// The post-apply `sshd -T` of `ssh.hardening` for admin `ops`,
+    /// answering what the drop-in of `p` sets.
+    pub fn expect_sshd_t(&self, p: &Resolved) {
+        self.runner.expect(
+            crate::modules::ssh::SSHD,
+            &["-T", "-C", "user=ops,host=localhost,addr=127.0.0.1"],
+            Ok(CommandOutput::ok(sshd_t_output(p))),
+        );
+    }
+}
+
+/// `sshd -T` output agreeing with `ssh.hardening` for admin `ops`.
+pub fn sshd_t_output(p: &Resolved) -> String {
+    let mut s = String::from("port 22\n");
+    for (k, v) in crate::modules::ssh::EFFECTIVE {
+        s.push_str(&format!("{k} {v}\n"));
+    }
+    for u in crate::modules::ssh::allow_users("ops", p).split(' ') {
+        s.push_str(&format!("allowusers {u}\n"));
+    }
+    s
+}
+
+impl Env {
     /// A server with the admin `ops` (uid 1000), roster keys and a stock
     /// `sshd_config`.
     pub fn with_admin(self) -> Self {

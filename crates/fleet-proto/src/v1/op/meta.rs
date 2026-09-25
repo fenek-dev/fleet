@@ -144,8 +144,13 @@ impl Op {
                     .any(|p| !under_any(p, &CONFIG_ROOTS)),
             ),
             // A custom profile can configure anything; built-ins are
-            // reviewed with the agent release.
-            Op::ProfileApply { spec, .. } => elevated_if(spec.is_custom()),
+            // reviewed with the agent release. Setting the admin's sudo
+            // password is root-equivalent too (whoever knows it has sudo).
+            Op::ProfileApply {
+                spec,
+                password_hash,
+                ..
+            } => elevated_if(spec.is_custom() || password_hash.is_some()),
 
             Op::AuthorizedKeysSet { .. }
             | Op::RosterUpdate { .. }

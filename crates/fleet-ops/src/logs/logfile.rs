@@ -53,8 +53,8 @@ pub fn open_nofollow(ctx: &SysCtx, abs: &str) -> io::Result<(File, PathBuf)> {
     let full = ctx.path(abs).ok_or(io::ErrorKind::InvalidInput)?;
     let denied = |e: io::Error| {
         let refusal = e.kind() == io::ErrorKind::Other
-            || [libc::ELOOP, libc::ENOTDIR]
-                .map(Some)
+            || [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR]
+                .map(|x| Some(x.raw_os_error()))
                 .contains(&e.raw_os_error());
         if refusal {
             io::ErrorKind::PermissionDenied.into()
@@ -229,7 +229,9 @@ fn io_code(e: io::Error) -> OpError {
     let code = match e.kind() {
         io::ErrorKind::NotFound => ErrorCode::NotFound,
         io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => ErrorCode::PolicyDenied,
-        _ if e.raw_os_error() == Some(libc::ELOOP) => ErrorCode::PolicyDenied,
+        _ if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            ErrorCode::PolicyDenied
+        }
         _ => ErrorCode::Internal,
     };
     OpError::new(code).with_detail(e.to_string())

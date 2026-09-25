@@ -36,6 +36,7 @@ use crate::ctx::SysCtx;
 use crate::fswrite;
 use crate::handler::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput, Registry};
 use crate::runner::{CommandOutput, CommandSpec, RunError, SYSTEMCTL};
+use crate::scope::ScopeLimits;
 use crate::telemetry::GaugeSink;
 use crate::users::parse::lookup;
 use fleet_proto::args::{AbsPath, GameName, UserName};
@@ -77,6 +78,88 @@ pub struct Instance {
     pub uid: u32,
     pub gid: u32,
     pub installed_ms: u64,
+    /// Loopback port of this instance's RCON ([`RCON_PORTS`], allocated at
+    /// install); `None` for records written before per-instance ports
+    /// (the template's port then).
+    #[serde(default)]
+    pub rcon_port: Option<u16>,
+}
+
+/// Loopback ports handed out to instances' RCON listeners.
+pub const RCON_PORTS: std::ops::RangeInclusive<u16> = 27100..=27999;
+
+/// TCP sockets listening now (`/proc/net/tcp{,6}`).
+fn tcp_listeners(ctx: &SysCtx) -> Vec<crate::security::ports::Socket> {
+    let mut v = Vec::new();
+    for f in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Some(t) = ctx.procfs.read(f) {
+            v.extend(crate::security::ports::parse_proc_net(
+                &t,
+                fleet_proto::args::Protocol::Tcp,
+            ));
+        }
+    }
+    v
+}
+
+/// The lowest port of [`RCON_PORTS`] that no other instance holds and
+/// nothing listens on.
+pub fn allocate_rcon_port(ctx: &SysCtx, taken: &[u16]) -> Option<u16> {
+    let busy: Vec<u16> = tcp_listeners(ctx).iter().map(|s| s.port).collect();
+    RCON_PORTS
+        .into_iter()
+        .find(|p| !taken.contains(p) && !busy.contains(p))
+}
+
+/// The host port RCON of `inst` is reached on.
+pub fn rcon_port(inst: &Instance, r: &template::Rcon) -> u16 {
+    inst.rcon_port.unwrap_or(r.port)
+}
+
+/// Before the password is sent: whoever listens on loopback `port` must be
+/// the game itself. A native game's socket must belong to the game user;
+/// for a container game, Docker either DNATs the port (no host listener
+/// with `userland-proxy: false`) or `docker-proxy` (root) listens. Any
+/// other listener could collect the RCON password.
+pub fn check_rcon_listener(
+    ctx: &SysCtx,
+    t: &Template,
+    inst: &Instance,
+    port: u16,
+) -> Result<(), OpError> {
+    let loopback = |a: &std::net::IpAddr| a.is_loopback() || a.is_unspecified();
+    let socks: Vec<_> = tcp_listeners(ctx)
+        .into_iter()
+        .filter(|s| s.port == port && loopback(&s.addr))
+        .collect();
+    let deny = |d: &'static str| OpError::new(ErrorCode::PolicyDenied).with_detail(d);
+    if t.is_container() {
+        if socks.is_empty() {
+            return Ok(());
+        }
+        if socks.iter().any(|s| s.uid != 0) {
+            return Err(deny("rcon port held by another user"));
+        }
+        let ports = crate::security::ports::collect(ctx);
+        let ok = ports
+            .ports
+            .iter()
+            .filter(|p| p.port == port && p.proto == fleet_proto::args::Protocol::Tcp)
+            .all(|p| p.process.as_deref() == Some("docker-proxy"));
+        return if ok {
+            Ok(())
+        } else {
+            Err(deny("rcon port held by another process"))
+        };
+    }
+    if socks.is_empty() {
+        return Err(OpError::new(ErrorCode::NotFound).with_detail("rcon not listening"));
+    }
+    if socks.iter().all(|s| s.uid == inst.uid) {
+        Ok(())
+    } else {
+        Err(deny("rcon port held by another user"))
+    }
 }
 
 fn internal(what: &str, out: &CommandOutput) -> OpError {
@@ -123,30 +206,47 @@ pub fn useradd_spec(name: &GameName) -> CommandSpec {
     ])
 }
 
-/// `program args…` as the game user, in the op's scope.
+/// How a tool runs as the game user: its groups (from `/etc/group`, passed
+/// explicitly to `setpriv`) and the scope's resource limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunAs {
+    pub groups: Vec<u32>,
+    pub limits: ScopeLimits,
+}
+
+/// `program args…` as the game user (`setpriv` with explicit groups, no
+/// capabilities), in the op's resource-limited scope, stopped when the
+/// program exits.
 pub fn as_user(
     op_id: u64,
     inst: &Instance,
+    run: &RunAs,
     program: &'static str,
     args: Vec<String>,
     timeout: Duration,
 ) -> CommandSpec {
     let inner = CommandSpec::new(crate::shell::SETPRIV)
-        .arg(format!("--reuid={}", inst.uid))
-        .arg(format!("--regid={}", inst.gid))
-        .args(["--init-groups", "--reset-env", "--", program])
+        .args(crate::shell::setpriv_args(inst.uid, inst.gid, &run.groups))
+        .args(["--", program])
         .args(args)
         .timeout(timeout)
         .output_cap(64 * 1024);
-    crate::scope::scoped(op_id, inner)
+    crate::scope::scoped_limited(op_id, inner, run.limits)
 }
 
 /// SteamCMD `app_update` as the game user, or `docker pull` (root).
-pub fn install_spec(op_id: u64, t: &Template, name: &GameName, inst: &Instance) -> CommandSpec {
+pub fn install_spec(
+    op_id: u64,
+    t: &Template,
+    name: &GameName,
+    inst: &Instance,
+    run: &RunAs,
+) -> CommandSpec {
     match &t.install {
         Install::Steamcmd { app_id, .. } => as_user(
             op_id,
             inst,
+            run,
             STEAMCMD,
             vec![
                 "+force_install_dir".into(),
@@ -160,10 +260,16 @@ pub fn install_spec(op_id: u64, t: &Template, name: &GameName, inst: &Instance) 
             ],
             INSTALL_TIMEOUT,
         ),
+        // `check_install` refused an unpinned image; the tag is only a
+        // fallback for a template that lost its digest meanwhile.
         Install::Container { image, .. } => crate::scope::scoped(
             op_id,
             CommandSpec::new(template::DOCKER)
-                .args(["pull", "--", image.as_str()])
+                .args([
+                    "pull",
+                    "--",
+                    &t.pinned_image().unwrap_or_else(|| image.clone()),
+                ])
                 .env("HOME", "/root")
                 .timeout(INSTALL_TIMEOUT)
                 .output_cap(64 * 1024),
@@ -173,7 +279,13 @@ pub fn install_spec(op_id: u64, t: &Template, name: &GameName, inst: &Instance) 
 
 /// `tar --zstd --ignore-failed-read -cf <dir>/.fleet-backup.tar.zst -C
 /// <dir> -- <paths>` as the game user.
-pub fn backup_spec(op_id: u64, t: &Template, name: &GameName, inst: &Instance) -> CommandSpec {
+pub fn backup_spec(
+    op_id: u64,
+    t: &Template,
+    name: &GameName,
+    inst: &Instance,
+    run: &RunAs,
+) -> CommandSpec {
     let d = template::dir(name);
     let mut args = vec![
         "--zstd".to_owned(),
@@ -185,28 +297,157 @@ pub fn backup_spec(op_id: u64, t: &Template, name: &GameName, inst: &Instance) -
         "--".to_owned(),
     ];
     args.extend(t.backup.paths.iter().cloned());
-    as_user(op_id, inst, TAR, args, BACKUP_TIMEOUT)
+    as_user(op_id, inst, run, TAR, args, BACKUP_TIMEOUT)
 }
 
 pub fn backup_path(name: &GameName, id: u64) -> String {
     format!("{BACKUP_DIR}/{}/{id}.tar.zst", name.as_str())
 }
 
-/// `tar --zstd -xf <backup> -C <dir>` as the game user.
-pub fn restore_spec(op_id: u64, name: &GameName, inst: &Instance, id: u64) -> CommandSpec {
+/// Largest archive listing read before a restore (members beyond it make
+/// the restore refuse rather than extract unchecked entries).
+pub const LIST_CAP: usize = 32 << 20;
+
+/// `tar --zstd --list --verbose --quoting-style=c -f <backup>` as the game
+/// user: every member (and link target) C-quoted, checked by
+/// [`check_listing`] before anything is extracted.
+pub fn list_spec(
+    op_id: u64,
+    name: &GameName,
+    inst: &Instance,
+    run: &RunAs,
+    id: u64,
+) -> CommandSpec {
+    let mut s = as_user(
+        op_id,
+        inst,
+        run,
+        TAR,
+        vec![
+            "--zstd".into(),
+            "--list".into(),
+            "--verbose".into(),
+            "--quoting-style=c".into(),
+            "-f".into(),
+            backup_path(name, id),
+        ],
+        BACKUP_TIMEOUT,
+    );
+    s.output_cap = LIST_CAP;
+    s
+}
+
+/// `tar --zstd -xf <backup> --no-same-owner --no-same-permissions
+/// --delay-directory-restore -C <dir>` as the game user.
+pub fn restore_spec(
+    op_id: u64,
+    name: &GameName,
+    inst: &Instance,
+    run: &RunAs,
+    id: u64,
+) -> CommandSpec {
     as_user(
         op_id,
         inst,
+        run,
         TAR,
         vec![
             "--zstd".into(),
             "-xf".into(),
             backup_path(name, id),
+            "--no-same-owner".into(),
+            "--no-same-permissions".into(),
+            "--delay-directory-restore".into(),
             "-C".into(),
             template::dir(name),
         ],
         BACKUP_TIMEOUT,
     )
+}
+
+/// One C-quoted string (`--quoting-style=c`) at the start of `s`: the
+/// decoded bytes and the rest after the closing quote.
+fn c_quoted(s: &str) -> Option<(Vec<u8>, &str)> {
+    let body = s.strip_prefix('"')?;
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => return Some((out, &body[i + 1..])),
+            b'\\' => {
+                let c = *b.get(i + 1)?;
+                i += 2;
+                match c {
+                    b'0'..=b'7' => {
+                        let mut v = u32::from(c - b'0');
+                        for _ in 0..2 {
+                            match b.get(i) {
+                                Some(d @ b'0'..=b'7') => {
+                                    v = v * 8 + u32::from(d - b'0');
+                                    i += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        out.push(u8::try_from(v).ok()?);
+                    }
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'a' => out.push(7),
+                    b'b' => out.push(8),
+                    b'f' => out.push(12),
+                    b'v' => out.push(11),
+                    other => out.push(other),
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// A member path that stays inside the extraction directory: relative,
+/// no `..` component.
+fn member_ok(p: &[u8]) -> bool {
+    !p.is_empty() && p[0] != b'/' && p.split(|c| *c == b'/').all(|c| c != b"..")
+}
+
+/// Checks a `tar --list --verbose --quoting-style=c` listing: every member
+/// relative without `..`; symlink targets relative and without `..`
+/// climbing out (any `..` refused); hard link targets likewise. Returns
+/// the refusal reason.
+pub fn check_listing(text: &str, truncated: bool) -> Result<(), &'static str> {
+    if truncated {
+        return Err("archive listing too long");
+    }
+    for l in text.lines().filter(|l| !l.trim().is_empty()) {
+        let kind = l.as_bytes()[0];
+        let q = l.find('"').ok_or("unparsable listing line")?;
+        let (name, rest) = c_quoted(&l[q..]).ok_or("unparsable member name")?;
+        if !member_ok(&name) {
+            return Err("absolute or `..` member path");
+        }
+        let target = match kind {
+            b'l' => Some(rest.strip_prefix(" -> ").ok_or("unparsable symlink")?),
+            b'h' => Some(
+                rest.strip_prefix(" link to ")
+                    .ok_or("unparsable hard link")?,
+            ),
+            _ => None,
+        };
+        if let Some(t) = target {
+            let (t, _) = c_quoted(t).ok_or("unparsable link target")?;
+            if !member_ok(&t) {
+                return Err("link target absolute or with `..`");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Alphanumeric secret from the kernel CSPRNG.
@@ -232,14 +473,37 @@ fn euid_is_root() -> bool {
     rustix::process::geteuid().is_root()
 }
 
-/// chown (root only; tests run unprivileged) + chmod.
+/// `fchown` (root only; tests run unprivileged) + `fchmod` through an fd:
+/// the parents are walked without following symlinks and the file itself
+/// is opened `O_NOFOLLOW`, so a symlink the game user planted is refused
+/// (`ELOOP`) instead of redirecting root's chown.
 fn own(ctx: &SysCtx, abs: &str, uid: u32, gid: u32, mode: u32) -> Result<(), OpError> {
-    use std::os::unix::fs::PermissionsExt;
-    let p = ctx.path(abs).ok_or_else(|| OpError::internal("bad path"))?;
+    use rustix::fs::{self as rfs, Mode, OFlags};
+    let (dir, name) = crate::files::walk::open_parent(ctx, abs)
+        .map_err(|e| OpError::internal(format!("{abs}: {e}")))?;
+    let fd = rfs::openat(
+        &dir,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        rustix::io::Errno::LOOP => {
+            OpError::new(ErrorCode::PolicyDenied).with_detail(format!("{abs}: symlink"))
+        }
+        e => OpError::internal(format!("{abs}: {e}")),
+    })?;
     if euid_is_root() {
-        std::os::unix::fs::lchown(&p, Some(uid), Some(gid)).map_err(OpError::internal)?;
+        rfs::fchown(
+            &fd,
+            Some(rustix::process::Uid::from_raw(uid)),
+            Some(rustix::process::Gid::from_raw(gid)),
+        )
+        .map_err(|e| OpError::internal(format!("{abs}: {e}")))?;
     }
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).map_err(OpError::internal)
+    #[allow(clippy::unnecessary_cast)] // `mode_t` is u16 on macOS (tests)
+    let mode = Mode::from_raw_mode(mode as rustix::fs::RawMode);
+    rfs::fchmod(&fd, mode).map_err(|e| OpError::internal(format!("{abs}: {e}")))
 }
 
 fn remove_file(ctx: &SysCtx, abs: &str) -> Result<(), OpError> {
@@ -262,16 +526,47 @@ pub struct GameService {
     players: RefCell<BTreeMap<String, u32>>,
     last_tick: Cell<Option<u64>>,
     last_players: Cell<u64>,
+    /// Scope limits of SteamCMD and tar runs.
+    tool_limits: ScopeLimits,
 }
 
 impl GameService {
     pub fn new(templates: Vec<Template>, gauges: Rc<dyn GaugeSink>) -> Rc<Self> {
+        Self::with_limits(templates, gauges, ScopeLimits::GAME_TOOL)
+    }
+
+    /// [`GameService::new`] with other scope limits for game tools.
+    pub fn with_limits(
+        templates: Vec<Template>,
+        gauges: Rc<dyn GaugeSink>,
+        tool_limits: ScopeLimits,
+    ) -> Rc<Self> {
         Rc::new(Self {
             templates,
             gauges,
             players: RefCell::default(),
             last_tick: Cell::new(None),
             last_players: Cell::new(0),
+            tool_limits,
+        })
+    }
+
+    /// The game user as tools run it: it must still be the account the
+    /// instance was installed with (same uid and gid), not share its uid
+    /// with another account, and never be uid 0; its groups come from
+    /// `/etc/group`.
+    pub fn run_as(&self, ctx: &SysCtx, name: &GameName, inst: &Instance) -> Result<RunAs, OpError> {
+        let pw = crate::users::passwd(ctx)?;
+        let e = lookup(&pw, &template::user(name))
+            .cloned()
+            .ok_or(not_found("game user"))?;
+        if e.uid == 0 || e.uid != inst.uid || e.gid != inst.gid {
+            return Err(OpError::new(ErrorCode::PolicyDenied).with_detail("game user changed"));
+        }
+        crate::shell::check_unique_uid(ctx, &e)?;
+        Ok(RunAs {
+            groups: crate::shell::group_ids(ctx, &e)?,
+            limits: self.tool_limits,
         })
     }
 
@@ -393,10 +688,13 @@ impl GameService {
             .rcon
             .as_ref()
             .ok_or(OpError::new(ErrorCode::Unsupported).with_detail("no rcon"))?;
+        let inst = self.load(ctx, name)?.ok_or(not_found("no such game"))?;
+        let port = rcon_port(&inst, r);
+        check_rcon_listener(ctx, t, &inst, port)?;
         let pw = self
             .env_value(ctx, name, &r.password_env)?
             .ok_or(not_found("rcon password"))?;
-        rcon::run(r.port, &pw, cmd, rcon::TIMEOUT)
+        rcon::run(port, &pw, cmd, rcon::TIMEOUT)
             .await
             .map_err(|e| match e {
                 rcon::RconError::Timeout => OpError::new(ErrorCode::Timeout),
@@ -422,6 +720,11 @@ impl GameService {
         {
             return Err(OpError::new(ErrorCode::Busy).with_detail("game already exists"));
         }
+        if t.is_container() && t.pinned_image().is_none() {
+            // Tags move; the image must be the one reviewed (design §9.6).
+            return Err(OpError::new(ErrorCode::PolicyDenied)
+                .with_detail("container image not pinned by digest (template `digest`)"));
+        }
         let tool = if t.is_container() {
             template::DOCKER
         } else {
@@ -446,12 +749,28 @@ impl GameService {
         let entry = lookup(&crate::users::passwd(ctx)?, &user)
             .cloned()
             .ok_or_else(|| OpError::internal("game user missing after useradd"))?;
+        let rcon_port = match &t.rcon {
+            Some(_) => {
+                let taken: Vec<u16> = self
+                    .instances(ctx)
+                    .iter()
+                    .filter_map(|(_, i)| i.rcon_port)
+                    .collect();
+                Some(
+                    allocate_rcon_port(ctx, &taken)
+                        .ok_or(OpError::new(ErrorCode::Busy).with_detail("no free rcon port"))?,
+                )
+            }
+            None => None,
+        };
         let inst = Instance {
             template: t.id.clone(),
             uid: entry.uid,
             gid: entry.gid,
             installed_ms: now,
+            rcon_port,
         };
+        let run = self.run_as(ctx, name, &inst)?;
         // Directories: created by root under the root-owned /srv/games, then
         // handed to the (new, process-less) game user.
         let d = template::dir(name);
@@ -473,14 +792,16 @@ impl GameService {
         let rec = toml::to_string(&inst).map_err(OpError::internal)?;
         fswrite::write_atomic(ctx, &template::instance_path(name), rec.as_bytes(), 0o600)?;
         // Unit.
-        let unit = template::render_unit(t, name, inst.uid, inst.gid);
+        let unit = template::render_unit(t, name, inst.uid, inst.gid, inst.rcon_port)?;
         fswrite::write_atomic(ctx, &template::unit_path(name), unit.as_bytes(), 0o644)?;
         ok(
             ctx.runner.run(systemctl(&["daemon-reload"])).await,
             "daemon-reload",
         )?;
         ok(
-            ctx.runner.run(install_spec(op_id, t, name, &inst)).await,
+            ctx.runner
+                .run(install_spec(op_id, t, name, &inst, &run))
+                .await,
             "install",
         )?;
         ok(
@@ -557,8 +878,11 @@ impl GameService {
         }
         let stage = format!("{}/{STAGE}", template::dir(name));
         remove_file(ctx, &stage)?;
+        let run = self.run_as(ctx, name, inst)?;
         ok(
-            ctx.runner.run(backup_spec(op_id, t, name, inst)).await,
+            ctx.runner
+                .run(backup_spec(op_id, t, name, inst, &run))
+                .await,
             "tar",
         )?;
         // Copy out as root, never following a link the game user planted.
@@ -584,7 +908,7 @@ impl GameService {
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
                 .mode(0o640)
                 .open(&tmp)
                 .map_err(OpError::internal)?
@@ -619,10 +943,24 @@ impl GameService {
         id: u64,
         op_id: u64,
     ) -> Result<(), OpError> {
+        let run = self.run_as(ctx, name, inst)?;
+        // List first, as the game user: nothing is extracted from an
+        // archive with absolute or `..` paths or links pointing out.
+        let listing = ctx
+            .runner
+            .run(list_spec(op_id, name, inst, &run, id))
+            .await?;
+        if !listing.success() {
+            return Err(internal("tar --list", &listing));
+        }
+        check_listing(&String::from_utf8_lossy(&listing.stdout), listing.truncated)
+            .map_err(|d| OpError::new(ErrorCode::PolicyDenied).with_detail(d))?;
         let unit = template::unit(name);
         ok(ctx.runner.run(systemctl(&["stop", &unit])).await, "stop")?;
         ok(
-            ctx.runner.run(restore_spec(op_id, name, inst, id)).await,
+            ctx.runner
+                .run(restore_spec(op_id, name, inst, &run, id))
+                .await,
             "tar",
         )?;
         ok(ctx.runner.run(systemctl(&["start", &unit])).await, "start")
@@ -803,11 +1141,14 @@ impl OpHandler for GameOps {
                 }
                 Op::GameUpdate { name } => {
                     let (inst, t) = s.get(ctx, name)?;
+                    let run = s.run_as(ctx, name, &inst)?;
                     let unit = template::unit(name);
                     let was = s.is_active(ctx, name).await;
                     ok(ctx.runner.run(systemctl(&["stop", &unit])).await, "stop")?;
                     ok(
-                        ctx.runner.run(install_spec(op_id()?, t, name, &inst)).await,
+                        ctx.runner
+                            .run(install_spec(op_id()?, t, name, &inst, &run))
+                            .await,
                         "update",
                     )?;
                     if was {

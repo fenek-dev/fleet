@@ -62,6 +62,8 @@ struct BuiltinFile {
     #[serde(default)]
     auditd: AuditdSettings,
     #[serde(default)]
+    admin_shell: AdminShellSettings,
+    #[serde(default)]
     journald: JournaldSettings,
     #[serde(default)]
     packages: PackageSettings,
@@ -99,6 +101,13 @@ struct SudoSettings {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuditdSettings {
+    immutable: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminShellSettings {
+    /// `chattr +i` on the admin's shell startup files.
     immutable: Option<bool>,
 }
 
@@ -247,11 +256,11 @@ struct CustomHeader {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdminSection {
+    /// No `password_hash` here: the sudo password hash comes only in
+    /// `profile.apply`'s own field, which makes the op Elevated and is
+    /// redacted in the audit log (a hash in the TOML would be stored in
+    /// the clear in the audit args).
     user: String,
-    /// crypt(3) hash of the per-server sudo password, computed on the Mac
-    /// (yescrypt `$y$` or sha512-crypt `$6$`). Never plaintext.
-    #[serde(default)]
-    password_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,6 +378,8 @@ pub struct Settings {
     pub ssh_rate: (u32, u16),
     pub sudo_log_io: bool,
     pub auditd_immutable: bool,
+    /// Strict: the admin's shell startup files are also `chattr +i`.
+    pub admin_shell_immutable: bool,
     pub journald_max_use: String,
     pub packages: Vec<String>,
     pub blacklist: BTreeSet<String>,
@@ -410,8 +421,8 @@ impl Resolved {
 
     /// Sets the admin's sudo password hash from `profile.apply`
     /// (`admin.user` then runs `chpasswd --encrypted`). Refused without an
-    /// admin, for the redacted audit form, and when the profile TOML
-    /// already names a different hash.
+    /// admin and for the redacted audit form. The op field is the only
+    /// source of the hash (profile TOML has no `password_hash`).
     pub fn set_password(&mut self, h: &SudoPasswordHash) -> Result<(), ProfileError> {
         if h.is_redacted() {
             return err("password_hash: a crypt(3) hash, not the audit form");
@@ -419,15 +430,8 @@ impl Resolved {
         let Some(admin) = self.admin.as_mut() else {
             return err("password_hash needs an admin user");
         };
-        match &admin.password_hash {
-            Some(cur) if cur != h => {
-                err("password_hash given both in the profile and in the command")
-            }
-            _ => {
-                admin.password_hash = Some(h.clone());
-                Ok(())
-            }
-        }
+        admin.password_hash = Some(h.clone());
+        Ok(())
     }
 
     pub fn role(&self, r: ProfileRole) -> Option<&RoleManifest> {
@@ -591,6 +595,9 @@ pub fn builtin(level: ProfileLevel, roles: &[ProfileRole]) -> Result<Resolved, P
         if let Some(v) = f.auditd.immutable {
             s.auditd_immutable = v;
         }
+        if let Some(v) = f.admin_shell.immutable {
+            s.admin_shell_immutable = v;
+        }
         if let Some(v) = &f.journald.system_max_use {
             s.journald_max_use.clone_from(v);
         }
@@ -713,20 +720,12 @@ pub fn parse_custom(text: &str) -> Result<Resolved, ProfileError> {
     }
     if let Some(a) = f.admin {
         let user = UserName::new(a.user.as_str()).map_err(|_| ProfileError("admin user".into()))?;
-        if user.as_str() == "root" {
-            return err("admin user can't be root");
+        if user.is_root() || user.is_fleet() {
+            return err("admin user can't be root or a fleet* account");
         }
-        let password_hash = match a.password_hash {
-            Some(h) => Some(SudoPasswordHash::crypt(h).map_err(|_| {
-                ProfileError(
-                    "admin password_hash: a crypt(3) hash ($y$ or $6$), never plaintext".into(),
-                )
-            })?),
-            None => None,
-        };
         p.admin = Some(Admin {
             name: user.as_str().to_owned(),
-            password_hash,
+            password_hash: None,
         });
     }
     if let Some(ssh) = f.ssh {
@@ -769,9 +768,21 @@ pub fn parse_custom(text: &str) -> Result<Resolved, ProfileError> {
 /// The admin user exec keeps roster keys for: the only file under
 /// `/etc/fleet/authorized_keys/` with a managed roster section.
 pub fn detect_admin(sys: &SysCtx) -> Option<String> {
-    let dir = sys.path(authorized_keys::DIR)?;
+    let mut found = roster_users(sys);
+    (found.len() == 1).then(|| found.remove(0))
+}
+
+/// Every user whose file under `/etc/fleet/authorized_keys/` has a managed
+/// roster section (at most 256 entries are looked at).
+pub fn roster_users(sys: &SysCtx) -> Vec<String> {
+    let Some(dir) = sys.path(authorized_keys::DIR) else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
-    for e in std::fs::read_dir(dir).ok()?.flatten().take(256) {
+    for e in rd.flatten().take(256) {
         let Some(name) = e.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -781,7 +792,8 @@ pub fn detect_admin(sys: &SysCtx) -> Option<String> {
             found.push(name);
         }
     }
-    (found.len() == 1).then(|| found.remove(0))
+    found.sort();
+    found
 }
 
 /// `ProfileSpec` → resolved profile, `only` checked against its modules.

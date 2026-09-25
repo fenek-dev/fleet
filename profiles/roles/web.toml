@@ -18,8 +18,11 @@ rate = "20r/s"
 [apt_repo]
 name = "caddy"
 key_url = "https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
-# Caddy stable (Cloudsmith) signing key; verify against caddyserver.com
-# before a release.
+# Caddy stable (Cloudsmith) signing key. UNVERIFIED: caddyserver.com/docs/install
+# publishes only the key URL, no fingerprint (checked 2026-09-25), so this
+# value is not confirmed from an official source. Confirm it out of band
+# (e.g. Cloudsmith's repository page or Caddy maintainers) before a release;
+# the agent refuses a downloaded key with any other primary fingerprint.
 fingerprint = "65760C51EDEA2017CEA2CA15155B6D79CA56EA34"
 uri = "https://dl.cloudsmith.io/public/caddy/stable/deb/debian"
 suite = "any-version"

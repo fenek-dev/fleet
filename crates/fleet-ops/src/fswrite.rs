@@ -24,13 +24,10 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
-/// First 8 bytes (LE) of BLAKE3: the `expected_version` of a replaced
-/// file or section.
+/// The `expected_version` of a replaced file or section
+/// ([`fleet_proto::version::content_version`]).
 pub fn version_of(bytes: &[u8]) -> u64 {
-    let h = blake3::hash(bytes);
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&h.as_bytes()[..8]);
-    u64::from_le_bytes(b)
+    fleet_proto::version::content_version(bytes)
 }
 
 fn euid() -> u32 {

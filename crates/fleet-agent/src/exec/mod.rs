@@ -47,7 +47,7 @@ pub use state::{StoredPolicy, load_signing_key};
 use crate::now_ms;
 use crate::paths::Paths;
 use crate::pending::{ChangeKind, PendingChange, PendingError, SessionId};
-use crate::revert::{RegistryRevert, Revert};
+use crate::revert::{self, RegistryRevert, Revert};
 use crate::store::StoreError;
 use conn::{Budget, ConnGuard};
 use fleet_crypto::receipt::{receipt_for, sign_receipt};
@@ -125,8 +125,14 @@ pub struct ExecConfig {
     /// Snapshot modules for auto-revert ops, by kind (§4.10). An auto-revert
     /// op whose kind has none is refused with `Unsupported`.
     pub reverters: Reverters,
-    /// Runs `systemd-run`/`systemctl` for auto-revert timers (blocking,
-    /// `revert::TIMER_COMMAND_TIMEOUT` each).
+    /// Where snapshots and restores run: `Some` builds a
+    /// [`RegistryRevert`] on the blocking pool for each (production:
+    /// [`revert::system_offload`]), so synchronous file, `nft` and
+    /// `systemctl` work never blocks the runtime; `None` runs `reverters`
+    /// and `reverter` inline (tests with fakes that aren't `Send`).
+    pub offload: Option<revert::OffloadReverter>,
+    /// Runs `systemd-run`/`systemctl` for auto-revert timers (through the
+    /// async runner, `revert::TIMER_COMMAND_TIMEOUT` each).
     pub timers: Rc<dyn CommandRunner>,
     /// `None`: [`SshdTerminator`] over the sshd journal's logins and
     /// `<ctx root>/proc`.
@@ -172,6 +178,7 @@ impl ExecConfig {
             maintenance_interval: Duration::from_secs(5),
             reverter: Box::new(RegistryRevert::system()),
             reverters: fleet_hardening::reverters(),
+            offload: Some(revert::system_offload()),
             timers: Rc::new(fleet_ops::SystemRunner),
             terminator: None,
             ctx: SysCtx::system(),
@@ -243,6 +250,8 @@ struct Exec {
     st: Rc<RefCell<State>>,
     registry: Registry,
     reverters: Reverters,
+    /// `ExecConfig::offload`.
+    offload: Option<revert::OffloadReverter>,
     ctx: SysCtx,
     /// Streams running across all connections
     /// (`limits.max_stream_sessions`), and per device.
@@ -267,15 +276,18 @@ struct Exec {
     confirm_sshd_login: Option<Duration>,
 }
 
-/// Marks a change kind as being applied; released on drop.
+/// Marks the change kinds an op claims as being applied; released on drop.
 struct KindSlot {
     kinds: Rc<Exec>,
-    kind: ChangeKind,
+    claimed: Vec<ChangeKind>,
 }
 
 impl Drop for KindSlot {
     fn drop(&mut self) {
-        self.kinds.kinds.borrow_mut().remove(&self.kind);
+        let mut k = self.kinds.kinds.borrow_mut();
+        for c in &self.claimed {
+            k.remove(c);
+        }
     }
 }
 
@@ -365,11 +377,14 @@ impl Exec {
                 .map_err(refuse)?;
         }
         // One pending change per kind: a second snapshot would capture the
-        // first, unconfirmed change, and the reverts would fight.
-        if let Some((kind, _)) = &revertible
-            && self.kind_busy(*kind).map_err(refuse)?
-        {
-            return Err(refuse(ErrorCode::Busy));
+        // first, unconfirmed change, and the reverts would fight. A profile
+        // change that may run `firewall.baseline` holds the firewall too.
+        if revertible.is_some() {
+            for kind in fleet_ops::revertible::claimed_kinds(op) {
+                if self.kind_busy(kind).map_err(refuse)? {
+                    return Err(refuse(ErrorCode::Busy));
+                }
+            }
         }
         let intent_seq = self
             .st
@@ -377,10 +392,11 @@ impl Exec {
             .commit_intent(&meta.command, cmd, now)?;
         meta.audit_seq = Some(intent_seq);
         let revertible = revertible.map(|(kind, r)| {
-            self.kinds.borrow_mut().insert(kind);
+            let claimed = fleet_ops::revertible::claimed_kinds(op);
+            self.kinds.borrow_mut().extend(claimed.iter().copied());
             let slot = KindSlot {
                 kinds: self.clone(),
-                kind,
+                claimed,
             };
             (kind, r, slot)
         });
@@ -442,9 +458,14 @@ impl Exec {
             log("scan pending", e);
             ErrorCode::Internal
         })?;
-        Ok(entries
-            .iter()
-            .any(|e| e.value.as_ref().is_none_or(|c| c.kind == kind)))
+        // A pending profile change may hold the firewall table too (its
+        // revert restores it): conservatively, any pending profile change
+        // blocks firewall changes.
+        Ok(entries.iter().any(|e| {
+            e.value.as_ref().is_none_or(|c| {
+                c.kind == kind || (kind == ChangeKind::Firewall && c.kind == ChangeKind::Profile)
+            })
+        }))
     }
 
     /// Runs an admitted request: plain ops through their handler, auto-revert
@@ -668,6 +689,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     let ctx = cfg.ctx.clone();
     let extra = std::mem::take(&mut cfg.handlers);
     let reverters = std::mem::take(&mut cfg.reverters);
+    let offload = cfg.offload.take();
     let (checkpoint_every, send_timeout) =
         (cfg.stream_checkpoint_interval, cfg.stream_send_timeout);
     let (compact_every, compact_force_after) = (cfg.compact_interval, cfg.compact_force_after);
@@ -692,7 +714,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         timers: cfg.timers,
         terminator,
     })?;
-    state.startup(now_ms())?;
+    let rearm = state.startup(now_ms())?;
 
     let listener = conn::bind_exec_socket(&paths)?;
     crate::notify::notify("READY=1");
@@ -721,6 +743,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         st: st.clone(),
         registry,
         reverters,
+        offload,
         ctx,
         streams: Cell::new(0),
         device_streams: RefCell::default(),
@@ -741,6 +764,17 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
+            {
+                // Confirm timers of changes still pending (dropped by a
+                // reboot). Fails harmlessly if a timer survived (exec
+                // restart); maintenance reverts on the deadline regardless.
+                let timers = st.borrow().timers.clone();
+                for (id, secs) in rearm {
+                    if let Err(e) = revert::arm_timer_async(timers.as_ref(), id, secs).await {
+                        log(&format!("re-arm revert timer {id}"), e);
+                    }
+                }
+            }
             tokio::task::spawn_local(tel.clone().run(exec.ctx.clone()));
             sources.spawn();
             if background {
@@ -772,7 +806,18 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
                         }
                     }
                     _ = maint.tick() => {
-                        st.borrow_mut().maintenance(now_ms());
+                        let due = st.borrow_mut().maintenance(now_ms());
+                        for id in due {
+                            // Off the main loop: the restore may take a
+                            // while (files, nft, reloads).
+                            let exec = exec.clone();
+                            tokio::task::spawn_local(async move {
+                                if let Err(e) = exec.revert_change(id).await {
+                                    log(&format!("revert {id}"), e);
+                                }
+                                exec.st.borrow_mut().reverted(id);
+                            });
+                        }
                         bus.flush();
                         maybe_compact(&exec, &compaction, compact_force_after);
                     }

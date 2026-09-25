@@ -17,6 +17,12 @@ log_io = true
 # `-e 2`: rules can't change until the next reboot (PendingReboot).
 immutable = true
 
+[admin_shell]
+# The admin's shell startup files are also `chattr +i` (root can still
+# clear it; the admin can't replace or rename them even with a writable
+# home directory).
+immutable = true
+
 [kernel]
 blacklist = ["usb-storage"]
 

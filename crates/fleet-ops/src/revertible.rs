@@ -35,6 +35,50 @@ pub trait Revertible {
     /// `revert <id>` process (no redb, no exec state) or in exec at startup
     /// / maintenance, possibly after a reboot; must be idempotent.
     fn restore(&self, ctx: &SysCtx, snapshot: &[u8]) -> Result<(), OpError>;
+
+    /// [`Revertible::restore`] knowing the change's `new_version` (what
+    /// the handler reported after applying; `None` when it failed or
+    /// reported none). Modules that restore several parts (the profile's
+    /// files plus the firewall) use it to skip a part whose state moved
+    /// on; the default ignores it.
+    fn restore_versioned(
+        &self,
+        ctx: &SysCtx,
+        snapshot: &[u8],
+        new_version: Option<u64>,
+    ) -> Result<(), OpError> {
+        let _ = new_version;
+        self.restore(ctx, snapshot)
+    }
+}
+
+/// Every kind an op holds while it is applying or pending (one change per
+/// kind, design §4.10): its own, plus [`ChangeKind::Firewall`] for a
+/// `profile.apply` whose scope may run `firewall.baseline` (the profile's
+/// revert restores the table too, so a `firewall.apply` meanwhile would
+/// fight it).
+pub fn claimed_kinds(op: &Op) -> Vec<ChangeKind> {
+    let Some(k) = change_kind(op) else {
+        return Vec::new();
+    };
+    let mut v = vec![k];
+    if let Op::ProfileApply { spec, phase, .. } = op
+        && profile_touches_firewall(spec, *phase)
+    {
+        v.push(ChangeKind::Firewall);
+    }
+    v
+}
+
+/// A `profile.apply` of `spec` in `phase` may run `firewall.baseline`.
+pub fn profile_touches_firewall(
+    spec: &fleet_proto::op::ProfileSpec,
+    phase: fleet_proto::op::ProfilePhase,
+) -> bool {
+    use fleet_proto::op::ProfilePhase;
+    let listed =
+        spec.only.is_empty() || spec.only.iter().any(|m| m.as_str() == "firewall.baseline");
+    matches!(phase, ProfilePhase::Access | ProfilePhase::All) && listed
 }
 
 /// The kind an auto-revert op snapshots; `None` for every other op.
@@ -99,9 +143,21 @@ impl Reverters {
 
     /// Restores `snapshot` with the module for `kind`; `Unsupported` if none.
     pub fn restore(&self, ctx: &SysCtx, kind: ChangeKind, snapshot: &[u8]) -> Result<(), OpError> {
+        self.restore_versioned(ctx, kind, snapshot, None)
+    }
+
+    /// [`Reverters::restore`] with the change's `new_version`
+    /// ([`Revertible::restore_versioned`]).
+    pub fn restore_versioned(
+        &self,
+        ctx: &SysCtx,
+        kind: ChangeKind,
+        snapshot: &[u8],
+        new_version: Option<u64>,
+    ) -> Result<(), OpError> {
         self.get(kind)
             .ok_or(OpError::new(fleet_proto::ErrorCode::Unsupported))?
-            .restore(ctx, snapshot)
+            .restore_versioned(ctx, snapshot, new_version)
     }
 }
 
@@ -120,6 +176,38 @@ mod tests {
             *self.0.borrow_mut() = s.to_vec();
             Ok(())
         }
+    }
+
+    #[test]
+    fn profile_changes_touching_the_firewall_claim_it() {
+        use fleet_proto::args::ModuleId;
+        use fleet_proto::op::{ProfileLevel, ProfilePhase, ProfileSource, ProfileSpec};
+        let apply = |only: &[&str], phase| Op::ProfileApply {
+            spec: ProfileSpec {
+                source: ProfileSource::Builtin {
+                    level: ProfileLevel::Baseline,
+                    roles: vec![],
+                },
+                only: only.iter().map(|m| ModuleId::new(*m).unwrap()).collect(),
+            },
+            plan_hash: [0; 32],
+            phase,
+            password_hash: None,
+        };
+        use ChangeKind::{Firewall, Profile};
+        assert_eq!(
+            claimed_kinds(&apply(&[], ProfilePhase::Access)),
+            [Profile, Firewall]
+        );
+        assert_eq!(
+            claimed_kinds(&apply(&["ssh.hardening"], ProfilePhase::Access)),
+            [Profile]
+        );
+        assert_eq!(
+            claimed_kinds(&apply(&["firewall.baseline"], ProfilePhase::All)),
+            [Profile, Firewall]
+        );
+        assert_eq!(claimed_kinds(&Op::SystemInfo), []);
     }
 
     #[test]

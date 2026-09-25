@@ -5,6 +5,10 @@
 //! 2. `/usr/bin/systemctl show --property=… -- <units>`
 //! 3. `/usr/sbin/auditctl -s` (only when `auditd` is installed)
 //! 4. `/usr/sbin/nft -j list table inet fleet`
+//! 5. `/usr/sbin/sshd -T -C user=<admin>,host=localhost,addr=127.0.0.1`
+//!    (only when the profile runs `ssh.hardening` and has an admin)
+//! 6. `/usr/bin/gpg … --with-colons --show-keys` of each existing role
+//!    apt key file (stdin)
 //!
 //! Plus files: `/etc/os-release`, `/var/lib/dpkg/status`, `/proc/meminfo`,
 //! `/proc/swaps`, `/sys/module/apparmor/parameters/enabled`,
@@ -74,6 +78,24 @@ pub struct Facts {
     pub boot_id: String,
     /// `Err`: nft failed or the listing didn't parse.
     pub firewall: Option<Result<Table, String>>,
+    /// sshd's effective configuration for the admin (`sshd -T -C …`):
+    /// `(keyword, value)` lines, keyword lowercase. `None`: not gathered.
+    pub sshd_effective: Option<Vec<(String, String)>>,
+    /// Primary-key fingerprints of existing role apt key files, by path
+    /// (`gpg --show-keys`; empty when gpg failed). Absent: not gathered
+    /// (no such file).
+    pub key_fingerprints: BTreeMap<String, Vec<String>>,
+}
+
+/// `sshd -T` output → `(keyword, value)` pairs (keyword lowercased).
+pub fn parse_sshd_t(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let (k, v) = l.trim().split_once(' ')?;
+            Some((k.to_ascii_lowercase(), v.trim().to_owned()))
+        })
+        .take(4096)
+        .collect()
 }
 
 impl Facts {
@@ -181,8 +203,21 @@ pub fn units_spec(names: &[String]) -> CommandSpec {
         .timeout(T_FACT)
 }
 
-/// Reads every fact; `units` are the unit names modules ask about.
-pub async fn gather(sys: &SysCtx, units: &[String]) -> Facts {
+/// What [`gather`] needs to know beyond the fixed facts.
+#[derive(Debug, Clone, Default)]
+pub struct Wanted {
+    /// Unit names modules ask about.
+    pub units: Vec<String>,
+    /// The admin whose effective sshd settings to read.
+    pub sshd_user: Option<String>,
+    /// Role apt key files whose fingerprints to read.
+    pub key_files: Vec<String>,
+}
+
+/// Reads every fact.
+pub async fn gather(sys: &SysCtx, want: &Wanted) -> Facts {
+    let units = want.units.as_slice();
+    let sshd_user = want.sshd_user.as_deref();
     let mut f = Facts {
         os: parse_os_release(&read_small(sys, "/etc/os-release")),
         mem_total_kib: parse_meminfo_total(&read_small(sys, "/proc/meminfo")),
@@ -231,5 +266,27 @@ pub async fn gather(sys: &SysCtx, units: &[String]) -> Facts {
         firewall::table_from(sys.runner.run(firewall::list_table_spec()).await)
             .map_err(|e| e.detail().unwrap_or("nft failed").to_owned()),
     );
+    if let Some(user) = sshd_user
+        && let Ok(o) = sys
+            .runner
+            .run(crate::modules::ssh::effective_spec(user).timeout(T_FACT))
+            .await
+        && o.success()
+    {
+        f.sshd_effective = Some(parse_sshd_t(&String::from_utf8_lossy(&o.stdout)));
+    }
+    for key in &want.key_files {
+        let Ok(Some(bytes)) = fleet_ops::fswrite::read_regular(sys, key, 64 << 10) else {
+            continue;
+        };
+        let _ = fleet_ops::fswrite::ensure_dir(sys, crate::exec::GNUPG_HOME, 0o700);
+        let fprs = match sys.runner.run(crate::exec::gpg_show_spec(bytes)).await {
+            Ok(o) if o.success() => {
+                crate::exec::primary_fingerprints(&String::from_utf8_lossy(&o.stdout))
+            }
+            _ => Vec::new(),
+        };
+        f.key_fingerprints.insert(key.clone(), fprs);
+    }
     f
 }

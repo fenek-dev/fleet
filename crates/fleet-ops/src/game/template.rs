@@ -58,7 +58,12 @@ pub enum Install {
         env: Vec<String>,
     },
     Container {
+        /// `repo:tag`, or `repo@sha256:<hex>` (pinned).
         image: String,
+        /// `sha256:<64 hex>`: the digest `image` must resolve to. Install
+        /// refuses an image pinned neither here nor in `image`.
+        #[serde(default)]
+        digest: Option<String>,
         data_dir: String,
         /// `NAME=value`, or `NAME` to pass through from the environment.
         #[serde(default)]
@@ -283,12 +288,20 @@ impl Template {
             }
             Install::Container {
                 image,
+                digest,
                 data_dir,
                 env,
                 args,
             } => {
                 if !token_ok(image) || image.contains(['$', '{']) || image.starts_with('-') {
                     return bad("image");
+                }
+                let inline = image.split_once('@');
+                if inline.is_some_and(|(r, d)| r.is_empty() || !digest_ok(d))
+                    || digest.as_deref().is_some_and(|d| !digest_ok(d))
+                    || (inline.is_some() && digest.is_some())
+                {
+                    return bad("image digest");
                 }
                 if !data_dir.starts_with('/')
                     || !token_ok(data_dir)
@@ -359,6 +372,48 @@ impl Template {
     pub fn is_container(&self) -> bool {
         matches!(self.install, Install::Container { .. })
     }
+
+    /// The container image pinned by digest (`repo@sha256:…`), or `None`
+    /// for a tag-only image (install refuses it) and native games.
+    pub fn pinned_image(&self) -> Option<String> {
+        let Install::Container { image, digest, .. } = &self.install else {
+            return None;
+        };
+        match digest {
+            Some(d) => {
+                let repo = image.split_once('@').map_or(image.as_str(), |(r, _)| r);
+                Some(format!("{repo}@{d}"))
+            }
+            None => image.contains('@').then(|| image.clone()),
+        }
+    }
+}
+
+/// `sha256:` and 64 lowercase hex digits.
+fn digest_ok(d: &str) -> bool {
+    d.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Docker `--cpus` from a systemd `CPUQuota` (`300%` → `3`, `150%` →
+/// `1.5`).
+pub fn cpus_of(quota: &str) -> Option<String> {
+    let pct: u32 = quota.strip_suffix('%')?.parse().ok()?;
+    if pct == 0 {
+        return None;
+    }
+    let whole = pct / 100;
+    let frac = pct % 100;
+    Some(if frac == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{frac:02}")
+            .trim_end_matches('0')
+            .to_owned()
+    })
 }
 
 /// Every built-in template (a broken one is a build defect: tests parse
@@ -402,11 +457,44 @@ pub fn expand(s: &str, name: &GameName) -> String {
         .replace("{name}", name.as_str())
 }
 
+/// Extra sandboxing of native (SteamCMD) game units: no capabilities, no
+/// devices, namespaces, foreign address families or non-service syscalls,
+/// other processes hidden, kernel logs and clock off limits, files 0027.
+/// Container units run the Docker CLI instead (the container gets
+/// `--cap-drop ALL` and its own limits).
+pub const NATIVE_HARDENING: &str = "CapabilityBoundingSet=\n\
+AmbientCapabilities=\n\
+PrivateDevices=yes\n\
+RestrictNamespaces=yes\n\
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n\
+SystemCallFilter=@system-service\n\
+SystemCallArchitectures=native\n\
+ProtectProc=invisible\n\
+ProtectKernelLogs=yes\n\
+ProtectClock=yes\n\
+UMask=0027\n";
+
 /// The hardened unit (design §9.6). SteamCMD games run as `game-<name>`;
 /// container games run the Docker CLI as root and the container as
-/// `<uid>:<gid>` without capabilities.
-pub fn render_unit(t: &Template, name: &GameName, uid: u32, gid: u32) -> String {
+/// `<uid>:<gid>` without capabilities. `rcon_port` is the instance's
+/// loopback RCON port (`{rcon_port}` in native args; the host side of the
+/// container's RCON publish). A container image must be pinned by digest.
+pub fn render_unit(
+    t: &Template,
+    name: &GameName,
+    uid: u32,
+    gid: u32,
+    rcon_port: Option<u16>,
+) -> Result<String, crate::handler::OpError> {
     let d = dir(name);
+    let rport = rcon_port.or(t.rcon.as_ref().map(|r| r.port));
+    let expand_rcon = |s: &str| {
+        let s = expand(s, name);
+        match rport {
+            Some(p) => s.replace("{rcon_port}", &p.to_string()),
+            None => s,
+        }
+    };
     let mut s = String::new();
     let _ = write!(
         s,
@@ -443,16 +531,21 @@ pub fn render_unit(t: &Template, name: &GameName, uid: u32, gid: u32) -> String 
             let mut line = format!("{d}/server/{exec}");
             for a in args {
                 line.push(' ');
-                line.push_str(&expand(a, name));
+                line.push_str(&expand_rcon(a));
             }
             let _ = writeln!(s, "ExecStart={line}");
+            s.push_str(NATIVE_HARDENING);
         }
         Install::Container {
-            image,
             data_dir,
             env,
             args,
+            ..
         } => {
+            let image = t.pinned_image().ok_or_else(|| {
+                crate::handler::OpError::new(fleet_proto::ErrorCode::PolicyDenied)
+                    .with_detail("container image not pinned by digest")
+            })?;
             let _ = writeln!(
                 s,
                 "WorkingDirectory={d}\nEnvironmentFile={}",
@@ -465,12 +558,19 @@ pub fn render_unit(t: &Template, name: &GameName, uid: u32, gid: u32) -> String 
                 mem = t.limits.memory_max,
                 tasks = t.limits.tasks_max,
             );
+            if let Some(cpus) = t.limits.cpu_quota.as_deref().and_then(cpus_of) {
+                let _ = write!(line, " --cpus {cpus}");
+            }
+            // Explicit wildcard binds: the daemon's default bind address
+            // is 127.0.0.1 (design §9.6), and the `forward` chain of
+            // `inet fleet` decides who reaches the port.
             for p in &t.ports {
                 let r = p.text();
-                let _ = write!(line, " -p {r}:{r}/{}", p.proto.as_str());
+                let proto = p.proto.as_str();
+                let _ = write!(line, " -p 0.0.0.0:{r}:{r}/{proto} -p [::]:{r}:{r}/{proto}");
             }
-            if let Some(r) = &t.rcon {
-                let _ = write!(line, " -p 127.0.0.1:{p}:{p}/tcp", p = r.port);
+            if let (Some(r), Some(host)) = (&t.rcon, rport) {
+                let _ = write!(line, " -p 127.0.0.1:{host}:{}/tcp", r.port);
             }
             let _ = write!(line, " -v {d}/data:{data_dir}");
             for e in env {
@@ -483,7 +583,7 @@ pub fn render_unit(t: &Template, name: &GameName, uid: u32, gid: u32) -> String 
             }
             let _ = write!(line, " {image}");
             for a in args {
-                let _ = write!(line, " {}", expand(a, name));
+                let _ = write!(line, " {}", expand_rcon(a));
             }
             let _ = writeln!(s, "ExecStart={line}");
             let _ = writeln!(s, "ExecStop={DOCKER} stop --time 30 {}", user(name));
@@ -512,5 +612,5 @@ pub fn render_unit(t: &Template, name: &GameName, uid: u32, gid: u32) -> String 
         let _ = writeln!(s, "CPUQuota={c}");
     }
     s.push_str("\n[Install]\nWantedBy=multi-user.target\n");
-    s
+    Ok(s)
 }

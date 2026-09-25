@@ -38,6 +38,67 @@ fn no_admin() -> Status {
     )
 }
 
+/// Whether `shell` is a real login shell: not `nologin`/`false`, absolute,
+/// and listed in `/etc/shells` when that file exists.
+fn valid_login_shell(ctx: &Ctx, e: &parse::PasswdEntry) -> Result<bool, OpError> {
+    if !e.can_login() || !e.shell.starts_with('/') {
+        return Ok(false);
+    }
+    let shells = read_text(&ctx.sys, "/etc/shells")?;
+    if shells.trim().is_empty() {
+        return Ok(true);
+    }
+    Ok(shells.lines().any(|l| l.trim() == e.shell))
+}
+
+/// Why `name` can't be the admin (design §9.4), or `Ok(None)` when it
+/// doesn't exist yet (`useradd` then picks a uid ≥ `UID_MIN`). An existing
+/// admin must be a regular account (uid ≥ `UID_MIN`, never 0), not a
+/// `fleet*` account, and have a valid login shell: making a system or
+/// service account the sudo admin (or locking SSH to it) would be wrong
+/// either way.
+pub fn admin_problem(ctx: &Ctx, name: &str) -> Result<Option<String>, OpError> {
+    if name == "root" || name.starts_with("fleet") {
+        return Ok(Some(format!("{name} can't be the admin")));
+    }
+    let pw = users::passwd(&ctx.sys)?;
+    let Some(e) = parse::lookup(&pw, name) else {
+        return Ok(None);
+    };
+    let (uid_min, _) = users::uid_range(&ctx.sys)?;
+    if e.uid == 0 || e.uid < uid_min {
+        return Ok(Some(format!(
+            "admin {name} has uid {} (needs a regular account, uid ≥ {uid_min})",
+            e.uid
+        )));
+    }
+    if !valid_login_shell(ctx, e)? {
+        return Ok(Some(format!(
+            "admin {name} has no valid login shell ({:?})",
+            e.shell
+        )));
+    }
+    Ok(None)
+}
+
+fn admin_denied(detail: String) -> OpError {
+    OpError::new(fleet_proto::ErrorCode::PolicyDenied).with_detail(detail)
+}
+
+/// `admin_problem` as an error (`PolicyDenied`), for plan/apply paths.
+pub fn ensure_admin_ok(ctx: &Ctx, name: &str) -> Result<(), OpError> {
+    match admin_problem(ctx, name)? {
+        Some(p) => Err(admin_denied(p)),
+        None => Ok(()),
+    }
+}
+
+/// Users with a Fleet roster section under `/etc/fleet/authorized_keys`
+/// (the admin, and any other account exec writes roster keys for).
+pub fn roster_users(ctx: &Ctx) -> Vec<String> {
+    crate::profile::roster_users(&ctx.sys)
+}
+
 // ---- admin.user ----
 
 /// The admin user (design §9.4): exists, in `sudo`, sudo password set from
@@ -65,6 +126,9 @@ impl Module for AdminUser {
         let Some(admin) = &ctx.profile.admin else {
             return Ok(no_admin());
         };
+        if let Some(p) = admin_problem(ctx, &admin.name)? {
+            return Ok(Status::Drifted(p));
+        }
         let plan = self.plan(ctx)?;
         if !plan.is_empty() {
             return Ok(status_of(&plan));
@@ -88,6 +152,7 @@ impl Module for AdminUser {
             return Ok(Vec::new());
         };
         let name = admin.name.as_str();
+        ensure_admin_ok(ctx, name)?;
         let mut plan = Vec::new();
         let pw = users::passwd(&ctx.sys)?;
         match parse::lookup(&pw, name) {
@@ -196,8 +261,11 @@ impl Module for AdminShell {
     }
 
     fn check(&self, ctx: &Ctx) -> Result<Status, OpError> {
-        if ctx.profile.admin.is_none() {
+        let Some(admin) = &ctx.profile.admin else {
             return Ok(no_admin());
+        };
+        if let Some(p) = admin_problem(ctx, &admin.name)? {
+            return Ok(Status::Drifted(p));
         }
         Ok(status_of(&self.plan(ctx)?))
     }
@@ -210,19 +278,24 @@ impl Module for AdminShell {
         let Some(admin) = &ctx.profile.admin else {
             return Ok(Vec::new());
         };
+        ensure_admin_ok(ctx, &admin.name)?;
         let pw = users::passwd(&ctx.sys)?;
         let home = parse::lookup(&pw, &admin.name)
             .map_or_else(|| format!("/home/{}", admin.name), |e| e.home.clone());
+        let immutable = ctx.profile.settings.admin_shell_immutable;
         let mut plan = Vec::new();
         for name in SHELL_FILES {
             let content = shell_content(name);
-            if is_root_owned(&ctx.sys, &home, name, content.map(str::as_bytes)) {
+            if is_root_owned(&ctx.sys, &home, name, content.map(str::as_bytes))
+                && (!immutable || crate::exec::home_file_immutable(&ctx.sys, &home, name))
+            {
                 continue;
             }
-            let what = if content.is_some() {
-                "replace with Fleet's version, root-owned 0644"
-            } else {
-                "root-owned 0644 (created empty if missing)"
+            let what = match (content.is_some(), immutable) {
+                (true, false) => "replace with Fleet's version, root-owned 0644",
+                (true, true) => "replace with Fleet's version, root-owned 0644, immutable",
+                (false, false) => "root-owned 0644 (created empty if missing)",
+                (false, true) => "root-owned 0644, immutable (created empty if missing)",
             };
             plan.push(Change {
                 module: self.id(),
@@ -234,6 +307,7 @@ impl Module for AdminShell {
                     user: admin.name.clone(),
                     name: (*name).to_owned(),
                     content: content.map(|c| c.as_bytes().to_vec()),
+                    immutable,
                 }],
             });
         }
@@ -258,9 +332,58 @@ pub fn sudoers(p: &Resolved) -> String {
     s
 }
 
+/// Cloud provider sudoers drop-ins Fleet knows and may remove once the
+/// admin has a sudo password: cloud-init's default-user grant, Azure's
+/// `waagent` and Google's guest agent.
+pub const CLOUD_SUDOERS: &[&str] = &[
+    SUDOERS_CLOUD_INIT,
+    "/etc/sudoers.d/waagent",
+    "/etc/sudoers.d/google_sudoers",
+];
+pub const SUDOERS_D: &str = "/etc/sudoers.d";
+
+/// Files in `/etc/sudoers.d` (as sudo reads them: no `.` in the name, no
+/// trailing `~`; Fleet's own excluded) that let the admin run commands
+/// without a password (`NOPASSWD`, `!authenticate`), in name order.
+pub fn nopasswd_files(ctx: &Ctx, admin: &str) -> Result<Vec<String>, OpError> {
+    let pw = users::passwd(&ctx.sys)?;
+    let Some(e) = parse::lookup(&pw, admin) else {
+        return Ok(Vec::new());
+    };
+    let gr = users::groups(&ctx.sys)?;
+    let groups: Vec<(String, u32)> = e.groups_in(&gr).map(|g| (g.name.clone(), g.gid)).collect();
+    let Some(dir) = ctx.sys.path(SUDOERS_D) else {
+        return Ok(Vec::new());
+    };
+    let mut names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .take(256)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.contains('.') && !n.ends_with('~'))
+            .collect(),
+        Err(_) => return Ok(Vec::new()),
+    };
+    names.sort();
+    let mut out = Vec::new();
+    for n in names {
+        let path = format!("{SUDOERS_D}/{n}");
+        if path == SUDOERS_FLEET {
+            continue;
+        }
+        let text = read_text(&ctx.sys, &path)?;
+        if fleet_ops::escalation::nopasswd_grants(&text).covers(admin, e.uid, &groups) {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
 /// sudo drop-in (use_pty, logging; Strict: I/O logging), checked with
-/// `visudo -c`. cloud-init's passwordless grant is removed once the admin
-/// has a sudo password.
+/// `visudo -c`. Passwordless grants for the admin in `/etc/sudoers.d` are
+/// drift: once the admin has a sudo password, the cloud provider files
+/// Fleet knows ([`CLOUD_SUDOERS`]) are removed; any other one is only
+/// reported (it may be the operator's own).
 pub struct SudoPolicy;
 
 impl Module for SudoPolicy {
@@ -274,6 +397,24 @@ impl Module for SudoPolicy {
         Phase::Accounts
     }
 
+    fn check(&self, ctx: &Ctx) -> Result<Status, OpError> {
+        let plan = self.plan(ctx)?;
+        if !plan.is_empty() {
+            return Ok(status_of(&plan));
+        }
+        if let Some(admin) = &ctx.profile.admin {
+            let files = nopasswd_files(ctx, &admin.name)?;
+            if !files.is_empty() {
+                return Ok(Status::Drifted(format!(
+                    "passwordless sudo for {} in {} (not removed automatically)",
+                    admin.name,
+                    files.join(", ")
+                )));
+            }
+        }
+        Ok(Status::Compliant)
+    }
+
     fn plan(&self, ctx: &Ctx) -> Result<Vec<Change>, OpError> {
         let mut plan: Vec<Change> = file_change(
             &ctx.sys,
@@ -284,13 +425,18 @@ impl Module for SudoPolicy {
         )?
         .into_iter()
         .collect();
-        let has_password = ctx
-            .profile
-            .admin
-            .as_ref()
-            .is_some_and(|a| a.password_hash.is_some());
-        if has_password && let Some(c) = remove_change(&ctx.sys, self.id(), SUDOERS_CLOUD_INIT)? {
-            plan.push(c);
+        // Only once the admin has a password: removing the grant earlier
+        // would leave it without working sudo.
+        if let Some(admin) = &ctx.profile.admin
+            && admin.password_hash.is_some()
+        {
+            for f in nopasswd_files(ctx, &admin.name)? {
+                if CLOUD_SUDOERS.contains(&f.as_str())
+                    && let Some(c) = remove_change(&ctx.sys, self.id(), &f)?
+                {
+                    plan.push(c);
+                }
+            }
         }
         crate::module::then_run(
             &mut plan,
@@ -300,7 +446,9 @@ impl Module for SudoPolicy {
     }
 
     fn paths(&self, _p: &Resolved) -> Vec<String> {
-        vec![SUDOERS_FLEET.into(), SUDOERS_CLOUD_INIT.into()]
+        let mut v = vec![SUDOERS_FLEET.to_owned()];
+        v.extend(CLOUD_SUDOERS.iter().map(|s| (*s).to_owned()));
+        v
     }
 }
 
@@ -352,6 +500,8 @@ impl Module for PwQuality {
 const KEEP_SHELL: &[&str] = &["sync", "shutdown", "halt"];
 
 /// System accounts (uid 1..UID_MIN) get `nologin` and a locked password.
+/// The admin and every account with a roster section in its authorized
+/// keys file are never touched (locking them would lock the operator out).
 pub struct AccountsLock;
 
 impl Module for AccountsLock {
@@ -366,8 +516,16 @@ impl Module for AccountsLock {
         let (uid_min, _) = users::uid_range(&ctx.sys)?;
         let shadow = read_text(&ctx.sys, "/etc/shadow")?;
         let mut plan = Vec::new();
+        let mut keep = roster_users(ctx);
+        if let Some(a) = &ctx.profile.admin {
+            keep.push(a.name.clone());
+        }
         for e in users::passwd(&ctx.sys)? {
-            if e.uid == 0 || e.uid >= uid_min || KEEP_SHELL.contains(&e.name.as_str()) {
+            if e.uid == 0
+                || e.uid >= uid_min
+                || KEEP_SHELL.contains(&e.name.as_str())
+                || keep.contains(&e.name)
+            {
                 continue;
             }
             // Names come from /etc/passwd; `--` keeps a hostile one from

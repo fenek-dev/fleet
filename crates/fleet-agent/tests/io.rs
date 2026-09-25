@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct NoopRevert;
 impl Revert for NoopRevert {
-    fn revert(&self, _: ChangeKind, _: &[u8]) -> Result<(), RevertError> {
+    fn revert(&self, _: ChangeKind, _: &[u8], _: Option<u64>) -> Result<(), RevertError> {
         Ok(())
     }
 }
@@ -322,7 +322,7 @@ fn revert_timer_argv() {
 /// Restores only while the state still has the change's version.
 struct Versioned(u64, RefCell<u32>);
 impl Revert for Versioned {
-    fn revert(&self, _: ChangeKind, _: &[u8]) -> Result<(), RevertError> {
+    fn revert(&self, _: ChangeKind, _: &[u8], _: Option<u64>) -> Result<(), RevertError> {
         *self.1.borrow_mut() += 1;
         Ok(())
     }

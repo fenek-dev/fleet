@@ -83,8 +83,6 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 serde_json = "1.0.151"
 # TLS certificate discovery (design §2.4); pure Rust, no default features.
 x509-parser = { version = "0.18.1", default-features = false }
-# Open-flag constants only (`O_NOFOLLOW`, `O_NONBLOCK`); no FFI calls.
-libc = "0.2.189"
 # Compose validation (design §4.2): event-level parser only (no loader), so
 # anchors/aliases are rejected before anything is built. Pure Rust, YAML 1.2;
 # chosen over serde_yaml (deprecated) and serde_yaml_ng (unsafe-libyaml).

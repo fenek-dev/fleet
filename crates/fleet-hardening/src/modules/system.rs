@@ -240,9 +240,18 @@ pub const AUDIT_RULES_TEXT: &str = "## Managed by Fleet (design §9.4). Changes 
 -w /etc/ssh/sshd_config -p wa -k sshd\n\
 -w /etc/ssh/sshd_config.d/ -p wa -k sshd\n\
 -w /etc/fleet/authorized_keys/ -p wa -k sshd\n\
+-w /etc/fleet/ -p wa -k fleet\n\
+-w /usr/lib/fleet/ -p wa -k fleet\n\
+-w /etc/pam.d/ -p wa -k pam\n\
+-w /etc/apt/sources.list.d/ -p wa -k apt-sources\n\
+-w /etc/apt/keyrings/ -p wa -k apt-sources\n\
+-w /etc/systemd/system/ -p wa -k systemd\n\
+-w /etc/wireguard/ -p wa -k wireguard\n\
 -a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time-change\n\
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -k time-change\n\
 -w /etc/localtime -p wa -k time-change\n\
 -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules\n\
+-a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k modules\n\
 -w /usr/bin/kmod -p x -k modules\n\
 -a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=unset -k privileged\n\
 -a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=unset -k privileged\n\
@@ -648,10 +657,12 @@ impl Module for Swap {
         let fstab = read_text(&ctx.sys, FSTAB)?;
         if !fstab_has(&fstab, SWAP_LINE) {
             let mode = read_file(&ctx.sys, FSTAB)?.map_or(0o644, |f| f.1);
+            let new = fstab_with(&fstab, 0, SWAPFILE, SWAP_LINE).into_bytes();
             c.diff.push_str(&format!("+ {FSTAB}: {SWAP_LINE}\n"));
+            c.actions.push(Action::VerifyFstab(new.clone()));
             c.actions.push(Action::Write {
                 path: FSTAB.into(),
-                content: fstab_with(&fstab, 0, SWAPFILE, SWAP_LINE).into_bytes(),
+                content: new,
                 mode,
             });
         }
@@ -679,6 +690,19 @@ pub const TMP_MOUNTS: &[(&str, &str)] = &[
         "/tmp /var/tmp none rw,bind,nosuid,nodev,noexec 0 0",
     ),
 ];
+
+/// An `fstab` line mounting a real filesystem (not tmpfs, not a bind
+/// mount) at `mp`: a separate `/tmp` or `/var/tmp` partition. Fleet never
+/// replaces it (its data would be hidden); `mounts.tmp` reports it.
+pub fn foreign_mount<'a>(fstab: &'a str, mp: &str) -> Option<&'a str> {
+    fstab.lines().find(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        !l.trim_start().starts_with('#')
+            && f.get(1) == Some(&mp)
+            && f.get(2) != Some(&"tmpfs")
+            && !f.get(3).is_some_and(|o| o.split(',').any(|x| x == "bind"))
+    })
+}
 
 pub struct MountsTmp;
 
@@ -719,6 +743,17 @@ impl Module for MountsTmp {
         if !plan.is_empty() {
             return Ok(status_of(&plan));
         }
+        let fstab = read_text(&ctx.sys, FSTAB)?;
+        let foreign: Vec<String> = TMP_MOUNTS
+            .iter()
+            .filter_map(|(mp, _)| foreign_mount(&fstab, mp).map(|l| format!("{mp} ({})", l.trim())))
+            .collect();
+        if !foreign.is_empty() {
+            return Ok(Status::Drifted(format!(
+                "separate filesystems in {FSTAB}, not changed: {}",
+                foreign.join("; ")
+            )));
+        }
         let left = Self::unmounted(ctx);
         Ok(if left.is_empty() {
             Status::Compliant
@@ -731,7 +766,7 @@ impl Module for MountsTmp {
         let old = read_text(&ctx.sys, FSTAB)?;
         let mut text = old.clone();
         for (mp, line) in TMP_MOUNTS {
-            if !fstab_has(&text, line) {
+            if !fstab_has(&text, line) && foreign_mount(&old, mp).is_none() {
                 text = fstab_with(&text, 1, mp, line);
             }
         }
@@ -739,11 +774,14 @@ impl Module for MountsTmp {
             return Ok(Vec::new());
         }
         let mode = read_file(&ctx.sys, FSTAB)?.map_or(0o644, |f| f.1);
-        let mut actions = vec![Action::Write {
-            path: FSTAB.into(),
-            content: text.clone().into_bytes(),
-            mode,
-        }];
+        let mut actions = vec![
+            Action::VerifyFstab(text.clone().into_bytes()),
+            Action::Write {
+                path: FSTAB.into(),
+                content: text.clone().into_bytes(),
+                mode,
+            },
+        ];
         // /dev/shm can be tightened live; /tmp and /var/tmp at boot (a
         // live mount would hide files in use).
         let remount = Cmd::new(MOUNT, ["-o", "remount,nosuid,nodev,noexec", "/dev/shm"]);

@@ -404,11 +404,41 @@ async fn call_within(
     op: Op,
     limit: Duration,
 ) -> Result<Payload, ErrorCode> {
-    tokio::time::timeout(limit, s.request(op, &fx.server, Actor::Human, None))
+    // Elevated ops (e.g. `profile.apply` with a sudo password hash) carry
+    // a root-key approval from the test Mac, as the app's Touch ID would.
+    let approval = (op.authorization() == fleet_proto::Authorization::RootApproval)
+        .then(|| approval_for(fx, &op));
+    tokio::time::timeout(limit, s.request(op, &fx.server, Actor::Human, approval))
         .await
         .expect("request timed out")
         .expect("request failed")
         .result
+}
+
+/// A one-item root-key approval of `op` for the fixture's server, signed
+/// by `macs[0]` (valid for five minutes).
+fn approval_for(fx: &Fixture, op: &Op) -> fleet_proto::RootApproval {
+    use fleet_crypto::approval::{ApprovalParams, build_approvals, op_digest};
+    let m = &fx.macs[0];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut approval_id = [0u8; 16];
+    fleet_crypto::random_bytes(&mut approval_id).unwrap();
+    let params = ApprovalParams {
+        fleet_id: fx.fleet,
+        approval_id,
+        issued_at_ms: now,
+        expires_at_ms: now + 5 * 60_000,
+    };
+    let item = fleet_proto::ApprovalItem {
+        server_id: fx.server.clone(),
+        op_digest: op_digest(op, None),
+    };
+    build_approvals(&m.keys.root, m.id, &params, &[item])
+        .unwrap()
+        .remove(0)
 }
 
 async fn call(s: &mut Sess, fx: &Fixture, op: Op) -> Result<Payload, ErrorCode> {
@@ -524,7 +554,8 @@ fn container_ip(fx: &Fixture) -> String {
         &[
             "inspect",
             "-f",
-            "{{.NetworkSettings.IPAddress}}",
+            // Newer Docker API versions dropped the top-level field.
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
             &fx.container.name,
         ],
         Duration::from_secs(10),

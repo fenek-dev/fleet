@@ -50,7 +50,7 @@ write_files:
   - path: \"/etc/ssh/sshd_config.d/05-fleet-bootstrap.conf\"
     owner: \"root:root\"
     permissions: \"0644\"
-    content: \"# Fleet bootstrap (design §9.7); replaced by the profile's 10-fleet.conf.\\nPermitRootLogin no\\nPasswordAuthentication no\\nKbdInteractiveAuthentication no\\n\"
+    content: \"# Fleet bootstrap (design §9.7); overridden by the profile's 00-fleet.conf.\\nPermitRootLogin no\\nPasswordAuthentication no\\nKbdInteractiveAuthentication no\\n\"
 ";
 
 #[test]

@@ -47,25 +47,55 @@ pub fn sources(r: &AptRepo, os: &str, codename: &str) -> String {
     )
 }
 
-/// Pinned to one major version: matching versions preferred, every other
-/// version of these packages never installed.
-pub fn pin(r: &AptRepo) -> Option<String> {
-    let v = r.pin_version.as_ref()?;
-    let pkgs = r.pin_packages.join(" ");
-    Some(format!(
-        "# Managed by Fleet (design §9.6).\n\
-         Package: {pkgs}\n\
-         Pin: version {v}\n\
-         Pin-Priority: 990\n\
-         \n\
-         Package: {pkgs}\n\
-         Pin: version *\n\
-         Pin-Priority: -1\n"
-    ))
+/// The host of the repository URI, as apt matches `Pin: origin`.
+pub fn origin_host(r: &AptRepo) -> &str {
+    let rest = r.uri.strip_prefix("https://").unwrap_or(&r.uri);
+    rest.split('/').next().unwrap_or(rest)
 }
 
-/// Key (fetched, fingerprint-checked), sources and pin of `r`.
-pub fn repo_plan(ctx: &Ctx, module: &'static str, r: &AptRepo) -> Result<Vec<Change>, OpError> {
+/// apt preferences for the repository: nothing from its origin is ever
+/// installed (`Package: *` at -1) except the role's own packages (500),
+/// so a third-party repository can't replace a distribution package. A
+/// `pin_version` additionally holds `pin_packages` to one major version
+/// (990 for it, -1 for every other version). apt uses the first matching
+/// package-specific record, so the version pins come first.
+pub fn pin(r: &AptRepo, packages: &[String]) -> String {
+    let host = origin_host(r);
+    let mut s = String::from("# Managed by Fleet (design §9.6).\n");
+    if let Some(v) = &r.pin_version {
+        let pkgs = r.pin_packages.join(" ");
+        s.push_str(&format!(
+            "Package: {pkgs}\nPin: version {v}\nPin-Priority: 990\n\n\
+             Package: {pkgs}\nPin: version *\nPin-Priority: -1\n\n"
+        ));
+    }
+    let mut role: Vec<&str> = packages
+        .iter()
+        .chain(&r.pin_packages)
+        .map(String::as_str)
+        .collect();
+    role.sort_unstable();
+    role.dedup();
+    if !role.is_empty() {
+        s.push_str(&format!(
+            "Package: {}\nPin: origin \"{host}\"\nPin-Priority: 500\n\n",
+            role.join(" ")
+        ));
+    }
+    s.push_str(&format!(
+        "Package: *\nPin: origin \"{host}\"\nPin-Priority: -1\n"
+    ));
+    s
+}
+
+/// Key (fetched, fingerprint-checked), sources and pin of `r`; `packages`
+/// are the role's packages (the only ones its origin may supply).
+pub fn repo_plan(
+    ctx: &Ctx,
+    module: &'static str,
+    r: &AptRepo,
+    packages: &[String],
+) -> Result<Vec<Change>, OpError> {
     let os = os_id(ctx)?;
     let codename = ctx.facts.os.codename.as_str();
     if codename.is_empty() || !codename.bytes().all(|b| b.is_ascii_lowercase()) {
@@ -73,7 +103,16 @@ pub fn repo_plan(ctx: &Ctx, module: &'static str, r: &AptRepo) -> Result<Vec<Cha
     }
     let mut plan = Vec::new();
     let key = key_path(r);
-    if read_file(&ctx.sys, &key)?.is_none() {
+    // An existing key file must hold exactly the pinned key (fingerprints
+    // read with `gpg --show-keys` while gathering facts); anything else is
+    // drift and the key is fetched again.
+    let stale = read_file(&ctx.sys, &key)?.is_some()
+        && ctx
+            .facts
+            .key_fingerprints
+            .get(&key)
+            .is_some_and(|f| f != std::slice::from_ref(&r.fingerprint));
+    if stale || read_file(&ctx.sys, &key)?.is_none() {
         plan.extend(install_change(
             ctx,
             module,
@@ -84,10 +123,21 @@ pub fn repo_plan(ctx: &Ctx, module: &'static str, r: &AptRepo) -> Result<Vec<Cha
             ],
         ));
         let url = r.key_url.replace("{os}", os);
+        let (verb, diff) = if stale {
+            (
+                "replace (fingerprint mismatch)",
+                format!("~ {key} from {url}\n"),
+            )
+        } else {
+            ("add", format!("+ {key} from {url}\n"))
+        };
         plan.push(Change {
             module,
-            description: format!("add the {} apt key (fingerprint {})", r.name, r.fingerprint),
-            diff: format!("+ {key} from {url}\n"),
+            description: format!(
+                "{verb} the {} apt key (fingerprint {})",
+                r.name, r.fingerprint
+            ),
+            diff,
             actions: vec![Action::FetchKey {
                 url,
                 fingerprint: r.fingerprint.clone(),
@@ -102,10 +152,24 @@ pub fn repo_plan(ctx: &Ctx, module: &'static str, r: &AptRepo) -> Result<Vec<Cha
         &sources(r, os, codename),
         0o644,
     )?);
-    if let Some(p) = pin(r) {
-        plan.extend(file_change(&ctx.sys, module, &pin_path(r), &p, 0o644)?);
-    }
+    plan.extend(file_change(
+        &ctx.sys,
+        module,
+        &pin_path(r),
+        &pin(r, packages),
+        0o644,
+    )?);
     Ok(plan)
+}
+
+/// Key files of the profile's role repositories (their fingerprints are
+/// gathered as facts).
+pub fn key_files(p: &Resolved) -> Vec<String> {
+    p.role_manifests
+        .iter()
+        .filter_map(|m| m.apt_repo.as_ref())
+        .map(key_path)
+        .collect()
 }
 
 fn repo_paths(m: Option<&RoleManifest>) -> Vec<String> {
@@ -139,7 +203,7 @@ impl Module for Docker {
     fn plan(&self, ctx: &Ctx) -> Result<Vec<Change>, OpError> {
         let m = manifest(ctx, ProfileRole::Docker)?;
         let mut plan = match &m.apt_repo {
-            Some(r) => repo_plan(ctx, self.id(), r)?,
+            Some(r) => repo_plan(ctx, self.id(), r, &m.packages)?,
             None => Vec::new(),
         };
         plan.extend(install_change(ctx, self.id(), &m.packages));
@@ -263,7 +327,7 @@ impl Module for Web {
         let mut plan = Vec::new();
         let (unit, mut files, validate) = if Self::caddy(m) {
             if let Some(r) = &m.apt_repo {
-                plan.extend(repo_plan(ctx, id, r)?);
+                plan.extend(repo_plan(ctx, id, r, &m.packages)?);
             }
             plan.extend(install_change(ctx, id, &["caddy".to_owned()]));
             let mut f = Vec::new();
