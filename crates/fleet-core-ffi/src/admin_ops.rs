@@ -72,7 +72,7 @@ pub(crate) fn abs_path(p: &str) -> Result<AbsPath, FleetError> {
 
 fn pending(p: Payload) -> Result<PendingChangeRow, FleetError> {
     match p {
-        Payload::ChangePending(c) => Ok(c.into()),
+        Payload::ChangePending { change, .. } => Ok(change.into()),
         p => unexpected(p),
     }
 }

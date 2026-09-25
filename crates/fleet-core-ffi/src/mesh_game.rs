@@ -35,7 +35,7 @@ impl FleetCore {
     /// Leaves the mesh (auto-revert: confirm with `confirm_change`).
     pub async fn mesh_leave(&self, server_id: String) -> Result<PendingChangeRow, FleetError> {
         match self.send_op(&server_id, Op::MeshLeave, None).await? {
-            Payload::ChangePending(c) => Ok(c.into()),
+            Payload::ChangePending { change, .. } => Ok(change.into()),
             p => unexpected(p),
         }
     }

@@ -281,12 +281,16 @@ impl Runner<'_> {
             }
             Err(c) => return Err(step_err(id, step, format!("{c:?}"))),
         };
-        let Payload::ChangePending(PendingChange {
-            change_id,
-            deadline_ms,
-            new_version,
+        let Payload::ChangePending {
+            change:
+                PendingChange {
+                    change_id,
+                    deadline_ms,
+                    new_version,
+                    ..
+                },
             ..
-        }) = pending
+        } = pending
         else {
             return Err(step_err(id, step, "unexpected reply"));
         };
