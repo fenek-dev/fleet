@@ -25,6 +25,7 @@
 //! commit → intent. Ops with `Op::auto_revert` then run under the
 //! auto-revert protocol (§4.10, [`Exec::apply_reverting`]).
 
+mod confighist;
 mod ops;
 mod stream;
 mod telemetry;
@@ -1321,6 +1322,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         registry.register(tag, change_ops.clone());
     }
     let tel = telemetry::start(&st, &ctx, &mut registry);
+    let config = confighist::start(&st, &mut registry);
     for (tag, h) in extra {
         registry.register(tag, h);
     }
@@ -1338,6 +1340,9 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     local
         .run_until(async {
             tokio::task::spawn_local(tel.run(exec.ctx.clone()));
+            if let Some(c) = config {
+                tokio::task::spawn_local(confighist::run(c, exec.ctx.clone()));
+            }
             tokio::pin!(shutdown);
             let mut maint = tokio::time::interval(maint_every);
             let mut cp = tokio::time::interval(cp_every);

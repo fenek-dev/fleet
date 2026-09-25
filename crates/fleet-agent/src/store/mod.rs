@@ -8,11 +8,13 @@
 //! (`crate::pending`) so the separate `revert` process can read them.
 
 mod audit;
+mod config;
 mod meta;
 mod metrics;
 mod replay;
 
 pub use audit::{AuditLog, ChainError, ChainHead, CheckpointSigner, Intent};
+pub use config::ConfigDb;
 pub use meta::{Meta, MetaKey};
 pub use metrics::MetricsDb;
 pub use replay::ReplayCache;
@@ -63,12 +65,17 @@ impl Store {
         audit::create_tables(&tx)?;
         meta::create_tables(&tx)?;
         metrics::create_tables(&tx)?;
+        config::create_tables(&tx)?;
         tx.commit()?;
         Ok(Self { db: db.into() })
     }
 
     pub fn metrics(&self) -> MetricsDb {
         MetricsDb::new(self.db.clone())
+    }
+
+    pub fn config(&self) -> ConfigDb {
+        ConfigDb::new(self.db.clone())
     }
 
     pub fn replay(&self) -> ReplayCache<'_> {

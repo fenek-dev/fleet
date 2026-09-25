@@ -24,6 +24,7 @@ x509-parser.workspace = true
 sha2.workspace = true
 blake3.workspace = true
 yaml-rust2.workspace = true
+miniz_oxide.workspace = true
 libc.workspace = true
 rustix.workspace = true
 

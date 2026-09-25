@@ -71,6 +71,9 @@ libc = "0.2.189"
 # anchors/aliases are rejected before anything is built. Pure Rust, YAML 1.2;
 # chosen over serde_yaml (deprecated) and serde_yaml_ng (unsafe-libyaml).
 yaml-rust2 = { version = "0.13.0", default-features = false }
+# Config history blobs (design §4.9): DEFLATE, `#![forbid(unsafe_code)]`,
+# pure Rust (zstd would need its C library).
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 # statvfs, kill, setpriority without first-party `unsafe` (telemetry, process ops).
 rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "process"] }
 

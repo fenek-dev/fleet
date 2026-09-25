@@ -206,6 +206,8 @@ impl Registry {
         );
         crate::packages::register(&mut r);
         crate::logs::register(&mut r);
+        crate::files::register(&mut r);
+        crate::search::register(&mut r);
         // Exec re-registers `logins.query` with its roster resolver.
         crate::security::register(&mut r, Rc::new(crate::security::NoResolver));
         r
