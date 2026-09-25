@@ -310,7 +310,7 @@ impl OpStream for JournalFollow {
 mod tests {
     use super::*;
     use crate::logs::lines::FakeLineSpawner;
-    use crate::test_util::{block, ctx, meta};
+    use crate::testutil::{T0, block, ctx_empty, meta_at};
     use fleet_proto::args::{GrepPattern, JournalCursor, Priority, TimeRange, UnitName};
 
     const SAMPLE: &[&str] = &[
@@ -420,10 +420,11 @@ mod tests {
         let lines: Vec<&str> = SAMPLE.iter().rev().copied().collect();
         sp.expect(JOURNALCTL, &base_args(&["--reverse"]), &lines, false);
         let h = JournalHandler::new(sp.clone());
-        let c = ctx();
+        let c = ctx_empty();
         let op = Op::JournalQuery(q(2));
-        h.validate(&c, &op, &meta()).unwrap();
-        let out = block(h.handle(&c, &op, &meta())).unwrap();
+        h.validate(&c, &op, &meta_at(Op::SystemInfo, Some(1), T0))
+            .unwrap();
+        let out = block(h.handle(&c, &op, &meta_at(Op::SystemInfo, Some(1), T0))).unwrap();
         let OpOutput::Payload(Payload::JournalEntries(j)) = out else {
             panic!()
         };
@@ -440,13 +441,25 @@ mod tests {
         let mut g = q(10);
         g.grep = Some(GrepPattern::new("listening").unwrap());
         sp.expect(JOURNALCTL, &base_args(&["--reverse"]), SAMPLE, false);
-        let out = block(h.handle(&c, &Op::JournalQuery(g), &meta())).unwrap();
+        let out = block(h.handle(
+            &c,
+            &Op::JournalQuery(g),
+            &meta_at(Op::SystemInfo, Some(1), T0),
+        ))
+        .unwrap();
         let OpOutput::Payload(Payload::JournalEntries(j)) = out else {
             panic!()
         };
         assert_eq!(j.entries.len(), 1);
 
-        assert!(h.validate(&c, &Op::JournalQuery(q(0)), &meta()).is_err());
+        assert!(
+            h.validate(
+                &c,
+                &Op::JournalQuery(q(0)),
+                &meta_at(Op::SystemInfo, Some(1), T0)
+            )
+            .is_err()
+        );
         assert!(h.supports(&Op::JournalFollow(q(1)), Invocation::Stream));
         assert!(!h.supports(&Op::JournalFollow(q(1)), Invocation::Request));
     }
@@ -461,8 +474,13 @@ mod tests {
             true,
         );
         let h = JournalHandler::new(sp.clone());
-        let c = ctx();
-        let out = block(h.handle(&c, &Op::JournalFollow(q(3)), &meta())).unwrap();
+        let c = ctx_empty();
+        let out = block(h.handle(
+            &c,
+            &Op::JournalFollow(q(3)),
+            &meta_at(Op::SystemInfo, Some(1), T0),
+        ))
+        .unwrap();
         let OpOutput::Stream(mut s) = out else {
             panic!()
         };

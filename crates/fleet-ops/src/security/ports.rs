@@ -241,7 +241,7 @@ pub fn ephemeral_range(ctx: &SysCtx) -> (u16, u16) {
 mod tests {
     use super::*;
     use crate::FakeRunner;
-    use crate::test_util::ctx_at;
+    use crate::testutil::{T0, ctx_at};
     use std::rc::Rc;
 
     const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -290,7 +290,7 @@ mod tests {
             }
             std::os::unix::fs::symlink("/dev/null", p.join("fd/0")).unwrap();
         }
-        let ctx = ctx_at(d, Rc::new(FakeRunner::new()));
+        let ctx = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let ports = collect(&ctx).ports;
         let summary: Vec<String> = ports
             .iter()

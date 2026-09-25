@@ -858,7 +858,7 @@ mod tests {
     use super::*;
     use crate::security::VecSink;
     use crate::security::authlog::parse_sshd;
-    use crate::test_util::{block, ctx_at, meta};
+    use crate::testutil::{T0, block, ctx_at, meta_at};
     use crate::{CommandOutput, FakeRunner};
     use fleet_proto::args::Label;
 
@@ -1018,8 +1018,8 @@ mod tests {
         cfg.threshold = 2;
         let svc = BanService::new(cfg, sink.clone());
         let dir = tempfile::tempdir().unwrap();
-        let c = ctx_at(dir.path(), runner.clone());
-        let now = meta().now_ms;
+        let c = ctx_at(dir.path(), runner.clone(), T0);
+        let now = meta_at(Op::SystemInfo, Some(1), T0).now_ms;
 
         // Detector path: two failures → nft add → event.
         let ev = parse_sshd("Failed password for root from 198.51.100.7 port 1 ssh2").unwrap();
@@ -1058,7 +1058,7 @@ mod tests {
         block(svc.fleet_login(&c, ip("203.0.113.50"), now)).unwrap();
 
         let h = BansHandler(svc.clone());
-        let m = meta();
+        let m = meta_at(Op::SystemInfo, Some(1), T0);
         let add = Op::BansAdd {
             addr: ip("203.0.113.50"),
             duration_s: 600,
@@ -1189,8 +1189,8 @@ mod tests {
     fn restore_kernel_only_fills_empty_sets() {
         let runner = Rc::new(FakeRunner::new());
         let dir = tempfile::tempdir().unwrap();
-        let c = ctx_at(dir.path(), runner.clone());
-        let now = 1_700_000_000_000;
+        let c = ctx_at(dir.path(), runner.clone(), T0);
+        let now = T0;
         let svc = BanService::new(default_config(), Rc::new(VecSink::default()));
         let mut st = svc.export(now);
         st.bans.push(BanEntry {

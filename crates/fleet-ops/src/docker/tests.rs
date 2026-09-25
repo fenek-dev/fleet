@@ -34,7 +34,7 @@ fn fake() -> Rc<FakeDocker> {
 }
 
 fn run(h: &DockerHandler, op: Op) -> Result<OpOutput, ErrorCode> {
-    let c = crate::test_util::ctx();
+    let c = crate::testutil::ctx_empty();
     let m = meta(op.clone(), Some(1));
     h.validate(&c, &op, &m).map_err(|e| e.code())?;
     block(h.handle(&c, &op, &m)).map_err(|e| e.code())
@@ -239,7 +239,7 @@ fn logs_stream_batches_and_parses_timestamps() {
         since_ms: Some(5_500),
         follow: false,
     };
-    let c = crate::test_util::ctx();
+    let c = crate::testutil::ctx_empty();
     let OpOutput::Stream(mut s) = block(h.handle(&c, &op, &meta(op.clone(), None))).unwrap() else {
         panic!()
     };
@@ -602,7 +602,7 @@ fn deploy_refuses_symlinks_and_compose_env() {
 
 #[test]
 fn deploy_escalation_and_errors() {
-    let c = crate::test_util::ctx();
+    let c = crate::testutil::ctx_empty();
     let m = meta(Op::ComposeList, Some(1));
     assert_eq!(deploy_op(YAML, false).tier(), Tier::Change);
     assert!(

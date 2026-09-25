@@ -352,7 +352,7 @@ impl OpStream for TailStream {
 mod tests {
     use super::*;
     use crate::FakeRunner;
-    use crate::test_util::{block, ctx_at, meta};
+    use crate::testutil::{T0, block, ctx_at, meta_at};
     use std::io::Write;
     use std::rc::Rc;
 
@@ -402,9 +402,9 @@ mod tests {
         std::fs::write(d.join("var/log/syslog"), "x\n").unwrap();
         std::os::unix::fs::symlink(d.join("etc/shadow"), d.join("var/log/evil")).unwrap();
         std::os::unix::fs::symlink(d.join("etc"), d.join("var/log/dir")).unwrap();
-        let c = ctx_at(d, Rc::new(FakeRunner::new()));
+        let c = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let h = LogfileTailHandler::default();
-        let m = meta();
+        let m = meta_at(Op::SystemInfo, Some(1), T0);
         assert!(
             h.validate(&c, &op("/var/log/syslog", 10, false), &m)
                 .is_ok()
@@ -440,9 +440,14 @@ mod tests {
         std::fs::create_dir_all(d.join("var/log")).unwrap();
         let log = d.join("var/log/app.log");
         std::fs::write(&log, "old1\nold2\n").unwrap();
-        let c = ctx_at(d, Rc::new(FakeRunner::new()));
+        let c = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let h = LogfileTailHandler::default().with_poll(Duration::from_millis(5));
-        let out = block(h.handle(&c, &op("/var/log/app.log", 1, true), &meta())).unwrap();
+        let out = block(h.handle(
+            &c,
+            &op("/var/log/app.log", 1, true),
+            &meta_at(Op::SystemInfo, Some(1), T0),
+        ))
+        .unwrap();
         let OpOutput::Stream(mut s) = out else {
             panic!()
         };
@@ -476,11 +481,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("var/log")).unwrap();
         std::fs::write(dir.path().join("var/log/a"), "1\n2\n").unwrap();
-        let c = ctx_at(dir.path(), Rc::new(FakeRunner::new()));
+        let c = ctx_at(dir.path(), Rc::new(FakeRunner::new()), T0);
         let h = LogfileTailHandler::default();
-        let OpOutput::Stream(mut s) =
-            block(h.handle(&c, &op("/var/log/a", 5, false), &meta())).unwrap()
-        else {
+        let OpOutput::Stream(mut s) = block(h.handle(
+            &c,
+            &op("/var/log/a", 5, false),
+            &meta_at(Op::SystemInfo, Some(1), T0),
+        ))
+        .unwrap() else {
             panic!()
         };
         block(async {

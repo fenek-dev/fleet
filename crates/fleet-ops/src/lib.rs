@@ -44,8 +44,6 @@ pub mod services;
 pub mod system;
 pub mod telemetry;
 #[cfg(test)]
-pub(crate) mod test_util;
-#[cfg(test)]
 pub(crate) mod testutil;
 pub mod users;
 

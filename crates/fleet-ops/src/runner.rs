@@ -382,14 +382,7 @@ impl CommandRunner for FakeRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn block<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(f)
-    }
+    use crate::testutil::block;
 
     #[test]
     fn fake_matches_argv_in_order() {
