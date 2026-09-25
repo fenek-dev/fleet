@@ -1242,10 +1242,11 @@ extends = "baseline"          # baseline | strict
 roles = ["docker", "web"]
 
 [admin]
-user = "ops"
+user = "ops"                  # default: the agent's --admin-user (roster keys)
+password_hash = "$y$…"        # optional: crypt(3) hash of the sudo password, made on the Mac
 
 [ssh]
-allow_from = []               # empty means anywhere; otherwise a CIDR allow-list
+allow_from = []               # empty means anywhere; otherwise a CIDR allow-list (sshd AllowUsers)
 
 [updates]
 reboot_window = "Sun 04:00-05:00 UTC"
@@ -1389,6 +1390,20 @@ The app can generate a cloud-init file that creates the admin user with the enro
 ### 9.8 Profile testing
 
 Every profile and role runs in CI against throwaway VMs (Lima or Multipass) for each supported OS version. Tests cover applying from scratch, re-applying, reverting, and deliberately breaking SSH access to confirm auto-revert restores it.
+
+### 9.9 Implementation notes (`fleet-hardening`)
+
+- **Profiles as data.** `profiles/baseline.toml`, `strict.toml` (`extends = "baseline"`) and `roles/{docker,web,game}.toml` are compiled into the agent. They hold the module list (apply order) and every setting (sysctl keys, blacklist, services to disable, SSH session/rate limits, sudo I/O logging, immutable audit rules, journald cap, packages); role manifests add packages, an apt repository with a pinned key fingerprint, firewall rules, sysctl overrides, kernel modules to load, exceptions, tracked paths and health checks. Operator TOML (§9.2) is parsed with `deny_unknown_fields`, may extend only `baseline` or `strict`, and can only choose roles, the admin (and a sudo password **hash**, `$y$`/`$6$`, applied with `chpasswd --encrypted` over stdin, never in argv or a plan diff), `ssh.allow_from`, the reboot window, and skip or except known module ids or items (`sysctl.<key>`, `kernel.modules.<name>`, `services.<unit>`). Without `[admin]`, the admin is the one user with a roster section under `/etc/fleet/authorized_keys/`.
+- **Modules.** `admin.user`, `admin.shell`, `sudo.policy` (phase 1); `ssh.hardening`, `firewall.baseline` (phase 2); `sysctl`, `kernel.modules`, `coredump`, `updates`, `services.disable`, `auditd`, `journald`, `apparmor`, `umask`, `accounts.lock`, `time`, `basics`, `swap` (phase 3); Strict adds `mounts.tmp`, `cron.allow`, `sudo.pwquality`; roles add `role.docker`, `role.web`, `role.game`. `check` is "the plan is empty" unless a module knows better (`PendingReboot` for immutable audit rules and `/tmp` mounts, `NotApplicable` without an admin, AppArmor disabled on the kernel command line is drifted but not fixable).
+- **Plans.** A plan is a list of changes, each a human-readable description and diff plus exact actions (file writes, argv commands, apt installs in the op's scope, validated key fetches, the firewall model). `plan_hash` is BLAKE3 (derive-key `"fleet profile plan v1"`) of the postcard-encoded plan including every action, so `profile.apply` re-plans and refuses with `VersionConflict` unless the hash is unchanged. `ProfileSpec::only` selects the provisioning phase or a one-click audit fix.
+- **Validation before reload.** `sshd -t`, `visudo -c`, `caddy validate`, `nginx -t` run after the module's files are written; a failure puts every file of that module back before the error. `ssh.hardening` also refuses unless the admin exists with a login shell and a roster section in its authorized-keys file. PQ hybrid key exchange (`mlkem768x25519-sha256`, `sntrup761x25519-sha512@openssh.com`) is listed only when `ssh -Q kex` reports it.
+- **`ssh.allow_from`** is enforced by sshd (`AllowUsers admin@cidr …`), not by the firewall: `firewall::model::check` refuses a Managed table without an unrestricted SSH accept. The SSH rule is rate-limited per source. Operator rules (comments not starting with `profile:`) are kept on every re-apply.
+- **Admin shell files** are made `root:root` 0644 through an fd opened without following symlinks and refused unless it is a single-link regular file of the user or root; `.profile` and `.bash_profile` get fixed content with a PATH of root-owned directories.
+- **Third-party apt keys** are downloaded with `curl` (HTTPS only, 64 KiB cap), checked with `gpg --show-keys --with-colons` (exactly one primary key with the manifest's fingerprint), then written to `/etc/apt/keyrings/fleet-<name>.asc`; sources are deb822 with `Signed-By`. Docker is pinned to one major version (`Pin-Priority: 990` for the major, `-1` for every other version).
+- **Auto-revert.** `profile.apply` is `ChangeKind::Profile`. `ProfileRevert` snapshots every file the in-scope modules may write (content and mode, or absence), the firewall table when `firewall.baseline` is in scope, and the reload commands (`sshd -t` + `systemctl try-reload-or-restart ssh.service`, `sysctl --ignore --system`, …; restore accepts only a fixed program list). Package installs, enabled units and created users are not undone. `new_version` is `None`, so a revert always restores.
+- **Audit.** `audit.run` checks the built-in level without roles; the score is the weighted share of compliant modules (pending reboot counts, skipped and not-applicable don't). Findings name the module (`fixable` when drifted and fixable: `profile.apply` with `only = [module]`), and accepted item exceptions appear as `Skipped`.
+- **cloud-init** (`fleet_hardening::cloudinit`, pure, for the Mac): admin with the Macs' keys and a locked password, `disable_root`, no password SSH, the Mac-generated Ed25519/ECDSA host keys (`ssh_deletekeys`, no generated types) and a `05-fleet-bootstrap.conf` drop-in. YAML comes from a typed tree with every value double-quoted and escaped.
+- **Not yet:** a `PendingReboot` wire status (reported as `Compliant` with a "pending reboot" detail); exec's 30 s `apply_timeout` is too short for phase 3 package installs, and exec answers `ChangePending` rather than `ProfileApplied` (per-module results and before/after scores); per-game templates, CPU governor, hostname/locale, `accept_ra` for static IPv6, the "only sshd listens publicly" check; recording changes in config history.
 
 ---
 

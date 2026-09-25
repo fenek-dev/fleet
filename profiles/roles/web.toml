@@ -1,0 +1,41 @@
+# Web / reverse proxy role add-on (design §9.6).
+
+[role]
+id = "web"
+description = "Caddy (automatic HTTPS) with hardened TLS and headers"
+modules = ["role.web"]
+packages = ["caddy"]
+tracked_paths = ["/etc/caddy/Caddyfile", "/etc/caddy/fleet-headers.caddy"]
+health_checks = ["caddy.service"]
+
+[settings]
+# "caddy" (official apt repository) or "nginx" (from the distribution).
+server = "caddy"
+# nginx only: request body cap and per-IP request rate.
+max_body = "16m"
+rate = "20r/s"
+
+[apt_repo]
+name = "caddy"
+key_url = "https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
+# Caddy stable (Cloudsmith) signing key; verify against caddyserver.com
+# before a release.
+fingerprint = "65760C51EDEA2017CEA2CA15155B6D79CA56EA34"
+uri = "https://dl.cloudsmith.io/public/caddy/stable/deb/debian"
+suite = "any-version"
+components = ["main"]
+
+# Per-IP meters on 80/443 (coarse limits with Caddy, design §9.6).
+[[firewall]]
+proto = "tcp"
+ports = [80, 443]
+rate_per_minute = 1200
+rate_burst = 200
+comment = "web"
+
+[[firewall]]
+proto = "udp"
+ports = [443]
+rate_per_minute = 1200
+rate_burst = 200
+comment = "web-h3"

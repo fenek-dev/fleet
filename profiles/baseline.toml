@@ -1,0 +1,97 @@
+# Fleet Baseline profile (design §9.4). Shipped inside fleet-agent
+# (`include_str!` in fleet-hardening) and reviewed with the release.
+# Operator profiles (design §9.2) extend this file; they can't change the
+# settings below, only skip modules or items and declare exceptions.
+
+[profile]
+name = "baseline"
+# In apply order within each phase (1 access, 2 sshd + firewall, 3 rest).
+modules = [
+    "admin.user",
+    "admin.shell",
+    "sudo.policy",
+    "ssh.hardening",
+    "firewall.baseline",
+    "sysctl",
+    "kernel.modules",
+    "coredump",
+    "updates",
+    "services.disable",
+    "auditd",
+    "journald",
+    "apparmor",
+    "umask",
+    "accounts.lock",
+    "time",
+    "basics",
+    "swap",
+]
+
+[ssh]
+max_sessions = 10
+# Per-source new-connection limit on the SSH accept rule.
+rate_per_minute = 30
+rate_burst = 10
+
+[sudo]
+log_io = false
+
+[auditd]
+immutable = false
+
+[journald]
+system_max_use = "1G"
+
+[packages]
+install = ["tmux", "logrotate"]
+
+[kernel]
+blacklist = ["dccp", "sctp", "rds", "tipc", "cramfs", "freevxfs", "hfs", "hfsplus", "jffs2"]
+
+[services]
+# Stopped and disabled where installed (legacy remote shells: rsh/rlogin/
+# rexec/telnet via inetd sockets).
+disable = [
+    "avahi-daemon.service",
+    "avahi-daemon.socket",
+    "cups.service",
+    "cups.socket",
+    "cups-browsed.service",
+    "rpcbind.service",
+    "rpcbind.socket",
+    "rsh.socket",
+    "rlogin.socket",
+    "rexec.socket",
+    "telnet.socket",
+    "inetd.service",
+]
+
+[sysctl]
+"net.ipv4.conf.all.rp_filter" = "1"
+"net.ipv4.conf.default.rp_filter" = "1"
+"net.ipv4.conf.all.accept_redirects" = "0"
+"net.ipv4.conf.default.accept_redirects" = "0"
+"net.ipv4.conf.all.secure_redirects" = "0"
+"net.ipv4.conf.default.secure_redirects" = "0"
+"net.ipv4.conf.all.send_redirects" = "0"
+"net.ipv4.conf.default.send_redirects" = "0"
+"net.ipv6.conf.all.accept_redirects" = "0"
+"net.ipv6.conf.default.accept_redirects" = "0"
+"net.ipv4.conf.all.accept_source_route" = "0"
+"net.ipv4.conf.default.accept_source_route" = "0"
+"net.ipv6.conf.all.accept_source_route" = "0"
+"net.ipv6.conf.default.accept_source_route" = "0"
+"net.ipv4.tcp_syncookies" = "1"
+"net.ipv4.conf.all.log_martians" = "1"
+"net.ipv4.conf.default.log_martians" = "1"
+"net.ipv4.ip_forward" = "0"
+"kernel.kptr_restrict" = "2"
+"kernel.dmesg_restrict" = "1"
+"kernel.yama.ptrace_scope" = "1"
+"kernel.unprivileged_bpf_disabled" = "1"
+"net.core.bpf_jit_harden" = "2"
+"fs.protected_symlinks" = "1"
+"fs.protected_hardlinks" = "1"
+"fs.protected_fifos" = "2"
+"fs.protected_regular" = "2"
+"fs.suid_dumpable" = "0"

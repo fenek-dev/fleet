@@ -280,7 +280,7 @@ pub fn policy_toml(fleet: FleetId, version: u64) -> String {
 fleet_id = "{fleet}"
 server_id = "{SERVER}"
 [capabilities]
-allow = ["system", "logs", "security", "services", "packages"]
+allow = ["system", "logs", "security", "services", "packages", "profile"]
 shell_exec = false
 shell_exec_users = []
 [elevated]

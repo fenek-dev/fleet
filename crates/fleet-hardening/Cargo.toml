@@ -1,0 +1,24 @@
+[package]
+name = "fleet-hardening"
+description = "Provisioning modules (check/plan/apply/revert), profiles, audit score, cloud-init export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fleet-proto.workspace = true
+fleet-ops.workspace = true
+fleet-crypto.workspace = true
+serde.workspace = true
+# Profile and role TOML (design §9.2), strict schema (deny_unknown_fields).
+toml.workspace = true
+blake3.workspace = true
+# fd-relative ownership changes in the admin's home (no unsafe, no libc).
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

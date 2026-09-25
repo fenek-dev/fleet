@@ -323,3 +323,41 @@ fn idle_memory_report() {
     );
     assert!(gate > 0 && exec > 0);
 }
+
+/// `profile.check` + `profile.plan` of Baseline against the real system
+/// (read-only; nothing is applied).
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn profile_check_and_plan() {
+    use fleet_proto::op::{ProfileLevel, ProfileSource, ProfileSpec};
+    let fx = fixture();
+    let spec = ProfileSpec {
+        source: ProfileSource::Builtin {
+            level: ProfileLevel::Baseline,
+            roles: vec![],
+        },
+        only: vec![],
+    };
+    let Payload::ProfileCheck(c) = read(fx, Op::ProfileCheck(spec.clone())) else {
+        panic!("wrong payload")
+    };
+    eprintln!("profile.check: score {} ({})", c.score, fx.os);
+    for m in &c.modules {
+        eprintln!(
+            "  {:<18} {:?} {}",
+            m.id,
+            m.status,
+            m.detail.lines().next().unwrap_or("")
+        );
+    }
+    assert!(c.modules.iter().any(|m| m.id == "ssh.hardening"));
+    assert!(c.score <= 100);
+    let Payload::ProfilePlan(p) = read(fx, Op::ProfilePlan(spec)) else {
+        panic!("wrong payload")
+    };
+    eprintln!("profile.plan: {} changes", p.changes.len());
+    for ch in &p.changes {
+        eprintln!("  {:<18} {}", ch.module, ch.description);
+    }
+    assert!(!p.changes.is_empty());
+}

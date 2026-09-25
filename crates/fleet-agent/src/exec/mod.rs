@@ -165,7 +165,7 @@ impl ExecConfig {
             checkpoint_interval: Duration::from_secs(3600),
             maintenance_interval: Duration::from_secs(5),
             reverter: Box::new(RegistryRevert::system()),
-            reverters: Reverters::with_generic(),
+            reverters: fleet_hardening::reverters(),
             timers: Rc::new(fleet_ops::SystemRunner),
             terminator: None,
             ctx: SysCtx::system(),
@@ -672,6 +672,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
 
     let st = Rc::new(RefCell::new(state));
     let mut registry = Registry::with_generic();
+    fleet_hardening::register(&mut registry);
     let state_ops: Rc<dyn OpHandler> = Rc::new(ops::StateOps(st.clone()));
     for tag in ops::TAGS {
         registry.register(tag, state_ops.clone());

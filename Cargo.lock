@@ -1105,6 +1105,7 @@ dependencies = [
  "blake3",
  "fleet-core",
  "fleet-crypto",
+ "fleet-hardening",
  "fleet-ops",
  "fleet-proto",
  "hex",
@@ -1177,6 +1178,20 @@ dependencies = [
  "unicode-normalization",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "fleet-hardening"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fleet-crypto",
+ "fleet-ops",
+ "fleet-proto",
+ "rustix",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
