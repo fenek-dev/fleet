@@ -8,9 +8,12 @@
 //!   `/usr/bin/crontab -u <user> -` with the rendered text on stdin (the
 //!   setgid `crontab` keeps spool ownership and signals cron). The version
 //!   is BLAKE3 of the spool file (`fswrite::version_of`; "" when absent), so
-//!   an edit made with `crontab -e` is a conflict. Elevated for root from
-//!   the arguments; exec escalates for privileged users through
-//!   [`escalation::cron_set`](crate::escalation::cron_set).
+//!   an edit made with `crontab -e` is a conflict; `expected_version` is
+//!   required. Environment lines (`MAILTO=`, `PATH=`, `SHELL=`, …) of the
+//!   existing crontab are kept, above the entries. Only regular login
+//!   accounts and `root` ([`users::check_login_target`](crate::users::check_login_target)).
+//!   Elevated for root from the arguments; exec escalates for privileged
+//!   users through [`escalation::cron_set`](crate::escalation::cron_set).
 //! - `timers.list`: see [`timers`].
 
 pub mod parse;
@@ -110,13 +113,7 @@ fn check(ctx: &SysCtx, op: &Op) -> Result<(), OpError> {
             if entries.len() > 256 {
                 return Err(OpError::new(ErrorCode::InvalidArgument).with_detail("entries"));
             }
-            if !crate::users::passwd(ctx)?
-                .iter()
-                .any(|p| p.name == user.as_str())
-            {
-                return Err(OpError::new(ErrorCode::NotFound).with_detail("no such user"));
-            }
-            Ok(())
+            crate::users::check_login_target(ctx, user).map(|_| ())
         }
         Op::CronList { .. } | Op::TimersList => Ok(()),
         _ => Err(ErrorCode::Unsupported.into()),
@@ -129,16 +126,15 @@ async fn set(
     user: &UserName,
     entries: &[CronEntry],
 ) -> Result<CronTabs, OpError> {
-    let current = user_tab(ctx, user.as_str())?.version;
-    if let Some(v) = meta.command.body.expected_version
-        && v != current
-    {
+    let abs = format!("{SPOOL}/{}", user.as_str());
+    let existing = read(ctx, &abs)?.unwrap_or_default();
+    let current = fswrite::version_of(&existing);
+    // Required: a blind overwrite would drop jobs added with `crontab -e`.
+    if meta.command.body.expected_version != Some(current) {
         return Err(ErrorCode::VersionConflict { current }.into());
     }
-    let out = ctx
-        .runner
-        .run(crontab_cmd(user, &parse::render(entries)))
-        .await?;
+    let text = parse::render(entries, &String::from_utf8_lossy(&existing));
+    let out = ctx.runner.run(crontab_cmd(user, &text)).await?;
     if !out.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let code = if err.contains("not allowed") {
