@@ -30,6 +30,7 @@ fleet-crypto.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 uniffi.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

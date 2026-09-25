@@ -9,7 +9,7 @@ final class CoreBridge {
     enum Status: Equatable {
         case starting
         case running
-        /// No fleet/device id yet: the table works, nothing connects.
+        /// No fleet/device id yet: onboarding (create a fleet) comes first.
         case notEnrolled
         case failed(String)
     }
@@ -22,8 +22,13 @@ final class CoreBridge {
     private(set) var hostKeyPrompts: [HostKeyPrompt] = []
     private(set) var failures: [String: String] = [:]
     private(set) var usesSoftwareKeys = false
+    private(set) var fleetName: String?
 
     @ObservationIgnored private var core: FleetCore?
+
+    /// The Rust core, for typed calls from the server tabs. `nil` until
+    /// `open` succeeded.
+    var api: FleetCore? { core }
 
     var onlineCount: Int { servers.filter { $0.state == .ready }.count }
     var criticalCount: Int {
@@ -38,12 +43,23 @@ final class CoreBridge {
             let core = try FleetCore.open(cachePath: path, signer: keys, keyStore: keyStore)
             self.core = core
             reload()
-            do {
-                try core.start(listener: Listener(bridge: self))
-                status = .running
-            } catch FleetError.NotEnrolled {
-                status = .notEnrolled
-            }
+            startManager()
+        } catch {
+            status = .failed(String(describing: error))
+        }
+    }
+
+    /// Starts the connection manager; after enrollment too.
+    func startManager() {
+        guard let core else { return }
+        fleetName = core.fleetName()
+        do {
+            try core.start(listener: Listener(bridge: self))
+            status = .running
+        } catch FleetError.NotEnrolled {
+            status = .notEnrolled
+        } catch FleetError.AlreadyStarted {
+            status = .running
         } catch {
             status = .failed(String(describing: error))
         }
@@ -67,10 +83,12 @@ final class CoreBridge {
         core?.setSessionKind(kind: locked ? .monitor : .device)
     }
 
-    func addServer(_ s: NewServer) throws {
-        guard let core else { return }
-        _ = try core.addServer(server: s)
+    @discardableResult
+    func addServer(_ s: NewServer) throws -> ServerRow? {
+        guard let core else { return nil }
+        let row = try core.addServer(server: s)
         reload()
+        return row
     }
 
     func addGroup(_ name: String) throws {
@@ -95,6 +113,11 @@ final class CoreBridge {
         } else {
             try? core?.rejectHostKey(serverId: prompt.serverId)
         }
+        reload()
+    }
+
+    func sshPublicKey() -> String? {
+        try? core?.sshPublicKey()
     }
 
     func systemInfo(_ id: String) async throws -> SystemInfoRow {
@@ -112,6 +135,8 @@ final class CoreBridge {
     fileprivate func apply(_ change: StateChange) {
         if let i = servers.firstIndex(where: { $0.id == change.serverId }) {
             servers[i].state = change.state
+        } else {
+            reload()
         }
         failures[change.serverId] = change.failure
     }
@@ -128,6 +153,14 @@ final class CoreBridge {
 
     fileprivate func apply(_ prompt: HostKeyPrompt) {
         if !hostKeyPrompts.contains(prompt) { hostKeyPrompts.append(prompt) }
+    }
+
+    fileprivate func apply(_ m: ServerMetricsRow) {
+        guard let i = servers.firstIndex(where: { $0.id == m.serverId }) else { return }
+        servers[i].cpuPercent = m.cpuPercent
+        servers[i].memPercent = m.memPercent
+        servers[i].diskPercent = m.diskPercent
+        servers[i].lastSeenMs = m.timeMs
     }
 
     private static func cachePath() throws -> String {
@@ -162,5 +195,41 @@ private final class Listener: CoreListener {
 
     func onResync() {
         Task { @MainActor [bridge] in bridge.reload() }
+    }
+
+    func onMetrics(row: ServerMetricsRow) {
+        Task { @MainActor [bridge] in bridge.apply(row) }
+    }
+}
+
+extension Error {
+    /// Operator-facing wording for core errors (Rust sends fixed codes).
+    var fleetMessage: String {
+        guard let e = self as? FleetError else { return "Request failed." }
+        switch e {
+        case .NotStarted, .NotEnrolled: return "Not connected: this Mac is not enrolled."
+        case .NotReady(let state): return "Not connected (\(state.label))."
+        case .Locked: return "Unlock Fleet first."
+        case .Timeout: return "The server did not answer in time."
+        case .Agent(let code): return "The agent refused the request (\(code))."
+        case .UnknownServer: return "Server not managed yet (agent keys not pinned)."
+        case .InvalidArgument(let field): return "Invalid \(field)."
+        case .Cancelled: return "Cancelled."
+        case .HostKeyNotConfirmed: return "Confirm the server's host key first."
+        case .SshKeyRefused: return "The server refused this Mac's SSH key. Add it to the user's authorized_keys."
+        case .HostKeyChanged: return "The server's host key changed. Check the server before trusting it."
+        case .Ssh(let m): return "SSH failed: \(m)"
+        case .Install(let m): return "Install failed: \(m)"
+        case .FileNotFound: return "No such file."
+        case .FilePermissionDenied: return "Permission denied."
+        case .FileChanged: return "The file changed on the server since it was opened."
+        case .FileTooLarge(let size): return "File too large to edit (\(Format.bytes(size)))."
+        case .File(let m): return "File operation failed: \(m)"
+        case .Enrollment(let reason): return "Enrollment: \(reason)."
+        case .Stream(let m): return "Stream failed: \(m)"
+        case .Session(let m): return "Session error: \(m)"
+        case .Keys: return "Key store unavailable."
+        default: return "Request failed."
+        }
     }
 }

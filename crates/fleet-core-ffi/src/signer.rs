@@ -38,6 +38,8 @@ pub trait CoreListener: Send + Sync {
     fn on_event(&self, event: AgentEventRow);
     /// Events were dropped (slow listener): reload `list_servers`.
     fn on_resync(&self);
+    /// Live CPU/memory/disk for the fleet table (10 s telemetry).
+    fn on_metrics(&self, row: crate::rows::ServerMetricsRow);
 }
 
 /// Checks lengths and normalizes to low-S, which `fleet-exec` requires

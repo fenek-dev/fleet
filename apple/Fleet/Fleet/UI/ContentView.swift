@@ -6,6 +6,15 @@ struct ContentView: View {
     @State private var selection: NavItem? = .fleet
 
     var body: some View {
+        if core.status == .notEnrolled {
+            EnrollmentView()
+                .frame(minWidth: 900, minHeight: 640)
+        } else {
+            main
+        }
+    }
+
+    private var main: some View {
         NavigationSplitView {
             SidebarView(selection: $selection) { paletteShown = true }
                 .navigationSplitViewColumnWidth(240)

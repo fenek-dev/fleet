@@ -145,6 +145,86 @@ pub enum FleetError {
     Keys { error: SignerError },
     #[error("internal: {message}")]
     Internal { message: String },
+    /// Enrollment step out of order, words already shown, check failed…
+    #[error("enrollment: {reason}")]
+    Enrollment { reason: String },
+    /// The operator cancelled Touch ID (root key).
+    #[error("cancelled")]
+    Cancelled,
+    /// The server has no pinned host key yet: probe and confirm first.
+    #[error("host key not confirmed")]
+    HostKeyNotConfirmed,
+    /// The server refused this Mac's SSH key (not in `authorized_keys`).
+    #[error("SSH key refused")]
+    SshKeyRefused,
+    /// The server's host key differs from the pinned one.
+    #[error("host key changed")]
+    HostKeyChanged,
+    #[error("ssh: {message}")]
+    Ssh { message: String },
+    /// A remote install step failed; `message` holds untrusted server text.
+    #[error("install: {message}")]
+    Install { message: String },
+    #[error("no such file")]
+    FileNotFound,
+    #[error("permission denied")]
+    FilePermissionDenied,
+    #[error("file changed on the server")]
+    FileChanged,
+    #[error("file too large ({size} bytes)")]
+    FileTooLarge { size: u64 },
+    #[error("file: {message}")]
+    File { message: String },
+    /// A stream ended or failed verification.
+    #[error("stream: {message}")]
+    Stream { message: String },
+}
+
+impl From<fleet_core::sftp::SftpError> for FleetError {
+    fn from(e: fleet_core::sftp::SftpError) -> Self {
+        use fleet_core::sftp::SftpError as E;
+        match e {
+            E::NotFound => Self::FileNotFound,
+            E::PermissionDenied => Self::FilePermissionDenied,
+            E::Changed => Self::FileChanged,
+            E::TooLarge { size } => Self::FileTooLarge { size },
+            E::InvalidPath => Self::InvalidArgument {
+                field: "path".into(),
+            },
+            other => Self::File {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<fleet_core::ssh::SshError> for FleetError {
+    fn from(e: fleet_core::ssh::SshError) -> Self {
+        use fleet_core::ssh::SshError as E;
+        match e {
+            E::AuthRejected => Self::SshKeyRefused,
+            E::HostKeyChanged { .. } => Self::HostKeyChanged,
+            E::Timeout => Self::Timeout,
+            E::Signer(signer::SignerError::Cancelled) => Self::Cancelled,
+            E::Signer(_) => Self::Locked,
+            other => Self::Ssh {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<fleet_core::install::InstallError> for FleetError {
+    fn from(e: fleet_core::install::InstallError) -> Self {
+        use fleet_core::install::InstallError as E;
+        match e {
+            E::Ssh(s) => s.into(),
+            E::Sftp(s) => s.into(),
+            other => Self::Install {
+                message: other.to_string(),
+            },
+        }
+    }
 }
 
 impl From<fleet_core::cache::CacheError> for FleetError {
@@ -188,7 +268,11 @@ pub struct ServerRow {
     pub user: String,
     pub group_id: Option<String>,
     pub tags: Vec<String>,
+    /// `user@host:port` hops, first hop first (`ssh -J` form).
+    pub proxy_jump: Option<String>,
     pub state: ConnState,
+    /// SSH host key pinned (first use confirmed).
+    pub host_key_pinned: bool,
     /// Agent Noise and signing keys are pinned (agent installed).
     pub agent_pinned: bool,
     pub cpu_percent: Option<f32>,
@@ -210,6 +294,9 @@ pub struct NewServer {
     pub user: String,
     pub group_id: Option<String>,
     pub tags: Vec<String>,
+    /// `user@host:port[,user@host:port…]`, first hop first; empty or
+    /// `None` for a direct connection.
+    pub proxy_jump: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]

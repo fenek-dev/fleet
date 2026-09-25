@@ -5,7 +5,12 @@
 //! - [`FleetCore`]: one object per app. Opens the cache, lists and edits
 //!   servers and groups, runs the connection manager on its own core
 //!   thread, switches the session kind on lock/unlock and sends
-//!   `system.info` / `agent.health`.
+//!   `system.info` / `agent.health`, and the typed operations the server
+//!   tabs use (`ops`).
+//! - [`Enrollment`]: first-Mac fleet bootstrap (genesis roster, recovery
+//!   code shown once); `install_agent` puts the agent on a server over SSH.
+//! - Streams ([`StreamHandle`] with [`MetricsSink`] / [`JournalSink`]),
+//!   terminals ([`TerminalSession`] with [`TerminalSink`]) and SFTP files.
 //! - Callback interfaces Swift implements: [`DeviceSigner`] (Secure Enclave
 //!   signing, one role at a time), [`KeyStore`] (the Keychain-held X25519
 //!   Noise key) and [`CoreListener`] (state changes, events, host key
@@ -22,12 +27,25 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod enrollment;
+mod files;
+mod install;
+mod ops;
+mod rows;
 mod signer;
+mod streams;
+mod terminal;
 mod types;
 mod validate;
 
 pub use api::FleetCore;
+pub use enrollment::Enrollment;
+pub use files::TransferListener;
+pub use install::InstallListener;
+pub use rows::*;
 pub use signer::{CoreListener, DeviceSigner, KeyStore, SignerAdapter};
+pub use streams::{JournalSink, MetricsSink, StreamHandle};
+pub use terminal::{TerminalSession, TerminalSink};
 pub use types::*;
 
 uniffi::setup_scaffolding!("fleet_core");

@@ -16,6 +16,19 @@ struct FleetTests {
         #expect(Format.uptime(12 * 86_400 + 5) == "12 d")
     }
 
+    @Test func chartMetricsFromRawSeries() {
+        let v: [String: Double] = [
+            "cpu.busy": 12, "mem.used": 1, "mem.total": 4, "disk.used:/": 40,
+            "net.rx:eth0": 100, "net.rx:other": 50, "net.tx:eth0": 7,
+        ]
+        #expect(ChartMetric.cpu.value(v) == 12)
+        #expect(ChartMetric.memory.value(v) == 25)
+        #expect(ChartMetric.disk.value(v) == 40)
+        #expect(ChartMetric.netRx.value(v) == 150)
+        #expect(ChartMetric.netTx.value(v) == 7)
+        #expect(ChartMetric.memory.value(["mem.used": 1, "mem.total": 0]) == nil)
+    }
+
     /// Device and SSH keys refuse to sign while locked, before touching the
     /// Keychain or the enclave.
     @Test func lockedGateRefusesDeviceAndSsh() throws {
