@@ -98,7 +98,7 @@ fn list_all_sources() {
 fn set_writes_through_crontab_stdin() {
     let d = root();
     let entries = vec![entry("0 4 * * sun", "/usr/bin/true", "weekly")];
-    let text = parse::render(&entries);
+    let text = parse::render(&entries, "");
     let r = Rc::new(FakeRunner::new());
     r.expect(CRONTAB, &["-u", "web", "-"], Ok(CommandOutput::ok("")));
     let c = ctx(d.path(), r.clone());
@@ -123,6 +123,60 @@ fn set_writes_through_crontab_stdin() {
         entries: vec![],
     };
     assert_eq!(run(&c, unknown, None), Err(ErrorCode::NotFound));
+}
+
+#[test]
+fn set_refusals_and_env_kept() {
+    let d = root();
+    let p = d.path();
+    std::fs::write(
+        p.join("etc/passwd"),
+        "root:x:0:0::/root:/bin/sh\nweb:x:1001:1001::/home/web:/bin/bash\n\
+         fleet-gate:x:1100:1100::/:/bin/sh\nsshd:x:105:65534::/run/sshd:/bin/sh\n\
+         toor:x:0:0::/:/bin/sh\nsvc:x:1002:1002::/:/usr/sbin/nologin\n\
+         f:x:1003:1003::/:/bin/false\nbig:x:70000:70000::/:/bin/sh\n",
+    )
+    .unwrap();
+    std::fs::write(p.join("etc/login.defs"), "UID_MIN 1000\nUID_MAX 60000\n").unwrap();
+    let c = ctx(p, Rc::new(FakeRunner::new()));
+    let op = |u: &str| Op::CronSet {
+        user: UserName::new(u).unwrap(),
+        entries: vec![],
+    };
+    for (u, want) in [
+        ("fleet-gate", ErrorCode::PolicyDenied),
+        ("sshd", ErrorCode::PolicyDenied), // system uid
+        ("toor", ErrorCode::PolicyDenied), // uid 0 but not root
+        ("big", ErrorCode::PolicyDenied),  // above UID_MAX
+        ("svc", ErrorCode::PolicyDenied),  // nologin
+        ("f", ErrorCode::PolicyDenied),    // /bin/false
+        ("ghost", ErrorCode::NotFound),
+    ] {
+        assert_eq!(run(&c, op(u), Some(0)), Err(want), "{u}");
+    }
+    // Missing expected_version → conflict, crontab not run.
+    let current = user_tab(&c, "web").unwrap().version;
+    assert_eq!(
+        run(&c, op("web"), None),
+        Err(ErrorCode::VersionConflict { current })
+    );
+
+    // root is allowed (Elevated); env lines of the old crontab survive.
+    std::fs::write(
+        p.join("var/spool/cron/crontabs/root"),
+        "MAILTO=ops\nPATH=/usr/bin:/bin\n0 1 * * * /old\n",
+    )
+    .unwrap();
+    let r = Rc::new(FakeRunner::new());
+    r.expect(CRONTAB, &["-u", "root", "-"], Ok(CommandOutput::ok("")));
+    let c = ctx(p, r.clone());
+    let current = user_tab(&c, "root").unwrap().version;
+    run(&c, op("root"), Some(current)).unwrap();
+    let stdin = r.calls()[0].stdin.clone().unwrap();
+    assert_eq!(
+        String::from_utf8(stdin).unwrap(),
+        format!("{}\nMAILTO=ops\nPATH=/usr/bin:/bin\n", parse::HEADER)
+    );
 }
 
 #[test]

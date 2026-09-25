@@ -51,6 +51,12 @@ impl UserName {
     pub fn is_root(&self) -> bool {
         self.0 == "root"
     }
+
+    /// Fleet's own accounts (`fleet*`): no op may change them or their
+    /// crontab and keys.
+    pub fn is_fleet(&self) -> bool {
+        self.0.starts_with("fleet")
+    }
 }
 
 validated_string!(
@@ -60,14 +66,37 @@ validated_string!(
     posix_name_ok
 );
 
-/// Groups whose membership is root-equivalent on Debian/Ubuntu. Adding a user
-/// to one makes `users.create`/`users.groups.set` Elevated (design §4.2 names
-/// `sudo` and `docker`; the rest grant root just as directly).
-pub const PRIVILEGED_GROUPS: &[&str] = &["root", "sudo", "docker", "disk", "shadow", "lxd"];
+/// Groups whose membership is root-equivalent (or reads secrets/logs that
+/// lead there) on Debian/Ubuntu. Adding a user to one makes
+/// `users.create`/`users.groups.set` Elevated (design §4.2 names `sudo` and
+/// `docker`; `admin`/`wheel` are sudo groups on older or customised
+/// systems; `adm`/`systemd-journal` read every log; `incus-admin`, `lxd`,
+/// `libvirt`, `kvm` start privileged guests or touch raw devices). Groups
+/// granted by sudoers are added at run time by `fleet_ops::escalation`.
+pub const PRIVILEGED_GROUPS: &[&str] = &[
+    "root",
+    "sudo",
+    "admin",
+    "wheel",
+    "adm",
+    "systemd-journal",
+    "docker",
+    "disk",
+    "shadow",
+    "lxd",
+    "incus-admin",
+    "libvirt",
+    "kvm",
+];
 
 impl GroupName {
     pub fn is_privileged(&self) -> bool {
         PRIVILEGED_GROUPS.contains(&self.0.as_str())
+    }
+
+    /// Fleet's own groups (`fleet*`), which no operation may create or join.
+    pub fn is_fleet(&self) -> bool {
+        self.0.starts_with("fleet")
     }
 }
 
@@ -178,8 +207,29 @@ mod tests {
         assert!(UserName::new("1abc").is_err());
         assert!(UserName::new("Admin").is_err());
         assert!(UserName::new("a".repeat(33)).is_err());
-        assert!(GroupName::new("sudo").unwrap().is_privileged());
-        assert!(!GroupName::new("adm").unwrap().is_privileged());
+        for g in [
+            "root",
+            "sudo",
+            "admin",
+            "wheel",
+            "adm",
+            "systemd-journal",
+            "docker",
+            "disk",
+            "shadow",
+            "lxd",
+            "incus-admin",
+            "libvirt",
+            "kvm",
+        ] {
+            assert!(GroupName::new(g).unwrap().is_privileged(), "{g}");
+        }
+        for g in ["users", "www-data", "staff", "incus"] {
+            assert!(!GroupName::new(g).unwrap().is_privileged(), "{g}");
+        }
+        assert!(UserName::new("fleet-gate").unwrap().is_fleet());
+        assert!(GroupName::new("fleet").unwrap().is_fleet());
+        assert!(!UserName::new("ops").unwrap().is_fleet());
 
         assert!(DebPackageName::new("libc6").is_ok());
         assert!(DebPackageName::new("g++").is_ok());

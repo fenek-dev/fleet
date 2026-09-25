@@ -189,6 +189,15 @@ pub async fn read_state(ctx: &SysCtx) -> Result<FirewallState, OpError> {
     })
 }
 
+/// Lockout checks against where sshd listens now (`InvalidArgument`,
+/// also when sshd's config can't be read in full).
+fn check_set(ctx: &SysCtx, set: &FirewallRuleSet) -> Result<model::SshInfo, OpError> {
+    let invalid = |d| OpError::new(ErrorCode::InvalidArgument).with_detail(d);
+    let ssh = model::ssh_info(ctx).map_err(invalid)?;
+    model::check(set, &ssh).map_err(invalid)?;
+    Ok(ssh)
+}
+
 /// `firewall.get` and `firewall.apply`.
 #[derive(Default)]
 pub struct FirewallHandler;
@@ -201,15 +210,28 @@ impl FirewallHandler {
         meta: &OpMeta,
     ) -> Result<OpOutput, OpError> {
         let set = model::canonical(set);
-        let ssh = model::ssh_ports(ctx);
-        model::check(&set, &ssh)
-            .map_err(|d| OpError::new(ErrorCode::InvalidArgument).with_detail(d))?;
+        let ssh = check_set(ctx, &set)?;
+        // Ban updates must not interleave with the replacement.
+        let _table = crate::nftlock::lock().await;
         // Versioned state (design §2.6): re-read right before applying.
-        let current = table_from(ctx.runner.run(list_table_spec()).await)?.version();
+        let table = table_from(ctx.runner.run(list_table_spec()).await)?;
+        let current = table.version();
         if meta.command.body.expected_version != Some(current) {
             return Err(ErrorCode::VersionConflict { current }.into());
         }
-        applied(ctx.runner.run(apply_spec(render::render(&set, &ssh))).await)?;
+        let mut script = render::render(&set, &ssh.ports);
+        if let Table::Present(p) = &table
+            && p.model.is_none()
+        {
+            // Unrecognized: drop its foreign chains/sets first, keep the
+            // ban/exempt sets (re-adding elements of any recreated one).
+            let c = p.cleanup.as_ref().map_err(|d| {
+                OpError::new(ErrorCode::InvalidArgument)
+                    .with_detail(format!("inet fleet can't be replaced: {d}"))
+            })?;
+            script = format!("{}{script}{}", c.pre, c.post);
+        }
+        applied(ctx.runner.run(apply_spec(script)).await)?;
         // Exec fills in id, deadline and origin; only `new_version` is read.
         Ok(OpOutput::Payload(Payload::ChangePending(PendingChange {
             change_id: [0; 16],
@@ -226,8 +248,7 @@ impl OpHandler for FirewallHandler {
     fn validate(&self, ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<(), OpError> {
         match op {
             Op::FirewallGet => Ok(()),
-            Op::FirewallApply(set) => model::check(&model::canonical(set), &model::ssh_ports(ctx))
-                .map_err(|d| OpError::new(ErrorCode::InvalidArgument).with_detail(d)),
+            Op::FirewallApply(set) => check_set(ctx, &model::canonical(set)).map(|_| ()),
             _ => Err(ErrorCode::Unsupported.into()),
         }
     }
@@ -284,18 +305,69 @@ impl Snapshot {
         }
     }
 
-    /// The `nft -f -` script that puts this snapshot back.
-    pub fn script(&self, ssh_ports: &[u16]) -> String {
-        match self {
+    /// The `nft -f -` script that puts this snapshot back. A raw snapshot
+    /// must be exactly one `table inet fleet { … }` block.
+    pub fn script(&self, ssh_ports: &[u16]) -> Result<String, OpError> {
+        Ok(match self {
             Snapshot::Absent => render::delete_table_script(),
             Snapshot::Model(m) => render::render(m, ssh_ports),
             Snapshot::Raw(text) => {
+                check_raw(text)
+                    .map_err(|e| OpError::internal(format!("firewall snapshot: {e}")))?;
                 let mut s = render::delete_table_script();
                 s.push_str(text);
                 s
             }
+        })
+    }
+}
+
+/// `text` is a single `table inet fleet { … }` block: nothing before or
+/// after it, no `include`/`define`/variables, no nested `table`, no `#`
+/// comments (which could hide braces). Quoted strings are skipped.
+pub fn check_raw(text: &str) -> Result<(), &'static str> {
+    let body = text
+        .trim_start()
+        .strip_prefix("table inet fleet {")
+        .ok_or("not a table inet fleet block")?;
+    let mut depth = 1usize;
+    let mut word = String::new();
+    let mut chars = body.char_indices();
+    let mut end = None;
+    while let Some((i, c)) = chars.next() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        if matches!(word.as_str(), "include" | "define" | "table") {
+            return Err("forbidden statement");
+        }
+        word.clear();
+        match c {
+            '"' => loop {
+                match chars.next() {
+                    Some((_, '"')) => break,
+                    Some((_, '\n')) | None => return Err("unterminated string"),
+                    Some(_) => {}
+                }
+            },
+            '#' | '$' | '\\' => return Err("forbidden character"),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
         }
     }
+    let end = end.ok_or("unbalanced braces")?;
+    if !body[end..].trim().is_empty() {
+        return Err("content after the table");
+    }
+    Ok(())
 }
 
 /// Auto-revert module for [`ChangeKind::Firewall`]. Synchronous (the
@@ -316,6 +388,9 @@ impl FirewallRevert {
                     }
                     let text = String::from_utf8(out.stdout)
                         .map_err(|_| OpError::internal("nft: listing not UTF-8"))?;
+                    // Refuse the op now rather than hold a snapshot that
+                    // can't be restored.
+                    check_raw(&text).map_err(|e| OpError::internal(format!("nft listing: {e}")))?;
                     Snapshot::Raw(text)
                 }
             },
@@ -330,7 +405,12 @@ impl Revertible for FirewallRevert {
 
     fn restore(&self, ctx: &SysCtx, snapshot: &[u8]) -> Result<(), OpError> {
         let snap = Snapshot::decode(snapshot)?;
-        let script = snap.script(&model::ssh_ports(ctx));
+        let script = snap.script(&model::ssh_ports_lenient(ctx))?;
+        // Synchronous: take the table lock when free. When an async writer
+        // in this process holds it, waiting would deadlock the
+        // single-threaded runtime, and a revert must not be skipped, so
+        // it proceeds (the `fleet-agent revert` process never contends).
+        let _table = crate::nftlock::try_lock();
         applied(ctx.runner.run_blocking(apply_spec(script)))
     }
 }

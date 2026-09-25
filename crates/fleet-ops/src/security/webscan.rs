@@ -1,8 +1,12 @@
 //! Web scanner detection (design §4.7) from JSON access-log lines written
 //! by Caddy (`http.log.access`) or nginx (`log_format … escape=json`, the
-//! web role's format). Pure; every field is attacker-influenced.
+//! web role's format). Pure; every field is attacker-influenced, and the
+//! whole line is as trusted as the web-server uid that writes the log (see
+//! `bans::web` for what may ban).
 
-use serde_json::Value;
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Value};
+use std::fmt;
 use std::net::IpAddr;
 
 /// One request, as far as the detector cares.
@@ -55,12 +59,81 @@ fn status_of(v: &Value) -> Option<u16> {
     }
 }
 
-/// Parses a Caddy or nginx JSON access line. `None` if it isn't one.
+/// A JSON value whose objects (at any depth) have no duplicate keys.
+/// `serde_json` keeps the last of duplicate keys, while other readers of
+/// the same line may take the first: a line like
+/// `{"remote_addr":"a","remote_addr":"b"}` is ambiguous, so it is refused.
+struct Strict(Value);
+
+impl<'de> Deserialize<'de> for Strict {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(StrictVisitor).map(Strict)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> Visitor<'de> for StrictVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("JSON without duplicate keys")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
+        let mut v = Vec::new();
+        while let Some(Strict(x)) = a.next_element()? {
+            v.push(x);
+        }
+        Ok(Value::Array(v))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
+        let mut m = Map::new();
+        while let Some(k) = a.next_key::<String>()? {
+            let Strict(v) = a.next_value()?;
+            if m.insert(k, v).is_some() {
+                return Err(de::Error::custom("duplicate key"));
+            }
+        }
+        Ok(Value::Object(m))
+    }
+}
+
+/// Parses `line` as JSON, refusing duplicate object keys.
+pub fn parse_strict_json(line: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Strict>(line).ok().map(|s| s.0)
+}
+
+/// Parses a Caddy or nginx JSON access line. `None` if it isn't one
+/// (including lines with duplicate keys, see [`parse_strict_json`]).
 pub fn parse_access_line(line: &[u8]) -> Option<AccessHit> {
     if line.len() > 64 * 1024 {
         return None;
     }
-    let v: Value = serde_json::from_slice(line).ok()?;
+    let v = parse_strict_json(line)?;
     let ip = str_at(&v, &["request", "client_ip"])
         .or_else(|| str_at(&v, &["request", "remote_ip"]))
         .or_else(|| str_at(&v, &["remote_addr"]))
@@ -111,6 +184,19 @@ mod tests {
             parse_access_line(br#"{"remote_addr":"nope","request_uri":"/","status":1}"#).is_none()
         );
         assert!(parse_access_line(b"127.0.0.1 - - [x] \"GET / HTTP/1.1\" 200").is_none());
+    }
+
+    #[test]
+    fn duplicate_keys_rejected() {
+        for (line, ok) in [
+            (&br#"{"remote_addr":"192.0.2.1","request_uri":"/.env","status":404}"#[..], true),
+            (br#"{"remote_addr":"192.0.2.1","remote_addr":"192.0.2.2","request_uri":"/.env","status":404}"#, false),
+            (br#"{"remote_addr":"192.0.2.1","request_uri":"/.env","status":404,"status":200}"#, false),
+            (br#"{"request":{"client_ip":"192.0.2.1","client_ip":"192.0.2.9","uri":"/"},"status":404}"#, false),
+            (br#"{"remote_addr":"192.0.2.1","request_uri":"/","status":404,"h":[{"a":1},{"a":2}]}"#, true),
+        ] {
+            assert_eq!(parse_access_line(line).is_some(), ok, "{}", String::from_utf8_lossy(line));
+        }
     }
 
     proptest! {

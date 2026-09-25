@@ -12,7 +12,10 @@
 //! - `unit.stop` / `unit.disable` of `ssh.service`, `sshd.service` or
 //!   `ssh.socket` (lockout: every Mac reaches the server only over SSH).
 //!   `unit.restart`/`unit.reload` of sshd stay allowed (existing sessions
-//!   survive an sshd restart).
+//!   survive an sshd restart);
+//! - `unit.stop` / `unit.disable` of [`CRITICAL_UNITS`] (bus, logind,
+//!   networking, journald, nftables);
+//! - every job but `unit.enable` on `nftables.service` ([`NO_JOB_UNITS`]).
 //!
 //! Mutating ops wait for the job's `JobRemoved` signal (bounded by
 //! [`DEFAULT_JOB_TIMEOUT`]) and answer the unit's fresh `UnitStatus`.
@@ -53,6 +56,31 @@ const MAX_TEXT: usize = 256;
 
 /// Units whose stop/disable would lock every Mac out.
 pub const LOCKOUT_UNITS: &[&str] = &["ssh.service", "sshd.service", "ssh.socket"];
+
+/// Unit base names (any type: `.service`, `.socket`) whose stop/disable
+/// cuts the network, logging, the bus or logins. Plus every
+/// `systemd-journald*` unit ([`critical_unit`]).
+pub const CRITICAL_UNITS: &[&str] = &[
+    "dbus",
+    "dbus-broker",
+    "systemd-networkd",
+    "networking",
+    "NetworkManager",
+    "systemd-logind",
+    "nftables",
+];
+
+/// Units that take no job at all but `enable`: starting, restarting or
+/// reloading `nftables.service` runs `nft -f /etc/nftables.conf`, whose
+/// `flush ruleset` wipes `table inet fleet` and Docker's rules
+/// (cooperative firewall mode, design §4.8).
+pub const NO_JOB_UNITS: &[&str] = &["nftables.service"];
+
+/// See [`CRITICAL_UNITS`].
+pub fn critical_unit(unit: &str) -> bool {
+    let base = unit.rsplit_once('.').map_or(unit, |(b, _)| b);
+    CRITICAL_UNITS.contains(&base) || base.starts_with("systemd-journald")
+}
 
 /// One row of `ListUnits`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -219,11 +247,19 @@ pub fn check_unit_op(op: &Op) -> Result<(), OpError> {
         Op::UnitList | Op::UnitStatus { .. } => return Ok(()),
         _ => return Err(ErrorCode::Unsupported.into()),
     };
+    let denied = |why: &'static str| Err(OpError::new(ErrorCode::PolicyDenied).with_detail(why));
+    let name = unit.as_str();
     if unit.is_fleet() {
-        return Err(OpError::new(ErrorCode::PolicyDenied).with_detail("fleet unit"));
+        return denied("fleet unit");
     }
-    if lockout_sensitive && LOCKOUT_UNITS.contains(&unit.as_str()) {
-        return Err(OpError::new(ErrorCode::PolicyDenied).with_detail("ssh lockout"));
+    if lockout_sensitive && LOCKOUT_UNITS.contains(&name) {
+        return denied("ssh lockout");
+    }
+    if lockout_sensitive && critical_unit(name) {
+        return denied("critical unit");
+    }
+    if !matches!(op, Op::UnitEnable { .. }) && NO_JOB_UNITS.contains(&name) {
+        return denied("flushes ruleset");
     }
     Ok(())
 }

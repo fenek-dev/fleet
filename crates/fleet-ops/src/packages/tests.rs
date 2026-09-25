@@ -81,6 +81,12 @@ fn sim(verb: &[&str]) -> Vec<&'static str> {
     v
 }
 
+fn prio(names: &[&str]) -> Vec<&'static str> {
+    let mut v = vec!["-W", "-f=${Package}\\t${Priority}\\n"];
+    v.extend(names.iter().map(|s| &*s.to_string().leak()));
+    v
+}
+
 fn scoped_mark(verb: &[&str]) -> Vec<&'static str> {
     let mut v: Vec<&str> = SCOPE.to_vec();
     v.extend(["/usr/bin/apt-mark", "-o", "DPkg::Lock::Timeout=60"]);
@@ -348,6 +354,7 @@ fn remove_and_purge_argv() {
                 &sim(&[verb, "nginx"]),
                 ok("Remv nginx [1.22.1-9]\n"),
             )
+            .expect(DPKG_QUERY, &prio(&["nginx"]), ok("nginx\toptional\n"))
             .expect(SYSTEMD_RUN, &scoped_apt(&[verb, "nginx"]), ok(""))
             .expect(DPKG_QUERY, &QUERY, ok(""));
         let op = Op::PkgRemove {
@@ -405,6 +412,94 @@ fn protected_removal_refused_before_running() {
     let e = run_op(dir.path(), r.clone(), op, Some(7)).unwrap_err();
     assert_eq!(e.code(), ErrorCode::PolicyDenied);
     assert_eq!(r.calls().len(), 2);
+}
+
+#[test]
+fn protected_names_table() {
+    let dir = root_with(&[("/proc/sys/kernel/osrelease", "6.1.0-18-amd64\n")]);
+    let c = ctx(dir.path(), Rc::new(FakeRunner::new()));
+    for (name, want) in [
+        ("libpam-modules", true),
+        ("libpam-runtime", true),
+        ("libpam0g:amd64", true),
+        ("login", true),
+        ("passwd", true),
+        ("netplan.io", true),
+        ("ifupdown", true),
+        ("isc-dhcp-client", true),
+        ("iproute2", true),
+        ("network-manager", true),
+        ("ca-certificates", true),
+        ("grub-pc", true),
+        ("grub-efi-amd64-signed", true),
+        ("linux-image-amd64", true),
+        ("linux-image-generic", true),
+        ("linux-image-6.1.0-18-amd64", true),
+        ("linux-image-6.1.0-17-amd64", false),
+        ("nginx", false),
+        ("grub", false),
+    ] {
+        assert_eq!(is_protected_on(&c, name), want, "{name}");
+    }
+    // Refused by name in validate, nothing runs.
+    let r = Rc::new(FakeRunner::new());
+    let op = Op::PkgRemove {
+        packages: vec![pkg("linux-image-6.1.0-18-amd64")],
+        purge: false,
+    };
+    let e = run_op(dir.path(), r.clone(), op, Some(7)).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::PolicyDenied);
+    assert!(r.calls().is_empty());
+}
+
+/// Truncated simulation, required/important priority, unanswered
+/// priority: all refuse before apt runs.
+#[test]
+fn removal_fails_closed() {
+    let truncated = Ok(CommandOutput {
+        truncated: true,
+        ..CommandOutput::ok(b"Remv nginx [1]\n".to_vec())
+    });
+    let sim_ok = || ok("Remv nginx [1]\nRemv mawk [1]\n");
+    type Case = (
+        Result<CommandOutput, RunError>,
+        Option<Result<CommandOutput, RunError>>,
+        ErrorCode,
+    );
+    let cases: [Case; 4] = [
+        (truncated, None, ErrorCode::Internal),
+        (
+            sim_ok(),
+            Some(ok("nginx\toptional\nmawk\trequired\n")),
+            ErrorCode::PolicyDenied,
+        ),
+        (
+            sim_ok(),
+            Some(ok("nginx\timportant\nmawk\toptional\n")),
+            ErrorCode::PolicyDenied,
+        ),
+        (sim_ok(), Some(ok("nginx\toptional\n")), ErrorCode::Internal),
+    ];
+    for (i, (sim_out, prio_out, code)) in cases.into_iter().enumerate() {
+        let dir = root_with(&[]);
+        let r = Rc::new(FakeRunner::new());
+        r.expect(DPKG_QUERY, &QUERY, ok(""))
+            .expect(APT_GET, &sim(&["remove", "nginx"]), sim_out);
+        let calls = if let Some(p) = prio_out {
+            r.expect(DPKG_QUERY, &prio(&["nginx", "mawk"]), p);
+            3
+        } else {
+            2
+        };
+        let op = Op::PkgRemove {
+            packages: vec![pkg("nginx")],
+            purge: false,
+        };
+        let e = run_op(dir.path(), r.clone(), op, Some(7)).unwrap_err();
+        assert_eq!(e.code(), code, "case {i}");
+        assert_eq!(r.calls().len(), calls, "case {i}: apt never ran");
+        assert_eq!(r.pending(), 0, "case {i}");
+    }
 }
 
 #[test]

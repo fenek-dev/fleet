@@ -306,7 +306,7 @@ impl IntegrityWatcher {
 mod tests {
     use super::*;
     use crate::FakeRunner;
-    use crate::test_util::{block, ctx_at, meta};
+    use crate::testutil::{T0, block, ctx_at, meta_at};
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -317,7 +317,7 @@ mod tests {
         for f in ["passwd", "shadow", "group"] {
             std::fs::write(d.join("etc").join(f), f).unwrap();
         }
-        let ctx = ctx_at(d, Rc::new(FakeRunner::new()));
+        let ctx = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let paths: Vec<String> = [
             "/etc/passwd",
             "/etc/shadow",
@@ -328,9 +328,12 @@ mod tests {
         .to_vec();
         let store = Rc::new(MemoryBaselineStore::default());
         let h = IntegrityHandler::new(store.clone(), paths);
-        let OpOutput::Payload(Payload::IntegrityStatus(s)) =
-            block(h.handle(&ctx, &Op::IntegrityStatus, &meta())).unwrap()
-        else {
+        let OpOutput::Payload(Payload::IntegrityStatus(s)) = block(h.handle(
+            &ctx,
+            &Op::IntegrityStatus,
+            &meta_at(Op::SystemInfo, Some(1), T0),
+        ))
+        .unwrap() else {
             panic!()
         };
         assert_eq!((s.files_checked, s.violations.len()), (3, 0));
@@ -380,7 +383,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(info.join("openssh-server:amd64.list"), "/usr/sbin/sshd\n").unwrap();
-        let ctx = ctx_at(d, Rc::new(FakeRunner::new()));
+        let ctx = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let paths: Vec<String> = ["/usr/bin/su", "/usr/sbin/sshd"].map(String::from).to_vec();
         let store = Rc::new(MemoryBaselineStore::default());
         let h = IntegrityHandler::new(store.clone(), paths.clone());

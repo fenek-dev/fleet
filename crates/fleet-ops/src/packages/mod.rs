@@ -15,7 +15,9 @@
 //! - Before any apt transaction, the same command is simulated (`-s`); if
 //!   it would remove a [`PROTECTED`] package (sshd, sudo, systemd, the
 //!   agent, …) the op is refused with `PolicyDenied`, whatever the reason
-//!   (a conflict pulled in by an install, a cascading remove).
+//!   (a conflict pulled in by an install, a cascading remove). Removing a
+//!   package of dpkg priority `required`/`important` is refused too, and a
+//!   truncated simulation fails the op (a `Remv` line may be missing).
 //! - Results are the diff of `dpkg-query` before and after, so they are
 //!   exact whatever apt did.
 //!
@@ -71,8 +73,10 @@ pub const REBOOT_REQUIRED: &str = "/run/reboot-required";
 const UPDATE_STAMP: &str = "/var/lib/apt/periodic/update-success-stamp";
 const LISTS_DIR: &str = "/var/lib/apt/lists";
 
-/// Never removed by any op (lockout, or the agent itself). Names starting
-/// with `fleet` are protected too.
+/// Never removed by any op (lockout, login/PAM, networking, boot, TLS
+/// roots, or the agent itself). Names starting with `fleet` or `grub-`
+/// are protected too, and so is the running kernel's image
+/// ([`is_protected_on`]).
 pub const PROTECTED: &[&str] = &[
     "openssh-server",
     "openssh-sftp-server",
@@ -81,7 +85,30 @@ pub const PROTECTED: &[&str] = &[
     "systemd-sysv",
     "dbus",
     "nftables",
+    "libpam-modules",
+    "libpam-runtime",
+    "libpam0g",
+    "login",
+    "passwd",
+    "netplan.io",
+    "ifupdown",
+    "isc-dhcp-client",
+    "iproute2",
+    "network-manager",
+    "ca-certificates",
+    // Kernel meta packages (Ubuntu, Debian amd64/arm64, cloud images).
+    "linux-image-generic",
+    "linux-image-virtual",
+    "linux-image-amd64",
+    "linux-image-arm64",
+    "linux-image-cloud-amd64",
+    "linux-image-cloud-arm64",
 ];
+
+/// The running kernel's release (`uname -r`).
+pub const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
+/// Per-package priority, for the required/important guard.
+const PRIORITY_FORMAT: &str = "${Package}\\t${Priority}\\n";
 
 /// Options of every mutating `apt-get` call.
 pub const APT_OPTS: &[&str] = &[
@@ -110,7 +137,75 @@ const MAX_LOG_BYTES: u64 = 16 << 20;
 
 pub fn is_protected(name: &str) -> bool {
     let n = parse::strip_arch(name);
-    PROTECTED.contains(&n) || n.starts_with("fleet")
+    PROTECTED.contains(&n) || n.starts_with("fleet") || n.starts_with("grub-")
+}
+
+/// `linux-image-<uname -r>` (and Ubuntu's `-unsigned-` variant) of the
+/// running kernel, from the context root.
+pub fn running_kernel_images(ctx: &SysCtx) -> Vec<String> {
+    let Some(rel) = ctx.procfs.read(OSRELEASE) else {
+        return Vec::new();
+    };
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("linux-image-{rel}"),
+        format!("linux-image-unsigned-{rel}"),
+    ]
+}
+
+/// [`is_protected`] plus the running kernel image.
+pub fn is_protected_on(ctx: &SysCtx, name: &str) -> bool {
+    let n = parse::strip_arch(name);
+    is_protected(n) || running_kernel_images(ctx).iter().any(|k| k == n)
+}
+
+/// `dpkg-query -W -f=<name>\t<priority> names…`. Names come from the
+/// simulation and are re-validated; any that isn't a valid Debian name
+/// refuses the op (and so can never be read as an option).
+pub fn priority_cmd(names: &[&str]) -> Result<CommandSpec, OpError> {
+    let mut spec = CommandSpec::new(DPKG_QUERY)
+        .args(["-W", &format!("-f={PRIORITY_FORMAT}")])
+        .timeout(T_QUERY);
+    for n in names {
+        let n = parse::strip_arch(n);
+        DebPackageName::new(n).map_err(|_| {
+            OpError::new(ErrorCode::PolicyDenied).with_detail("unexpected package name")
+        })?;
+        spec = spec.arg(n);
+    }
+    Ok(spec)
+}
+
+/// Refuses removing any package of priority `required` or `important`;
+/// every name must be answered for (fail closed).
+async fn check_priorities(ctx: &SysCtx, remove: &[String]) -> Result<(), OpError> {
+    if remove.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = remove.iter().map(String::as_str).collect();
+    let out = run_ok(ctx, priority_cmd(&names)?).await?;
+    if out.truncated {
+        return Err(OpError::internal("dpkg-query output truncated"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut seen = HashSet::new();
+    for line in text.lines() {
+        let Some((name, prio)) = line.split_once('\t') else {
+            continue;
+        };
+        if matches!(prio.trim(), "required" | "important") {
+            return Err(OpError::new(ErrorCode::PolicyDenied)
+                .with_detail(format!("would remove {} package {name}", prio.trim())));
+        }
+        seen.insert(name);
+    }
+    match names.iter().find(|n| !seen.contains(parse::strip_arch(n))) {
+        Some(n) => Err(OpError::internal(format!("no priority for {n}"))),
+        None => Ok(()),
+    }
 }
 
 /// stderr of apt/dpkg when another process holds the lock.
@@ -201,8 +296,12 @@ async fn installed(ctx: &SysCtx) -> Result<Vec<Installed>, OpError> {
     Ok(parse_dpkg_query(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// A truncated simulation could hide a `Remv` line: fail closed.
 async fn simulate(ctx: &SysCtx, verb: &[String]) -> Result<Sim, OpError> {
     let out = run_ok(ctx, sim_cmd(verb)).await?;
+    if out.truncated {
+        return Err(OpError::internal("apt simulation output truncated"));
+    }
     Ok(parse_apt_sim(&String::from_utf8_lossy(&out.stdout)))
 }
 
@@ -365,9 +464,10 @@ async fn transaction(
     let id = op_id(meta)?;
     let before = installed(ctx).await?;
     let sim = simulate(ctx, &verb).await?;
-    if let Some(p) = sim.remove.iter().find(|n| is_protected(n)) {
+    if let Some(p) = sim.remove.iter().find(|n| is_protected_on(ctx, n)) {
         return Err(OpError::new(ErrorCode::PolicyDenied).with_detail(format!("would remove {p}")));
     }
+    check_priorities(ctx, &sim.remove).await?;
     let auto = if restore_auto {
         auto_installed(ctx)
     } else {
@@ -462,9 +562,9 @@ async fn hold(
 }
 
 /// Refusals that need no system state (before the nonce is consumed).
-pub fn check_pkg_op(op: &Op) -> Result<(), OpError> {
+pub fn check_pkg_op(ctx: &SysCtx, op: &Op) -> Result<(), OpError> {
     if let Op::PkgRemove { packages, .. } = op
-        && let Some(p) = packages.iter().find(|p| is_protected(p.as_str()))
+        && let Some(p) = packages.iter().find(|p| is_protected_on(ctx, p.as_str()))
     {
         return Err(OpError::new(ErrorCode::PolicyDenied).with_detail(format!("protected {p}")));
     }
@@ -476,7 +576,7 @@ pub struct PackagesHandler;
 
 impl PackagesHandler {
     async fn run(ctx: &SysCtx, op: &Op, meta: &OpMeta) -> Result<Payload, OpError> {
-        check_pkg_op(op)?;
+        check_pkg_op(ctx, op)?;
         Ok(match op {
             Op::PkgList { filter } => {
                 Payload::Packages(list(ctx, filter.as_ref().map(|f| f.as_str())).await?)
@@ -514,8 +614,8 @@ impl PackagesHandler {
 }
 
 impl OpHandler for PackagesHandler {
-    fn validate(&self, _ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<(), OpError> {
-        check_pkg_op(op)
+    fn validate(&self, ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<(), OpError> {
+        check_pkg_op(ctx, op)
     }
 
     fn handle<'a>(

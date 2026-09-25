@@ -82,7 +82,11 @@ impl OpHandler for TelemetryOps {
         op.check_args()
             .map_err(|_| OpError::new(ErrorCode::InvalidArgument))?;
         match op {
-            Op::ProcessSignal { pid, .. } | Op::ProcessRenice { pid, .. } => {
+            Op::ProcessSignal { pid, signal } => {
+                procs::check_signal_target(ctx, self.0.sys().self_pid(), pid.get(), *signal)?;
+                Ok(())
+            }
+            Op::ProcessRenice { pid, .. } => {
                 procs::check_target(ctx, self.0.sys().self_pid(), pid.get())?;
                 Ok(())
             }
@@ -119,11 +123,7 @@ impl OpHandler for TelemetryOps {
                     Payload::ProcessHistory(history(&self.0, now, range)?)
                 }
                 Op::ProcessSignal { pid, signal } => {
-                    procs::check_target(ctx, self.0.sys().self_pid(), pid.get())?;
-                    self.0
-                        .sys()
-                        .kill(pid.get(), *signal)
-                        .map_err(|e| io_code(&e))?;
+                    procs::send_signal(ctx, self.0.sys(), pid.get(), *signal)?;
                     Payload::Empty
                 }
                 Op::ProcessRenice { pid, nice } => {
@@ -726,6 +726,8 @@ mod tests {
     #[test]
     fn signal_and_renice_guarded() {
         let r = rig();
+        let cg = r.dir.path().join("proc/4242/cgroup");
+        std::fs::write(&cg, "0::/user.slice/user-1000.slice/session-3.scope\n").unwrap();
         let sig = |pid| Op::ProcessSignal {
             pid: Pid::new(pid).unwrap(),
             signal: Signal::Term,
@@ -749,6 +751,48 @@ mod tests {
         };
         assert_eq!(run(&r, renice, None), Ok(Payload::Empty));
         assert_eq!(*r.sys.calls.borrow(), ["kill 4242 15", "renice 4242 10"]);
+    }
+
+    #[test]
+    fn signal_refused_to_protected_units() {
+        let r = rig();
+        let cg = r.dir.path().join("proc/4242/cgroup");
+        let sig = |signal| Op::ProcessSignal {
+            pid: Pid::new(4242).unwrap(),
+            signal,
+        };
+        let denied = Err(ErrorCode::PolicyDenied);
+        let cases: [(&str, Signal, Result<(), ErrorCode>); 9] = [
+            ("0::/system.slice/ssh.service", Signal::Term, denied),
+            ("0::/system.slice/ssh.service", Signal::Hup, denied),
+            ("0::/system.slice/fleet-agent.service", Signal::Kill, denied),
+            ("0::/system.slice/dbus-broker.service", Signal::Stop, denied),
+            (
+                "0::/system.slice/systemd-journald.service",
+                Signal::Int,
+                denied,
+            ),
+            (
+                "1:name=systemd:/system.slice/systemd-logind.service\n0::/",
+                Signal::Quit,
+                denied,
+            ),
+            // Cont never hurts; ordinary services stay signallable.
+            ("0::/system.slice/ssh.service", Signal::Cont, Ok(())),
+            ("0::/system.slice/nginx.service", Signal::Term, Ok(())),
+            // No cgroup file: gone (fail closed).
+            ("", Signal::Term, Err(ErrorCode::NotFound)),
+        ];
+        for (text, s, want) in cases {
+            if text.is_empty() {
+                let _ = std::fs::remove_file(&cg);
+            } else {
+                std::fs::write(&cg, text).unwrap();
+            }
+            let got = run(&r, sig(s), None).map(|_| ()).map_err(|e| e.code());
+            assert_eq!(got, want, "{text} {s:?}");
+        }
+        assert_eq!(*r.sys.calls.borrow(), ["kill 4242 18", "kill 4242 15"]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::model::{self, canonical, canonical_ports, check, parse_sshd_ports, version};
+use super::model::{self, SshInfo, canonical, canonical_ports, check, parse_sshd_ports, version};
 use super::parse::{parse_table, parse_ufw, summarize_ruleset};
 use super::render::{delete_table_script, render};
 use super::*;
@@ -237,29 +237,93 @@ fn version_is_canonical_and_nonzero() {
 fn lockout_checks() {
     use FwAction::*;
     use FwChain::*;
-    assert_eq!(check(&fixture_model(), &[22]), Ok(()));
-    // No SSH rule at all.
+    let both = SshInfo::ports(&[22]);
+    let v4_only = SshInfo {
+        v6: false,
+        ..both.clone()
+    };
+    let live_2222 = SshInfo {
+        ports: vec![22, 2222],
+        live: vec![2222],
+        ..both.clone()
+    };
+    let (only_2222, two) = (SshInfo::ports(&[2222]), SshInfo::ports(&[22, 2222]));
     let web = named(rule(Input, Accept, Protocol::Tcp, vec![p(80)]), "web");
-    assert!(check(&managed(vec![web.clone()]), &[22]).is_err());
-    // SSH on another port than sshd listens on.
-    assert!(check(&managed(vec![ssh()]), &[2222]).is_err());
-    assert_eq!(check(&managed(vec![ssh()]), &[22, 2222]), Ok(()));
-    // Source-restricted SSH is fine (exempt sets and auto-revert cover it).
-    let office = from(ssh(), "203.0.113.0/24");
-    assert_eq!(check(&managed(vec![office]), &[22]), Ok(()));
-    // Blanket drop of SSH.
     let block = rule(Input, Drop, Protocol::Tcp, vec![pr(1, 1024)]);
-    assert!(check(&managed(vec![block.clone(), ssh()]), &[22]).is_err());
-    assert_eq!(
-        check(&managed(vec![from(block, "192.0.2.0/24"), ssh()]), &[22]),
-        Ok(())
-    );
-    // UDP 22 is not SSH.
-    let udp = rule(Input, Accept, Protocol::Udp, vec![p(22)]);
-    assert!(check(&managed(vec![udp]), &[22]).is_err());
-    // Rate limits only on accept rules; bounded meter count.
+    let ssh_on = |n: u16| rule(Input, Accept, Protocol::Tcp, vec![p(n)]);
     let bad = limited(rule(Input, Drop, Protocol::Tcp, vec![p(25)]), 5, 0);
-    assert!(check(&managed(vec![ssh(), bad]), &[22]).is_err());
+    let cases: Vec<(&str, Vec<FirewallRule>, &SshInfo, bool)> = vec![
+        ("fixture", fixture_model().rules, &both, true),
+        ("no ssh rule", vec![web.clone()], &both, false),
+        ("other port", vec![ssh()], &only_2222, false),
+        ("one of the ports", vec![ssh()], &two, true),
+        // Source-restricted SSH alone could lock out everyone else.
+        (
+            "restricted",
+            vec![from(ssh(), "203.0.113.0/24")],
+            &both,
+            false,
+        ),
+        // Shorter than /8 counts as anywhere, but per family.
+        ("v4 /4 only", vec![from(ssh(), "0.0.0.0/4")], &both, false),
+        (
+            "v4 /4, v4 host",
+            vec![from(ssh(), "0.0.0.0/4")],
+            &v4_only,
+            true,
+        ),
+        ("v4 /7", vec![from(ssh(), "0.0.0.0/7")], &v4_only, true),
+        ("v4 /8", vec![from(ssh(), "10.0.0.0/8")], &v4_only, false),
+        (
+            "v4 + v6 wide",
+            vec![from(ssh(), "0.0.0.0/0"), from(ssh(), "::/15")],
+            &both,
+            true,
+        ),
+        (
+            "v6 /16",
+            vec![from(ssh(), "0.0.0.0/0"), from(ssh(), "2001::/16")],
+            &both,
+            false,
+        ),
+        ("drop before", vec![block.clone(), ssh()], &both, false),
+        // Any earlier drop covering SSH, whatever its source.
+        (
+            "restricted drop before",
+            vec![from(block.clone(), "192.0.2.0/24"), ssh()],
+            &both,
+            false,
+        ),
+        ("drop after", vec![ssh(), block.clone()], &both, true),
+        // A v6-only drop can't block v4 SSH.
+        (
+            "v6 drop, v4 host",
+            vec![from(block.clone(), "2001:db8::/32"), ssh()],
+            &v4_only,
+            true,
+        ),
+        (
+            "v6 drop, both",
+            vec![from(block, "2001:db8::/32"), ssh()],
+            &both,
+            false,
+        ),
+        (
+            "udp",
+            vec![rule(Input, Accept, Protocol::Udp, vec![p(22)])],
+            &both,
+            false,
+        ),
+        // sshd listens on 2222 only: an accept for config port 22 isn't enough.
+        ("live port", vec![ssh_on(22)], &live_2222, false),
+        ("live port ok", vec![ssh_on(2222)], &live_2222, true),
+        // Rate limits only on accept rules.
+        ("limited drop", vec![ssh(), bad], &both, false),
+    ];
+    for (name, rules, info, ok) in cases {
+        assert_eq!(check(&managed(rules), info).is_ok(), ok, "{name}");
+    }
+    let both = &both;
     let many: Vec<_> = (0..=model::MAX_METERED)
         .map(|i| {
             limited(
@@ -270,20 +334,20 @@ fn lockout_checks() {
         })
         .chain([ssh()])
         .collect();
-    assert!(check(&managed(many), &[22]).is_err());
+    assert!(check(&managed(many), both).is_err());
     // Bans-only needs no SSH rule, but can't carry rules.
     let bo = FirewallRuleSet {
         mode: FirewallMode::BansOnly,
         rules: vec![],
     };
-    assert_eq!(check(&bo, &[22]), Ok(()));
+    assert_eq!(check(&bo, both), Ok(()));
     assert!(
         check(
             &FirewallRuleSet {
                 rules: vec![web],
                 ..bo
             },
-            &[22]
+            both
         )
         .is_err()
     );
@@ -291,29 +355,101 @@ fn lockout_checks() {
 
 #[test]
 fn sshd_ports() {
-    let text = "# Port 99\nPort 2222\nport=2200\nListenAddress 0.0.0.0\nPort 0\nPort x\nMatch User git\nPort 3333\n";
+    let text =
+        "# Port 99\nPort 2222\nport=2200\nListenAddress 0.0.0.0\nMatch User git\nPort 3333\n";
     assert_eq!(parse_sshd_ports(text), vec![2222, 2200]);
+    // A malformed Port is an error, not skipped.
+    let mut cfg = model::SshdConfig::default();
+    assert!(model::parse_sshd_config("Port x\n", &mut cfg, &mut |_| Ok(())).is_err());
 
+    // (files under /etc/ssh, Ok(ports) or Err)
+    let long = "Port 22\n".repeat(10_001);
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, Result<Vec<u16>, ()>);
+    let cases: Vec<Case> = vec![
+        ("no config", vec![], Ok(vec![22])),
+        (
+            "include glob, relative and absolute",
+            vec![
+                (
+                    "sshd_config",
+                    "Include sshd_config.d/*.conf /etc/ssh/extra\nPort 22\n",
+                ),
+                ("sshd_config.d/10-fleet.conf", "Port 2222\n"),
+                ("sshd_config.d/x.disabled", "Port 1\n"),
+                ("sshd_config.d/.hidden.conf", "Port 2\n"),
+                ("extra", "Port 2200\n"),
+            ],
+            Ok(vec![22, 2200, 2222]),
+        ),
+        (
+            "listen addresses",
+            vec![(
+                "sshd_config",
+                "Port 2000\nListenAddress 10.0.0.1:2201\nListenAddress [2001:db8::1]:2202\nListenAddress 2001:db8::2\n",
+            )],
+            Ok(vec![2000, 2201, 2202]),
+        ),
+        (
+            "listen ports only: Port unused",
+            vec![("sshd_config", "ListenAddress 0.0.0.0:2201\n")],
+            Ok(vec![2201]),
+        ),
+        (
+            "include loop hits depth bound",
+            vec![("sshd_config", "Include sshd_config\n")],
+            Err(()),
+        ),
+        (
+            "too many ports",
+            vec![(
+                "sshd_config",
+                "Port 1\nPort 2\nPort 3\nPort 4\nPort 5\nPort 6\nPort 7\nPort 8\nPort 9\n",
+            )],
+            Err(()),
+        ),
+        ("too long", vec![("sshd_config", long.as_str())], Err(())),
+        (
+            "bad listen port",
+            vec![("sshd_config", "ListenAddress [::1]:x\n")],
+            Err(()),
+        ),
+    ];
+    for (name, files, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        for (f, text) in files {
+            let p = dir.path().join("etc/ssh").join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+        let c = ctx(dir.path(), Rc::new(FakeRunner::new()));
+        let got = model::ssh_info(&c).map(|i| i.ports).map_err(|_| ());
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+/// Live sshd sockets (from `/proc`) join the configured ports and decide
+/// which one an accept rule must cover.
+#[test]
+fn sshd_live_ports_from_proc() {
     let dir = tempfile::tempdir().unwrap();
-    let c = ctx(dir.path(), Rc::new(FakeRunner::new()));
-    assert_eq!(model::ssh_ports(&c), vec![22]);
-    std::fs::create_dir_all(dir.path().join("etc/ssh/sshd_config.d")).unwrap();
+    let d = dir.path();
+    std::fs::create_dir_all(d.join("proc/net")).unwrap();
+    std::fs::create_dir_all(d.join("proc/700/fd")).unwrap();
+    std::fs::write(d.join("proc/700/comm"), "sshd\n").unwrap();
+    // 0.0.0.0:2222 LISTEN, inode 4242.
     std::fs::write(
-        dir.path().join("etc/ssh/sshd_config"),
-        "Include /etc/ssh/sshd_config.d/*.conf\n",
+        d.join("proc/net/tcp"),
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 00000000:08AE 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4242 1 0 100 0 0 10 0\n",
     )
     .unwrap();
-    std::fs::write(
-        dir.path().join("etc/ssh/sshd_config.d/10-fleet.conf"),
-        "Port 2222\nPort 22\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("etc/ssh/sshd_config.d/x.disabled"),
-        "Port 1\n",
-    )
-    .unwrap();
-    assert_eq!(model::ssh_ports(&c), vec![22, 2222]);
+    std::os::unix::fs::symlink("socket:[4242]", d.join("proc/700/fd/3")).unwrap();
+    let c = ctx(d, Rc::new(FakeRunner::new()));
+    let info = model::ssh_info(&c).unwrap();
+    assert_eq!(
+        (info.ports.as_slice(), info.live.as_slice()),
+        (&[22, 2222][..], &[2222][..])
+    );
+    assert!(check(&managed(vec![ssh()]), &info).is_err());
 }
 
 // ---- parsing ----
@@ -379,6 +515,85 @@ fn parse_rejects_garbage() {
     assert_eq!(
         parse_table(jump.as_bytes()).unwrap().unrecognized,
         Some("statement")
+    );
+}
+
+/// Anything `render` wouldn't write, down to base rules and chain
+/// definitions, makes the table unrecognized.
+#[test]
+fn parse_round_trip_checks() {
+    let exprs65 = format!(
+        r#"{}{{"reject": null}}]"#,
+        r#"{"counter": null}, "#.repeat(64)
+    );
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "base rule changed",
+            MANAGED_JSON.replace(r#""rate": 10, "burst": 20"#, r#""rate": 11, "burst": 20"#),
+            "base rules",
+        ),
+        (
+            "base rule missing",
+            MANAGED_JSON.replace(
+                r#"{"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": "invalid"}}, {"drop": null}"#,
+                r#"{"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": "invalid"}}, {"accept": null}"#,
+            ),
+            "base rules",
+        ),
+        (
+            "unknown base statement",
+            MANAGED_JSON.replace(
+                r#"{"match": {"op": "==", "left": {"meta": {"key": "iif"}}, "right": "lo"}}, {"accept": null}"#,
+                r#"{"match": {"op": "==", "left": {"meta": {"key": "iif"}}, "right": "lo"}}, {"jump": {"target": "x"}}"#,
+            ),
+            "base rule",
+        ),
+        (
+            "chain priority",
+            MANAGED_JSON.replace(r#""hook": "input", "prio": 0"#, r#""hook": "input", "prio": 10"#),
+            "chain definition",
+        ),
+        (
+            "chain hook",
+            MANAGED_JSON.replace(r#""hook": "forward""#, r#""hook": "output""#),
+            "chain definition",
+        ),
+        (
+            "forward policy",
+            MANAGED_JSON.replace(
+                r#""hook": "forward", "prio": 0, "policy": "accept""#,
+                r#""hook": "forward", "prio": 0, "policy": "drop""#,
+            ),
+            "chain definition",
+        ),
+        (
+            "rule over 64 expressions",
+            MANAGED_JSON.replace(r#"{"reject": null}]"#, &exprs65),
+            "rule too long",
+        ),
+        (
+            "meter slot out of range",
+            MANAGED_JSON.replace(r#""name": "m4_1""#, r#""name": "m4_16""#),
+            "unknown set",
+        ),
+    ];
+    for (name, json, why) in cases {
+        assert_ne!(json, MANAGED_JSON, "{name}: fixture unchanged");
+        let got = parse_table(json.as_bytes()).unwrap();
+        assert_eq!(
+            (got.model.is_none(), got.unrecognized),
+            (true, Some(why)),
+            "{name}"
+        );
+    }
+    // The fixture itself round-trips, exempt ports masked.
+    let exempt4 = r#""right": 22}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "@exempt4""#;
+    let other_ssh =
+        MANAGED_JSON.replace(exempt4, &exempt4.replace("22}", "{\"set\": [22, 2222]}}"));
+    assert_ne!(other_ssh, MANAGED_JSON);
+    assert_eq!(
+        parse_table(other_ssh.as_bytes()).unwrap().unrecognized,
+        None
     );
 }
 
@@ -555,6 +770,169 @@ fn apply_checks_version_then_applies_atomically() {
     );
 }
 
+/// An unrecognized table is replaced: every chain flushed and deleted,
+/// foreign sets deleted, ban/exempt sets kept (or recreated with their
+/// listed elements when declared differently).
+#[test]
+fn apply_replaces_unrecognized_table() {
+    let set = managed(vec![ssh()]);
+    let flush_io = "flush chain inet fleet input\nflush chain inet fleet forward\ndelete chain inet fleet input\ndelete chain inet fleet forward\n";
+    // Objects listed ahead of the first chain.
+    let insert = |objs: &str| {
+        HAND_EDITED_JSON.replacen(r#"{"chain": {"#, &format!("{objs}\n{{\"chain\": {{"), 1)
+    };
+    let foreign_set = insert(
+        r#"{"set": {"family": "inet", "name": "extra", "table": "fleet", "type": "ipv4_addr", "handle": 90}},
+{"chain": {"family": "inet", "table": "fleet", "name": "x-1", "handle": 91}},"#,
+    );
+    let odd_ban = HAND_EDITED_JSON.replacen(
+        r#""flags": ["interval", "timeout"]"#,
+        r#""flags": ["timeout"]"#,
+        1,
+    );
+    let bad_name = insert(
+        r#"{"chain": {"family": "inet", "table": "fleet", "name": "x; flush ruleset", "handle": 91}},"#,
+    );
+    let flowtable = insert(
+        r#"{"flowtable": {"family": "inet", "table": "fleet", "name": "ft", "handle": 91}},"#,
+    );
+    // (listing, Ok((pre, post)) or Err)
+    type Case = (&'static str, String, Option<(String, String)>);
+    let cases: Vec<Case> = vec![
+        ("hand edited", HAND_EDITED_JSON.into(), Some((flush_io.into(), String::new()))),
+        (
+            "foreign set and chain",
+            foreign_set,
+            Some((
+                "flush chain inet fleet x-1\nflush chain inet fleet input\nflush chain inet fleet forward\ndelete chain inet fleet x-1\ndelete chain inet fleet input\ndelete chain inet fleet forward\ndelete set inet fleet extra\n".into(),
+                String::new(),
+            )),
+        ),
+        (
+            "ban set declared differently",
+            odd_ban,
+            Some((
+                format!("{flush_io}delete set inet fleet banned4\n"),
+                "add element inet fleet banned4 { 192.0.2.10 timeout 3412s }\n".into(),
+            )),
+        ),
+        ("unsafe name", bad_name, None),
+        ("unsupported object", flowtable, None),
+    ];
+    for (name, listing, want) in cases {
+        let parsed = parse_table(listing.as_bytes()).unwrap();
+        assert!(parsed.model.is_none(), "{name}");
+        let f = Rc::new(FakeRunner::new());
+        f.expect(NFT, &LIST_TABLE, out(&listing));
+        if want.is_some() {
+            f.expect(NFT, &APPLY, out(""));
+        }
+        let c = ctx(nowhere(), f.clone());
+        let (op, m) = apply_meta(set.clone(), Some(parsed.version));
+        let got = run(&FirewallHandler, &c, &op, &m);
+        match want {
+            Some((pre, post)) => {
+                assert!(got.is_ok(), "{name}: {got:?}");
+                let script = format!("{pre}{}{post}", render(&set, &[22]));
+                assert_eq!(
+                    f.calls()[1].stdin.as_deref(),
+                    Some(script.as_bytes()),
+                    "{name}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    got.unwrap_err().code(),
+                    ErrorCode::InvalidArgument,
+                    "{name}"
+                );
+                assert_eq!(f.calls().len(), 1, "{name}: nothing applied");
+            }
+        }
+    }
+}
+
+/// `firewall.apply` holds the table lock across its nft calls and
+/// releases it after.
+#[test]
+fn apply_holds_table_lock() {
+    use std::task::{Context, Waker};
+    let f = Rc::new(FakeRunner::new());
+    f.expect(NFT, &LIST_TABLE, absent());
+    f.expect(NFT, &APPLY, out(""));
+    let c = ctx(nowhere(), f.clone());
+    let (op, m) = apply_meta(managed(vec![ssh()]), Some(0));
+    // Other tests may hold it briefly: wait for it.
+    let held = block(crate::nftlock::lock());
+    let mut fut = FirewallHandler.handle(&c, &op, &m);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+    assert!(
+        f.calls().is_empty(),
+        "no nft call while another writer holds the table"
+    );
+    drop(held);
+    assert!(block(fut).is_ok());
+    assert_eq!(f.calls().len(), 2);
+}
+
+#[test]
+fn raw_snapshot_must_be_one_fleet_table() {
+    let ok = "table inet fleet {\n\tset s {\n\t\ttype ipv4_addr\n\t}\n\tchain input {\n\t\ttcp dport 3306 accept comment \"a } b\"\n\t}\n}\n";
+    let cases: Vec<(&str, String, bool)> = vec![
+        ("listing", ok.into(), true),
+        (
+            "trailing table",
+            format!("{ok}table ip filter {{\n}}\n"),
+            false,
+        ),
+        ("trailing command", format!("{ok}flush ruleset\n"), false),
+        (
+            "include inside",
+            ok.replace("\tset s", "\tinclude \"/etc/x\"\n\tset s"),
+            false,
+        ),
+        ("define", format!("define x = 1\n{ok}"), false),
+        ("other table", ok.replace("inet fleet", "ip filter"), false),
+        (
+            "nested table",
+            ok.replace("\tset s {", "\ttable ip x {"),
+            false,
+        ),
+        (
+            "unbalanced",
+            ok.trim_end().trim_end_matches('}').into(),
+            false,
+        ),
+        (
+            "hash comment",
+            ok.replace("accept comment", "accept # }\n comment"),
+            false,
+        ),
+        ("variable", ok.replace("3306", "$p"), false),
+        (
+            "unterminated string",
+            ok.replace("\"a } b\"", "\"a } b"),
+            false,
+        ),
+    ];
+    for (name, text, want) in cases {
+        assert_eq!(check_raw(&text).is_ok(), want, "{name}");
+        let script = Snapshot::Raw(text).script(&[22]);
+        assert_eq!(script.is_ok(), want, "{name}");
+    }
+    // A listing that can't be restored refuses the op at snapshot time.
+    let f = Rc::new(FakeRunner::new());
+    let c = ctx(nowhere(), f.clone());
+    f.expect(NFT, &LIST_TABLE, out(HAND_EDITED_JSON));
+    f.expect(
+        NFT,
+        &["list", "table", "inet", "fleet"],
+        out(&format!("{ok}flush ruleset\n")),
+    );
+    assert!(FirewallRevert.snapshot(&c, &Op::FirewallGet).is_err());
+}
+
 #[test]
 fn apply_refuses_lockout_before_touching_anything() {
     let f = Rc::new(FakeRunner::new());
@@ -578,7 +956,7 @@ fn lockout_safety_restore_equals_snapshot() {
     let c = ctx(nowhere(), f.clone());
     let reverters = Reverters::with_generic();
     let module = reverters.get(ChangeKind::Firewall).unwrap();
-    let new = managed(vec![from(ssh(), "192.0.2.0/24")]);
+    let new = managed(vec![ssh()]);
     let (op, m) = apply_meta(new, Some(version(&fixture_model())));
 
     // 1. Exec snapshots (blocking) before calling the handler.
@@ -605,7 +983,7 @@ fn lockout_safety_restore_equals_snapshot() {
     let want = render(&fixture_model(), &[22]);
     assert_eq!(last.stdin.as_deref(), Some(want.as_bytes()));
     assert_eq!(
-        Snapshot::decode(&snap).unwrap().script(&[22]),
+        Snapshot::decode(&snap).unwrap().script(&[22]).unwrap(),
         want,
         "restore = the snapshot's own script"
     );

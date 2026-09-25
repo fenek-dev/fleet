@@ -15,7 +15,12 @@
 //!   or group change of a user with a roster section in its authorized keys
 //!   file (the admin the Macs log in as: lockout).
 //! - Privileged groups (`sudo`, `docker`, …) make `users.create` and
-//!   `users.groups.set` Elevated from their arguments (catalog tier).
+//!   `users.groups.set` Elevated from their arguments (catalog tier); exec
+//!   escalates further through [`escalation::users_create`] and
+//!   [`escalation::users_groups_set`] (sudoers-granted groups, users that
+//!   are privileged already).
+//! - [`passwd`], [`groups`], [`uid_range`] and [`parse`] are the only
+//!   `/etc/passwd`, `/etc/group` and `login.defs` readers in this crate.
 
 pub mod authorized_keys;
 pub mod parse;
@@ -23,10 +28,11 @@ pub mod parse;
 mod tests;
 
 use crate::ctx::SysCtx;
+use crate::escalation;
 use crate::handler::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput, Registry};
 use crate::runner::{CommandOutput, CommandSpec};
 use crate::security::EventSink;
-use fleet_proto::args::{GroupName, PRIVILEGED_GROUPS, UserName};
+use fleet_proto::args::{GroupName, UserName};
 use fleet_proto::event::UserChangeKind;
 use fleet_proto::op::tag;
 use fleet_proto::payload::{GroupInfo, UserInfo, Users};
@@ -46,43 +52,59 @@ pub(crate) fn read_etc(ctx: &SysCtx, abs: &str) -> Result<String, OpError> {
     Ok(String::from_utf8_lossy(&b).into_owned())
 }
 
-pub(crate) fn passwd(ctx: &SysCtx) -> Result<Vec<PasswdEntry>, OpError> {
+/// `/etc/passwd` entries (empty if absent). The one passwd reader.
+pub fn passwd(ctx: &SysCtx) -> Result<Vec<PasswdEntry>, OpError> {
     Ok(parse::parse_passwd(&read_etc(ctx, "/etc/passwd")?))
 }
 
-fn groups(ctx: &SysCtx) -> Result<Vec<GroupEntry>, OpError> {
+/// `/etc/group` entries (empty if absent). The one group reader.
+pub fn groups(ctx: &SysCtx) -> Result<Vec<GroupEntry>, OpError> {
     Ok(parse::parse_group(&read_etc(ctx, "/etc/group")?))
+}
+
+/// `(UID_MIN, UID_MAX)` of this host.
+pub fn uid_range(ctx: &SysCtx) -> Result<(u32, u32), OpError> {
+    Ok(parse::uid_range(&read_etc(ctx, "/etc/login.defs")?))
 }
 
 fn denied(detail: &'static str) -> OpError {
     OpError::new(ErrorCode::PolicyDenied).with_detail(detail)
 }
 
-fn reserved(name: &str) -> bool {
-    name.starts_with("fleet")
+/// Account whose crontab (`cron.set`) or extra keys (`authorized_keys.set`)
+/// may be replaced: exists, not `fleet*`, a login shell, and a regular
+/// account (`UID_MIN..=UID_MAX`) or `root` itself (Elevated by the catalog).
+/// Refused with `PolicyDenied` (unknown: `NotFound`).
+pub fn check_login_target(ctx: &SysCtx, user: &UserName) -> Result<PasswdEntry, OpError> {
+    if user.is_fleet() {
+        return Err(denied("fleet account"));
+    }
+    let entry = parse::lookup(&passwd(ctx)?, user.as_str())
+        .cloned()
+        .ok_or_else(|| OpError::new(ErrorCode::NotFound).with_detail("no such user"))?;
+    let (uid_min, uid_max) = uid_range(ctx)?;
+    if !(user.is_root() && entry.uid == 0) && !(uid_min..=uid_max).contains(&entry.uid) {
+        return Err(denied("system account"));
+    }
+    if !entry.can_login() {
+        return Err(denied("account has no login shell"));
+    }
+    Ok(entry)
 }
 
 /// `users.list`.
 pub fn list(ctx: &SysCtx, now_ms: u64) -> Result<Users, OpError> {
-    let pw = passwd(ctx)?;
-    let gr = groups(ctx)?;
+    let pv = escalation::Privileges::load(ctx)?;
     let shadow = parse::parse_shadow(&read_etc(ctx, "/etc/shadow")?);
-    let (uid_min, uid_max) = parse::uid_range(&read_etc(ctx, "/etc/login.defs")?);
+    let (uid_min, uid_max) = uid_range(ctx)?;
     let today = now_ms / 86_400_000;
-    let mut users: Vec<UserInfo> = pw
+    let mut users: Vec<UserInfo> = pv
+        .passwd
         .iter()
         .map(|p| {
-            let mut names: Vec<String> = gr
-                .iter()
-                .filter(|g| g.gid == p.gid || g.members.contains(&p.name))
-                .map(|g| g.name.clone())
-                .collect();
+            let mut names: Vec<String> = p.groups_in(&pv.groups).map(|g| g.name.clone()).collect();
             names.dedup();
-            let privileged = p.uid == 0
-                || gr.iter().any(|g| {
-                    (g.gid == p.gid || g.members.contains(&p.name))
-                        && (g.gid == 0 || PRIVILEGED_GROUPS.contains(&g.name.as_str()))
-                });
+            let privileged = pv.entry_privileged(p);
             UserInfo {
                 name: p.name.clone(),
                 uid: p.uid,
@@ -98,7 +120,8 @@ pub fn list(ctx: &SysCtx, now_ms: u64) -> Result<Users, OpError> {
         })
         .collect();
     users.sort_by_key(|u| u.uid);
-    let mut groups: Vec<GroupInfo> = gr
+    let mut groups: Vec<GroupInfo> = pv
+        .groups
         .into_iter()
         .map(|g| GroupInfo {
             name: g.name,
@@ -112,14 +135,13 @@ pub fn list(ctx: &SysCtx, now_ms: u64) -> Result<Users, OpError> {
 
 /// Lock, delete and group changes: only ordinary, non-admin accounts.
 fn check_modifiable(ctx: &SysCtx, name: &UserName) -> Result<PasswdEntry, OpError> {
-    if name.is_root() || reserved(name.as_str()) {
+    if name.is_root() || name.is_fleet() {
         return Err(denied("protected account"));
     }
-    let entry = passwd(ctx)?
-        .into_iter()
-        .find(|p| p.name == name.as_str())
+    let entry = parse::lookup(&passwd(ctx)?, name.as_str())
+        .cloned()
         .ok_or_else(|| OpError::new(ErrorCode::NotFound).with_detail("no such user"))?;
-    let (uid_min, uid_max) = parse::uid_range(&read_etc(ctx, "/etc/login.defs")?);
+    let (uid_min, uid_max) = uid_range(ctx)?;
     if entry.uid == 0 {
         return Err(denied("uid 0"));
     }
@@ -136,7 +158,7 @@ fn check_groups(groups: &[GroupName]) -> Result<(), OpError> {
     if groups.len() > 32 {
         return Err(OpError::new(ErrorCode::InvalidArgument).with_detail("too many groups"));
     }
-    if groups.iter().any(|g| reserved(g.as_str())) {
+    if groups.iter().any(GroupName::is_fleet) {
         return Err(denied("fleet group"));
     }
     Ok(())
@@ -151,7 +173,7 @@ pub(crate) fn check(ctx: &SysCtx, op: &Op) -> Result<(), OpError> {
             comment,
             ..
         } => {
-            if reserved(name.as_str()) || name.is_root() {
+            if name.is_fleet() || name.is_root() {
                 return Err(denied("reserved name"));
             }
             // `:` would split the passwd line (useradd refuses it too).
@@ -168,7 +190,7 @@ pub(crate) fn check(ctx: &SysCtx, op: &Op) -> Result<(), OpError> {
             check_modifiable(ctx, name).map(|_| ())
         }
         Op::GroupsCreate { name } => {
-            if reserved(name.as_str()) {
+            if name.is_fleet() {
                 return Err(denied("reserved name"));
             }
             Ok(())
@@ -352,6 +374,17 @@ impl UsersHandler {
 impl OpHandler for UsersHandler {
     fn validate(&self, ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<(), OpError> {
         check(ctx, op)
+    }
+
+    /// Joining a group that is privileged or granted by sudoers (design
+    /// §4.2), or changing an already privileged user. Exec asks only when
+    /// `Op::may_escalate` holds.
+    fn requires_elevated(&self, ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<bool, OpError> {
+        match op {
+            Op::UsersCreate { .. } => escalation::users_create(ctx, op),
+            Op::UsersGroupsSet { .. } => escalation::users_groups_set(ctx, op),
+            _ => Ok(false),
+        }
     }
 
     fn handle<'a>(

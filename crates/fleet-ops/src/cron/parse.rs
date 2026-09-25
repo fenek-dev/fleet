@@ -91,11 +91,25 @@ fn nth_field_rest(l: &str, n: usize) -> Option<&str> {
     Some(rest.trim_end())
 }
 
-/// Crontab text for `cron.set`: our header, then per entry an optional
-/// `# comment` line and `schedule command`. Arguments are validated
-/// single-line values, so an entry can't spill into another line.
-pub fn render(entries: &[CronEntry]) -> String {
+/// `NAME=value` lines of a crontab (`MAILTO`, `PATH`, `SHELL`, …), trimmed,
+/// in order.
+pub fn env_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| is_env_assignment(l))
+        .collect()
+}
+
+/// Crontab text for `cron.set`: our header, the environment lines of
+/// `existing` (they apply to every entry below, so they go first), then per
+/// entry an optional `# comment` line and `schedule command`. Arguments are
+/// validated single-line values, so an entry can't spill into another line.
+pub fn render(entries: &[CronEntry], existing: &str) -> String {
     let mut s = format!("{HEADER}\n");
+    for l in env_lines(existing) {
+        s.push_str(l);
+        s.push('\n');
+    }
     for e in entries {
         if !e.comment.as_str().is_empty() {
             s.push_str(&format!("# {}\n", e.comment.as_str()));
@@ -151,7 +165,7 @@ mod tests {
                 comment: Label::new("").unwrap(),
             },
         ];
-        let text = render(&e);
+        let text = render(&e, "");
         assert_eq!(
             text,
             format!("{HEADER}\n# weekly\n0 4 * * sun /usr/bin/true\n*/5 * * * * /bin/echo hi\n")
@@ -160,5 +174,27 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].comment.as_deref(), Some("weekly"));
         assert_eq!(back[1].comment, None);
+    }
+
+    #[test]
+    fn render_keeps_env_lines() {
+        let existing = "# DO NOT EDIT\nMAILTO=\"ops@example.org\"\n0 1 * * * /old\n\
+                        PATH=/usr/local/bin:/usr/bin\n  SHELL = /bin/bash\n\
+                        */5 * * * * echo A=b\n# X=1\n";
+        let e = vec![CronEntry {
+            schedule: CronSpec::new("0 0 * * *").unwrap(),
+            command: CronCommand::new("/new").unwrap(),
+            comment: Label::new("").unwrap(),
+        }];
+        assert_eq!(
+            render(&e, existing),
+            format!(
+                "{HEADER}\nMAILTO=\"ops@example.org\"\nPATH=/usr/local/bin:/usr/bin\n\
+                 SHELL = /bin/bash\n0 0 * * * /new\n"
+            )
+        );
+        // Idempotent: a second render keeps the same env lines once.
+        let once = render(&e, existing);
+        assert_eq!(render(&e, &once), once);
     }
 }

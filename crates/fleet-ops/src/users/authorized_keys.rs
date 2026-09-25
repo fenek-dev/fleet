@@ -8,13 +8,12 @@
 //! block is written back byte for byte. Extra entries are plain
 //! `algo base64 [comment]` lines ([`SshPublicKey::to_line`]): no options.
 
-use super::passwd;
 use crate::ctx::SysCtx;
 use crate::fswrite;
 use crate::handler::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput};
 use crate::revertible::Revertible;
 use crate::security::EventSink;
-use fleet_proto::args::SshPublicKey;
+use fleet_proto::args::{SshPublicKey, UserName};
 use fleet_proto::payload::{AuthorizedKeys, ChangeKind, ChangeSource, PendingChange, RosterKey};
 use fleet_proto::{DeviceId, ErrorCode, Event, Op, Payload};
 use std::collections::HashSet;
@@ -175,7 +174,8 @@ fn write_extra(ctx: &SysCtx, user: &str, extra: &[String]) -> Result<u64, OpErro
     Ok(split(&new).map_err(unterminated)?.version())
 }
 
-fn check_set(ctx: &SysCtx, user: &str, keys: &[SshPublicKey]) -> Result<(), OpError> {
+/// Bounds, then the target account ([`super::check_login_target`]).
+fn check_set(ctx: &SysCtx, user: &UserName, keys: &[SshPublicKey]) -> Result<(), OpError> {
     if keys.len() > 64 {
         return Err(OpError::new(ErrorCode::InvalidArgument).with_detail("more than 64 keys"));
     }
@@ -186,10 +186,7 @@ fn check_set(ctx: &SysCtx, user: &str, keys: &[SshPublicKey]) -> Result<(), OpEr
     {
         return Err(OpError::new(ErrorCode::InvalidArgument).with_detail("duplicate key"));
     }
-    if !passwd(ctx)?.iter().any(|p| p.name == user) {
-        return Err(OpError::new(ErrorCode::NotFound).with_detail("no such user"));
-    }
-    Ok(())
+    super::check_login_target(ctx, user).map(|_| ())
 }
 
 /// `authorized_keys.get/set`. `set` is Elevated and auto-reverted: exec
@@ -203,16 +200,17 @@ impl AuthorizedKeysHandler {
         &self,
         ctx: &SysCtx,
         meta: &OpMeta,
-        user: &str,
+        user: &UserName,
         keys: &[SshPublicKey],
     ) -> Result<Payload, OpError> {
         check_set(ctx, user, keys)?;
+        let user = user.as_str();
         let current = split(&read_file(ctx, user)?)
             .map_err(unterminated)?
             .version();
-        if let Some(v) = meta.command.body.expected_version
-            && v != current
-        {
+        // Required: a blind overwrite could drop keys added since the
+        // operator's last read.
+        if meta.command.body.expected_version != Some(current) {
             return Err(ErrorCode::VersionConflict { current }.into());
         }
         let lines: Vec<String> = keys.iter().map(SshPublicKey::to_line).collect();
@@ -239,7 +237,7 @@ impl AuthorizedKeysHandler {
 impl OpHandler for AuthorizedKeysHandler {
     fn validate(&self, ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<(), OpError> {
         match op {
-            Op::AuthorizedKeysSet { user, keys } => check_set(ctx, user.as_str(), keys),
+            Op::AuthorizedKeysSet { user, keys } => check_set(ctx, user, keys),
             Op::AuthorizedKeysGet { .. } => Ok(()),
             _ => Err(ErrorCode::Unsupported.into()),
         }
@@ -254,7 +252,7 @@ impl OpHandler for AuthorizedKeysHandler {
         Box::pin(async move {
             let p = match op {
                 Op::AuthorizedKeysGet { user } => Payload::AuthorizedKeys(get(ctx, user.as_str())?),
-                Op::AuthorizedKeysSet { user, keys } => self.set(ctx, meta, user.as_str(), keys)?,
+                Op::AuthorizedKeysSet { user, keys } => self.set(ctx, meta, user, keys)?,
                 _ => return Err(ErrorCode::Unsupported.into()),
             };
             Ok(OpOutput::Payload(p))

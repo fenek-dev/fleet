@@ -490,13 +490,97 @@ fn set_refusals() {
 }
 
 #[test]
+fn set_target_account_and_version_required() {
+    let d = root();
+    let p = d.path();
+    let mut pw = std::fs::read_to_string(p.join("etc/passwd")).unwrap();
+    pw.push_str(
+        "fleet-gate:x:1100:1100::/:/bin/sh\nsvc:x:1003:1003::/:/usr/sbin/nologin\n\
+         f:x:1004:1004::/:/usr/bin/false\n",
+    );
+    std::fs::write(p.join("etc/passwd"), pw).unwrap();
+    let c = ctx(p, Rc::new(FakeRunner::new()));
+    let (_, h) = keys_handler();
+    for (u, want) in [
+        ("fleet-gate", ErrorCode::PolicyDenied),
+        ("sshd", ErrorCode::PolicyDenied), // system uid, nologin
+        ("toor", ErrorCode::PolicyDenied), // uid 0, not root
+        ("svc", ErrorCode::PolicyDenied),  // nologin
+        ("f", ErrorCode::PolicyDenied),    // false
+    ] {
+        assert_eq!(
+            run_set(&h, &c, set_op(u, vec![]), Some(0)),
+            Err(want),
+            "{u}"
+        );
+    }
+    // root is a valid target (Elevated by the catalog).
+    let v = authorized_keys::get(&c, "root").unwrap().version;
+    run_set(&h, &c, set_op("root", vec![key(4, "")]), Some(v)).unwrap();
+    // No expected_version → conflict, file untouched.
+    let v = authorized_keys::get(&c, "web").unwrap().version;
+    assert_eq!(
+        run_set(&h, &c, set_op("web", vec![key(4, "")]), None),
+        Err(ErrorCode::VersionConflict { current: v })
+    );
+    assert!(!p.join("etc/fleet/authorized_keys/web").exists());
+}
+
+#[test]
+fn sudoers_privilege_in_list_and_escalation() {
+    let d = root();
+    std::fs::write(
+        d.path().join("etc/sudoers"),
+        "web ALL=(ALL) ALL\n%ci ALL=ALL\n",
+    )
+    .unwrap();
+    let (c, _, h) = users(d.path(), Rc::new(FakeRunner::new()));
+    let Payload::Users(u) = run_op(&h, &c, Op::UsersList).unwrap() else {
+        panic!()
+    };
+    assert!(u.users.iter().find(|x| x.name == "web").unwrap().privileged);
+    let m = meta(Op::UsersList, None);
+    for (op, want) in [
+        (
+            Op::UsersGroupsSet {
+                name: un("web"),
+                groups: vec![],
+            },
+            true,
+        ),
+        (
+            Op::UsersCreate {
+                name: un("x"),
+                groups: vec![gn("ci")],
+                shell: LoginShell::Bash,
+                comment: Label::new("").unwrap(),
+            },
+            true,
+        ),
+        (
+            Op::UsersCreate {
+                name: un("x"),
+                groups: vec![gn("web")],
+                shell: LoginShell::Bash,
+                comment: Label::new("").unwrap(),
+            },
+            false,
+        ),
+        (Op::UsersList, false),
+    ] {
+        assert_eq!(h.requires_elevated(&c, &op, &m).unwrap(), want, "{op:?}");
+    }
+}
+
+#[test]
 fn reverter_restores_extra_under_current_roster() {
     let d = root();
     let c = ctx(d.path(), Rc::new(FakeRunner::new()));
     let (_, h) = keys_handler();
     let op = set_op("admin", vec![key(5, "new")]);
     let snap = AuthorizedKeysReverter.snapshot(&c, &op).unwrap();
-    run_set(&h, &c, op, None).unwrap();
+    let v = authorized_keys::get(&c, "admin").unwrap().version;
+    run_set(&h, &c, op, Some(v)).unwrap();
     // A roster rewrite inside the confirm window.
     let path = d.path().join("etc/fleet/authorized_keys/admin");
     let cur = std::fs::read_to_string(&path).unwrap();

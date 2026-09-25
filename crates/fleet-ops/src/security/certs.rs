@@ -235,7 +235,7 @@ impl CertWatcher {
 mod tests {
     use super::*;
     use crate::FakeRunner;
-    use crate::test_util::ctx_at;
+    use crate::testutil::{T0, ctx_at};
     use std::rc::Rc;
 
     const PEM: &[u8] = include_bytes!("../../tests/fixtures/cert.pem");
@@ -286,7 +286,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = ctx_at(d, Rc::new(FakeRunner::new()));
+        let ctx = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let certs = collect(&ctx, &CertsHandler::default().patterns);
         let sources: Vec<&str> = certs.certs.iter().map(|c| c.source.as_str()).collect();
         assert_eq!(
