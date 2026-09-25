@@ -26,7 +26,7 @@ mod users;
 pub use cron::CronEntry;
 pub use mesh::MeshConfig;
 pub use packages::{PkgSpec, UpgradeScope};
-pub use profile::{ProfileLevel, ProfileSpec};
+pub use profile::{ProfileLevel, ProfileRole, ProfileSource, ProfileSpec};
 pub use security::BanConfig;
 pub use shell::ShellExec;
 pub use system::{ProcessSort, Resolution, SampleInterval};
@@ -70,8 +70,14 @@ tagged_enum! {
         /// Per-minute top-10 by CPU and memory (design §4.3).
         ProcessesHistory { range: TimeRange } = PROCESSES_HISTORY(13, "processes.history"),
         ConnectionsList = CONNECTIONS_LIST(20, "connections.list"),
-        /// Timeline and "while you were away" digest (design §4.5).
-        EventsQuery { range: TimeRange, limit: u32 } = EVENTS_QUERY(30, "events.query"),
+        /// The agent's persisted event log (design §4.4, §4.5): signed
+        /// events strictly after `(since_run_id, since_seq)`, oldest first,
+        /// as `Payload::SignedEvents`. `None` (or a run no longer stored)
+        /// starts at the oldest event kept. `limit` 1..=1000. Allowed in
+        /// monitor sessions, so a Mac catches up on what happened while it
+        /// was away or its live feed lagged.
+        EventsQuery { since_run_id: Option<[u8; 16]>, since_seq: u64, limit: u32 }
+            = EVENTS_QUERY(30, "events.query"),
         HealthChecksList = HEALTH_CHECKS_LIST(40, "health_checks.list"),
         HealthChecksUpdate(checks: HealthCheckSet) = HEALTH_CHECKS_UPDATE(41, "health_checks.update"),
         /// `delay_s` at most one hour.

@@ -258,6 +258,9 @@ impl Mac {
             device_key: self.keys.device.public(),
             monitor_key: self.keys.monitor.public(),
             ssh_key: self.keys.ssh.public(),
+            // Placeholder until the Mac has its own monitor SSH key; the
+            // agent skips a monitor line identical to the device key.
+            monitor_ssh_key: self.keys.ssh.public(),
             noise_static: self.noise.public(),
             added_at: 0,
             added_by: self.id,

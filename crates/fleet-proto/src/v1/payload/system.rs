@@ -135,6 +135,15 @@ pub struct TimelineEvent {
     pub event: Event,
 }
 
+/// `events.query` page: events exactly as they were pushed (each verified
+/// by the Mac like a live `Event`, design §5.6), oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedEventPage {
+    pub events: Vec<crate::v1::SignedEvent>,
+    /// More events follow the last one returned.
+    pub more: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timeline {
     pub events: Vec<TimelineEvent>,

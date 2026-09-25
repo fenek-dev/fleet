@@ -9,6 +9,7 @@
 
 mod audit;
 mod config;
+mod events;
 mod meta;
 mod metrics;
 mod replay;
@@ -16,6 +17,7 @@ mod security;
 
 pub use audit::{AuditLog, ChainError, ChainHead, CheckpointSigner, Intent};
 pub use config::ConfigDb;
+pub use events::{EventLog, MAX_EVENTS, RETENTION_MS as EVENT_RETENTION_MS, StoredEvent};
 pub use meta::{Meta, MetaKey};
 pub use metrics::MetricsDb;
 pub use replay::ReplayCache;
@@ -106,6 +108,7 @@ impl Store {
         metrics::create_tables(&tx)?;
         security::create_tables(&tx)?;
         config::create_tables(&tx)?;
+        events::create_tables(&tx)?;
         tx.commit()?;
         Ok(Self {
             db: Arc::new(RwLock::new(db)),
@@ -137,10 +140,37 @@ impl Store {
         Meta::new(read(&self.db))
     }
 
+    pub fn events(&self) -> EventLog<'_> {
+        EventLog::new(read(&self.db))
+    }
+
     /// Compacts the file if at least `min_free` bytes, and a quarter of
-    /// the file, are unused (design §4.4). Runs synchronously; its cost is
-    /// bounded by the database budget (64 MB), and exec calls it at most
-    /// daily while idle. Never waits for the write side.
+    /// the file, are unused (design §4.4). See [`Compactor::compact`].
+    pub fn compact(&self, min_free: u64) -> Result<Compaction> {
+        self.compactor().compact(min_free)
+    }
+
+    /// A `Send` handle for compacting on the blocking pool.
+    pub fn compactor(&self) -> Compactor {
+        Compactor {
+            db: self.db.clone(),
+            path: self.path.clone(),
+        }
+    }
+}
+
+/// Compacts the database from another thread ([`Store::compactor`]).
+pub struct Compactor {
+    db: Db,
+    path: PathBuf,
+}
+
+impl Compactor {
+    /// Never waits for the write side: `Busy` if a view or transaction is
+    /// alive. While it runs, every other database user waits for it
+    /// (bounded by the database budget, 64 MB). Exec runs it on the
+    /// blocking pool, so its own thread (watchdog, sockets) only stalls if
+    /// it touches the database meanwhile.
     pub fn compact(&self, min_free: u64) -> Result<Compaction> {
         let Ok(mut db) = self.db.try_write() else {
             return Ok(Compaction::Busy);

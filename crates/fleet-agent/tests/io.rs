@@ -7,10 +7,9 @@ use fleet_agent::frame::{
 };
 use fleet_agent::ipc::{self, IpcError, IpcMsg};
 use fleet_agent::pending::{ChangeId, ChangeKind, PendingChange, PendingDir, RevertedMarker};
-use fleet_agent::revert::{
-    self, FixedCommand, Revert, RevertError, RevertOutcome, RunError, Runner, UnavailableRevert,
-};
+use fleet_agent::revert::{self, Revert, RevertError, RevertOutcome, UnavailableRevert};
 use fleet_agent::store::{Intent, Store};
+use fleet_ops::{CommandOutput, CommandRunner, CommandSpec, LocalBoxFuture, RunError};
 use fleet_proto::{Actor, DeviceId, OpSummary, Outcome, Phase, ResultSummary, Signature};
 use std::cell::RefCell;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -231,6 +230,7 @@ fn unavailable_reverter_reports_failure() {
         snapshot: vec![],
         deadline_ms: 1,
         audit_seq: 1,
+        applying: false,
     };
     dir.insert(id, &change).unwrap();
     assert_eq!(
@@ -263,39 +263,141 @@ fn bridge_fails_without_socket() {
     });
 }
 
-#[derive(Default)]
-struct Recorder(RefCell<Vec<FixedCommand>>);
-impl Runner for Recorder {
-    fn run(&self, cmd: &FixedCommand) -> Result<(), RunError> {
-        self.0.borrow_mut().push(cmd.clone());
-        Ok(())
+/// Records commands; exits with `code`.
+struct Recorder(RefCell<Vec<CommandSpec>>, i32);
+impl CommandRunner for Recorder {
+    fn run(&self, spec: CommandSpec) -> LocalBoxFuture<'_, Result<CommandOutput, RunError>> {
+        Box::pin(std::future::ready(self.run_blocking(spec)))
     }
+    fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutput, RunError> {
+        self.0.borrow_mut().push(spec);
+        Ok(CommandOutput::exit(self.1))
+    }
+}
+
+fn argv(s: &CommandSpec) -> Vec<String> {
+    s.args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[test]
 fn revert_timer_argv() {
     let id = ChangeId([0xab; 16]);
     let hex = "ab".repeat(16);
-    let rec = Recorder::default();
+    let rec = Recorder(RefCell::default(), 0);
     revert::arm_timer(&rec, id, 60).unwrap();
+    revert::arm_guard(&rec, id, 120).unwrap();
     revert::disarm_timer(&rec, id).unwrap();
     let cmds = rec.0.into_inner();
     assert_eq!(cmds[0].program, "/usr/bin/systemd-run");
     assert_eq!(
-        cmds[0].args,
+        argv(&cmds[0]),
         vec![
             "--on-active=60".to_owned(),
+            "--timer-property=AccuracySec=1s".to_owned(),
             format!("--unit=fleet-revert-{hex}"),
             "/usr/lib/fleet/fleet-agent".to_owned(),
             "revert".to_owned(),
             hex.clone(),
         ]
     );
-    assert_eq!(cmds[1].program, "/usr/bin/systemctl");
+    assert!(cmds[0].timeout <= std::time::Duration::from_secs(10));
+    assert!(argv(&cmds[1]).contains(&format!("--unit=fleet-revert-{hex}-guard")));
+    assert_eq!(cmds[2].program, "/usr/bin/systemctl");
     assert_eq!(
-        cmds[1].args,
-        vec!["stop".to_owned(), format!("fleet-revert-{hex}.timer")]
+        argv(&cmds[2]),
+        vec![
+            "stop".to_owned(),
+            format!("fleet-revert-{hex}.timer"),
+            format!("fleet-revert-{hex}-guard.timer"),
+        ]
     );
+    // A failing systemd-run is an error (no timer, no apply).
+    let bad = Recorder(RefCell::default(), 1);
+    assert!(revert::arm_timer(&bad, id, 60).is_err());
+}
+
+/// Restores only while the state still has the change's version.
+struct Versioned(u64, RefCell<u32>);
+impl Revert for Versioned {
+    fn revert(&self, _: ChangeKind, _: &[u8]) -> Result<(), RevertError> {
+        *self.1.borrow_mut() += 1;
+        Ok(())
+    }
+    fn current_version(&self, _: ChangeKind, _: &[u8]) -> Option<u64> {
+        Some(self.0)
+    }
+}
+
+#[test]
+fn revert_keeps_state_changed_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = PendingDir::new(dir.path().join("pending"), dir.path().join("reverted"));
+    dir.create().unwrap();
+    let mut change = PendingChange {
+        kind: ChangeKind::Firewall,
+        origin: Default::default(),
+        snapshot: vec![],
+        deadline_ms: 1,
+        audit_seq: 1,
+        applying: false,
+    };
+    change.origin.new_version = Some(8);
+    let (a, b) = (ChangeId([1; 16]), ChangeId([2; 16]));
+    dir.insert(a, &change).unwrap();
+    dir.insert(b, &change).unwrap();
+    // Still at the change's version: restored.
+    let same = Versioned(8, RefCell::default());
+    assert_eq!(
+        revert::run_revert(&dir, a, &same, 5).unwrap(),
+        RevertOutcome::Reverted
+    );
+    assert_eq!(*same.1.borrow(), 1);
+    // Changed again since: kept, marker records the conflict.
+    let moved = Versioned(9, RefCell::default());
+    assert_eq!(
+        revert::run_revert(&dir, b, &moved, 6).unwrap(),
+        RevertOutcome::Kept
+    );
+    assert_eq!(*moved.1.borrow(), 0);
+    let m = dir.markers().unwrap();
+    let m = &m.iter().find(|(id, _)| *id == b).unwrap().1;
+    assert_eq!((m.restored, m.conflict), (false, Some(9)));
+}
+
+#[test]
+fn pending_update_never_resurrects_a_claimed_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = PendingDir::new(dir.path().join("pending"), dir.path().join("reverted"));
+    p.create().unwrap();
+    let id = ChangeId([3; 16]);
+    let mut c = PendingChange {
+        kind: ChangeKind::Firewall,
+        origin: Default::default(),
+        snapshot: vec![],
+        deadline_ms: 1,
+        audit_seq: 1,
+        applying: true,
+    };
+    p.insert(id, &c).unwrap();
+    c.applying = false;
+    assert!(p.update(id, &c).unwrap());
+    assert_eq!(p.get(id).unwrap(), Some(c.clone()));
+    assert!(p.claim(id).unwrap());
+    assert!(!p.update(id, &c).unwrap());
+    assert_eq!(p.get(id).unwrap(), None);
+    // An update cut short by a crash is repaired at startup.
+    let id2 = ChangeId([4; 16]);
+    p.insert(id2, &c).unwrap();
+    std::fs::rename(
+        dir.path().join(format!("pending/{id2}.bin")),
+        dir.path().join(format!("pending/{id2}.updating")),
+    )
+    .unwrap();
+    p.repair_updates().unwrap();
+    assert_eq!(p.get(id2).unwrap(), Some(c));
 }
 
 #[test]
@@ -329,6 +431,7 @@ fn revert_runs_once_and_audits() {
             snapshot: vec![],
             deadline_ms: 10,
             audit_seq: origin,
+            applying: false,
         },
     )
     .unwrap();
@@ -345,6 +448,7 @@ fn revert_runs_once_and_audits() {
                 origin_audit_seq: origin,
                 restored: true,
                 time_ms: 70,
+                conflict: None,
             }
         )]
     );
@@ -377,7 +481,29 @@ fn cli_parse() {
     );
     assert_eq!(cli::parse(&["revert", "0F".repeat(16).as_str()]), None);
     assert_eq!(cli::parse(&["revert"]), None);
-    assert_eq!(cli::parse(&["bridge", "--x"]), None);
+    // Extra argv (a forced command's user input) never widens a bridge.
+    assert_eq!(
+        cli::parse(&["bridge", "--x"]),
+        Some(Mode::Bridge(BridgeMode::Normal))
+    );
+    for args in [
+        &["bridge", "--monitor"][..],
+        &["bridge", "--monitor", "--x"],
+        &["bridge", "--x", "--monitor"],
+        &["bridge", "--recovery", "--monitor"],
+    ] {
+        assert_eq!(
+            cli::parse(args),
+            Some(Mode::Bridge(BridgeMode::Monitor)),
+            "{args:?}"
+        );
+    }
+    assert_eq!(
+        cli::parse(&["bridge", "--recovery", "sh"]),
+        Some(Mode::Bridge(BridgeMode::Recovery))
+    );
+    assert_eq!(BridgeMode::from_header(2), Some(BridgeMode::Monitor));
+    assert_eq!(BridgeMode::from_header(3), None);
     assert_eq!(cli::parse::<&str>(&[]), None);
     assert_eq!(cli::parse(&["gate", "extra"]), None);
 }

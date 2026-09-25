@@ -86,6 +86,10 @@ pub struct Device {
     pub device_key: P256Public,
     pub monitor_key: P256Public,
     pub ssh_key: P256Public,
+    /// SSH key of read-only monitor sessions (Secure Enclave, usable while
+    /// the app is locked). `authorized_keys` pins it to
+    /// `fleet-agent bridge --monitor` (design §5.9).
+    pub monitor_ssh_key: P256Public,
     pub noise_static: X25519Public,
     pub added_at: u64,
     pub added_by: DeviceId,

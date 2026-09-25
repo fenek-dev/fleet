@@ -9,7 +9,7 @@ use fleet_agent::install::{self, InstallInput, InstallOutput};
 use fleet_agent::ipc::{self, IpcMsg};
 use fleet_agent::paths::Paths;
 use fleet_agent::pending::{ChangeId, ChangeKind, PendingChange, PendingDir, RevertedMarker};
-use fleet_agent::revert::{FixedCommand, Revert, RevertError, RunError, Runner};
+use fleet_agent::revert::{Revert, RevertError};
 use fleet_agent::store::Store;
 use fleet_agent::{fsutil, now_ms};
 use fleet_core::{
@@ -22,6 +22,7 @@ use fleet_crypto::receipt::{receipt_for, sign_event, sign_receipt, verify_respon
 use fleet_crypto::roster::{roster_hash, sign_recovery, sign_root};
 use fleet_crypto::sig::{Ed25519Signer, Signer, SoftwareP256Signer};
 use fleet_crypto::verify::command_hash;
+use fleet_ops::{CommandOutput, CommandRunner, CommandSpec, LocalBoxFuture, RunError};
 use fleet_proto::chunk::{Reassembler, split_frame};
 use fleet_proto::{
     Actor, AgentHealth, AgentVersion, ApprovalItem, BoundedString, CommandBody, Device, DeviceId,
@@ -96,6 +97,7 @@ impl Mac {
             device_key: self.device.public(),
             monitor_key: self.monitor.public(),
             ssh_key: self.device.public(),
+            monitor_ssh_key: self.monitor.public(),
             noise_static: self.noise.public(),
             added_at: 0,
             added_by: self.id,
@@ -157,6 +159,7 @@ struct Pol {
     max_streams: u32,
     /// TOML list body of `capabilities.allow`.
     groups: &'static str,
+    ai_per_minute: u32,
 }
 
 impl Default for Pol {
@@ -166,6 +169,7 @@ impl Default for Pol {
             ai: "full",
             max_streams: 32,
             groups: r#""system""#,
+            ai_per_minute: 60,
         }
     }
 }
@@ -176,6 +180,7 @@ fn policy_toml(fleet: FleetId, version: u64, pol: Pol) -> String {
         ai,
         max_streams,
         groups,
+        ai_per_minute,
     } = pol;
     format!(
         r#"version = {version}
@@ -190,7 +195,7 @@ extra = []
 [actors]
 ai = "{ai}"
 ai_bulk_confirm_above = 5
-ai_commands_per_minute = 60
+ai_commands_per_minute = {ai_per_minute}
 [limits]
 commands_per_minute = {commands_per_minute}
 max_stream_sessions = {max_streams}
@@ -208,12 +213,18 @@ impl Revert for NoopRevert {
     }
 }
 
-/// Records timer commands across threads.
-struct SharedRecorder(Arc<Mutex<Vec<FixedCommand>>>);
-impl Runner for SharedRecorder {
-    fn run(&self, cmd: &FixedCommand) -> Result<(), RunError> {
-        self.0.lock().unwrap().push(cmd.clone());
-        Ok(())
+/// Records timer commands across threads (argv as strings); all succeed.
+type Timers = Arc<Mutex<Vec<Vec<String>>>>;
+struct SharedRecorder(Timers);
+impl CommandRunner for SharedRecorder {
+    fn run(&self, spec: CommandSpec) -> LocalBoxFuture<'_, Result<CommandOutput, RunError>> {
+        Box::pin(std::future::ready(self.run_blocking(spec)))
+    }
+    fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutput, RunError> {
+        let mut argv = vec![spec.program.to_owned()];
+        argv.extend(spec.args.iter().map(|a| a.to_string_lossy().into_owned()));
+        self.0.lock().unwrap().push(argv);
+        Ok(CommandOutput::ok(""))
     }
 }
 
@@ -317,6 +328,10 @@ impl Fixture {
                 // No journalctl/D-Bus/pollers against the host; tests that
                 // want them use fakes (`tests/e2e/sources.rs`).
                 cfg.sources.enabled = false;
+                // No sshd journal to vouch for a new login; tests that
+                // check it turn it back on.
+                cfg.confirm_sshd_login = None;
+                cfg.terminator = Some(Box::new(exec::NoopTerminator));
                 tweak(&mut cfg);
                 exec::run(cfg, async {
                     let _ = rx.await;
@@ -721,9 +736,21 @@ fn preauth_flood_does_not_block_sessions_or_recovery() {
     });
 }
 
+/// Records the SSH keys whose sessions exec asks to end.
+struct RecTerm(Arc<Mutex<Vec<fleet_proto::P256Public>>>);
+impl exec::SessionTerminator for RecTerm {
+    fn end_sessions(&self, removed: &[fleet_proto::P256Public]) {
+        self.0.lock().unwrap().extend_from_slice(removed);
+    }
+}
+
 #[test]
 fn revoked_device_rejected_and_authorized_keys_rewritten() {
-    let fx = Fixture::new(2, 0);
+    let mut fx = Fixture::new(2, 0);
+    let ended = Arc::new(Mutex::new(Vec::new()));
+    let e2 = ended.clone();
+    fx.exec = None;
+    fx.start_exec_with(move |cfg| cfg.terminator = Some(Box::new(RecTerm(e2))));
     let ak_path = fx.paths.authorized_keys_dir.join("admin");
     // Hand edits: an extra key and a stale duplicate managed block.
     let seeded = format!(
@@ -775,6 +802,217 @@ fn revoked_device_rejected_and_authorized_keys_rewritten() {
         assert!(ak.contains("ssh-ed25519 AAAA extra\n"));
         assert!(!ak.contains("stale"));
         assert_eq!(ak.matches(fleet_agent::authorized_keys::BEGIN).count(), 1);
+        // The remaining Mac's monitor key, pinned to the monitor bridge.
+        let monitor_line = ak
+            .lines()
+            .find(|l| l.ends_with(&format!("fleet-monitor-{}", m1.id)))
+            .unwrap();
+        assert!(monitor_line.starts_with(
+            "restrict,command=\"/usr/lib/fleet/fleet-agent bridge --monitor\" ecdsa-sha2-nistp256 "
+        ));
+        assert!(!ak.contains(&format!("fleet-monitor-{}", m0.id)));
+        // The removed Mac's SSH sessions (device and monitor key) are ended.
+        assert_eq!(
+            *ended.lock().unwrap(),
+            [m0.device.public(), m0.monitor.public()]
+        );
+    });
+}
+
+/// A monitor bridge (`bridge --monitor`, mode 2) takes only monitor-key
+/// sessions; the normal bridge takes both.
+#[test]
+fn monitor_bridge_accepts_only_monitor_key() {
+    let fx = Fixture::new(1, 0);
+    let m = &fx.macs[0];
+    // First message after `DeviceAuth` on a raw session.
+    async fn first_after_auth(fx: &Fixture, mac: &Mac, mode: u8, key: KeyKind) -> Message {
+        let mut s = UnixStream::connect(&fx.paths.agent_sock).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut s, &[mode])
+            .await
+            .unwrap();
+        let mut hs = Handshake::initiator(&mac.noise, &noise::prologue(mode)).unwrap();
+        let m1 = hs.write_message(&[]).unwrap();
+        frame::write_frame(&mut s, &m1, MAX_STREAM_FRAME)
+            .await
+            .unwrap();
+        let m2 = frame::read_frame(&mut s, MAX_STREAM_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        hs.read_message(&m2).unwrap();
+        let m3 = hs.write_message(&[]).unwrap();
+        frame::write_frame(&mut s, &m3, MAX_STREAM_FRAME)
+            .await
+            .unwrap();
+        let mut t = hs.into_transport(now_ms()).unwrap();
+        let signer = if key == KeyKind::Monitor {
+            &mac.monitor
+        } else {
+            &mac.device
+        };
+        let msg = Message::device_auth_message(key, &mac.id, t.handshake_hash());
+        let auth = Message::DeviceAuth {
+            device_id: mac.id,
+            key,
+            sig: signer.sign(&msg).unwrap(),
+        };
+        let ct = t.encrypt(&split_frame(1, &encode(&auth))[0]).unwrap();
+        frame::write_frame(&mut s, &ct, MAX_STREAM_FRAME)
+            .await
+            .unwrap();
+        let ct = frame::read_frame(&mut s, MAX_STREAM_FRAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let pt = t.decrypt(&ct).unwrap();
+        let mut r = Reassembler::for_exec();
+        let (_, f) = r.push(&pt).unwrap().unwrap();
+        decode(&f).unwrap()
+    }
+    run(async {
+        let unauthorized = |msg: &Message| {
+            matches!(
+                msg,
+                Message::Response {
+                    id: 0,
+                    result: Err(ErrorCode::Unauthorized),
+                    ..
+                }
+            )
+        };
+        let hello = |msg: &Message| matches!(msg, Message::Hello { .. });
+        assert!(hello(&first_after_auth(&fx, m, 2, KeyKind::Monitor).await));
+        assert!(unauthorized(
+            &first_after_auth(&fx, m, 2, KeyKind::Device).await
+        ));
+        assert!(hello(&first_after_auth(&fx, m, 0, KeyKind::Monitor).await));
+        assert!(hello(&first_after_auth(&fx, m, 0, KeyKind::Device).await));
+    });
+}
+
+/// Events are kept in the agent's log: `events.query` (allowed in monitor
+/// sessions) pages through them, signed, also across an exec restart.
+#[test]
+fn events_persist_and_page() {
+    let mut fx = Fixture::new(1, 0);
+    let m = &fx.macs[0];
+    let run_ids = |p: &fleet_proto::payload::SignedEventPage| -> Vec<([u8; 16], u64)> {
+        p.events.iter().map(|e| (e.run_id, e.seq)).collect()
+    };
+    let (first_run, page1) = {
+        let fx = &fx;
+        let mut out = None;
+        run(async {
+            let mut s = fx.connect(m).await;
+            for v in 2..=3 {
+                let op = fx.policy_op(v);
+                let approval = fx.approve(m, &op);
+                let r = s
+                    .request(op, &fx.server, Actor::Human, Some(approval))
+                    .await
+                    .unwrap();
+                assert_eq!(r.result, Ok(Payload::Empty));
+            }
+            let run_id = s.status().health.as_ref().unwrap().run_id;
+            let mut mon = fx.connect_with(fx.cfg(m, KeyKind::Monitor)).await.unwrap();
+            let q = Op::EventsQuery {
+                since_run_id: None,
+                since_seq: 0,
+                limit: 1,
+            };
+            let r = mon
+                .request(q, &fx.server, Actor::Human, None)
+                .await
+                .unwrap();
+            let Ok(Payload::SignedEvents(p)) = r.result else {
+                panic!("{r:?}")
+            };
+            assert!(p.more);
+            out = Some((run_id, p));
+        });
+        out.unwrap()
+    };
+    assert_eq!(run_ids(&page1), [(first_run, 1)]);
+    for e in &page1.events {
+        fleet_crypto::receipt::verify_event(e, &fx.keys.signing_key, &fx.server).unwrap();
+    }
+    assert!(matches!(
+        page1.events[0].event,
+        Event::PolicyChanged { version: 2 }
+    ));
+    fx.restart_exec();
+    let m = &fx.macs[0];
+    let fx = &fx;
+    run(async {
+        let mut s = fx.connect(m).await;
+        let q = Op::EventsQuery {
+            since_run_id: Some(first_run),
+            since_seq: 1,
+            limit: 100,
+        };
+        let r = s.request(q, &fx.server, Actor::Human, None).await.unwrap();
+        let Ok(Payload::SignedEvents(p)) = r.result else {
+            panic!("{r:?}")
+        };
+        assert!(!p.more);
+        assert_eq!(run_ids(&p), [(first_run, 2)]);
+        assert!(matches!(
+            p.events[0].event,
+            Event::PolicyChanged { version: 3 }
+        ));
+        // Bounds are checked.
+        let q = Op::EventsQuery {
+            since_run_id: None,
+            since_seq: 0,
+            limit: 0,
+        };
+        let r = s.request(q, &fx.server, Actor::Human, None).await.unwrap();
+        assert_eq!(err(r), ErrorCode::InvalidArgument);
+    });
+}
+
+/// `actors.ai_commands_per_minute`, per device and AI client.
+#[test]
+fn ai_command_rate_limited_per_actor() {
+    let fx = Fixture::with(
+        1,
+        0,
+        Opts {
+            pol: Pol {
+                ai_per_minute: 2,
+                ..Pol::default()
+            },
+            ..Opts::default()
+        },
+    );
+    let ai = |c: &str| Actor::Ai {
+        client: BoundedString::new(c).unwrap(),
+        session: [1; 16],
+    };
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
+        for _ in 0..2 {
+            let r = s
+                .request(Op::SystemInfo, &fx.server, ai("claude"), None)
+                .await
+                .unwrap();
+            assert!(r.result.is_ok());
+        }
+        let r = s
+            .request(Op::SystemInfo, &fx.server, ai("claude"), None)
+            .await
+            .unwrap();
+        assert_eq!(r.receipt.receipt.audit_seq, None);
+        assert_eq!(err(r), ErrorCode::Busy);
+        // Other actors aren't affected.
+        for actor in [ai("other"), Actor::Human] {
+            let r = s
+                .request(Op::SystemInfo, &fx.server, actor, None)
+                .await
+                .unwrap();
+            assert!(r.result.is_ok());
+        }
     });
 }
 
@@ -1215,12 +1453,14 @@ fn exec_startup_recovers_pending_dir() {
         snapshot: vec![],
         deadline_ms,
         audit_seq: 999,
+        applying: false,
     };
     let marker = RevertedMarker {
         kind: ChangeKind::Firewall,
         origin_audit_seq: 999,
         restored: true,
         time_ms: now,
+        conflict: None,
     };
     let [
         expired,
@@ -1230,9 +1470,20 @@ fn exec_startup_recovers_pending_dir() {
         marked,
         stale_marker,
         bad_marker,
-    ] = [1u8, 2, 3, 4, 5, 6, 7].map(|i| ChangeId([i; 16]));
+        interrupted,
+    ] = [1u8, 2, 3, 4, 5, 6, 7, 8].map(|i| ChangeId([i; 16]));
     dir.insert(expired, &change(now - 1_000)).unwrap();
     dir.insert(future, &change(now + 3_600_000)).unwrap();
+    // Exec crashed while applying it: reverted even though its (guard)
+    // deadline is ahead.
+    dir.insert(
+        interrupted,
+        &PendingChange {
+            applying: true,
+            ..change(now + 3_600_000)
+        },
+    )
+    .unwrap();
     std::fs::write(fx.paths.pending_dir.join(format!("{corrupt}.bin")), b"junk").unwrap();
     std::fs::write(
         fx.paths.pending_dir.join(format!("{claimed}.claimed")),
@@ -1252,7 +1503,7 @@ fn exec_startup_recovers_pending_dir() {
     let rec = Arc::new(Mutex::new(Vec::new()));
     let rec2 = rec.clone();
     fx.start_exec_with(move |cfg| {
-        cfg.runner = Box::new(SharedRecorder(rec2));
+        cfg.timers = std::rc::Rc::new(SharedRecorder(rec2));
         cfg.reverter = Box::new(NoopRevert);
     });
     fx.exec = None;
@@ -1267,8 +1518,8 @@ fn exec_startup_recovers_pending_dir() {
     );
     let cmds = rec.lock().unwrap().clone();
     assert_eq!(cmds.len(), 1);
-    assert_eq!(cmds[0].program, "/usr/bin/systemd-run");
-    assert!(cmds[0].args.contains(&future.to_hex()));
+    assert_eq!(cmds[0][0], "/usr/bin/systemd-run");
+    assert!(cmds[0].contains(&future.to_hex()));
 
     let store = Store::open(&fx.paths.state_db).unwrap();
     let entries = store.audit().entries_since(0, 1000).unwrap();
@@ -1278,8 +1529,9 @@ fn exec_startup_recovers_pending_dir() {
             .filter(|e| e.actor == Actor::System && e.result == ResultSummary::Done(o))
             .count()
     };
-    // expired, claimed, marked, stale_marker (origin 999 missing).
-    assert_eq!(count(Outcome::Reverted), 4);
+    // expired, claimed, marked, stale_marker, interrupted (origin 999
+    // missing).
+    assert_eq!(count(Outcome::Reverted), 5);
     // The two quarantined files.
     assert_eq!(count(Outcome::Failed(ErrorCode::Internal)), 2);
     store.audit().verify_chain(1).unwrap();

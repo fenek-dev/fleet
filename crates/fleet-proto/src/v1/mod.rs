@@ -62,6 +62,7 @@ pub(crate) mod test_support {
                     device_key: P256Public(key),
                     monitor_key: P256Public(key),
                     ssh_key: P256Public(key),
+                    monitor_ssh_key: P256Public(key),
                     noise_static: X25519Public([3; 32]),
                     added_at: 1_700_000_000_000,
                     added_by: DeviceId([2; 16]),

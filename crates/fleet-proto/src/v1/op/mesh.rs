@@ -20,11 +20,38 @@ impl MeshConfig {
 
     pub fn validate(&self) -> Result<(), ArgError> {
         ensure(self.network.contains(self.address), "mesh address")?;
-        validate_peers(&self.peers)
+        validate_peers(&self.peers)?;
+        // Peers route only mesh addresses: never hijack other traffic.
+        let net = self.network;
+        ensure(
+            self.peers
+                .iter()
+                .flat_map(|p| &p.allowed_ips)
+                .all(|c| c.prefix() >= net.prefix() && net.contains(c.addr())),
+            "allowed ips outside mesh network",
+        )
     }
+}
+
+/// Shortest `allowed_ips` prefix: a default route (`/0`) or a wide prefix
+/// would pull unrelated traffic into the tunnel.
+pub const MIN_ALLOWED_PREFIX_V4: u8 = 16;
+pub const MIN_ALLOWED_PREFIX_V6: u8 = 48;
+
+fn allowed_ip_ok(c: &Cidr) -> bool {
+    let min = if c.addr().is_ipv4() {
+        MIN_ALLOWED_PREFIX_V4
+    } else {
+        MIN_ALLOWED_PREFIX_V6
+    };
+    c.prefix() >= min
 }
 
 pub(crate) fn validate_peers(peers: &[WgPeer]) -> Result<(), ArgError> {
     at_most(peers, MeshConfig::MAX_PEERS, "mesh peers")?;
-    peers.iter().try_for_each(WgPeer::validate)
+    peers.iter().try_for_each(WgPeer::validate)?;
+    ensure(
+        peers.iter().flat_map(|p| &p.allowed_ips).all(allowed_ip_ok),
+        "allowed ips prefix",
+    )
 }

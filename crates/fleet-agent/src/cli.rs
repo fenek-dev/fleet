@@ -31,7 +31,8 @@ pub struct Cli {
 }
 
 /// Fixed usage text; printed on any parse error.
-pub const USAGE: &str = "usage: fleet-agent [--root <dir>] gate | exec | bridge [--recovery] \
+pub const USAGE: &str = "usage: fleet-agent [--root <dir>] gate | exec \
+     | bridge [--recovery | --monitor] \
      | install --genesis <file> --policy <file> --server-id <id> [--admin-user <name>] \
      | revert <change-id>";
 
@@ -56,11 +57,25 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Option<Mode> {
     match a.as_slice() {
         ["gate"] => Some(Mode::Gate),
         ["exec"] => Some(Mode::Exec),
-        ["bridge"] => Some(Mode::Bridge(BridgeMode::Normal)),
-        ["bridge", "--recovery"] => Some(Mode::Bridge(BridgeMode::Recovery)),
+        ["bridge", rest @ ..] => Some(Mode::Bridge(bridge_mode(rest))),
         ["install", flags @ ..] => parse_install(flags).map(Mode::Install),
         ["revert", id] => ChangeId::parse(id).map(Mode::Revert),
         _ => None,
+    }
+}
+
+/// The bridge mode from its flags. A restricted key's forced command
+/// (`authorized_keys`) fixes the flag; anything else on the command line
+/// is ignored (the bridge never reads `SSH_ORIGINAL_COMMAND` either), and
+/// the most restricted flag present wins, so extra arguments can never
+/// widen a session.
+fn bridge_mode(flags: &[&str]) -> BridgeMode {
+    if flags.contains(&"--monitor") {
+        BridgeMode::Monitor
+    } else if flags.contains(&"--recovery") {
+        BridgeMode::Recovery
+    } else {
+        BridgeMode::Normal
     }
 }
 

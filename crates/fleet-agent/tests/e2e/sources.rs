@@ -173,12 +173,16 @@ fn fake_upgrade(root: &std::path::Path, su: &str) {
 
 /// Fixture whose exec runs the sources against fakes rooted at `root`.
 fn fixture() -> (Fixture, tempfile::TempDir) {
+    fixture_with(GROUPS)
+}
+
+fn fixture_with(groups: &'static str) -> (Fixture, tempfile::TempDir) {
     let fx = Fixture::with(
         1,
         0,
         Opts {
             pol: Pol {
-                groups: GROUPS,
+                groups,
                 ..Pol::default()
             },
             ..Opts::default()
@@ -201,6 +205,15 @@ fn fixture() -> (Fixture, tempfile::TempDir) {
 /// (Re)starts exec with the sources on fakes; `list` is what `nft -j list
 /// set` answers.
 fn start(fx: &mut Fixture, root: PathBuf, list: Option<&'static str>) -> Feeds {
+    start_with(fx, root, list, |_| {})
+}
+
+fn start_with(
+    fx: &mut Fixture,
+    root: PathBuf,
+    list: Option<&'static str>,
+    tweak: impl FnOnce(&mut ExecConfig) + Send + 'static,
+) -> Feeds {
     let (jtx, jrx) = unbounded_channel();
     let (stx, srx) = unbounded_channel();
     let (nft, spawns): (Calls, Calls) = Default::default();
@@ -239,6 +252,7 @@ fn start(fx: &mut Fixture, root: PathBuf, list: Option<&'static str>) -> Feeds {
             cert_patterns: Vec::new(),
             correlation_window: Duration::from_secs(60),
         };
+        tweak(cfg);
     });
     Feeds {
         journal: jtx,
@@ -281,10 +295,15 @@ fn rules(fx: &mut Fixture) {
         .unwrap();
 }
 
-/// One `journalctl -o json` line from sshd, logged now.
+/// One `journalctl -o json` line from sshd (root, `_COMM=sshd`), logged now.
 fn jline(n: u32, msg: &str) -> String {
+    jline_from(n, msg, r#""_UID":"0","_COMM":"sshd","_PID":"77""#)
+}
+
+/// A line with these trusted fields (JSON members) instead.
+fn jline_from(n: u32, msg: &str, fields: &str) -> String {
     format!(
-        r#"{{"__CURSOR":"s=test;i={n}","__REALTIME_TIMESTAMP":"{}","SYSLOG_IDENTIFIER":"sshd","_PID":"77","MESSAGE":"{msg}"}}"#,
+        r#"{{"__CURSOR":"s=test;i={n}","__REALTIME_TIMESTAMP":"{}","SYSLOG_IDENTIFIER":"sshd",{fields},"MESSAGE":"{msg}"}}"#,
         now_ms() * 1000
     )
 }
@@ -626,5 +645,135 @@ fn services_without_bus_answer_internal() {
             "{r:?}"
         );
         ask(&mut s, &fx, Op::SystemInfo).await.unwrap();
+    });
+}
+
+/// Root lines that aren't sshd's own (another program, or a container's
+/// sshd forwarded by dockerd) neither ban nor log in.
+#[test]
+fn sshd_lines_from_other_programs_or_containers_ignored() {
+    let (mut fx, root) = fixture();
+    let feeds = start(&mut fx, root.path().to_owned(), None);
+    run(async {
+        let mut watch = fx.connect(&fx.macs[0]).await;
+        let m = format!("Failed password for admin from {ATTACKER} port 3 ssh2");
+        for (i, fields) in [
+            r#""_UID":"0","_COMM":"dockerd","_SYSTEMD_UNIT":"docker.service","CONTAINER_ID":"0123""#,
+            r#""_UID":"0","_COMM":"sshd","CONTAINER_ID":"0123""#,
+            r#""_UID":"0","_COMM":"logger""#,
+            r#""_UID":"1000","_COMM":"sshd""#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for k in 0..6 {
+                let n = u32::try_from(i * 10 + k).unwrap();
+                feeds.journal.send(jline_from(n, &m, fields)).unwrap();
+            }
+        }
+        // sshd itself, identified by its unit.
+        feeds
+            .journal
+            .send(jline_from(
+                90,
+                "Invalid user x from 192.0.2.99 port 4",
+                r#""_UID":"0","_COMM":"sshd-auth","_SYSTEMD_UNIT":"ssh.service""#,
+            ))
+            .unwrap();
+        let evs = events_until(
+            &mut watch,
+            |e| matches!(e, Event::Login { source: Some(a), .. } if *a == ip("192.0.2.99")),
+        )
+        .await;
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                Event::Login { source: Some(a), .. } if *a == ip(ATTACKER)
+            ) || matches!(e, Event::BanChanged { .. })),
+            "{evs:?}"
+        );
+    });
+}
+
+/// Auto-revert op stand-in for the confirm test: applies nothing.
+struct NoChange;
+impl fleet_ops::OpHandler for NoChange {
+    fn handle<'a>(
+        &'a self,
+        _: &'a SysCtx,
+        _: &'a Op,
+        _: &'a fleet_ops::OpMeta,
+    ) -> LocalBoxFuture<'a, Result<fleet_ops::OpOutput, fleet_ops::OpError>> {
+        Box::pin(async { Ok(fleet_ops::OpOutput::Payload(Payload::Empty)) })
+    }
+}
+struct NoSnapshot;
+impl fleet_ops::Revertible for NoSnapshot {
+    fn snapshot(&self, _: &SysCtx, _: &Op) -> Result<Vec<u8>, fleet_ops::OpError> {
+        Ok(Vec::new())
+    }
+    fn restore(&self, _: &SysCtx, _: &[u8]) -> Result<(), fleet_ops::OpError> {
+        Ok(())
+    }
+}
+
+/// `change.confirm` over a new session also needs sshd's journal to show
+/// that device's key logging in after the change (design §4.10 step 3);
+/// a container's forwarded line doesn't count.
+#[test]
+fn confirm_needs_sshd_login_after_the_change() {
+    let (mut fx2, root2) = fixture_with(r#""system", "security", "mesh""#);
+    let timers: Timers = Arc::default();
+    let t = timers.clone();
+    let feeds = start_with(&mut fx2, root2.path().to_owned(), None, move |cfg| {
+        cfg.handlers
+            .push((fleet_proto::op::tag::MESH_LEAVE, Rc::new(NoChange)));
+        cfg.reverters = fleet_ops::Reverters::new();
+        cfg.reverters
+            .register(fleet_proto::payload::ChangeKind::Mesh, Rc::new(NoSnapshot));
+        cfg.timers = Rc::new(SharedRecorder(t));
+        cfg.confirm_sshd_login = Some(Duration::from_millis(300));
+    });
+    let fx = &fx2;
+    run(async {
+        let mac = &fx.macs[0];
+        let mut s = fx.connect(mac).await;
+        let r = ask(&mut s, fx, Op::MeshLeave).await;
+        let Ok(Payload::ChangePending(p)) = r else {
+            panic!("{r:?}")
+        };
+        let confirm = Op::ChangeConfirm {
+            change_id: p.change_id,
+        };
+        let accepted = format!(
+            "Accepted publickey for admin from 203.0.113.9 port 5 ssh2: ECDSA {}",
+            fp(mac)
+        );
+        // New session, but no login in the journal (or only a container's).
+        feeds
+            .journal
+            .send(jline_from(
+                1,
+                &accepted,
+                r#""_UID":"0","_COMM":"sshd","_PID":"4242","CONTAINER_ID":"ab""#,
+            ))
+            .unwrap();
+        let mut s2 = fx.connect(mac).await;
+        assert_eq!(
+            ask(&mut s2, fx, confirm.clone()).await,
+            Err(ErrorCode::PolicyDenied)
+        );
+        // sshd logs the Mac's key: the confirm goes through.
+        feeds
+            .journal
+            .send(jline_from(
+                2,
+                &accepted,
+                r#""_UID":"0","_COMM":"sshd-session","_PID":"4243""#,
+            ))
+            .unwrap();
+        assert_eq!(ask(&mut s2, fx, confirm).await, Ok(Payload::Empty));
+        let stop = timers.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(stop[..2], ["/usr/bin/systemctl", "stop"]);
     });
 }

@@ -1,5 +1,6 @@
 //! Operations bound to exec's own state (roster, policy, veto,
-//! `agent.health`, `roster.pending`; `change.confirm` and `changes.list`
+//! `agent.health`, `roster.pending`, `events.query` over the event log;
+//! `change.confirm` and `changes.list`
 //! over the pending-change files), behind the `fleet_ops::OpHandler`
 //! trait so exec dispatches every op the same way.
 //!
@@ -7,7 +8,8 @@
 //! after the audit intent without yielding, so it sees the state
 //! `validate` checked.
 
-use super::{PendingState, State, StoredPolicy, log};
+use super::log;
+use super::state::{PendingState, State, StoredPolicy};
 use crate::pending::ChangeId;
 use crate::revert;
 use fleet_crypto::roster::{self, RosterDecision, roster_hash};
@@ -21,8 +23,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 /// Tags handled by [`StateOps`].
-pub(super) const TAGS: [u16; 5] = [
+pub(super) const TAGS: [u16; 6] = [
     tag::AGENT_HEALTH,
+    tag::EVENTS_QUERY,
     tag::ROSTER_UPDATE,
     tag::ROSTER_PENDING,
     tag::ROSTER_VETO,
@@ -33,6 +36,7 @@ pub(super) const TAGS: [u16; 5] = [
 pub(super) enum Plan {
     Health,
     Pending,
+    Events(Option<[u8; 16]>, u64, u32),
     Roster(Box<SignedRoster>, RosterDecision),
     Veto(Hash32),
     Policy(Box<Policy>, StoredPolicy),
@@ -88,7 +92,7 @@ impl OpHandler for ChangeOps {
                     if !st.pending_dir.remove(id).map_err(pending_err)? {
                         return Err(ErrorCode::NotFound.into());
                     }
-                    if let Err(e) = revert::disarm_timer(st.runner.as_ref(), id) {
+                    if let Err(e) = revert::disarm_timer(st.timers.as_ref(), id) {
                         // Harmless: the timer's revert is now a no-op.
                         log("disarm revert timer", e);
                     }
@@ -100,7 +104,7 @@ impl OpHandler for ChangeOps {
                         .list()
                         .map_err(pending_err)?
                         .iter()
-                        .map(|(id, c)| super::wire_pending(*id, c))
+                        .map(|(id, c)| super::apply::wire_pending(*id, c))
                         .collect();
                     Ok(OpOutput::Payload(Payload::PendingChanges(PendingChanges {
                         changes,
@@ -144,6 +148,11 @@ impl State {
         match op {
             Op::AgentHealth => Ok(Plan::Health),
             Op::RosterPending => Ok(Plan::Pending),
+            Op::EventsQuery {
+                since_run_id,
+                since_seq,
+                limit,
+            } => Ok(Plan::Events(*since_run_id, *since_seq, *limit)),
             Op::RosterUpdate { roster: cand } => {
                 let d = roster::evaluate(&self.roster, &self.epoch_hashes, cand, self.clock(now))
                     .map_err(|e| e.code())?;
@@ -201,6 +210,9 @@ impl State {
         match plan {
             Plan::Health => Ok(Payload::AgentHealth(self.health(ctx, now))),
             Plan::Pending => Ok(Payload::RosterPending(self.pending_wire(now))),
+            Plan::Events(since, seq, limit) => self
+                .events_after(since, seq, limit)
+                .map(Payload::SignedEvents),
             Plan::Roster(new, RosterDecision::Accept) => {
                 self.install_roster(*new, now).map_err(internal)?;
                 Ok(Payload::Empty)
@@ -228,7 +240,7 @@ impl State {
             Plan::Policy(p, stored) => {
                 self.store
                     .meta()
-                    .set(super::MetaKey::Policy, &fleet_proto::encode(&stored))
+                    .set(crate::store::MetaKey::Policy, &fleet_proto::encode(&stored))
                     .map_err(internal)?;
                 let version = p.version;
                 self.policy = *p;

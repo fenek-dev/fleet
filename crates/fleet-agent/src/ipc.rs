@@ -48,7 +48,7 @@ pub enum IpcMsg {
     Limits { commands_per_minute: u32 },
     /// gate → exec: the session's authenticated identity. Informational.
     SessionOpen {
-        /// Bridge mode header (0 normal, 1 recovery).
+        /// Bridge mode header (0 normal, 1 recovery, 2 monitor).
         mode: u8,
         device_id: DeviceId,
         key: KeyKind,
