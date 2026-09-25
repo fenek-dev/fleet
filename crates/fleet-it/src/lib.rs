@@ -45,6 +45,10 @@ pub const STEP: Duration = Duration::from_secs(20);
 
 pub type Res<T> = Result<T, String>;
 
+/// Policy `safety.auto_revert_seconds`: short, so the firewall test can
+/// wait out a deadline; long enough to confirm over a new SSH session.
+pub const AUTO_REVERT_SECONDS: u32 = 20;
+
 fn err<E: std::fmt::Display>(ctx: &str) -> impl FnOnce(E) -> String + '_ {
     move |e| format!("{ctx}: {e}")
 }
@@ -280,7 +284,7 @@ pub fn policy_toml(fleet: FleetId, version: u64) -> String {
 fleet_id = "{fleet}"
 server_id = "{SERVER}"
 [capabilities]
-allow = ["system", "logs", "security", "services", "packages", "profile"]
+allow = ["system", "logs", "security", "services", "firewall", "packages", "config", "profile"]
 shell_exec = false
 shell_exec_users = []
 [elevated]
@@ -293,7 +297,7 @@ ai_commands_per_minute = 60
 commands_per_minute = 240
 max_stream_sessions = 32
 [safety]
-auto_revert_seconds = 60
+auto_revert_seconds = {AUTO_REVERT_SECONDS}
 "#
     )
 }
@@ -467,6 +471,13 @@ impl Fixture {
     /// SSH as the admin user with `mac`'s SSH key, host key pinned.
     pub async fn ssh(&self, mac: &Mac) -> Res<SshConnection> {
         ssh_connect(&self.target(), mac, Some(self.host_key.clone())).await
+    }
+
+    /// SSH as another (possibly nonexistent) user with `mac`'s key; for
+    /// provoking sshd authentication failures.
+    pub async fn ssh_as(&self, user: &str, mac: &Mac) -> Res<SshConnection> {
+        let target = SshTarget::new("127.0.0.1", self.container.ssh_port, user);
+        ssh_connect(&target, mac, Some(self.host_key.clone())).await
     }
 
     pub fn cfg<'a>(&'a self, mac: &'a Mac) -> SessionConfig<'a> {

@@ -3,14 +3,21 @@
 //! image yourself and run `cargo test -p fleet-it -- --ignored
 //! --test-threads=1 --nocapture`.
 
-use fleet_core::ClientError;
+use fleet_core::ssh::{AgentStream, SshConnection};
+use fleet_core::{ClientError, CommandOpts, Session};
 use fleet_crypto::stream::{StreamItem, StreamVerifier};
 use fleet_crypto::verify::command_hash;
-use fleet_it::{Fixture, STEP, fixture, run};
-use fleet_proto::args::JournalQuery;
-use fleet_proto::op::SampleInterval;
-use fleet_proto::{Actor, ErrorCode, Message, Op, Payload, decode};
-use std::time::Duration;
+use fleet_it::{AUTO_REVERT_SECONDS, Fixture, STEP, fixture, run};
+use fleet_proto::args::{
+    AbsPath, FirewallMode, FirewallRule, FirewallRuleSet, FwAction, FwChain, FwComment,
+    GrepPattern, JournalQuery, ModuleId, Pid, Port, PortRange, Protocol, Signal, SudoPasswordHash,
+    TimeRange, UnitName,
+};
+use fleet_proto::op::{ProfileLevel, ProfilePhase, ProfileSource, ProfileSpec, SampleInterval};
+use fleet_proto::payload::{ConfigVersion, FirewallState, ModuleOutcome, ProfileApplied};
+use fleet_proto::{Actor, ChangeId, ErrorCode, Message, Op, Payload, decode};
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(90);
 
@@ -232,14 +239,23 @@ fn revoked_device_rejected_after_roster_update() {
             Ok(r) => assert_eq!(r.result, Err(ErrorCode::Unauthorized)),
             Err(e) => assert!(matches!(e, ClientError::Closed | ClientError::Io(_)), "{e}"),
         }
-        // SSH itself still works (keys in ~/.ssh), the agent refuses.
-        let c1b = fx.ssh(m1).await.unwrap();
-        match fx.session(&c1b, m1).await.unwrap() {
-            Err(ClientError::Rejected(ErrorCode::Unauthorized)) => {}
-            Err(e) => panic!("unexpected error: {e}"),
-            Ok(_) => panic!("revoked device got a session"),
+        // Before provisioning, SSH still works (keys in ~/.ssh) and the
+        // agent refuses. Once `provision_*` has hardened sshd
+        // (`AuthorizedKeysFile /etc/fleet/authorized_keys/%u`, rewritten
+        // from the roster), sshd itself refuses the removed Mac's key.
+        match fx.ssh(m1).await {
+            Ok(c1b) => match fx.session(&c1b, m1).await.unwrap() {
+                Err(ClientError::Rejected(ErrorCode::Unauthorized)) => {
+                    eprintln!("revocation: open session cut, new session Unauthorized");
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+                Ok(_) => panic!("revoked device got a session"),
+            },
+            Err(e) => {
+                assert!(e.contains("refused our key"), "{e}");
+                eprintln!("revocation: open session cut, SSH key refused by sshd");
+            }
         }
-        eprintln!("revocation: open session cut, new session Unauthorized");
     });
 }
 
@@ -360,4 +376,909 @@ fn profile_check_and_plan() {
         eprintln!("  {:<18} {}", ch.module, ch.description);
     }
     assert!(!p.changes.is_empty());
+}
+
+// ---------------------------------------------------------------- helpers
+//
+// Tests run in name order (`--test-threads=1`); the state-changing ones
+// below are named so that `bans_*` creates `table inet fleet` before
+// `firewall_*` switches it to Managed, and `provision_*` (which hardens
+// sshd and the firewall) runs after the read-only profile test.
+
+type Sess = Session<'static, AgentStream>;
+
+async fn open(fx: &'static Fixture) -> (SshConnection, Sess) {
+    let m = &fx.macs[0];
+    let conn = fx.ssh(m).await.expect("ssh");
+    let s = fx
+        .session(&conn, m)
+        .await
+        .expect("agent channel")
+        .expect("session");
+    (conn, s)
+}
+
+async fn call_within(
+    s: &mut Sess,
+    fx: &Fixture,
+    op: Op,
+    limit: Duration,
+) -> Result<Payload, ErrorCode> {
+    tokio::time::timeout(limit, s.request(op, &fx.server, Actor::Human, None))
+        .await
+        .expect("request timed out")
+        .expect("request failed")
+        .result
+}
+
+async fn call(s: &mut Sess, fx: &Fixture, op: Op) -> Result<Payload, ErrorCode> {
+    call_within(s, fx, op, STEP).await
+}
+
+/// `change.confirm` over a new SSH connection and session (exec requires
+/// sshd to have logged that login).
+async fn confirm(fx: &'static Fixture, id: ChangeId) -> Result<Payload, ErrorCode> {
+    let (c, mut s) = open(fx).await;
+    let r = call(&mut s, fx, Op::ChangeConfirm { change_id: id }).await;
+    c.disconnect().await;
+    r
+}
+
+async fn sleep(secs: u64) {
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+}
+
+/// Runs a blocking closure (docker CLI) off the runtime thread, so SSH
+/// connections keep being serviced.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(f).await.expect("blocking task")
+}
+
+fn image() -> String {
+    std::env::var("FLEET_IT_IMAGE").unwrap_or_else(|_| "fleet-it:debian12".into())
+}
+
+fn accept_tcp(port: u16, comment: &str) -> FirewallRule {
+    FirewallRule {
+        chain: FwChain::Input,
+        action: FwAction::Accept,
+        proto: Protocol::Tcp,
+        ports: vec![PortRange::single(Port::new(port).unwrap())],
+        source: None,
+        rate_limit: None,
+        comment: FwComment::new(comment).unwrap(),
+    }
+}
+
+async fn fw_get(s: &mut Sess, fx: &Fixture) -> FirewallState {
+    match call(s, fx, Op::FirewallGet).await {
+        Ok(Payload::Firewall(f)) => f,
+        other => panic!("firewall.get: {other:?}"),
+    }
+}
+
+/// `firewall.apply` needs `expected_version` (the version the operator
+/// saw), which `Session::request` doesn't set.
+async fn fw_apply(
+    s: &mut Sess,
+    fx: &Fixture,
+    set: FirewallRuleSet,
+    version: u64,
+) -> Result<Payload, ErrorCode> {
+    let opts = CommandOpts {
+        expected_version: Some(version),
+        ..Default::default()
+    };
+    let cmd = s
+        .build_command(
+            Op::FirewallApply(set),
+            &fx.server,
+            Actor::Human,
+            None,
+            &opts,
+        )
+        .expect("sign");
+    tokio::time::timeout(STEP, s.send(&cmd))
+        .await
+        .expect("firewall.apply timed out")
+        .expect("firewall.apply failed")
+        .result
+}
+
+fn nft(fx: &Fixture, args: &[&str]) -> String {
+    let mut argv = vec!["nft"];
+    argv.extend_from_slice(args);
+    fx.container.exec_status(&argv, 30).1
+}
+
+/// Creates `table inet fleet` (bans need its sets) with a confirmed
+/// bans-only apply, unless a Fleet firewall is already there.
+async fn ensure_fleet_table(fx: &'static Fixture) {
+    let (c, mut s) = open(fx).await;
+    let st = fw_get(&mut s, fx).await;
+    if st.version == 0 {
+        let set = FirewallRuleSet {
+            mode: FirewallMode::BansOnly,
+            rules: vec![],
+        };
+        match fw_apply(&mut s, fx, set, 0).await {
+            Ok(Payload::ChangePending { change, .. }) => {
+                let r = confirm(fx, change.change_id).await;
+                assert!(r.is_ok(), "confirm bans-only: {r:?}");
+            }
+            other => panic!("bans-only apply: {other:?}"),
+        }
+    }
+    c.disconnect().await;
+}
+
+async fn bans_list(s: &mut Sess, fx: &Fixture) -> fleet_proto::payload::Bans {
+    match call(s, fx, Op::BansList).await {
+        Ok(Payload::Bans(b)) => b,
+        other => panic!("bans.list: {other:?}"),
+    }
+}
+
+fn container_ip(fx: &Fixture) -> String {
+    fleet_it::docker(
+        &[
+            "inspect",
+            "-f",
+            "{{.NetworkSettings.IPAddress}}",
+            &fx.container.name,
+        ],
+        Duration::from_secs(10),
+    )
+    .expect("docker inspect")
+    .trim()
+    .to_owned()
+}
+
+/// `n` failed logins (nonexistent user, no key offered) against
+/// `target:22` from a throwaway sibling container on the Docker bridge.
+/// Returns the sibling's address. Each attempt is capped: once the ban
+/// lands mid-handshake, packets are dropped and ssh would wait for TCP.
+fn sibling_failures(target: &str, n: u32) -> IpAddr {
+    const SCRIPT: &str = r#"
+        echo "sibling $(hostname -i)"
+        i=0
+        while [ "$i" -lt "$2" ]; do
+            timeout 10 ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+                -o LogLevel=ERROR "fleet-it-nosuchuser@$1" true >/dev/null 2>&1
+            i=$((i + 1))
+        done
+    "#;
+    let n = n.to_string();
+    let img = image();
+    let out = fleet_it::docker(
+        &[
+            "run",
+            "--rm",
+            "--label",
+            "fleet-it=1",
+            "--entrypoint",
+            "/bin/sh",
+            &img,
+            "-c",
+            SCRIPT,
+            "sh",
+            target,
+            &n,
+        ],
+        Duration::from_secs(180),
+    )
+    .expect("sibling container");
+    out.lines()
+        .find_map(|l| l.strip_prefix("sibling "))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| panic!("no sibling address in {out:?}"))
+}
+
+// ---------------------------------------------------------------- bans
+
+/// Real sshd failures (journald → exec's sshd source) ban a sibling
+/// container's address in `banned4`; the same failures from the Mac's
+/// address (learned from its Fleet login) never ban it.
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn bans_sshd_failures_ban_sibling_not_learned_mac() {
+    let fx = fixture();
+    run(Duration::from_secs(300), async {
+        ensure_fleet_table(fx).await;
+        // A fresh Fleet login: exec learns (and exempts) this address.
+        let (c, mut s) = open(fx).await;
+        match call(&mut s, fx, Op::BansConfigGet).await {
+            Ok(p) => eprintln!("bans.config: {p:?}"),
+            Err(e) => eprintln!("bans.config.get: {e:?}"),
+        }
+        let t0 = Instant::now();
+        let mut b = bans_list(&mut s, fx).await;
+        while b.learned_exempt.is_empty() && t0.elapsed() < Duration::from_secs(15) {
+            sleep(1).await;
+            b = bans_list(&mut s, fx).await;
+        }
+        eprintln!(
+            "bans: learned_exempt {:?} after {:?}",
+            b.learned_exempt,
+            t0.elapsed()
+        );
+        assert!(!b.learned_exempt.is_empty(), "Mac address not learned");
+        let mac_ip = b.learned_exempt[0];
+
+        // Failures from the Mac's own address: an unknown user.
+        for _ in 0..6 {
+            let r = fx.ssh_as("fleet-it-nosuchuser", &fx.macs[0]).await;
+            assert!(r.is_err(), "unknown user logged in");
+        }
+
+        // The same from a sibling container.
+        let ip = container_ip(fx);
+        let sib = blocking(move || sibling_failures(&ip, 7)).await;
+        eprintln!("bans: sibling {sib} made 7 failed attempts (Mac address {mac_ip})");
+        let t0 = Instant::now();
+        let banned = loop {
+            let b = bans_list(&mut s, fx).await;
+            if let Some(e) = b.bans.iter().find(|e| e.addr == sib) {
+                break Some((e.clone(), b));
+            }
+            if t0.elapsed() > Duration::from_secs(30) {
+                eprintln!("bans: no ban after 30 s: {b:?}");
+                break None;
+            }
+            sleep(1).await;
+        };
+        let (entry, b) = banned.expect("sibling not banned");
+        eprintln!("bans: {entry:?} after {:?}", t0.elapsed());
+        assert!(
+            !b.bans.iter().any(|e| e.addr == mac_ip),
+            "learned Mac address banned: {b:?}"
+        );
+        let set = nft(fx, &["list", "set", "inet", "fleet", "banned4"]);
+        assert!(
+            set.contains(&sib.to_string()),
+            "{sib} not in banned4: {set}"
+        );
+        assert!(
+            !set.contains(&format!(" {mac_ip}")),
+            "Mac address in banned4"
+        );
+
+        let r = call(&mut s, fx, Op::BansRemove { addr: sib }).await;
+        assert!(r.is_ok(), "bans.remove: {r:?}");
+        let set = nft(fx, &["list", "set", "inet", "fleet", "banned4"]);
+        assert!(!set.contains(&sib.to_string()), "still in banned4: {set}");
+        c.disconnect().await;
+    });
+}
+
+// ---------------------------------------------------------------- config history
+
+async fn history(s: &mut Sess, fx: &Fixture, path: &str) -> Vec<ConfigVersion> {
+    let op = Op::ConfigHistory {
+        path: Some(AbsPath::new(path).unwrap()),
+        range: TimeRange::default(),
+        limit: 200,
+    };
+    match call(s, fx, op).await {
+        Ok(Payload::ConfigHistory(h)) => {
+            let mut v = h.versions;
+            v.sort_by_key(|v| v.version);
+            v
+        }
+        other => panic!("config.history {path}: {other:?}"),
+    }
+}
+
+/// Polls until `path` has more than `before` versions (30 s).
+async fn wait_versions(
+    s: &mut Sess,
+    fx: &Fixture,
+    path: &str,
+    before: usize,
+) -> Vec<ConfigVersion> {
+    let t0 = Instant::now();
+    loop {
+        let v = history(s, fx, path).await;
+        if v.len() > before {
+            eprintln!(
+                "config.history {path}: {} → {} versions after {:?}",
+                before,
+                v.len(),
+                t0.elapsed()
+            );
+            return v;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "no new version of {path} within 30 s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn diff(s: &mut Sess, fx: &Fixture, path: &str, from: u64, to: Option<u64>) -> String {
+    let op = Op::ConfigDiff {
+        path: AbsPath::new(path).unwrap(),
+        from,
+        to,
+    };
+    match call(s, fx, op).await {
+        Ok(Payload::ConfigDiff(d)) => d.unified,
+        other => panic!("config.diff {path}: {other:?}"),
+    }
+}
+
+/// inotify on `/etc`: an edit shows up in `config.history` and
+/// `config.diff`; `/etc/shadow` is recorded as a hash only.
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn config_history_inotify_and_secret_hash_only() {
+    let fx = fixture();
+    let c = &fx.container;
+    run(Duration::from_secs(180), async {
+        let (conn, mut s) = open(fx).await;
+        // Not /etc/hosts: Docker bind-mounts it over /etc, and inotify on
+        // the /etc directory sees no events for a mounted-over file (on a
+        // real host it is a plain file). A regular file under /etc instead.
+        let path = "/etc/fleet-it-confighist.conf";
+        let mut v = history(&mut s, fx, path).await;
+        // Create, then edit: two versions to diff.
+        for n in 1..=2 {
+            let line = format!("echo 'fleet-it-confighist {n}' >> {path}");
+            c.exec(&["sh", "-c", &line]).unwrap();
+            v = wait_versions(&mut s, fx, path, v.len()).await;
+        }
+        let (a, b) = (&v[v.len() - 2], &v[v.len() - 1]);
+        eprintln!("config.history {path}: {a:?}\n  → {b:?}");
+        assert!(!b.secret && !b.deleted);
+        let d = diff(&mut s, fx, path, a.version, Some(b.version)).await;
+        eprintln!("config.diff {path}:\n{d}");
+        assert!(d.contains("+fleet-it-confighist 2"), "{d}");
+
+        let shadow = "/etc/shadow";
+        let before = history(&mut s, fx, shadow).await;
+        c.exec(&["chage", "-W", "9", "ops"]).unwrap();
+        let after = wait_versions(&mut s, fx, shadow, before.len()).await;
+        let last = after.last().unwrap();
+        eprintln!("config.history /etc/shadow: {last:?}");
+        assert!(last.secret, "/etc/shadow not marked secret");
+        let from = after
+            .get(after.len().wrapping_sub(2))
+            .unwrap_or(last)
+            .version;
+        let d = diff(&mut s, fx, shadow, from, Some(last.version)).await;
+        eprintln!("config.diff /etc/shadow: {d}");
+        assert!(
+            !d.contains("ops:") && !d.contains("root:"),
+            "secret content leaked: {d}"
+        );
+        conn.disconnect().await;
+    });
+}
+
+// ---------------------------------------------------------------- firewall
+
+/// Managed ruleset with SSH → pending → confirmed over a new session →
+/// survives its deadline; a second apply left unconfirmed is reverted by
+/// the deadline (checked in the kernel with `nft`).
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn firewall_managed_confirm_then_auto_revert() {
+    let fx = fixture();
+    let secs = u64::from(AUTO_REVERT_SECONDS);
+    run(Duration::from_secs(120 + 3 * secs), async {
+        let (c, mut s) = open(fx).await;
+        let st = fw_get(&mut s, fx).await;
+        eprintln!(
+            "firewall.get: {:?} v{} rules {} banned {} foreign {} bytes",
+            st.mode,
+            st.version,
+            st.rules.len(),
+            st.banned,
+            st.foreign_ruleset.len()
+        );
+        let managed = FirewallRuleSet {
+            mode: FirewallMode::Managed,
+            rules: vec![accept_tcp(22, "ssh")],
+        };
+        let change = match fw_apply(&mut s, fx, managed.clone(), st.version).await {
+            Ok(Payload::ChangePending { change, .. }) => change,
+            other => panic!("firewall.apply: {other:?}"),
+        };
+        let window = change.deadline_ms.saturating_sub(change.created_ms);
+        eprintln!("firewall.apply Managed: pending, window {window} ms, {change:?}");
+        assert!(window <= (secs + 1) * 1000, "window {window} ms");
+        let table = nft(fx, &["list", "table", "inet", "fleet"]);
+        assert!(
+            table.contains("dport 22"),
+            "no ssh rule in the kernel:\n{table}"
+        );
+
+        let r = confirm(fx, change.change_id).await;
+        assert!(r.is_ok(), "change.confirm: {r:?}");
+        // The confirmed state outlives the deadline.
+        sleep(secs + 5).await;
+        let (c2, mut s2) = open(fx).await;
+        let st1 = fw_get(&mut s2, fx).await;
+        assert_eq!(st1.mode, FirewallMode::Managed);
+        assert_eq!(st1.rules, managed.rules);
+        let confirmed_version = st1.version;
+        let changes = call(&mut s2, fx, Op::ChangesList).await;
+        eprintln!("firewall: confirmed v{confirmed_version}; changes.list {changes:?}");
+        let before = nft(fx, &["list", "table", "inet", "fleet"]);
+        assert!(!before.contains("dport 8080"));
+
+        // Second apply, never confirmed.
+        let mut more = managed.clone();
+        more.rules.push(accept_tcp(8080, "it-temp"));
+        let change = match fw_apply(&mut s2, fx, more, confirmed_version).await {
+            Ok(Payload::ChangePending { change, .. }) => change,
+            other => panic!("second firewall.apply: {other:?}"),
+        };
+        let table = nft(fx, &["list", "table", "inet", "fleet"]);
+        assert!(table.contains("dport 8080"), "second apply not in kernel");
+        let t0 = Instant::now();
+        loop {
+            sleep(2).await;
+            let table = nft(fx, &["list", "table", "inet", "fleet"]);
+            if !table.contains("dport 8080") {
+                eprintln!(
+                    "firewall: reverted {:?} after apply (deadline {} ms after creation)",
+                    t0.elapsed(),
+                    change.deadline_ms - change.created_ms
+                );
+                assert!(table.contains("dport 22"), "ssh rule lost:\n{table}");
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(secs + 45),
+                "not reverted {:?} after apply:\n{table}",
+                t0.elapsed()
+            );
+        }
+        let st2 = fw_get(&mut s2, fx).await;
+        eprintln!("firewall.get after revert: {:?} v{}", st2.mode, st2.version);
+        assert_eq!(st2.mode, FirewallMode::Managed);
+        assert_eq!(st2.rules, managed.rules);
+        c2.disconnect().await;
+        c.disconnect().await;
+    });
+}
+
+// ---------------------------------------------------------------- streams
+
+/// Opens `op` as a verified stream; feeds items to `f` until it returns
+/// true, the stream ends, or `limit` passes. Returns (items, ended).
+async fn stream(
+    fx: &'static Fixture,
+    op: Op,
+    limit: Duration,
+    mut f: impl FnMut(&Payload) -> bool,
+) -> (usize, bool) {
+    let m = &fx.macs[0];
+    let conn = fx.ssh(m).await.unwrap();
+    let mut raw = fleet_it::RawSession::open(fx, &conn, m).await.unwrap();
+    let cmd = fx.signed(m, op).unwrap();
+    let mut v = StreamVerifier::new(fx.agent_signing, fx.server.clone(), command_hash(&cmd));
+    raw.send(&Message::StreamOpen { id: 1, cmd }).await.unwrap();
+    let (mut n, mut ended) = (0, false);
+    let r = tokio::time::timeout(limit, async {
+        loop {
+            match raw.recv().await.unwrap() {
+                Message::StreamData { id: 1, seq, chunk } => {
+                    match v.accept(seq, &chunk).expect("chunk verifies") {
+                        StreamItem::Data(d) => {
+                            n += 1;
+                            if f(&decode::<Payload>(&d).unwrap()) {
+                                return;
+                            }
+                        }
+                        StreamItem::Checkpoint { .. } => {}
+                        StreamItem::Final { outcome, .. } => {
+                            eprintln!("stream final: {outcome:?}");
+                            ended = true;
+                            return;
+                        }
+                    }
+                }
+                Message::StreamEnd { id: 1, status } => {
+                    eprintln!("stream end: {status:?}");
+                    ended = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    if r.is_err() {
+        eprintln!("stream: no end within {limit:?}");
+    }
+    let _ = raw.send(&Message::StreamCancel { id: 1 }).await;
+    conn.disconnect().await;
+    (n, ended)
+}
+
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn journal_follow_streams_new_entries() {
+    let fx = fixture();
+    let name = fx.container.name.clone();
+    // Log a marker every second for a while (the stream opens meanwhile).
+    let logger = std::thread::spawn(move || {
+        for i in 0..15 {
+            std::thread::sleep(Duration::from_secs(1));
+            let msg = format!("fleet-it-follow {i}");
+            let _ = fleet_it::docker(
+                &["exec", &name, "logger", "-t", "fleet-it", &msg],
+                Duration::from_secs(10),
+            );
+        }
+    });
+    let q = JournalQuery {
+        units: vec![],
+        priority: None,
+        range: TimeRange::default(),
+        grep: Some(GrepPattern::new("fleet-it-follow").unwrap()),
+        after_cursor: None,
+        limit: 100,
+    };
+    let mut seen = Vec::new();
+    run(LIMIT, async {
+        stream(fx, Op::JournalFollow(q), Duration::from_secs(30), |p| {
+            if let Payload::JournalEntries(j) = p {
+                seen.extend(j.entries.iter().map(|e| e.message.clone()));
+            }
+            seen.len() >= 2
+        })
+        .await;
+    });
+    let _ = logger.join();
+    eprintln!("journal.follow: {} matching entries: {seen:?}", seen.len());
+    assert!(
+        seen.iter().any(|m| m.starts_with("fleet-it-follow")),
+        "no followed entries"
+    );
+}
+
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn logfile_tail_var_log_allowed_etc_refused() {
+    let fx = fixture();
+    let mut lines = Vec::new();
+    run(LIMIT, async {
+        let op = Op::LogfileTail {
+            path: AbsPath::new("/var/log/dpkg.log").unwrap(),
+            lines: 20,
+            follow: false,
+        };
+        let (n, ended) = stream(fx, op, Duration::from_secs(20), |p| {
+            if let Payload::LogLines(l) = p {
+                lines.extend(l.lines.iter().cloned());
+            }
+            false
+        })
+        .await;
+        eprintln!(
+            "logfile.tail /var/log/dpkg.log: {n} items, {} lines, ended {ended}; last {:?}",
+            lines.len(),
+            lines.last()
+        );
+        let op = Op::LogfileTail {
+            path: AbsPath::new("/etc/shadow").unwrap(),
+            lines: 5,
+            follow: false,
+        };
+        let (n, ended) = stream(fx, op, Duration::from_secs(20), |_| false).await;
+        eprintln!("logfile.tail /etc/shadow: {n} items, ended {ended}");
+        assert_eq!(n, 0, "/etc/shadow was tailed");
+        assert!(ended);
+    });
+    assert!(
+        !lines.is_empty() && lines.len() <= 20,
+        "{} lines",
+        lines.len()
+    );
+}
+
+// ---------------------------------------------------------------- packages
+
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn pkg_upgradable_simulates() {
+    let fx = fixture();
+    let Payload::Upgradable(u) = read(fx, Op::PkgUpgradable) else {
+        panic!("wrong payload")
+    };
+    eprintln!(
+        "pkg.upgradable: {} packages ({} security), reboot_required {}, lists {:?}",
+        u.packages.len(),
+        u.packages.iter().filter(|p| p.security).count(),
+        u.reboot_required,
+        u.lists_updated_ms
+    );
+}
+
+// ---------------------------------------------------------------- processes
+
+fn pgrep(fx: &Fixture, args: &[&str]) -> Option<u32> {
+    let mut argv = vec!["pgrep"];
+    argv.extend_from_slice(args);
+    let (_, out) = fx.container.exec_status(&argv, 10);
+    out.lines().next().and_then(|l| l.trim().parse().ok())
+}
+
+/// `process.signal` goes through pidfd on Linux: refused for sshd (a
+/// protected unit's cgroup), delivered to an ordinary user's process.
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn process_signal_refuses_sshd_allows_user_process() {
+    let fx = fixture();
+    let c = &fx.container;
+    fleet_it::docker(
+        &["exec", "-d", "-u", "ops", &c.name, "sleep", "6001"],
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let t0 = Instant::now();
+    let sleeper = loop {
+        if let Some(p) = pgrep(fx, &["-u", "ops", "-f", "sleep 6001"]) {
+            break p;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(10), "sleep not started");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let sshd = match c.main_pid("ssh.service").unwrap() {
+        0 => pgrep(fx, &["-o", "-x", "sshd"]).expect("no sshd"),
+        p => p,
+    };
+    let cg = c.exec(&["cat", &format!("/proc/{sshd}/cgroup")]).unwrap();
+    eprintln!(
+        "process.signal: sshd pid {sshd} ({}), sleep pid {sleeper}",
+        cg.trim()
+    );
+    run(LIMIT, async {
+        let (conn, mut s) = open(fx).await;
+        for signal in [Signal::Term, Signal::Kill, Signal::Hup] {
+            let op = Op::ProcessSignal {
+                pid: Pid::new(sshd).unwrap(),
+                signal,
+            };
+            let r = call(&mut s, fx, op).await;
+            eprintln!("process.signal sshd {signal:?}: {r:?}");
+            assert_eq!(r, Err(ErrorCode::PolicyDenied), "sshd {signal:?}");
+        }
+        let op = Op::ProcessSignal {
+            pid: Pid::new(sleeper).unwrap(),
+            signal: Signal::Term,
+        };
+        let r = call(&mut s, fx, op).await;
+        eprintln!("process.signal sleep Term: {r:?}");
+        assert_eq!(r, Ok(Payload::Empty));
+        conn.disconnect().await;
+    });
+    let t0 = Instant::now();
+    while c
+        .exec_status(&["test", "-d", &format!("/proc/{sleeper}")], 10)
+        .0
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "sleep survived TERM"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(pgrep(fx, &["-x", "sshd"]).is_some(), "sshd gone");
+}
+
+// ---------------------------------------------------------------- provisioning
+
+/// Baseline, applied phase by phase as the app does: Accounts (with a sudo
+/// password hash), Access (auto-revert, confirmed over a new session),
+/// System. The audit score must improve.
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn provision_baseline_phases_apply_and_score() {
+    let fx = fixture();
+    let spec = ProfileSpec {
+        source: ProfileSource::Builtin {
+            level: ProfileLevel::Baseline,
+            roles: vec![],
+        },
+        only: vec![],
+    };
+    let hash = fx
+        .container
+        .exec(&["openssl", "passwd", "-6", "fleet-it-sudo-password"])
+        .ok()
+        .and_then(|h| SudoPasswordHash::new(h.trim()).ok());
+    eprintln!(
+        "provision: sudo password hash {}",
+        if hash.is_some() {
+            "set"
+        } else {
+            "skipped (no openssl)"
+        }
+    );
+    let score = async |s: &mut Sess| match call(s, fx, Op::ProfileCheck(spec.clone())).await {
+        Ok(Payload::ProfileCheck(c)) => c,
+        other => panic!("profile.check: {other:?}"),
+    };
+    run(Duration::from_secs(40 * 60), async {
+        let (mut conn, mut s) = open(fx).await;
+        let before = score(&mut s).await;
+        eprintln!("provision: score before {}", before.score);
+        let mut failed = Vec::new();
+        for phase in [
+            ProfilePhase::Accounts,
+            ProfilePhase::Access,
+            ProfilePhase::System,
+        ] {
+            // No kernel audit in a container (auditctl can't load rules
+            // outside the initial PID namespace; `augenrules` fails and the
+            // phase with it), so System runs without the auditd module.
+            // An `only` list must also leave out the other phases' modules.
+            const EARLIER: [&str; 5] = [
+                "admin.user",
+                "admin.shell",
+                "sudo.policy",
+                "ssh.hardening",
+                "firewall.baseline",
+            ];
+            let spec = if phase == ProfilePhase::System {
+                ProfileSpec {
+                    only: before
+                        .modules
+                        .iter()
+                        .filter(|m| m.id != "auditd" && !EARLIER.contains(&m.id.as_str()))
+                        .map(|m| ModuleId::new(m.id.clone()).unwrap())
+                        .collect(),
+                    ..spec.clone()
+                }
+            } else {
+                spec.clone()
+            };
+            let plan = match call(&mut s, fx, Op::ProfilePlan(spec.clone())).await {
+                Ok(Payload::ProfilePlan(p)) => p,
+                other => panic!("profile.plan: {other:?}"),
+            };
+            let op = Op::ProfileApply {
+                spec: spec.clone(),
+                plan_hash: plan.plan_hash,
+                phase,
+                password_hash: (phase == ProfilePhase::Accounts)
+                    .then(|| hash.clone())
+                    .flatten(),
+            };
+            let t0 = Instant::now();
+            let r = call_within(&mut s, fx, op, Duration::from_secs(30 * 60)).await;
+            let applied: ProfileApplied = match r {
+                Ok(Payload::ProfileApplied(a)) => a,
+                Ok(Payload::ChangePending { change, inner }) => {
+                    eprintln!("provision {phase:?}: pending {change:?}");
+                    let r = confirm(fx, change.change_id).await;
+                    eprintln!("provision {phase:?}: confirm {r:?}");
+                    assert!(r.is_ok(), "confirm {phase:?}: {r:?}");
+                    match inner.map(|b| *b) {
+                        Some(Payload::ProfileApplied(a)) => a,
+                        other => panic!("{phase:?} pending without result: {other:?}"),
+                    }
+                }
+                other => panic!("profile.apply {phase:?}: {other:?}"),
+            };
+            eprintln!(
+                "provision {phase:?}: {:?}, score {} → {}, {} planned changes",
+                t0.elapsed(),
+                applied.score_before,
+                applied.score_after,
+                plan.changes.len()
+            );
+            for m in &applied.modules {
+                if m.outcome != ModuleOutcome::Unchanged {
+                    eprintln!(
+                        "  {:<22} {:?} {}",
+                        m.id,
+                        m.outcome,
+                        m.detail.lines().next().unwrap_or("")
+                    );
+                }
+                if m.outcome == ModuleOutcome::Failed {
+                    failed.push((phase, m.id.clone(), m.detail.clone()));
+                }
+            }
+            // sshd may have been reloaded: continue on a fresh login.
+            conn.disconnect().await;
+            (conn, s) = open(fx).await;
+        }
+        let after = score(&mut s).await;
+        eprintln!("provision: score {} → {}", before.score, after.score);
+        for m in &after.modules {
+            eprintln!("  {:<22} {:?}", m.id, m.status);
+        }
+        conn.disconnect().await;
+        assert!(
+            !failed.iter().any(|(p, ..)| *p != ProfilePhase::System),
+            "failed modules: {failed:?}"
+        );
+        if !failed.is_empty() {
+            eprintln!("provision: System modules failed: {failed:?}");
+        }
+        assert!(after.score > before.score, "score did not improve");
+    });
+}
+
+// ---------------------------------------------------------------- services
+
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn services_unit_status_and_protected_stop() {
+    let fx = fixture();
+    run(LIMIT, async {
+        let (conn, mut s) = open(fx).await;
+        for unit in ["ssh.service", "cron.service", "fleet-exec.service"] {
+            let op = Op::UnitStatus {
+                unit: UnitName::new(unit).unwrap(),
+            };
+            match call(&mut s, fx, op).await {
+                Ok(Payload::UnitStatus(u)) => {
+                    eprintln!(
+                        "unit.status {unit}: {:?}/{} ({}) pid {:?} mem {:?} tasks {:?}",
+                        u.info.active,
+                        u.info.sub,
+                        u.info.file_state,
+                        u.main_pid,
+                        u.memory_bytes,
+                        u.tasks
+                    );
+                    assert_eq!(u.info.name, unit);
+                }
+                other => panic!("unit.status {unit}: {other:?}"),
+            }
+        }
+        for unit in ["ssh.service", "fleet-exec.service"] {
+            let op = Op::UnitStop {
+                unit: UnitName::new(unit).unwrap(),
+            };
+            let r = call(&mut s, fx, op).await;
+            eprintln!("unit.stop {unit}: {r:?}");
+            assert!(r.is_err(), "unit.stop {unit} was allowed");
+            if unit == "ssh.service" {
+                assert_eq!(r, Err(ErrorCode::PolicyDenied));
+            }
+        }
+        conn.disconnect().await;
+    });
+    // Still reachable.
+    let Payload::SystemInfo(_) = read(fx, Op::SystemInfo) else {
+        panic!("wrong payload")
+    };
+}
+
+/// Last by name: footprint after every other test in this run.
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn zz_resource_report() {
+    let fx = fixture();
+    let c = &fx.container;
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let gate = c.rss_bytes("fleet-gate.service").unwrap();
+    let exec = c.rss_bytes("fleet-exec.service").unwrap();
+    let size: u64 = c
+        .exec(&["stat", "-c", "%s", "/usr/lib/fleet/fleet-agent"])
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    eprintln!(
+        "after all tests ({}): gate RSS {:.2} MiB (idle {:.2}), exec RSS {:.2} MiB (idle {:.2}), binary {} bytes ({:.2} MiB)",
+        fx.os,
+        mib(gate),
+        mib(fx.idle_rss.0),
+        mib(exec),
+        mib(fx.idle_rss.1),
+        size,
+        mib(size)
+    );
 }

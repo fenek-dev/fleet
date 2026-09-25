@@ -99,12 +99,25 @@ pub fn arm_guard(runner: &dyn CommandRunner, id: ChangeId, secs: u32) -> Result<
     run_fixed(runner, guard_command(id, secs))
 }
 
+/// `systemctl stop` exits 5 when a named unit isn't loaded: the guard is
+/// normally stopped already once the confirm timer is armed, and a fired
+/// timer is gone. Stopping still happens for the units that are loaded, so
+/// "not loaded" is the disarmed state, not an error.
+const SYSTEMCTL_NOT_LOADED: i32 = 5;
+
+fn stop_units(runner: &dyn CommandRunner, spec: CommandSpec) -> Result<(), TimerError> {
+    match run_fixed(runner, spec) {
+        Err(TimerError::Status(_, Some(SYSTEMCTL_NOT_LOADED))) => Ok(()),
+        r => r,
+    }
+}
+
 pub fn disarm_timer(runner: &dyn CommandRunner, id: ChangeId) -> Result<(), TimerError> {
-    run_fixed(runner, disarm_command(id))
+    stop_units(runner, disarm_command(id))
 }
 
 pub fn disarm_guard(runner: &dyn CommandRunner, id: ChangeId) -> Result<(), TimerError> {
-    run_fixed(runner, disarm_guard_command(id))
+    stop_units(runner, disarm_guard_command(id))
 }
 
 /// Restores a snapshot.
@@ -285,4 +298,40 @@ pub fn finish_claimed(
         (false, Some(_)) => RevertOutcome::Kept,
         (false, None) => RevertOutcome::Failed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fleet_ops::{CommandOutput, FakeRunner};
+
+    fn exit(code: i32) -> Result<CommandOutput, RunError> {
+        Ok(CommandOutput {
+            code: Some(code),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+        })
+    }
+
+    /// Seen on Debian 12: the guard was stopped once the confirm timer was
+    /// armed, so confirming stops a unit that is no longer loaded.
+    #[test]
+    fn disarm_tolerates_units_already_gone_only() {
+        let id = ChangeId([7; 16]);
+        let (t, g) = (
+            format!("{}.timer", unit_name(id)),
+            format!("{}.timer", guard_unit_name(id)),
+        );
+        let r = FakeRunner::new();
+        r.expect(SYSTEMCTL, &["stop", &t, &g], exit(SYSTEMCTL_NOT_LOADED));
+        r.expect(SYSTEMCTL, &["stop", &g], exit(SYSTEMCTL_NOT_LOADED));
+        r.expect(SYSTEMCTL, &["stop", &t, &g], exit(1));
+        assert!(disarm_timer(&r, id).is_ok());
+        assert!(disarm_guard(&r, id).is_ok());
+        assert!(matches!(
+            disarm_timer(&r, id),
+            Err(TimerError::Status(_, Some(1)))
+        ));
+    }
 }

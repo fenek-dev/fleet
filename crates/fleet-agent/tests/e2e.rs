@@ -749,8 +749,10 @@ fn revoked_device_rejected_and_authorized_keys_rewritten() {
     let mut fx = Fixture::new(2, 0);
     let ended = Arc::new(Mutex::new(Vec::new()));
     let e2 = ended.clone();
+    // Stop exec before seeding: its maintenance tick (every 100 ms) does
+    // read-merge-rename on this file, and a write landing between its read
+    // and rename is lost.
     fx.exec = None;
-    fx.start_exec_with(move |cfg| cfg.terminator = Some(Box::new(RecTerm(e2))));
     let ak_path = fx.paths.authorized_keys_dir.join("admin");
     // Hand edits: an extra key and a stale duplicate managed block.
     let seeded = format!(
@@ -759,6 +761,7 @@ fn revoked_device_rejected_and_authorized_keys_rewritten() {
         fleet_agent::authorized_keys::END
     );
     std::fs::write(&ak_path, seeded).unwrap();
+    fx.start_exec_with(move |cfg| cfg.terminator = Some(Box::new(RecTerm(e2))));
     run(async {
         let (m0, m1) = (&fx.macs[0], &fx.macs[1]);
         let mut old = fx.connect(m0).await;
