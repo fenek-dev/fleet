@@ -11,11 +11,12 @@
 //!   catalog's tier; Fleet-owned paths and `/etc/fleet` are refused;
 //!   secrets (no content) and deletions can't be restored. Not an
 //!   auto-revert op: a rollback is undone by rolling back again.
-//! - `config.paths.get` / `config.paths.set` (versioned).
+//! - `config.paths.get` / `config.paths.set` (versioned). Tracking a path
+//!   outside `/etc`, `/srv`, `/opt`, `/usr/local/etc` is Elevated.
 
 use super::content::{self, as_text};
 use super::diff::unified;
-use super::rules::PathRules;
+use super::rules::{PathRules, under_operator_roots};
 use super::write::{Perms, replace};
 use super::{ConfigTracker, OperatorPaths, VersionRecord, store_err, to_version};
 use crate::ctx::SysCtx;
@@ -265,6 +266,18 @@ impl ConfigOps {
         }
     }
 
+    /// `config.paths.set` tracking a path outside
+    /// [`OPERATOR_ROOTS`](super::rules::OPERATOR_ROOTS) needs
+    /// a root-key approval ([`OpHandler::requires_elevated`]); checked here
+    /// too, so a handler reached without exec's escalation step refuses.
+    fn check_paths_roots(op: &Op, meta: &OpMeta) -> Result<(), OpError> {
+        if paths_set_escalates(op) && (meta.approval.is_none() || meta.command.approval.is_none()) {
+            return Err(OpError::new(ErrorCode::ApprovalRequired)
+                .with_detail("tracked path outside /etc, /srv, /opt, /usr/local/etc"));
+        }
+        Ok(())
+    }
+
     fn check_paths_version(&self, meta: &OpMeta) -> Result<u64, OpError> {
         let current = self.0.rules().operator.version;
         if meta.command.body.expected_version != Some(current) {
@@ -272,6 +285,13 @@ impl ConfigOps {
         }
         Ok(current)
     }
+}
+
+/// Whether `op` is a `config.paths.set` tracking a rule outside
+/// [`OPERATOR_ROOTS`](super::rules::OPERATOR_ROOTS).
+pub fn paths_set_escalates(op: &Op) -> bool {
+    matches!(op, Op::ConfigPathsSet { tracked, .. }
+        if tracked.iter().any(|p| !under_operator_roots(p.as_str())))
 }
 
 /// The live file for a diff: (hash, size, secret, content, label).
@@ -284,9 +304,9 @@ fn current(
     let label = format!("b{p}@now");
     match open_file(ctx, p) {
         Ok((f, m)) => {
-            let o = content::observe(f, m, !secret_path)
+            let o = content::observe(f, m, !secret_path, p)
                 .map_err(|e| crate::files::walk::io_err(e, "read"))?;
-            let secret = secret_path || o.has_key;
+            let secret = secret_path || o.secret;
             Ok((o.hash, m.size, secret, o.data, label))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((
@@ -310,9 +330,16 @@ impl OpHandler for ConfigOps {
         match op {
             Op::ConfigHistory { .. } | Op::ConfigDiff { .. } | Op::ConfigPathsGet => Ok(()),
             Op::ConfigRollback { path, version } => self.rollback_plan(path, *version).map(|_| ()),
-            Op::ConfigPathsSet { .. } => self.check_paths_version(meta).map(|_| ()),
+            Op::ConfigPathsSet { .. } => {
+                Self::check_paths_roots(op, meta)?;
+                self.check_paths_version(meta).map(|_| ())
+            }
             _ => Err(ErrorCode::Unsupported.into()),
         }
+    }
+
+    fn requires_elevated(&self, _ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<bool, OpError> {
+        Ok(paths_set_escalates(op))
     }
 
     fn handle<'a>(
@@ -334,6 +361,7 @@ impl OpHandler for ConfigOps {
                 }
                 Op::ConfigPathsGet => Payload::ConfigPaths(self.paths()),
                 Op::ConfigPathsSet { tracked, secret } => {
+                    Self::check_paths_roots(op, meta)?;
                     let current = self.check_paths_version(meta)?;
                     self.0.set_operator_paths(OperatorPaths {
                         tracked: tracked.iter().map(|p| p.as_str().to_owned()).collect(),

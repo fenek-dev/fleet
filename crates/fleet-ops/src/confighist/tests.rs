@@ -567,3 +567,165 @@ fn inotify_reports_changes() {
     };
     assert!(p.contains(&"/etc/nginx/nginx.conf".to_owned()), "{p:?}");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn watcher_next_is_cancel_safe() {
+    let r = Rig::new();
+    let mut w = watch::Watcher::new(&r.ctx, &["/etc".to_owned()]).expect("inotify");
+    std::fs::write(r.root().join("etc/nginx/nginx.conf"), "changed\n").unwrap();
+    let b = block(async {
+        // Dropped mid-debounce: the event was read but not handed over.
+        let first = tokio::time::timeout(watch::DEBOUNCE / 3, w.next()).await;
+        assert!(first.is_err(), "{first:?}");
+        tokio::time::timeout(Duration::from_secs(5), w.next())
+            .await
+            .unwrap()
+    });
+    let watch::Batch::Paths(p) = b else {
+        panic!("{b:?}")
+    };
+    assert!(p.contains(&"/etc/nginx/nginx.conf".to_owned()), "{p:?}");
+}
+
+#[test]
+fn startup_strips_content_of_new_builtin_secrets() {
+    // History written before `/etc/krb5.keytab` joined the secret list.
+    let store = Rc::new(MemStore::default());
+    let rec = VersionRecord {
+        time_ms: 1,
+        hash: *blake3::hash(b"keytab").as_bytes(),
+        size: 6,
+        mode: 0o600,
+        uid: 0,
+        gid: 0,
+        source: ChangeSource::Unknown,
+        secret: false,
+        deleted: false,
+        stored: 1,
+    };
+    let st = FileState {
+        version: 1,
+        size: 6,
+        mtime_ns: 1,
+        ino: 1,
+        mode: 0o600,
+        uid: 0,
+        gid: 0,
+        hash: rec.hash,
+        deleted: false,
+    };
+    let blob = content::compress(b"keytab");
+    for p in ["/etc/krb5.keytab", "/etc/hosts"] {
+        store.append(p, 1, &rec, Some(&blob), &st).unwrap();
+    }
+    ConfigTracker::new(
+        store.clone(),
+        Rc::new(VecSink::default()),
+        Rc::new(Unattributed),
+    )
+    .unwrap();
+    let k = store.record("/etc/krb5.keytab", 1).unwrap().unwrap();
+    assert!(k.secret && !k.has_content());
+    assert_eq!(k.hash, rec.hash);
+    assert!(
+        store
+            .record("/etc/hosts", 1)
+            .unwrap()
+            .unwrap()
+            .has_content()
+    );
+}
+
+#[test]
+fn content_secrets_and_hard_links_are_hash_only() {
+    let r = Rig::new();
+    std::fs::create_dir_all(r.root().join("etc/netplan")).unwrap();
+    std::fs::write(
+        r.root().join("etc/netplan/01.yaml"),
+        "network:\n  wifis:\n    wlan0:\n      access-points:\n        home:\n          password: x\n",
+    )
+    .unwrap();
+    std::fs::write(
+        r.root().join("etc/netplan/02.yaml"),
+        "network:\n  version: 2\n",
+    )
+    .unwrap();
+    std::fs::write(r.root().join("etc/age.key"), "AGE-SECRET-KEY-1ABC\n").unwrap();
+    std::fs::hard_link(
+        r.root().join("etc/shadow"),
+        r.root().join("etc/innocent.conf"),
+    )
+    .unwrap();
+    r.scan();
+    for (p, secret) in [
+        ("/etc/netplan/01.yaml", true),
+        ("/etc/netplan/02.yaml", false),
+        ("/etc/age.key", true),
+        ("/etc/innocent.conf", true),
+    ] {
+        let v = r.versions(p);
+        assert_eq!(v[0].1.secret, secret, "{p}");
+        assert_eq!(v[0].1.has_content(), !secret, "{p}");
+    }
+}
+
+#[test]
+fn paths_set_outside_roots_needs_approval() {
+    let r = Rig::new();
+    let h = ConfigOps(r.t.clone());
+    let set = |tracked: &[&str]| Op::ConfigPathsSet {
+        tracked: tracked.iter().map(|s| ap(s)).collect(),
+        secret: vec![],
+    };
+    let approved = |op: &Op| {
+        let mut m = meta(op.clone(), None);
+        m.command.body.expected_version = Some(r.t.rules().operator.version);
+        m.approval = Some(fleet_proto::RootApproval {
+            device_id: fleet_proto::DeviceId([2; 16]),
+            body: vec![],
+            signature: fleet_proto::Signature([0; 64]),
+            proof: fleet_proto::MerkleProof {
+                leaf_index: 0,
+                leaf_count: 1,
+                siblings: vec![],
+            },
+        });
+        m.command.approval = Some(fleet_crypto::approval::ApprovalLeaf {
+            approval_id: [0; 16],
+            leaf: [0; 32],
+            leaf_index: 0,
+            expires_at_ms: u64::MAX,
+            device_id: fleet_proto::DeviceId([2; 16]),
+        });
+        m
+    };
+    for (tracked, elevated) in [
+        (&["/etc/app.conf", "/srv/*/x.toml"][..], false),
+        (&["/opt/game/server.cfg", "/usr/local/etc/x"][..], false),
+        (&["/etc/a", "/home/*/app/*.toml"][..], true),
+        (&["/root/.bashrc"][..], true),
+        (&["/usr/local/bin/tool"][..], true),
+    ] {
+        let op = set(tracked);
+        let m = meta(op.clone(), None);
+        assert_eq!(
+            h.requires_elevated(&r.ctx, &op, &m).unwrap(),
+            elevated,
+            "{tracked:?}"
+        );
+        let plain = r.run(op.clone(), Some(r.t.rules().operator.version));
+        if elevated {
+            let e = plain.unwrap_err();
+            assert_eq!(e.code(), ErrorCode::ApprovalRequired, "{tracked:?}");
+            // With an approval (verified by exec) the handler goes ahead.
+            let mut m = approved(&op);
+            h.validate(&r.ctx, &op, &m).unwrap();
+            m.audit_seq = Some(78);
+            block(h.handle(&r.ctx, &op, &m)).unwrap();
+        } else {
+            plain.unwrap();
+        }
+        assert_eq!(r.t.rules().operator.tracked, tracked, "{tracked:?}");
+    }
+}

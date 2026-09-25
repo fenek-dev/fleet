@@ -40,8 +40,11 @@ impl AbsPath {
 
     /// Protected config paths whose `config.rollback` is Elevated: design
     /// §4.9 (`/etc/sudoers*`, `/etc/shadow`, `/etc/ssh/`, `/etc/fleet/`) plus
-    /// the other files that grant root or control authentication directly.
+    /// the other files that grant root, run code as root (cron, units,
+    /// the dynamic linker, apt hooks, logrotate scripts, module and udev
+    /// rules, login shells' profiles) or control authentication directly.
     pub fn is_protected_config(&self) -> bool {
+        // Files in /etc named with this prefix (`/etc/passwd-`).
         const FILE_PREFIXES: &[&str] = &[
             "/etc/sudoers",
             "/etc/shadow",
@@ -49,18 +52,39 @@ impl AbsPath {
             "/etc/passwd",
             "/etc/group",
         ];
+        // Anything named with this prefix, and everything below it
+        // (`/etc/cron.d/x`, `/etc/ld.so.conf.d/x`, `/etc/profile.d/x`).
+        const TREE_PREFIXES: &[&str] = &[
+            "/etc/cron.",
+            "/etc/ld.so.conf",
+            "/etc/apt/sources.list",
+            "/etc/profile",
+        ];
+        // The path itself and everything below it.
         const DIRS: &[&str] = &[
             "/etc/sudoers.d",
             "/etc/ssh",
             "/etc/fleet",
             "/etc/pam.d",
             "/etc/security",
+            "/etc/crontab",
+            "/etc/systemd/system",
+            "/etc/ld.so.preload",
+            "/etc/apt/apt.conf.d",
+            "/etc/logrotate.d",
+            "/etc/modprobe.d",
+            "/etc/udev/rules.d",
+            "/etc/bash.bashrc",
+            "/etc/polkit-1",
+            "/etc/sudo.conf",
+            "/etc/environment",
         ];
         let p = self.as_str();
         FILE_PREFIXES.iter().any(|f| {
             p.strip_prefix(f)
                 .is_some_and(|rest| rest.is_empty() || !rest.contains('/'))
-        }) || DIRS.iter().any(|d| self.under_str(d))
+        }) || TREE_PREFIXES.iter().any(|f| p.starts_with(f))
+            || DIRS.iter().any(|d| self.under_str(d))
     }
 
     /// Fleet's own state, binaries and units: never rolled back through
@@ -166,6 +190,35 @@ mod tests {
             "/etc/fleet/authorized_keys/ops",
             "/etc/passwd",
             "/etc/pam.d/sshd",
+            "/etc/crontab",
+            "/etc/cron.d",
+            "/etc/cron.d/backup",
+            "/etc/cron.daily/logrotate",
+            "/etc/cron.hourly/x",
+            "/etc/cron.weekly/x",
+            "/etc/cron.monthly/x",
+            "/etc/cron.allow",
+            "/etc/cron.deny",
+            "/etc/systemd/system",
+            "/etc/systemd/system/nginx.service",
+            "/etc/systemd/system/multi-user.target.wants/x.service",
+            "/etc/ld.so.preload",
+            "/etc/ld.so.conf",
+            "/etc/ld.so.conf.d/libc.conf",
+            "/etc/apt/apt.conf.d/99hook",
+            "/etc/apt/sources.list",
+            "/etc/apt/sources.list.d/docker.list",
+            "/etc/logrotate.d/nginx",
+            "/etc/modprobe.d/blacklist.conf",
+            "/etc/udev/rules.d/99-x.rules",
+            "/etc/profile",
+            "/etc/profile.d/x.sh",
+            "/etc/bash.bashrc",
+            "/etc/polkit-1/rules.d/49-x.rules",
+            "/etc/sudo.conf",
+            "/etc/environment",
+            "/etc/security/limits.conf",
+            "/etc/pam.d",
         ] {
             assert!(p(prot).is_protected_config(), "{prot}");
         }
@@ -174,6 +227,15 @@ mod tests {
             "/etc/hosts",
             "/etc/sshd",
             "/etc/fleetish",
+            "/etc/crontabs",
+            "/etc/systemd/network/10-eth.network",
+            "/etc/systemd/journald.conf",
+            "/etc/apt/preferences.d/pin",
+            "/etc/logrotate.conf",
+            "/etc/udev/hwdb.d/x",
+            "/etc/bash_completion.d/git",
+            "/etc/environment.d",
+            "/etc/securityx",
         ] {
             assert!(!p(free).is_protected_config(), "{free}");
         }
