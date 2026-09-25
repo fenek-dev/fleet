@@ -23,10 +23,12 @@
 
 pub mod allowed;
 pub mod compose;
+pub mod confighist;
 pub mod cron;
 pub mod ctx;
 pub mod docker;
 pub mod escalation;
+pub mod files;
 pub mod firewall;
 pub mod fswrite;
 pub mod handler;
@@ -36,6 +38,7 @@ pub mod procfs;
 pub mod revertible;
 pub mod runner;
 pub mod scope;
+pub mod search;
 pub mod security;
 pub mod services;
 pub mod system;
