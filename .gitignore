@@ -8,3 +8,5 @@
 /apple/Fleet/Generated/
 /apple/Fleet/build/
 xcuserdata/
+/build/
+.serena/
