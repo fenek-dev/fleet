@@ -3,9 +3,11 @@
 //! and the guard that keeps `process.signal`/`renice` off init, kernel
 //! threads and Fleet itself.
 
-use super::collect::read_into;
+use super::collect::{Syscalls, read_into};
 use super::parse::{self, PidStat, USER_HZ};
 use crate::ctx::SysCtx;
+use crate::handler::OpError;
+use fleet_proto::args::Signal;
 use fleet_proto::payload::{ProcessInfo, TopProcess};
 use fleet_proto::{ErrorCode, F32, op::ProcessSort};
 use std::collections::HashMap;
@@ -270,6 +272,129 @@ pub fn check_target(ctx: &SysCtx, self_pid: u32, pid: u32) -> Result<PidStat, Er
     Ok(stat)
 }
 
+/// Units whose processes `process.signal` never stops or terminates: the
+/// only way in (sshd), and what the system can't run without. `fleet-*`
+/// services are matched by [`protected_unit`].
+pub const PROTECTED_SIGNAL_UNITS: &[&str] = &[
+    "ssh.service",
+    "sshd.service",
+    "ssh.socket",
+    "systemd-journald.service",
+    "dbus.service",
+    "dbus-broker.service",
+    "systemd-logind.service",
+];
+
+/// One cgroup path component (`ssh.service`, `ssh@3-1.2.3.4:22.service`).
+pub fn protected_unit(unit: &str) -> bool {
+    PROTECTED_SIGNAL_UNITS.contains(&unit)
+        || (unit.starts_with("ssh@") && unit.ends_with(".service"))
+        || (unit.starts_with("fleet-") && unit.ends_with(".service"))
+}
+
+/// `/proc/<pid>/cgroup` (v2 `0::/system.slice/ssh.service`, or v1 hybrid
+/// lines): any component of any hierarchy's path naming a protected unit.
+pub fn cgroup_protected(text: &str) -> bool {
+    text.lines()
+        .filter_map(|l| l.splitn(3, ':').nth(2))
+        .flat_map(|path| path.split('/'))
+        .any(protected_unit)
+}
+
+/// Only `Cont` is harmless to a protected process: every other signal the
+/// enum carries stops it, ends it, or (`Usr1`/`Usr2`, `Hup` where
+/// unhandled) may terminate it by default action.
+fn signal_harmless(s: Signal) -> bool {
+    matches!(s, Signal::Cont)
+}
+
+/// [`check_target`] plus the protected-unit guard for `signal`. The
+/// cgroup must be readable (fail closed; unreadable means gone).
+pub fn check_signal_target(
+    ctx: &SysCtx,
+    self_pid: u32,
+    pid: u32,
+    signal: Signal,
+) -> Result<PidStat, OpError> {
+    let stat = check_target(ctx, self_pid, pid)?;
+    if !signal_harmless(signal) {
+        let mut buf = String::new();
+        if !read_into(ctx, &format!("/proc/{pid}/cgroup"), &mut buf) {
+            return Err(OpError::new(ErrorCode::NotFound));
+        }
+        if cgroup_protected(&buf) {
+            return Err(OpError::new(ErrorCode::PolicyDenied).with_detail("protected unit"));
+        }
+    }
+    Ok(stat)
+}
+
+/// Checks and signals `pid` without racing PID reuse. On Linux against
+/// the real `/proc` (root `/`): `pidfd_open`, then re-check the target
+/// through `/proc` and require the start time seen by the first check, then
+/// `pidfd_send_signal` — the fd names the process that passed the second
+/// check or one already dead. Elsewhere (tests with a fixture root, macOS
+/// dev builds) the second check runs and `sys.kill` delivers.
+pub fn send_signal(
+    ctx: &SysCtx,
+    sys: &dyn Syscalls,
+    pid: u32,
+    signal: Signal,
+) -> Result<(), OpError> {
+    let self_pid = sys.self_pid();
+    let first = check_signal_target(ctx, self_pid, pid, signal)?;
+    let recheck = || -> Result<(), OpError> {
+        let again = check_signal_target(ctx, self_pid, pid, signal)?;
+        if again.start_ticks != first.start_ticks {
+            return Err(OpError::new(ErrorCode::NotFound));
+        }
+        Ok(())
+    };
+    #[cfg(target_os = "linux")]
+    if ctx.root() == std::path::Path::new("/") {
+        return pidfd_signal(pid, signal, recheck);
+    }
+    recheck()?;
+    sys.kill(pid, signal).map_err(|e| signal_io(&e))
+}
+
+fn signal_io(e: &std::io::Error) -> OpError {
+    // ESRCH: the process exited in between.
+    if e.raw_os_error() == Some(3) {
+        OpError::new(ErrorCode::NotFound)
+    } else {
+        OpError::internal(e)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_signal(
+    pid: u32,
+    signal: Signal,
+    recheck: impl FnOnce() -> Result<(), OpError>,
+) -> Result<(), OpError> {
+    use rustix::process::{self as rp, Signal as R};
+    let raw = i32::try_from(pid)
+        .ok()
+        .and_then(rp::Pid::from_raw)
+        .ok_or_else(|| OpError::new(ErrorCode::InvalidArgument))?;
+    let fd = rp::pidfd_open(raw, rp::PidfdFlags::empty())
+        .map_err(|e| signal_io(&std::io::Error::from(e)))?;
+    recheck()?;
+    let sig = match signal {
+        Signal::Hup => R::HUP,
+        Signal::Int => R::INT,
+        Signal::Quit => R::QUIT,
+        Signal::Kill => R::KILL,
+        Signal::Usr1 => R::USR1,
+        Signal::Usr2 => R::USR2,
+        Signal::Term => R::TERM,
+        Signal::Cont => R::CONT,
+        Signal::Stop => R::STOP,
+    };
+    rp::pidfd_send_signal(&fd, sig).map_err(|e| signal_io(&std::io::Error::from(e)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +474,32 @@ mod tests {
             check_target(&ctx_at(d2.path()), 99, 4242),
             Err(ErrorCode::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn cgroup_protection_table() {
+        for (text, want) in [
+            ("0::/system.slice/ssh.service\n", true),
+            ("0::/system.slice/sshd.service\n", true),
+            (
+                "0::/system.slice/system-sshd.slice/ssh@3-10.0.0.1:22.service",
+                true,
+            ),
+            ("0::/system.slice/fleet-agent.service", true),
+            ("0::/system.slice/fleet-exec.service/sub", true),
+            ("0::/system.slice/dbus.service", true),
+            ("0::/system.slice/systemd-journald.service", true),
+            (
+                "12:pids:/\n1:name=systemd:/system.slice/systemd-logind.service\n0::/",
+                true,
+            ),
+            ("0::/system.slice/nginx.service", false),
+            ("0::/system.slice/fleet-op-7.scope", false),
+            ("0::/user.slice/user-0.slice/session-1.scope", false),
+            ("0::/system.slice/my-ssh.service", false),
+            ("garbage", false),
+        ] {
+            assert_eq!(cgroup_protected(text), want, "{text}");
+        }
     }
 }

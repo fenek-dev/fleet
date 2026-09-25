@@ -281,7 +281,7 @@ mod tests {
     use crate::FakeRunner;
     use crate::logs::lines::FakeLineSpawner;
     use crate::security::utmp::tests::record;
-    use crate::test_util::{block, ctx_at, meta};
+    use crate::testutil::{T0, block, ctx_at, meta_at};
 
     #[test]
     fn fingerprint_matches_ssh_keygen() {
@@ -367,14 +367,16 @@ mod tests {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         sp.expect(JOURNALCTL, &args, &lines, false);
         let h = LoginsHandler::new(sp, Rc::new(OneMac));
-        let c = ctx_at(dir.path(), Rc::new(FakeRunner::new()));
+        let c = ctx_at(dir.path(), Rc::new(FakeRunner::new()), T0);
         let op = Op::LoginsQuery {
             range,
             failed_only: false,
             limit: 10,
         };
-        h.validate(&c, &op, &meta()).unwrap();
-        let OpOutput::Payload(Payload::Logins(l)) = block(h.handle(&c, &op, &meta())).unwrap()
+        h.validate(&c, &op, &meta_at(Op::SystemInfo, Some(1), T0))
+            .unwrap();
+        let OpOutput::Payload(Payload::Logins(l)) =
+            block(h.handle(&c, &op, &meta_at(Op::SystemInfo, Some(1), T0))).unwrap()
         else {
             panic!()
         };
@@ -427,6 +429,13 @@ mod tests {
             failed_only: false,
             limit: 0,
         };
-        assert!(h.validate(&crate::test_util::ctx(), &bad, &meta()).is_err());
+        assert!(
+            h.validate(
+                &crate::testutil::ctx_empty(),
+                &bad,
+                &meta_at(Op::SystemInfo, Some(1), T0)
+            )
+            .is_err()
+        );
     }
 }

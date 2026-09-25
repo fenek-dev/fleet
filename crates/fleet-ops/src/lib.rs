@@ -33,6 +33,7 @@ pub mod firewall;
 pub mod fswrite;
 pub mod handler;
 pub mod logs;
+pub mod nftlock;
 pub mod packages;
 pub mod procfs;
 pub mod revertible;
@@ -43,8 +44,6 @@ pub mod security;
 pub mod services;
 pub mod system;
 pub mod telemetry;
-#[cfg(test)]
-pub(crate) mod test_util;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod users;

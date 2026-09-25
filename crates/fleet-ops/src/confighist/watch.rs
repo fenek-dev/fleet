@@ -67,6 +67,10 @@ mod linux {
         dirs: HashMap<i32, String>,
         ctx: SysCtx,
         buf: Vec<MaybeUninit<u8>>,
+        /// The batch being debounced. Kept here, not in `next`'s future,
+        /// so a `next` dropped mid-debounce (a `select!` branch losing)
+        /// loses nothing: the following call hands it over.
+        pending: Option<Outcome>,
     }
 
     fn mask() -> WatchFlags {
@@ -95,6 +99,7 @@ mod linux {
                 dirs: HashMap::new(),
                 ctx: ctx.clone(),
                 buf: vec![MaybeUninit::uninit(); 64 * 1024],
+                pending: None,
             };
             for r in roots {
                 w.watch_tree(r, &mut Vec::new());
@@ -136,8 +141,16 @@ mod linux {
             }
         }
 
-        /// Reads everything queued now. `Err` when the fd is unusable.
-        fn drain(&mut self, out: &mut Option<Outcome>) -> Result<(), Errno> {
+        /// Reads everything queued now into `pending`. `Err` when the fd
+        /// is unusable.
+        fn drain(&mut self) -> Result<(), Errno> {
+            let mut pending = self.pending.take();
+            let r = self.drain_into(&mut pending);
+            self.pending = pending;
+            r
+        }
+
+        fn drain_into(&mut self, out: &mut Option<Outcome>) -> Result<(), Errno> {
             let mut new_dirs = Vec::new();
             {
                 let mut r = inotify::Reader::new(self.fd.get_ref(), &mut self.buf);
@@ -165,7 +178,9 @@ mod linux {
                         continue;
                     }
                     let Some(name) = ev.file_name() else { continue };
-                    let path = join(&dir, &name.to_string_lossy());
+                    // Non-UTF-8 names aren't tracked.
+                    let Ok(name) = name.to_str() else { continue };
+                    let path = join(&dir, name);
                     if flags.contains(ReadFlags::ISDIR) {
                         if flags.intersects(ReadFlags::CREATE | ReadFlags::MOVED_TO) {
                             new_dirs.push(path);
@@ -199,11 +214,11 @@ mod linux {
             Ok(())
         }
 
-        /// The next batch of changes.
+        /// The next batch of changes. Cancel-safe: events read before the
+        /// future is dropped stay pending for the next call.
         pub async fn next(&mut self) -> Batch {
-            let mut out: Option<Outcome> = None;
             loop {
-                let waited = if out.is_some() {
+                let waited = if self.pending.is_some() {
                     tokio::time::timeout(DEBOUNCE, self.fd.readable())
                         .await
                         .ok()
@@ -213,7 +228,7 @@ mod linux {
                 match waited {
                     // Quiet for DEBOUNCE: hand the batch over.
                     None => {
-                        return match out.take() {
+                        return match self.pending.take() {
                             Some(Outcome::Rescan) => Batch::Rescan,
                             Some(Outcome::Paths(p)) => Batch::Paths(p.into_iter().collect()),
                             None => Batch::Paths(Vec::new()),
@@ -223,7 +238,7 @@ mod linux {
                     Some(Ok(mut guard)) => {
                         guard.clear_ready();
                         drop(guard);
-                        if self.drain(&mut out).is_err() {
+                        if self.drain().is_err() {
                             return Batch::Failed;
                         }
                     }

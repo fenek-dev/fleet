@@ -8,8 +8,10 @@ use crate::handler::{LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput};
 use fleet_proto::args::Protocol;
 use fleet_proto::payload::{ListeningPort, Ports};
 use fleet_proto::{Event, Op, Payload};
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
 
 const TCP_LISTEN: u8 = 0x0A;
 /// Unconnected UDP sockets are in `TCP_CLOSE` with no remote address.
@@ -127,7 +129,51 @@ fn users(ctx: &SysCtx) -> HashMap<u32, String> {
         .collect()
 }
 
+/// Socket owners of the last scan. The `/proc/*/fd` walk is by far the
+/// most expensive part of a poll, so it is redone only when the set of
+/// listening socket inodes changed (or a cached owner exited).
+#[derive(Debug, Default)]
+pub struct OwnerCache {
+    key: Option<(PathBuf, BTreeSet<u64>)>,
+    owners: HashMap<u64, u32>,
+    /// Full scans performed (tests, metrics).
+    pub scans: u64,
+}
+
+impl OwnerCache {
+    pub fn owners(&mut self, ctx: &SysCtx, wanted: &BTreeSet<u64>) -> HashMap<u64, u32> {
+        let root = ctx.path("/proc");
+        let fresh = match (&root, &self.key) {
+            (Some(r), Some((kr, ks))) => {
+                kr == r
+                    && ks == wanted
+                    && self
+                        .owners
+                        .values()
+                        .all(|pid| r.join(pid.to_string()).exists())
+            }
+            _ => false,
+        };
+        if !fresh {
+            self.owners = socket_owners(ctx, wanted);
+            self.scans += 1;
+            self.key = root.map(|r| (r, wanted.clone()));
+        }
+        self.owners.clone()
+    }
+}
+
+thread_local! {
+    /// The agent's runtime is single-threaded: one cache per process.
+    static OWNERS: RefCell<OwnerCache> = RefCell::new(OwnerCache::default());
+}
+
+/// [`collect_with`] using the process-wide owner cache.
 pub fn collect(ctx: &SysCtx) -> Ports {
+    OWNERS.with(|c| collect_with(ctx, &mut c.borrow_mut()))
+}
+
+pub fn collect_with(ctx: &SysCtx, cache: &mut OwnerCache) -> Ports {
     let mut socks = Vec::new();
     for (file, proto) in [
         ("/proc/net/tcp", Protocol::Tcp),
@@ -140,7 +186,7 @@ pub fn collect(ctx: &SysCtx) -> Ports {
         }
     }
     let wanted: BTreeSet<u64> = socks.iter().map(|s| s.inode).filter(|i| *i != 0).collect();
-    let owners = socket_owners(ctx, &wanted);
+    let owners = cache.owners(ctx, &wanted);
     let names = users(ctx);
     let mut seen = BTreeSet::new();
     let mut ports = Vec::new();
@@ -241,7 +287,7 @@ pub fn ephemeral_range(ctx: &SysCtx) -> (u16, u16) {
 mod tests {
     use super::*;
     use crate::FakeRunner;
-    use crate::test_util::ctx_at;
+    use crate::testutil::{T0, ctx_at};
     use std::rc::Rc;
 
     const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -290,7 +336,7 @@ mod tests {
             }
             std::os::unix::fs::symlink("/dev/null", p.join("fd/0")).unwrap();
         }
-        let ctx = ctx_at(d, Rc::new(FakeRunner::new()));
+        let ctx = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let ports = collect(&ctx).ports;
         let summary: Vec<String> = ports
             .iter()
@@ -354,6 +400,41 @@ mod tests {
             matches!(&ev[0], Event::NewListeningPort { port: 8080, process: Some(p), .. } if p == "node")
         );
         assert!(w.observe(&Ports { ports: more }, eph).is_empty());
+    }
+
+    #[test]
+    fn owner_scan_only_when_inodes_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("proc/812/fd")).unwrap();
+        std::fs::write(d.join("proc/812/comm"), "sshd\n").unwrap();
+        std::fs::create_dir_all(d.join("proc/net")).unwrap();
+        std::fs::write(d.join("proc/net/tcp"), TCP).unwrap();
+        let fd = d.join("proc/812/fd/3");
+        std::os::unix::fs::symlink("socket:[1001]", &fd).unwrap();
+        let ctx = ctx_at(d, Rc::new(FakeRunner::new()), T0);
+        let mut cache = OwnerCache::default();
+        let procs = |p: &Ports| -> Vec<Option<String>> {
+            p.ports.iter().map(|p| p.process.clone()).collect()
+        };
+        let sshd = Some("sshd".to_string());
+        // (tcp listing, fd link present, scans after, processes)
+        let steps: [(&str, bool, u64, Vec<Option<String>>); 3] = [
+            (TCP, true, 1, vec![sshd.clone(), None]),
+            // Same inodes: cached owner reused although the link is gone.
+            (TCP, false, 1, vec![sshd.clone(), None]),
+            // One socket closed: inode set changed, rescan.
+            (&TCP[..TCP.find("   1:").unwrap()], false, 2, vec![None]),
+        ];
+        for (tcp, link, scans, want) in steps {
+            std::fs::write(d.join("proc/net/tcp"), tcp).unwrap();
+            if !link {
+                let _ = std::fs::remove_file(&fd);
+            }
+            let got = collect_with(&ctx, &mut cache);
+            assert_eq!(cache.scans, scans);
+            assert_eq!(procs(&got), want);
+        }
     }
 
     #[test]

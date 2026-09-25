@@ -1,8 +1,9 @@
 //! Child processes (design §4.2 rule: fixed absolute binary paths plus an
 //! argument vector, never a shell). The environment is cleared and replaced
 //! by [`BASE_ENV`]; stdin is `/dev/null` unless [`CommandSpec::stdin`]
-//! supplies bytes (e.g. `nft -f -`); stdout and stderr are capped; a
-//! timeout kills the child.
+//! supplies bytes (e.g. `nft -f -`); stdout and stderr are capped. Each
+//! child leads its own process group; a timeout SIGKILLs the whole group
+//! and, for a scoped child, the `fleet-op-<id>.scope` unit.
 //!
 //! [`CommandRunner::run_blocking`] is the synchronous variant for callers
 //! that can't await (`Revertible::snapshot`/`restore`).
@@ -36,6 +37,10 @@ pub struct CommandSpec {
     /// Written to the child's stdin, which is then closed; `None` means
     /// `/dev/null` (e.g. `crontab -u <user> -`).
     pub stdin: Option<Vec<u8>>,
+    /// Set by [`crate::scope::scoped`]: the transient `fleet-op-<id>.scope`
+    /// the child runs in. On timeout the whole unit is SIGKILLed too
+    /// (catches processes that left the child's process group).
+    pub scope_unit: Option<String>,
 }
 
 impl CommandSpec {
@@ -47,6 +52,7 @@ impl CommandSpec {
             timeout: DEFAULT_TIMEOUT,
             output_cap: DEFAULT_OUTPUT_CAP,
             stdin: None,
+            scope_unit: None,
         }
     }
 
@@ -151,13 +157,45 @@ impl CommandRunner for SystemRunner {
     }
 }
 
+pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
+/// Budget for the post-timeout `systemctl kill` of a scope.
+const SCOPE_KILL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What to run after `spec` timed out: `systemctl kill --signal=SIGKILL
+/// <unit>.scope` for a scoped child, else nothing.
+pub fn scope_kill_spec(spec: &CommandSpec) -> Option<CommandSpec> {
+    let unit = spec.scope_unit.as_ref()?;
+    Some(
+        CommandSpec::new(SYSTEMCTL)
+            .arg("kill")
+            .arg("--signal=SIGKILL")
+            .arg(format!("{unit}.scope"))
+            .timeout(SCOPE_KILL_TIMEOUT)
+            .output_cap(4096),
+    )
+}
+
+/// SIGKILL the child's whole process group (the child leads it:
+/// `process_group(0)`). Called before the child is reaped, so the group id
+/// can't have been reused.
+fn kill_group(pid: Option<u32>) {
+    let pid = pid
+        .and_then(|p| i32::try_from(p).ok())
+        .and_then(rustix::process::Pid::from_raw);
+    if let Some(pid) = pid {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
 fn run_system_blocking(spec: CommandSpec) -> Result<CommandOutput, RunError> {
     use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
     if !spec.program.starts_with('/') {
         return Err(RunError::NotAbsolute);
     }
     let mut cmd = std::process::Command::new(spec.program);
-    cmd.args(&spec.args)
+    cmd.process_group(0)
+        .args(&spec.args)
         .env_clear()
         .envs(BASE_ENV)
         .envs(spec.env.iter().map(|(k, v)| (k, v)))
@@ -194,6 +232,7 @@ fn run_system_blocking(spec: CommandSpec) -> Result<CommandOutput, RunError> {
     };
     let t_out = reader(Box::new(out));
     let t_err = reader(Box::new(err));
+    let scope_kill = scope_kill_spec(&spec);
     let t_in = match (child.stdin.take(), spec.stdin) {
         (Some(mut w), Some(bytes)) => Some(std::thread::spawn(move || {
             // A child that exits without reading gets EPIPE; its exit
@@ -207,8 +246,12 @@ fn run_system_blocking(spec: CommandSpec) -> Result<CommandOutput, RunError> {
         match child.try_wait() {
             Ok(Some(s)) => break s,
             Ok(None) if std::time::Instant::now() >= deadline => {
+                kill_group(Some(child.id()));
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(k) = scope_kill {
+                    let _ = run_system_blocking(k);
+                }
                 return Err(RunError::Timeout);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
@@ -250,11 +293,15 @@ async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| RunError::Spawn(e.kind()))?;
+    let pid = child.id();
     let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        kill_group(pid);
         return Err(RunError::Io(std::io::ErrorKind::BrokenPipe));
     };
+    let scope_kill = scope_kill_spec(&spec);
     let stdin = child.stdin.take().zip(spec.stdin);
     let feed = async move {
         use tokio::io::AsyncWriteExt;
@@ -276,7 +323,12 @@ async fn run_system(spec: CommandSpec) -> Result<CommandOutput, RunError> {
     })
     .await;
     let Ok((out, err, status)) = res else {
+        // Group first: the child is not reaped yet, so its pgid is ours.
+        kill_group(pid);
         let _ = child.kill().await;
+        if let Some(k) = scope_kill {
+            let _ = Box::pin(run_system(k)).await;
+        }
         return Err(RunError::Timeout);
     };
     let (stdout, t1) = out.map_err(|e| RunError::Io(e.kind()))?;
@@ -382,14 +434,7 @@ impl CommandRunner for FakeRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn block<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(f)
-    }
+    use crate::testutil::block;
 
     #[test]
     fn fake_matches_argv_in_order() {
@@ -432,6 +477,43 @@ mod tests {
 
         let r = block(SystemRunner.run(CommandSpec::new("relative")));
         assert_eq!(r, Err(RunError::NotAbsolute));
+    }
+
+    /// A grandchild that outlives the child must die with it on timeout
+    /// (process-group kill), for both runner variants.
+    #[test]
+    fn timeout_kills_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        for blocking in [false, true] {
+            let pidfile = dir.path().join(format!("pid-{blocking}"));
+            // Test-only shell: backgrounds a sleeper and records its pid.
+            let spec = CommandSpec::new("/bin/sh")
+                .args(["-c", "/bin/sleep 30 & echo $! > \"$1\"; wait", "sh"])
+                .arg(pidfile.as_os_str())
+                .timeout(Duration::from_millis(300));
+            let t = std::time::Instant::now();
+            let r = if blocking {
+                SystemRunner.run_blocking(spec)
+            } else {
+                block(SystemRunner.run(spec))
+            };
+            assert_eq!(r, Err(RunError::Timeout));
+            assert!(t.elapsed() < Duration::from_secs(5));
+            let pid: i32 = std::fs::read_to_string(&pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let pid = rustix::process::Pid::from_raw(pid).unwrap();
+            let gone = (0..200).any(|_| {
+                let dead = rustix::process::test_kill_process(pid).is_err();
+                if !dead {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                dead
+            });
+            assert!(gone, "grandchild survived (blocking={blocking})");
+        }
     }
 
     #[test]

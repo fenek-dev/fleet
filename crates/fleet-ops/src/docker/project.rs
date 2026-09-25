@@ -7,8 +7,10 @@
 //! `/root/.docker`). No `COMPOSE_*`/`DOCKER_*` variable is ever passed, and
 //! the explicit `-f` means no `compose.override.yaml` or `COMPOSE_FILE` is
 //! merged in. Compose still reads `/srv/<p>/.env` for interpolation, so a
-//! `.env` that sets any `COMPOSE_*` or `DOCKER_*` key (profiles, path
-//! separator, host…) or is a symlink is refused (`PolicyDenied`).
+//! `.env` that sets any `COMPOSE_*`, `DOCKER_*`, `BUILDX_*` or `BUILDKIT_*`
+//! key (profiles, path separator, host, builder…; `KEY=`, `KEY:` and
+//! `export KEY=` forms, BOM stripped) or is a symlink is refused
+//! (`PolicyDenied`).
 //!
 //! `compose.deploy`:
 //! 1. `validate`: [`compose::validate`](crate::compose::validate) errors →
@@ -109,18 +111,33 @@ async fn run_ok(ctx: &SysCtx, what: &str, spec: CommandSpec) -> Result<CommandOu
     }
 }
 
+/// Key prefixes (case-insensitive) that change what Compose, the Docker CLI
+/// or BuildKit does rather than interpolate.
+pub const ENV_REFUSED_PREFIXES: &[&str] = &["COMPOSE_", "DOCKER_", "BUILDX_", "BUILDKIT_"];
+
+/// The key of one `.env` line: `KEY=…`, `KEY: …` or `export<ws>KEY=…`
+/// (first `=` or `:` ends the key). `None` for blanks and comments.
+fn env_key(line: &str) -> Option<&str> {
+    let l = line.trim_start_matches('\u{feff}').trim();
+    if l.is_empty() || l.starts_with('#') {
+        return None;
+    }
+    let l = match l.strip_prefix("export") {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        _ => l,
+    };
+    let end = l.find(['=', ':'])?;
+    Some(l[..end].trim())
+}
+
 /// `.env` keys that change what Compose does rather than interpolate.
 pub fn env_file_refused(text: &str) -> Option<String> {
     text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| {
-            let l = l.strip_prefix("export ").unwrap_or(l);
-            l.split_once('=').map(|(k, _)| k.trim().to_owned())
-        })
+        .filter_map(env_key)
+        .map(str::to_owned)
         .find(|k| {
             let k = k.to_ascii_uppercase();
-            k.starts_with("COMPOSE_") || k.starts_with("DOCKER_")
+            ENV_REFUSED_PREFIXES.iter().any(|p| k.starts_with(p))
         })
 }
 

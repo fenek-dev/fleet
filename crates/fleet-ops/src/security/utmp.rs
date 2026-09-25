@@ -352,7 +352,11 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("var/log")).unwrap();
         std::fs::write(dir.path().join("var/log/wtmp"), &data).unwrap();
-        let ctx = crate::test_util::ctx_at(dir.path(), std::rc::Rc::new(crate::FakeRunner::new()));
+        let ctx = crate::testutil::ctx_at(
+            dir.path(),
+            std::rc::Rc::new(crate::FakeRunner::new()),
+            crate::testutil::T0,
+        );
         let recs = read_file(&ctx, WTMP);
         assert_eq!(recs.len(), 6);
         assert_eq!(recs[1].time_ms, 1_100_500);

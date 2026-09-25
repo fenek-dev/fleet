@@ -237,6 +237,48 @@ fn job_results_map_to_codes() {
 }
 
 #[test]
+fn critical_unit_refusals() {
+    type Mk = fn(UnitName) -> Op;
+    let stop: Mk = |unit| Op::UnitStop { unit };
+    let disable: Mk = |unit| Op::UnitDisable { unit };
+    let start: Mk = |unit| Op::UnitStart { unit };
+    let restart: Mk = |unit| Op::UnitRestart { unit };
+    let reload: Mk = |unit| Op::UnitReload { unit };
+    let enable: Mk = |unit| Op::UnitEnable { unit };
+    let cases: [(&str, Mk, bool); 20] = [
+        ("dbus.service", stop, false),
+        ("dbus.socket", disable, false),
+        ("dbus-broker.service", stop, false),
+        ("systemd-journald.service", stop, false),
+        ("systemd-journald.socket", stop, false),
+        ("systemd-journald-dev-log.socket", disable, false),
+        ("systemd-networkd.service", stop, false),
+        ("networking.service", disable, false),
+        ("NetworkManager.service", stop, false),
+        ("systemd-logind.service", stop, false),
+        ("nftables.service", stop, false),
+        ("nftables.service", disable, false),
+        ("nftables.service", restart, false),
+        ("nftables.service", reload, false),
+        ("nftables.service", start, false),
+        ("ssh.service", stop, false),
+        // Allowed: restarts of critical units, enable of nftables, others.
+        ("dbus.service", restart, true),
+        ("systemd-journald.service", restart, true),
+        ("nftables.service", enable, true),
+        ("nginx.service", stop, true),
+    ];
+    for (name, mk, ok) in cases {
+        let op = mk(unit(name));
+        let r = check_unit_op(&op);
+        assert_eq!(r.is_ok(), ok, "{name} {}", op.name());
+        if let Err(e) = r {
+            assert_eq!(e.code(), ErrorCode::PolicyDenied);
+        }
+    }
+}
+
+#[test]
 fn refusals_touch_nothing() {
     let api = fake();
     let refused = [

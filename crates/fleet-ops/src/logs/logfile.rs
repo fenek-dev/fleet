@@ -2,13 +2,14 @@
 //! file, then (with `follow`) new lines as they are written, surviving
 //! rotation (inode change) and truncation.
 //!
-//! Opening is symlink-safe without `unsafe`: every directory component
-//! below the context root is checked with `lstat` (no symlinks, must be a
-//! directory) and the file itself is opened with `O_NOFOLLOW | O_NONBLOCK`
-//! and must be a regular file. (`openat2(RESOLVE_BENEATH)` would close the
-//! remaining check-then-open window; that needs a syscall crate.)
+//! Opening is symlink-safe without `unsafe`: every directory below the
+//! context root is opened from its parent fd with `openat(O_NOFOLLOW)` and
+//! the file itself with `O_NOFOLLOW | O_NONBLOCK`; it must be a regular
+//! file with one link, and on Linux `/proc/self/fd/<fd>` must name exactly
+//! the requested path (post-open verification).
 
 use crate::ctx::SysCtx;
+use crate::files::walk;
 use crate::handler::{Invocation, LocalBoxFuture, OpError, OpHandler, OpMeta, OpOutput, OpStream};
 use fleet_proto::args::{AbsPath, AllowedPath};
 use fleet_proto::payload::LogLines;
@@ -16,7 +17,7 @@ use fleet_proto::{ErrorCode, Op, Payload};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -44,25 +45,32 @@ pub const DENIED: &[&str] = &[
 ];
 
 /// Opens `abs` under the context root for reading without following any
-/// symlink below the root. The file must be a regular file.
+/// symlink below the root (fd-relative `openat(O_NOFOLLOW)` per component).
+/// The file must be a regular file with a single link, and (on Linux)
+/// `/proc/self/fd` must name exactly the expected path. Refusals are
+/// `PermissionDenied`.
 pub fn open_nofollow(ctx: &SysCtx, abs: &str) -> io::Result<(File, PathBuf)> {
     let full = ctx.path(abs).ok_or(io::ErrorKind::InvalidInput)?;
-    let mut dir = ctx.root().to_path_buf();
-    let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
-    for c in comps.iter().take(comps.len().saturating_sub(1)) {
-        dir.push(c);
-        let m = std::fs::symlink_metadata(&dir)?;
-        if m.file_type().is_symlink() || !m.is_dir() {
-            return Err(io::ErrorKind::PermissionDenied.into());
+    let denied = |e: io::Error| {
+        let refusal = e.kind() == io::ErrorKind::Other
+            || [libc::ELOOP, libc::ENOTDIR]
+                .map(Some)
+                .contains(&e.raw_os_error());
+        if refusal {
+            io::ErrorKind::PermissionDenied.into()
+        } else {
+            e
         }
+    };
+    let (dir, name) = walk::open_parent(ctx, abs).map_err(denied)?;
+    let (f, meta) = walk::open_file_at(&dir, name).map_err(denied)?;
+    if meta.nlink != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "hard-linked log file",
+        ));
     }
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&full)?;
-    if !f.metadata()?.is_file() {
-        return Err(io::ErrorKind::PermissionDenied.into());
-    }
+    walk::check_fd_path(&f, &walk::host_path(ctx, abs)?)?;
     Ok((f, full))
 }
 
@@ -185,7 +193,7 @@ impl OpHandler for LogfileTailHandler {
             };
             let allowed = self.allowed(path)?;
             let abs = allowed.path().as_str().to_owned();
-            let (mut f, full) = open_nofollow(ctx, &abs).map_err(io_code)?;
+            let (mut f, _) = open_nofollow(ctx, &abs).map_err(io_code)?;
             let (initial, offset) = tail_lines(&mut f, usize::from(*lines)).map_err(io_code)?;
             let ident = file_id(&f).map_err(io_code)?;
             let mut pending: VecDeque<LogLines> = initial
@@ -204,7 +212,6 @@ impl OpHandler for LogfileTailHandler {
             Ok(OpOutput::Stream(Box::new(TailStream {
                 ctx: ctx.clone(),
                 abs,
-                full,
                 follower: follow.then_some(Follower {
                     f,
                     ident,
@@ -279,7 +286,6 @@ impl Follower {
 struct TailStream {
     ctx: SysCtx,
     abs: String,
-    full: PathBuf,
     follower: Option<Follower>,
     pending: VecDeque<LogLines>,
     poll: Duration,
@@ -295,9 +301,9 @@ impl TailStream {
         fw.read_new(&mut lines, &mut rotated).map_err(io_code)?;
         // Rotation: the path now names another file. The old one was
         // drained above; continue with the new one from its start.
-        let now = std::fs::symlink_metadata(&self.full)
+        let now = walk::stat_path(&self.ctx, &self.abs)
             .ok()
-            .map(|m| (m.dev(), m.ino()));
+            .map(|m| (m.dev, m.ino));
         if now.is_some_and(|id| id != fw.ident)
             && let Ok((f, _)) = open_nofollow(&self.ctx, &self.abs)
         {
@@ -352,7 +358,7 @@ impl OpStream for TailStream {
 mod tests {
     use super::*;
     use crate::FakeRunner;
-    use crate::test_util::{block, ctx_at, meta};
+    use crate::testutil::{T0, block, ctx_at, meta_at};
     use std::io::Write;
     use std::rc::Rc;
 
@@ -402,9 +408,9 @@ mod tests {
         std::fs::write(d.join("var/log/syslog"), "x\n").unwrap();
         std::os::unix::fs::symlink(d.join("etc/shadow"), d.join("var/log/evil")).unwrap();
         std::os::unix::fs::symlink(d.join("etc"), d.join("var/log/dir")).unwrap();
-        let c = ctx_at(d, Rc::new(FakeRunner::new()));
+        let c = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let h = LogfileTailHandler::default();
-        let m = meta();
+        let m = meta_at(Op::SystemInfo, Some(1), T0);
         assert!(
             h.validate(&c, &op("/var/log/syslog", 10, false), &m)
                 .is_ok()
@@ -431,6 +437,12 @@ mod tests {
         assert_eq!(err("/var/log/evil"), ErrorCode::PolicyDenied);
         assert_eq!(err("/var/log/dir/shadow"), ErrorCode::PolicyDenied);
         assert_eq!(err("/var/log/missing"), ErrorCode::NotFound);
+        // Hard links (nlink > 1) are refused; so is a non-directory parent.
+        std::fs::hard_link(d.join("etc/shadow"), d.join("var/log/hl")).unwrap();
+        assert_eq!(err("/var/log/hl"), ErrorCode::PolicyDenied);
+        assert_eq!(err("/var/log/syslog/x"), ErrorCode::PolicyDenied);
+        let (_, full) = open_nofollow(&c, "/var/log/syslog").unwrap();
+        assert_eq!(full, d.join("var/log/syslog"));
     }
 
     #[test]
@@ -440,9 +452,14 @@ mod tests {
         std::fs::create_dir_all(d.join("var/log")).unwrap();
         let log = d.join("var/log/app.log");
         std::fs::write(&log, "old1\nold2\n").unwrap();
-        let c = ctx_at(d, Rc::new(FakeRunner::new()));
+        let c = ctx_at(d, Rc::new(FakeRunner::new()), T0);
         let h = LogfileTailHandler::default().with_poll(Duration::from_millis(5));
-        let out = block(h.handle(&c, &op("/var/log/app.log", 1, true), &meta())).unwrap();
+        let out = block(h.handle(
+            &c,
+            &op("/var/log/app.log", 1, true),
+            &meta_at(Op::SystemInfo, Some(1), T0),
+        ))
+        .unwrap();
         let OpOutput::Stream(mut s) = out else {
             panic!()
         };
@@ -476,11 +493,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("var/log")).unwrap();
         std::fs::write(dir.path().join("var/log/a"), "1\n2\n").unwrap();
-        let c = ctx_at(dir.path(), Rc::new(FakeRunner::new()));
+        let c = ctx_at(dir.path(), Rc::new(FakeRunner::new()), T0);
         let h = LogfileTailHandler::default();
-        let OpOutput::Stream(mut s) =
-            block(h.handle(&c, &op("/var/log/a", 5, false), &meta())).unwrap()
-        else {
+        let OpOutput::Stream(mut s) = block(h.handle(
+            &c,
+            &op("/var/log/a", 5, false),
+            &meta_at(Op::SystemInfo, Some(1), T0),
+        ))
+        .unwrap() else {
             panic!()
         };
         block(async {

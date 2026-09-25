@@ -21,6 +21,17 @@
 //! outside `/srv/<project>/`, host files read by Compose (`env_file`,
 //! `label_file`, secret/config `file`, build contexts and Dockerfiles)
 //! outside it, and `include`/`extends.file` (content not validated here).
+//! Also: `pid`/`ipc`/`network_mode` other than `none`, `bridge`, `private`,
+//! `shareable`, `service:<service in this file>` (and, for `network_mode`,
+//! `default` or a network declared here), `uts: host`; `volumes_from` other
+//! than `service:<service in this file>[:ro|:rw]`; `use_api_socket` unless
+//! literally false; `post_start`/`pre_stop` hooks that are privileged or
+//! carry `$` in `command`/`environment`; `build.cache_from`/`cache_to`
+//! `type=local` `src`/`dest` outside the project; `build.ssh` entries with
+//! a path; `gpus` and `deploy.resources.reservations.devices`; `provider`,
+//! `cgroup_parent`, `runtime` other than `runc`; top-level volumes that are
+//! `external` or named outside `<project>_`. Bind sources must be strictly
+//! below `/srv/<project>/` and not its `compose.yaml` or `.env`.
 //! A `$` in any of these values is a finding too: interpolation reads
 //! `.env` and the environment, which this check can't see.
 //!
@@ -71,6 +82,14 @@ pub enum FindingKind {
     ExternalFile,
     /// `$` in a checked value: resolved from `.env`/environment later.
     Interpolated,
+    /// `use_api_socket`: the Engine API socket inside the container.
+    DockerSocket,
+    /// `volumes_from` a container or service not defined in this file.
+    ForeignContainer,
+    /// A top-level volume that is `external` or named outside the project.
+    ExternalVolume,
+    /// `runtime` other than `runc`, `cgroup_parent`, `provider`.
+    Runtime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +164,20 @@ impl Node {
                 s.trim(),
                 "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF" | "0"
             ))
+    }
+
+    /// Literally `false` (null and other falsy spellings don't count).
+    fn is_literal_false(&self) -> bool {
+        matches!(self, Node::Scalar(s) if matches!(s.trim(), "false" | "False" | "FALSE"))
+    }
+
+    /// Any scalar (or map key) below this node contains `$`.
+    fn has_dollar(&self) -> bool {
+        match self {
+            Node::Scalar(s) => s.contains('$'),
+            Node::Seq(items) => items.iter().any(Node::has_dollar),
+            Node::Map(m) => m.iter().any(|(k, v)| k.contains('$') || v.has_dollar()),
+        }
     }
 
     fn get(&self, key: &str) -> Option<&Node> {
@@ -304,7 +337,11 @@ fn normalize(base: &str, path: &str) -> String {
 }
 
 struct Check {
+    project: String,
     dir: String,
+    /// Service and network names defined in this file.
+    services: Vec<String>,
+    networks: Vec<String>,
     service: Option<String>,
     findings: Vec<Finding>,
     errors: Vec<ComposeError>,
@@ -339,7 +376,13 @@ impl Check {
             return self.find(kind, key, raw);
         }
         let p = normalize(base, raw);
-        if !self.under_project(&p) {
+        // A bind of the project directory itself, its compose.yaml or .env
+        // would let a container rewrite what the next deploy trusts.
+        let own = kind == FindingKind::BindMount
+            && (p == self.dir
+                || p == format!("{}/compose.yaml", self.dir)
+                || p == format!("{}/.env", self.dir));
+        if own || !self.under_project(&p) {
             self.find(kind, key, raw);
         } else if !self.host_paths.contains(&p) {
             self.host_paths.push(p);
@@ -354,6 +397,124 @@ impl Check {
             }
             Some(_) => {}
             None => self.shape(key),
+        }
+    }
+
+    /// `pid`/`ipc`/`network_mode`: allow-listed values only.
+    fn ns_mode(&mut self, key: &str, v: &Node) {
+        if v.is_null() {
+            return;
+        }
+        let Some(s) = v.scalar() else {
+            return self.shape(key);
+        };
+        let t = s.trim();
+        if t.contains('$') {
+            return self.find(FindingKind::Interpolated, key, s);
+        }
+        let ok = matches!(t, "none" | "bridge" | "private" | "shareable")
+            || t.strip_prefix("service:")
+                .is_some_and(|n| self.services.iter().any(|x| x == n))
+            || (key == "network_mode" && (t == "default" || self.networks.iter().any(|x| x == t)));
+        if !ok {
+            self.find(FindingKind::HostNamespace, key, s);
+        }
+    }
+
+    /// `volumes_from`: only `service:<service in this file>[:ro|:rw]`.
+    fn volumes_from(&mut self, key: &str, v: &Node) {
+        let Some(items) = v.scalars() else {
+            return self.shape(key);
+        };
+        for it in items {
+            let t = it.trim();
+            if t.contains('$') {
+                self.find(FindingKind::Interpolated, key, it);
+                continue;
+            }
+            let ok = t.strip_prefix("service:").is_some_and(|r| {
+                let (name, mode) = r.split_once(':').unwrap_or((r, "ro"));
+                matches!(mode, "ro" | "rw") && self.services.iter().any(|x| x == name)
+            });
+            if !ok {
+                self.find(FindingKind::ForeignContainer, key, it);
+            }
+        }
+    }
+
+    /// `post_start`/`pre_stop`: privileged hooks or `$` in what they run.
+    fn hooks(&mut self, key: &str, v: &Node) {
+        let items = match v {
+            Node::Seq(items) => items,
+            _ if v.is_null() => return,
+            _ => return self.shape(key),
+        };
+        for h in items {
+            if !matches!(h, Node::Map(_)) {
+                self.shape(key);
+                continue;
+            }
+            if h.get("privileged").is_some_and(|p| !p.is_false()) {
+                self.find(FindingKind::Privileged, &format!("{key}.privileged"), "…");
+            }
+            for sub in ["command", "environment"] {
+                if h.get(sub).is_some_and(Node::has_dollar) {
+                    self.find(FindingKind::Interpolated, &format!("{key}.{sub}"), "…");
+                }
+            }
+        }
+    }
+
+    /// `build.cache_from`/`cache_to`: `type=local` reads/writes host paths.
+    fn cache_entries(&mut self, key: &str, v: &Node, dir: &str) {
+        let Some(entries) = v.scalars() else {
+            return self.shape(key);
+        };
+        for e in entries {
+            if e.contains('$') {
+                self.find(FindingKind::Interpolated, key, e);
+                continue;
+            }
+            let fields: Vec<(&str, &str)> = e
+                .split(',')
+                .filter_map(|f| f.split_once('='))
+                .map(|(k, v)| (k.trim(), v.trim()))
+                .collect();
+            if !fields.iter().any(|&(k, v)| k == "type" && v == "local") {
+                continue;
+            }
+            for (k, p) in fields {
+                if matches!(k, "src" | "dest") {
+                    self.host_path(FindingKind::HostFile, key, p, dir);
+                }
+            }
+        }
+    }
+
+    /// `build.ssh`: a bare `default`/id uses the (absent) agent socket; an
+    /// entry with a path reads a host key file.
+    fn build_ssh(&mut self, v: &Node) {
+        const KEY: &str = "build.ssh";
+        match v {
+            Node::Map(m) => {
+                for (id, p) in m {
+                    if !p.is_null() {
+                        self.find(FindingKind::HostFile, KEY, id);
+                    }
+                }
+            }
+            _ => match v.scalars() {
+                Some(entries) => {
+                    for e in entries {
+                        if e.contains('$') {
+                            self.find(FindingKind::Interpolated, KEY, e);
+                        } else if e.contains('=') {
+                            self.find(FindingKind::HostFile, KEY, e);
+                        }
+                    }
+                }
+                None => self.shape(KEY),
+            },
         }
     }
 
@@ -382,10 +543,39 @@ impl Check {
                     }
                     None => self.shape(k),
                 },
-                "pid" | "ipc" | "network_mode" | "userns_mode" | "cgroup" => self.host_mode(k, v),
-                "devices" | "device_cgroup_rules" if !v.is_empty() => {
+                "pid" | "ipc" | "network_mode" => self.ns_mode(k, v),
+                "userns_mode" | "cgroup" | "uts" => self.host_mode(k, v),
+                "devices" | "device_cgroup_rules" | "gpus" if !v.is_empty() => {
                     self.find(FindingKind::Devices, k, "…")
                 }
+                "deploy" => {
+                    let dev = v
+                        .get("resources")
+                        .and_then(|r| r.get("reservations"))
+                        .and_then(|r| r.get("devices"));
+                    if dev.is_some_and(|d| !d.is_empty()) {
+                        self.find(
+                            FindingKind::Devices,
+                            "deploy.resources.reservations.devices",
+                            "…",
+                        );
+                    }
+                }
+                "use_api_socket" if !v.is_literal_false() => {
+                    self.find(FindingKind::DockerSocket, k, v.scalar().unwrap_or("…"))
+                }
+                "volumes_from" => self.volumes_from(k, v),
+                "post_start" | "pre_stop" => self.hooks(k, v),
+                "provider" | "cgroup_parent" if !v.is_empty() => {
+                    self.find(FindingKind::Runtime, k, v.scalar().unwrap_or("…"))
+                }
+                "runtime" => match v.scalar() {
+                    _ if v.is_null() => {}
+                    Some(s) if s.contains('$') => self.find(FindingKind::Interpolated, k, s),
+                    Some(s) if s.trim() == "runc" => {}
+                    Some(s) => self.find(FindingKind::Runtime, k, s),
+                    None => self.shape(k),
+                },
                 "security_opt" => match v.scalars() {
                     Some(opts) => {
                         for o in opts {
@@ -525,6 +715,14 @@ impl Check {
             if let Some(n) = v.get("network") {
                 self.host_mode("build.network", n);
             }
+            for key in ["cache_from", "cache_to"] {
+                if let Some(n) = v.get(key) {
+                    self.cache_entries(&format!("build.{key}"), n, dir);
+                }
+            }
+            if let Some(n) = v.get("ssh") {
+                self.build_ssh(n);
+            }
         }
     }
 
@@ -547,6 +745,13 @@ impl Check {
             return self.shape("(document)");
         };
         let dir = self.dir.clone();
+        let prefix = format!("{}_", self.project);
+        let names = |key: &str| match root.get(key) {
+            Some(Node::Map(m)) => m.iter().map(|(k, _)| k.clone()).collect(),
+            _ => Vec::new(),
+        };
+        self.services = names("services");
+        self.networks = names("networks");
         for (k, v) in entries {
             self.service = None;
             match k.as_str() {
@@ -571,6 +776,18 @@ impl Check {
                                 &dir,
                             ),
                             None => c.shape("volumes.driver_opts.device"),
+                        }
+                    }
+                    let key = format!("volumes.{name}");
+                    if def.get("external").is_some_and(|e| !e.is_literal_false()) {
+                        c.find(FindingKind::ExternalVolume, &format!("{key}.external"), "…");
+                    }
+                    if let Some(n) = def.get("name") {
+                        let s = n.scalar().unwrap_or("…");
+                        if s.contains('$') {
+                            c.find(FindingKind::Interpolated, &format!("{key}.name"), s);
+                        } else if !s.trim().starts_with(&prefix) {
+                            c.find(FindingKind::ExternalVolume, &format!("{key}.name"), s);
                         }
                     }
                 }),
@@ -651,6 +868,9 @@ pub fn validate(project: &ComposeProject, yaml: &str) -> ComposeVerdict {
         }
     };
     let mut c = Check {
+        project: project.as_str().to_owned(),
+        services: Vec::new(),
+        networks: Vec::new(),
         dir: format!("/srv/{}", project.as_str()),
         service: None,
         findings: Vec::new(),
@@ -805,6 +1025,124 @@ mod tests {
             kinds("services:\n  w:\n    build: https://github.com/x/y.git\n"),
             vec![]
         );
+    }
+
+    #[test]
+    fn hardened_service_keys() {
+        for (body, want) in [
+            ("    use_api_socket: true\n", DockerSocket),
+            ("    use_api_socket: ~\n", DockerSocket),
+            ("    use_api_socket: \"no\"\n", DockerSocket),
+            (
+                "    post_start:\n      - command: [id]\n        privileged: true\n",
+                Privileged,
+            ),
+            (
+                "    pre_stop:\n      - command: [sh, -c, \"echo $X\"]\n",
+                Interpolated,
+            ),
+            (
+                "    post_start:\n      - command: id\n        environment: {A: $B}\n",
+                Interpolated,
+            ),
+            ("    volumes_from: [\"container:db\"]\n", ForeignContainer),
+            ("    volumes_from: [web]\n", ForeignContainer),
+            ("    volumes_from: [\"service:ghost\"]\n", ForeignContainer),
+            (
+                "    volumes_from: [\"service:web:rwx\"]\n",
+                ForeignContainer,
+            ),
+            ("    network_mode: \"container:db\"\n", HostNamespace),
+            ("    network_mode: \"service:ghost\"\n", HostNamespace),
+            ("    network_mode: undeclared\n", HostNamespace),
+            ("    pid: \"container:x\"\n", HostNamespace),
+            ("    ipc: \"service:ghost\"\n", HostNamespace),
+            ("    uts: host\n", HostNamespace),
+            ("    gpus: all\n", Devices),
+            (
+                "    deploy:\n      resources:\n        reservations:\n          devices:\n            - capabilities: [gpu]\n",
+                Devices,
+            ),
+            ("    provider:\n      type: model\n", Runtime),
+            ("    cgroup_parent: /system.slice\n", Runtime),
+            ("    runtime: nvidia\n", Runtime),
+            ("    runtime: ${R}\n", Interpolated),
+            (
+                "    build:\n      context: .\n      cache_from: [\"type=local,src=/var/cache\"]\n",
+                HostFile,
+            ),
+            (
+                "    build:\n      context: .\n      cache_to: [\"type=local,dest=../../tmp\"]\n",
+                HostFile,
+            ),
+            (
+                "    build:\n      context: .\n      ssh: [\"default=/root/.ssh/id_ed25519\"]\n",
+                HostFile,
+            ),
+            (
+                "    build:\n      context: .\n      ssh:\n        id: /root/.ssh/key\n",
+                HostFile,
+            ),
+            ("    volumes: [\".:/x\"]\n", BindMount),
+            ("    volumes: [\"/srv/app:/x\"]\n", BindMount),
+            ("    volumes: [\"./compose.yaml:/x\"]\n", BindMount),
+            ("    volumes: [\"./.env:/x:ro\"]\n", BindMount),
+            (
+                "    volumes:\n      - type: bind\n        source: ./x/..\n        target: /x\n",
+                BindMount,
+            ),
+        ] {
+            let yaml = format!(
+                "services:\n  db:\n    image: x\n  web:\n    image: nginx\n{body}networks:\n  back:\n"
+            );
+            assert_eq!(kinds(&yaml), vec![want], "{body}");
+        }
+        // Allowed values.
+        for body in [
+            "    use_api_socket: false\n",
+            "    volumes_from: [\"service:db\", \"service:db:ro\"]\n",
+            "    network_mode: \"service:db\"\n",
+            "    network_mode: none\n",
+            "    network_mode: bridge\n",
+            "    network_mode: back\n",
+            "    pid: \"service:db\"\n",
+            "    ipc: shareable\n",
+            "    ipc: private\n",
+            "    runtime: runc\n",
+            "    post_start:\n      - command: [\"/bin/init\"]\n        privileged: false\n",
+            "    build:\n      context: .\n      cache_from: [\"type=local,src=./cache\", \"type=registry,ref=x/y\"]\n      cache_to: [\"type=inline\"]\n      ssh: [default]\n",
+            "    volumes: [\"./data:/x\"]\n",
+        ] {
+            let yaml = format!(
+                "services:\n  db:\n    image: x\n  web:\n    image: nginx\n{body}networks:\n  back:\n"
+            );
+            assert_eq!(kinds(&yaml), vec![], "{body}");
+        }
+    }
+
+    #[test]
+    fn top_level_volumes() {
+        for (yaml, want) in [
+            ("volumes:\n  v:\n    external: true\n", vec![ExternalVolume]),
+            ("volumes:\n  v:\n    external: ~\n", vec![ExternalVolume]),
+            (
+                "volumes:\n  v:\n    name: other_data\n",
+                vec![ExternalVolume],
+            ),
+            ("volumes:\n  v:\n    name: app\n", vec![ExternalVolume]),
+            (
+                "volumes:\n  v:\n    external: true\n    name: app_x\n",
+                vec![ExternalVolume],
+            ),
+            ("volumes:\n  v:\n    name: ${N}\n", vec![Interpolated]),
+            (
+                "volumes:\n  v:\n    external: false\n    name: app_data\n",
+                vec![],
+            ),
+            ("volumes:\n  v:\n", vec![]),
+        ] {
+            assert_eq!(kinds(yaml), want, "{yaml}");
+        }
     }
 
     #[test]

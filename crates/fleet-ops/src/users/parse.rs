@@ -34,6 +34,42 @@ pub fn parse_passwd(s: &str) -> Vec<PasswdEntry> {
         .collect()
 }
 
+/// Entry for `name`.
+pub fn lookup<'a>(pw: &'a [PasswdEntry], name: &str) -> Option<&'a PasswdEntry> {
+    pw.iter().find(|p| p.name == name)
+}
+
+/// uid → name map (first entry wins for duplicate uids, like `getpwuid`).
+/// For modules that only label uids (ports, processes).
+pub fn uid_names(passwd: &str) -> HashMap<u32, String> {
+    let mut m = HashMap::new();
+    for p in parse_passwd(passwd) {
+        m.entry(p.uid).or_insert(p.name);
+    }
+    m
+}
+
+/// Shells that refuse interactive login.
+pub const NOLOGIN_SHELLS: &[&str] = &[
+    "/usr/sbin/nologin",
+    "/sbin/nologin",
+    "/bin/false",
+    "/usr/bin/false",
+];
+
+impl PasswdEntry {
+    /// The login shell is a real shell (not `nologin`/`false`, not empty).
+    pub fn can_login(&self) -> bool {
+        !self.shell.is_empty() && !NOLOGIN_SHELLS.contains(&self.shell.as_str())
+    }
+
+    /// Groups the user is in: primary (by gid) and supplementary.
+    pub fn groups_in<'a>(&'a self, gr: &'a [GroupEntry]) -> impl Iterator<Item = &'a GroupEntry> {
+        gr.iter()
+            .filter(move |g| g.gid == self.gid || g.members.contains(&self.name))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupEntry {
     pub name: String,
@@ -127,10 +163,35 @@ mod tests {
         );
         assert_eq!(p.len(), 2);
         assert_eq!(p[1].gecos, "Ops,,,");
+        assert_eq!(lookup(&p, "ops").map(|e| e.uid), Some(1000));
+        assert!(p[1].can_login());
+        let u = uid_names("a:x:5:5::/:/bin/sh\nb:x:5:5::/:/bin/sh\nbad\n");
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[&5], "a");
         let g = parse_group("sudo:x:27:ops, web\nempty:x:5:\nbroken\n");
         assert_eq!(g[0].members, ["ops", "web"]);
         assert!(g[1].members.is_empty());
         assert_eq!(g.len(), 2);
+        let ops = PasswdEntry {
+            gid: 5,
+            ..p[1].clone()
+        };
+        let names: Vec<&str> = ops.groups_in(&g).map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["sudo", "empty"]);
+        for (shell, ok) in [
+            ("/bin/bash", true),
+            ("/usr/sbin/nologin", false),
+            ("/sbin/nologin", false),
+            ("/bin/false", false),
+            ("/usr/bin/false", false),
+            ("", false),
+        ] {
+            let e = PasswdEntry {
+                shell: shell.into(),
+                ..ops.clone()
+            };
+            assert_eq!(e.can_login(), ok, "{shell}");
+        }
         let s = parse_shadow(
             "a:!$6$salt$hash:19000:0:99999:7:::\nb:!:19000:0:99999:7:::\n\
              c:$6$x$y:19000:0:99999:7::1:\nd:*:1::::::\n",

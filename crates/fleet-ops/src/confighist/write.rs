@@ -24,7 +24,8 @@ fn mode(bits: u32) -> Mode {
 /// `O_CREAT|O_EXCL|O_NOFOLLOW` in the same directory, owner and mode set
 /// before the content becomes visible, `fsync`, `renameat` over the
 /// target, `fsync` of the directory. An existing target keeps its own
-/// mode and owner; `fallback` applies when it's missing. A target that is
+/// mode and owner; `fallback` (special bits masked off) applies when it's
+/// missing. A target that is
 /// a symlink, directory or anything but a regular file is refused.
 pub fn replace(
     ctx: &SysCtx,
@@ -41,7 +42,11 @@ pub fn replace(
             gid: m.gid,
         },
         Ok(_) => return Err(io::Error::other("target is not a regular file")),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => fallback,
+        // Recreated from history: never setuid, setgid or sticky.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Perms {
+            mode: fallback.mode & 0o777,
+            ..fallback
+        },
         Err(e) => return Err(e),
     };
     let tmp = format!(".{name}{TMP_MARKER}{tag}");
@@ -106,6 +111,14 @@ mod tests {
         replace(&c, "/etc/b.conf", b"b", fb, 2).unwrap();
         let m = std::fs::metadata(r.join("etc/b.conf")).unwrap();
         assert_eq!(m.permissions().mode() & 0o7777, 0o644);
+        // Recreated with setuid/setgid/sticky in the version: masked off.
+        for (bits, want) in [(0o4755, 0o755), (0o2750, 0o750), (0o1777, 0o777)] {
+            std::fs::remove_file(r.join("etc/b.conf")).unwrap();
+            let p = replace(&c, "/etc/b.conf", b"b", Perms { mode: bits, ..fb }, 3).unwrap();
+            assert_eq!(p.mode, want);
+            let m = std::fs::metadata(r.join("etc/b.conf")).unwrap();
+            assert_eq!(m.permissions().mode() & 0o7777, want, "{bits:o}");
+        }
         // No temp files left.
         let names: Vec<_> = std::fs::read_dir(r.join("etc"))
             .unwrap()

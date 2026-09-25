@@ -108,6 +108,17 @@ pub fn to_version(path: &str, version: u64, r: &VersionRecord) -> ConfigVersion 
     }
 }
 
+/// Drops kept content (hashes and metadata stay) of every path `rules`
+/// calls secret.
+fn strip_secrets(store: &dyn ConfigStore, rules: &PathRules) -> Result<(), OpError> {
+    for (path, _) in store.files().map_err(store_err)? {
+        if rules.is_secret(&path) {
+            store.strip_content(&path).map_err(store_err)?;
+        }
+    }
+    Ok(())
+}
+
 pub struct ConfigTracker {
     store: Rc<dyn ConfigStore>,
     sink: Rc<dyn EventSink>,
@@ -133,11 +144,14 @@ impl ConfigTracker {
         retention: Retention,
     ) -> Result<Rc<Self>, OpError> {
         let operator = store.load_paths().map_err(store_err)?.unwrap_or_default();
+        let rules = PathRules::new(operator);
+        // The secret list may have grown since this history was written.
+        strip_secrets(store.as_ref(), &rules)?;
         Ok(Rc::new(Self {
             store,
             sink,
             attrib,
-            rules: RefCell::new(PathRules::new(operator)),
+            rules: RefCell::new(rules),
             retention,
             last_prune_ms: Cell::new(0),
         }))
@@ -160,11 +174,7 @@ impl ConfigTracker {
     pub fn set_operator_paths(&self, p: OperatorPaths) -> Result<(), OpError> {
         self.store.save_paths(&p).map_err(store_err)?;
         let rules = PathRules::new(p);
-        for (path, _) in self.store.files().map_err(store_err)? {
-            if rules.is_secret(&path) {
-                self.store.strip_content(&path).map_err(store_err)?;
-            }
-        }
+        strip_secrets(self.store.as_ref(), &rules)?;
         *self.rules.borrow_mut() = rules;
         Ok(())
     }
@@ -213,7 +223,7 @@ impl ConfigTracker {
         let now = ctx.clock.now_ms();
         let seen = match open_file(ctx, path) {
             Ok((f, meta)) => Some(
-                content::observe(f, meta, !secret_path)
+                content::observe(f, meta, !secret_path, path)
                     .map_err(|e| OpError::internal(format!("read {path}: {e}")))?,
             ),
             Err(e)
@@ -283,7 +293,7 @@ impl ConfigTracker {
                     }
                     return Ok((None, read));
                 }
-                let secret = secret_path || o.has_key;
+                let secret = secret_path || o.secret;
                 let blob = if secret {
                     None
                 } else {

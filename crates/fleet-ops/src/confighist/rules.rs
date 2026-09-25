@@ -26,17 +26,46 @@ pub const BUILTIN_SECRET: &[&str] = &[
     "/etc/shadow-",
     "/etc/gshadow",
     "/etc/gshadow-",
+    // Editor and tool backups of the above (`shadow.bak`, `.shadow.swp`, …).
+    "/etc/*shadow*",
+    "/etc/.*shadow*",
+    "/etc/security/opasswd",
     "/etc/ssh/ssh_host_*_key",
     "/etc/letsencrypt/**/privkey*",
+    "/etc/letsencrypt/accounts",
     "/etc/ssl/private",
     "/etc/wireguard",
+    "/etc/krb5.keytab",
+    "/etc/NetworkManager/system-connections",
+    "/etc/mysql/debian.cnf",
+    "/etc/postfix/sasl_passwd*",
+    "/etc/ppp/*-secrets",
     "/srv/**/.env",
 ];
+
+/// Netplan files: secret when their content configures Wi-Fi or holds a
+/// password (see `content::markers_for`).
+pub const NETPLAN: &[&str] = &["/etc/netplan/*.yaml", "/etc/netplan/*.yml"];
+
+/// Whether `path` is a netplan file.
+pub fn is_netplan(path: &str) -> bool {
+    NETPLAN.iter().any(|r| glob_match(r, path))
+}
 
 /// Never rolled back through config history, beyond `AbsPath::is_fleet_owned`
 /// (Fleet's state and units): Fleet's own configuration, which has typed,
 /// versioned ops of its own (`authorized_keys.set`, `policy.update`).
 pub const NO_ROLLBACK: &[&str] = &["/etc/fleet"];
+
+/// Where `config.paths.set` may add tracked rules without a root-key
+/// approval (anything else is Elevated: tracking reads content into
+/// history that Macs and AI can see).
+pub const OPERATOR_ROOTS: &[&str] = &["/etc", "/srv", "/opt", "/usr/local/etc"];
+
+/// Whether an operator tracked rule stays under [`OPERATOR_ROOTS`].
+pub fn under_operator_roots(rule: &str) -> bool {
+    OPERATOR_ROOTS.iter().any(|r| covers(r, rule))
+}
 
 /// Fleet's own state (its database changes constantly; never tracked).
 pub const NEVER_TRACKED: &[&str] = &["/var/lib/fleet", "/run/fleet"];
@@ -113,7 +142,9 @@ impl PathRules {
 
     pub fn is_tracked(&self, path: &str) -> bool {
         let name = path.rsplit('/').next().unwrap_or("");
-        if name.contains(TMP_MARKER) {
+        // Walk and watch names are converted lossily: a name that wasn't
+        // UTF-8 can't be opened again under its converted form.
+        if name.contains(TMP_MARKER) || path.contains(char::REPLACEMENT_CHARACTER) {
             return false;
         }
         if NEVER_TRACKED.iter().any(|r| covers(r, path)) {
@@ -178,6 +209,18 @@ mod tests {
             "/etc/wireguard/wg0.conf",
             "/srv/app/.env",
             "/srv/a/b/.env",
+            "/etc/shadow.bak",
+            "/etc/gshadow.dpkg-old",
+            "/etc/.shadow.swp",
+            "/etc/security/opasswd",
+            "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory/x/private_key.json",
+            "/etc/krb5.keytab",
+            "/etc/NetworkManager/system-connections/home.nmconnection",
+            "/etc/mysql/debian.cnf",
+            "/etc/postfix/sasl_passwd",
+            "/etc/postfix/sasl_passwd.db",
+            "/etc/ppp/chap-secrets",
+            "/etc/ppp/pap-secrets",
         ] {
             assert!(r.is_secret(s), "{s}");
         }
@@ -186,9 +229,16 @@ mod tests {
             "/etc/passwd",
             "/etc/letsencrypt/live/x.org/fullchain.pem",
             "/srv/app/compose.yaml",
+            "/etc/security/limits.conf",
+            "/etc/mysql/my.cnf",
+            "/etc/ppp/options",
+            "/etc/netplan/50-cloud-init.yaml",
         ] {
             assert!(!r.is_secret(s), "{s}");
         }
+        assert!(is_netplan("/etc/netplan/50-cloud-init.yaml"));
+        assert!(!is_netplan("/etc/netplan/sub/x.yaml"));
+        assert!(!r.is_tracked("/etc/bad\u{fffd}name.conf"));
         assert!(r.is_tracked("/etc/nginx/nginx.conf"));
         assert!(r.is_tracked("/srv/app/compose.yaml"));
         assert!(!r.is_tracked("/srv/app/data/compose.yaml"));
@@ -219,6 +269,26 @@ mod tests {
                 .iter()
                 .any(|w| w.root == "/etc" && w.pattern.is_none())
         );
+    }
+
+    #[test]
+    fn operator_roots() {
+        for (s, ok) in [
+            ("/etc/app.conf", true),
+            ("/etc", true),
+            ("/srv/*/app.toml", true),
+            ("/opt/**/*.cfg", true),
+            ("/usr/local/etc/x.conf", true),
+            ("/usr/local/bin/x", false),
+            ("/home/*/app/*.toml", false),
+            ("/root/.ssh/id_ed25519", false),
+            ("/etcetera", false),
+            ("/etc*", false),
+            ("/**", false),
+            ("/", false),
+        ] {
+            assert_eq!(under_operator_roots(s), ok, "{s}");
+        }
     }
 
     #[test]

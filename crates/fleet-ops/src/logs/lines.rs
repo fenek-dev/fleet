@@ -215,14 +215,7 @@ impl LineSpawner for FakeLineSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn block<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(f)
-    }
+    use crate::testutil::block;
 
     #[test]
     fn capped_lines_skip_long_and_keep_tail() {
