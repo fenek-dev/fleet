@@ -27,15 +27,17 @@
 //! gives the core a current-thread runtime). [`ManagerHandle`] is `Send +
 //! Sync` and can be used from anywhere.
 
-use crate::session::{ClientError, CommandSigner, Reply, Session, SessionConfig, SessionMode};
+use crate::session::{
+    ClientError, CommandSigner, Reply, Session, SessionConfig, SessionMode, StreamEvent,
+};
 use crate::signer::{DeviceSigner, KeyRole, RoleSigner, SignerError};
 use crate::ssh::{
     HostKey, HostKeyObservation, P256SshSigner, SshConnection, SshError, SshOptions, SshTarget,
 };
 use fleet_crypto::noise::StaticKeypair;
 use fleet_proto::{
-    Actor, DeviceId, Ed25519Public, ErrorCode, Event, FleetId, KeyKind, Op, RootApproval, ServerId,
-    X25519Public,
+    Actor, DeviceId, Ed25519Public, ErrorCode, Event, FleetId, KeyKind, Op, RequestId,
+    RootApproval, ServerId, X25519Public,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -235,6 +237,21 @@ pub trait AgentLink {
     fn next_event(&mut self) -> impl Future<Output = Result<(u64, Event), ClientError>>;
     /// Events buffered while a request waited for its response.
     fn take_events(&mut self) -> Vec<(u64, Event)>;
+    /// `StreamOpen` for a stream op; items arrive on the receiver.
+    fn open_stream(
+        &mut self,
+        _op: Op,
+        _actor: Actor,
+    ) -> impl Future<Output = Result<(RequestId, mpsc::Receiver<StreamEvent>), ClientError>> {
+        std::future::ready(Err(ClientError::Rejected(ErrorCode::Unsupported)))
+    }
+    fn cancel_stream(&mut self, _id: RequestId) -> impl Future<Output = Result<(), ClientError>> {
+        std::future::ready(Ok(()))
+    }
+    /// Periodic chores that write (queued stream cancels).
+    fn housekeeping(&mut self) -> impl Future<Output = Result<(), ClientError>> {
+        std::future::ready(Ok(()))
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AgentLink for Session<'_, S> {
@@ -255,6 +272,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentLink for Session<'_, S> {
     fn take_events(&mut self) -> Vec<(u64, Event)> {
         Session::take_events(self)
     }
+
+    async fn open_stream(
+        &mut self,
+        op: Op,
+        actor: Actor,
+    ) -> Result<(RequestId, mpsc::Receiver<StreamEvent>), ClientError> {
+        Session::open_stream(self, op, actor).await
+    }
+
+    async fn cancel_stream(&mut self, id: RequestId) -> Result<(), ClientError> {
+        Session::cancel_stream(self, id).await
+    }
+
+    async fn housekeeping(&mut self) -> Result<(), ClientError> {
+        self.flush_cancels().await
+    }
 }
 
 /// Builds sessions. Runs on the manager's thread (no `Send` needed).
@@ -270,11 +303,61 @@ pub trait Connector: 'static {
     ) -> impl Future<Output = Result<ServeEnd, LinkError>>;
 }
 
-struct PendingRequest {
-    op: Op,
-    actor: Actor,
-    approval: Option<RootApproval>,
-    reply: oneshot::Sender<Result<Reply, RequestError>>,
+enum Work {
+    Request {
+        op: Op,
+        actor: Actor,
+        approval: Option<RootApproval>,
+        reply: oneshot::Sender<Result<Reply, RequestError>>,
+    },
+    OpenStream {
+        op: Op,
+        actor: Actor,
+        reply: oneshot::Sender<Result<OpenedStream, RequestError>>,
+    },
+    /// `generation` of the link the stream was opened on; a cancel for an
+    /// older link is dropped (its streams died with it).
+    CancelStream { id: RequestId, link: u64 },
+}
+
+impl Work {
+    fn fail(self, e: RequestError) {
+        match self {
+            Work::Request { reply, .. } => {
+                let _ = reply.send(Err(e));
+            }
+            Work::OpenStream { reply, .. } => {
+                let _ = reply.send(Err(e));
+            }
+            Work::CancelStream { .. } => {}
+        }
+    }
+}
+
+/// Stream id, link generation, receiver.
+type OpenedStream = (RequestId, u64, mpsc::Receiver<StreamEvent>);
+
+/// SSH connections of Ready servers, for terminals and SFTP (design §3.2:
+/// one connection per server).
+type Transports = Arc<Mutex<HashMap<ServerId, (u64, Arc<SshConnection>)>>>;
+
+/// A live stream from [`ManagerHandle::open_stream`]. Dropping it cancels
+/// the stream on the agent. The receiver closes without an
+/// [`StreamEvent::End`] when the connection drops.
+pub struct ManagedStream {
+    pub events: mpsc::Receiver<StreamEvent>,
+    id: RequestId,
+    link: u64,
+    work: mpsc::Sender<Work>,
+}
+
+impl Drop for ManagedStream {
+    fn drop(&mut self) {
+        let _ = self.work.try_send(Work::CancelStream {
+            id: self.id,
+            link: self.link,
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -287,12 +370,15 @@ struct ServerCtl {
 /// Worker-side channels of one server.
 struct Worker {
     id: ServerId,
-    requests: mpsc::Receiver<PendingRequest>,
+    requests: mpsc::Receiver<Work>,
     ctl: watch::Receiver<ServerCtl>,
     kind: watch::Receiver<SessionKind>,
     state: watch::Sender<ConnState>,
     events: broadcast::Sender<ManagerEvent>,
     failures: u32,
+    transports: Transports,
+    /// Incremented per served link.
+    link: u64,
 }
 
 impl Worker {
@@ -343,14 +429,28 @@ impl LinkCtx<'_> {
         });
     }
 
+    /// Shares this link's SSH connection (terminals, SFTP) until the link
+    /// ends; [`ManagerHandle::ssh`] hands it out.
+    pub fn publish_ssh(&self, conn: Arc<SshConnection>) {
+        self.worker
+            .transports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.worker.id.clone(), (self.worker.link + 1, conn));
+    }
+
     /// Marks the server Ready and serves requests and events until the
     /// link breaks (`Err`) or the manager wants it closed.
     pub async fn serve<L: AgentLink>(mut self, link: &mut L) -> Result<ServeEnd, LinkError> {
         self.permit = None;
         let kind = self.kind;
         let w = self.worker;
+        w.link += 1;
+        let generation = w.link;
         w.failures = 0;
         w.set_state(ConnState::Ready, Some(kind), None);
+        let mut chores = tokio::time::interval(HOUSEKEEPING);
+        chores.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -368,29 +468,80 @@ impl LinkCtx<'_> {
                         return Ok(ServeEnd::KindChanged);
                     }
                 }
-                req = w.requests.recv() => {
-                    let Some(req) = req else { return Ok(ServeEnd::Stopped) };
-                    // The caller gave up (timeout): don't run it late.
-                    if req.reply.is_closed() {
-                        continue;
-                    }
-                    if kind == SessionKind::Monitor && !req.op.monitor_allowed() {
-                        let _ = req.reply.send(Err(RequestError::Locked));
-                        continue;
-                    }
-                    let res = link.request(req.op, req.actor, req.approval).await;
-                    w.emit_events(link.take_events());
-                    match res {
-                        Ok(reply) => {
-                            let _ = req.reply.send(Ok(reply));
+                work = w.requests.recv() => {
+                    let Some(work) = work else { return Ok(ServeEnd::Stopped) };
+                    let res = match work {
+                        Work::Request { op, actor, approval, reply } => {
+                            // The caller gave up (timeout): don't run it late.
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if kind == SessionKind::Monitor && !op.monitor_allowed() {
+                                let _ = reply.send(Err(RequestError::Locked));
+                                continue;
+                            }
+                            let res = link.request(op, actor, approval).await;
+                            w.emit_events(link.take_events());
+                            match res {
+                                Ok(r) => {
+                                    let _ = reply.send(Ok(r));
+                                    Ok(())
+                                }
+                                Err(e) => Err((e, Some(reply))),
+                            }
                         }
-                        Err(e) if link_broken(&e) => {
-                            let _ = req.reply.send(Err(RequestError::NotReady(ConnState::Degraded)));
+                        Work::OpenStream { op, actor, reply } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if kind == SessionKind::Monitor && !op.monitor_allowed() {
+                                let _ = reply.send(Err(RequestError::Locked));
+                                continue;
+                            }
+                            match link.open_stream(op, actor).await {
+                                Ok((id, rx)) => {
+                                    let _ = reply.send(Ok((id, generation, rx)));
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    let broken = link_broken(&e);
+                                    let _ = reply.send(Err(if broken {
+                                        RequestError::NotReady(ConnState::Degraded)
+                                    } else {
+                                        RequestError::Client(e)
+                                    }));
+                                    if broken {
+                                        return Err(LinkError::Client(ClientError::Closed));
+                                    }
+                                    Ok(())
+                                }
+                            }
+                        }
+                        Work::CancelStream { id, link: g } => {
+                            if g != generation {
+                                continue;
+                            }
+                            link.cancel_stream(id).await.map_err(|e| (e, None))
+                        }
+                    };
+                    match res {
+                        Ok(()) => {}
+                        Err((e, reply)) if link_broken(&e) => {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(RequestError::NotReady(ConnState::Degraded)));
+                            }
                             return Err(e.into());
                         }
-                        Err(e) => {
-                            let _ = req.reply.send(Err(RequestError::Client(e)));
+                        Err((e, reply)) => {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(RequestError::Client(e)));
+                            }
                         }
+                    }
+                }
+                _ = chores.tick() => {
+                    if let Err(e) = link.housekeeping().await {
+                        return Err(e.into());
                     }
                 }
                 ev = link.next_event() => {
@@ -401,6 +552,9 @@ impl LinkCtx<'_> {
         }
     }
 }
+
+/// How often the serve loop runs [`AgentLink::housekeeping`].
+const HOUSEKEEPING: Duration = Duration::from_secs(2);
 
 /// Transport or framing failure (the session can't be used any more), as
 /// opposed to a per-command verdict or a signer refusal.
@@ -437,7 +591,12 @@ async fn worker_loop<C: Connector>(
             kind,
             permit,
         };
-        let err = match connector.run(&spec, kind, ctx).await {
+        let ran = connector.run(&spec, kind, ctx).await;
+        w.transports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&w.id);
+        let err = match ran {
             Ok(ServeEnd::Stopped) => break,
             Ok(ServeEnd::KindChanged | ServeEnd::Reconnect) => continue,
             Err(e) => e,
@@ -475,7 +634,7 @@ async fn worker_loop<C: Connector>(
                     break;
                 }
                 req = w.requests.recv() => match req {
-                    Some(req) => { let _ = req.reply.send(Err(RequestError::NotReady(state))); }
+                    Some(work) => work.fail(RequestError::NotReady(state)),
                     None => break 'outer,
                 },
             }
@@ -485,7 +644,7 @@ async fn worker_loop<C: Connector>(
 }
 
 struct Slot {
-    requests: mpsc::Sender<PendingRequest>,
+    requests: mpsc::Sender<Work>,
     ctl: watch::Sender<ServerCtl>,
     state: watch::Receiver<ConnState>,
 }
@@ -496,6 +655,7 @@ struct Shared {
     kind: watch::Sender<SessionKind>,
     events: broadcast::Sender<ManagerEvent>,
     spawn: mpsc::UnboundedSender<Worker>,
+    transports: Transports,
 }
 
 /// Thread-safe front of the manager. Cheap to clone.
@@ -523,6 +683,7 @@ impl<C: Connector> ConnectionManager<C> {
                 kind: watch::Sender::new(kind),
                 events,
                 spawn: spawn_tx,
+                transports: Arc::default(),
             }),
         };
         let mgr = Self {
@@ -579,6 +740,8 @@ impl ManagerHandle {
             state: state_tx,
             events: self.shared.events.clone(),
             failures: 0,
+            transports: self.shared.transports.clone(),
+            link: 0,
         };
         if self.shared.spawn.send(worker).is_ok() {
             slots.insert(
@@ -649,7 +812,7 @@ impl ManagerHandle {
             .map(|s| s.requests.clone())
             .ok_or(RequestError::UnknownServer)?;
         let (reply, rx) = oneshot::channel();
-        let req = PendingRequest {
+        let req = Work::Request {
             op,
             actor,
             approval,
@@ -662,6 +825,56 @@ impl ManagerHandle {
         tokio::time::timeout(self.shared.cfg.request_timeout, fut)
             .await
             .map_err(|_| RequestError::Timeout)?
+    }
+
+    /// Opens a stream op ([`Op::is_stream`]) on `id`'s session. Waits like
+    /// [`ManagerHandle::request`] while connecting.
+    pub async fn open_stream(
+        &self,
+        id: &ServerId,
+        op: Op,
+        actor: Actor,
+    ) -> Result<ManagedStream, RequestError> {
+        let tx = self
+            .slots()
+            .get(id)
+            .map(|s| s.requests.clone())
+            .ok_or(RequestError::UnknownServer)?;
+        let (reply, rx) = oneshot::channel();
+        let fut = async {
+            tx.send(Work::OpenStream { op, actor, reply })
+                .await
+                .map_err(|_| RequestError::Stopped)?;
+            rx.await.map_err(|_| RequestError::Stopped)?
+        };
+        let (sid, link, events) = tokio::time::timeout(self.shared.cfg.request_timeout, fut)
+            .await
+            .map_err(|_| RequestError::Timeout)??;
+        Ok(ManagedStream {
+            events,
+            id: sid,
+            link,
+            work: tx,
+        })
+    }
+
+    /// The SSH connection of `id` while its session is Ready.
+    pub fn ssh(&self, id: &ServerId) -> Option<Arc<SshConnection>> {
+        self.shared
+            .transports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|(_, c)| c.clone())
+    }
+
+    /// Waits until `id` is Ready (or `timeout`); the final state.
+    pub async fn wait_ready(&self, id: &ServerId, timeout: Duration) -> Option<ConnState> {
+        let mut rx = self.slots().get(id).map(|s| s.state.clone())?;
+        let wait = rx.wait_for(|s| *s == ConnState::Ready);
+        let _ = tokio::time::timeout(timeout, wait).await;
+        let s = *rx.borrow();
+        Some(s)
     }
 }
 
@@ -695,6 +908,7 @@ impl Connector for SshConnector {
         if observation.needs_confirmation() {
             ctx.host_key_first_use(observation);
         }
+        let conn = Arc::new(conn);
         ctx.authenticating();
         let role = match kind {
             SessionKind::Monitor => KeyRole::Monitor,
@@ -718,6 +932,7 @@ impl Connector for SshConnector {
                 tokio::time::timeout(self.session_timeout, Session::connect_bridged(stream, cfg))
                     .await
                     .map_err(|_| LinkError::Timeout)??;
+            ctx.publish_ssh(conn.clone());
             ctx.serve(&mut session).await
         }
         .await;

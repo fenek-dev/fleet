@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct FleetApp: App {
     @State private var core = CoreBridge()
+    @State private var terminals = TerminalStore()
     @State private var lock: AppLock
     @State private var paletteShown = false
     private let gate: KeyGate
@@ -17,6 +18,7 @@ struct FleetApp: App {
         Window("Fleet", id: "main") {
             ContentView(paletteShown: $paletteShown)
                 .environment(core)
+                .environment(terminals)
                 .environment(lock)
                 .preferredColorScheme(.dark)
                 .task { start() }

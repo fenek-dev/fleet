@@ -2,11 +2,18 @@
 //!
 //! Threading: [`FleetCore::start`] spawns one `fleet-core` thread running a
 //! current-thread tokio runtime with a `LocalSet` (the manager's sessions
-//! aren't `Send`, see `fleet_core::manager`). Requests are spawned onto that
-//! runtime and awaited from Swift's executor; listener callbacks run on the
-//! core thread. The thread ends when the `FleetCore` is dropped (the last
-//! `ManagerHandle` goes with it).
+//! aren't `Send`, see `fleet_core::manager`). Requests, streams, terminals
+//! and SFTP calls are spawned onto that runtime and awaited from Swift's
+//! executor; callbacks (listener, sinks) run on the core thread and must
+//! return quickly. The thread ends when the `FleetCore` is dropped (the
+//! last `ManagerHandle` goes with it).
+//!
+//! The other `#[uniffi::export] impl FleetCore` blocks live next to their
+//! feature: `enrollment` (fleet bootstrap), `install` (agent install),
+//! `ops` (typed operations), `streams` (metrics / journal streams and the
+//! fleet-table telemetry), `terminal` (PTY) and `files` (SFTP).
 
+use crate::rows::ServerMetricsRow;
 use crate::signer::{CoreListener, DeviceSigner, KeyStore, SignerAdapter};
 use crate::types::*;
 use crate::validate;
@@ -14,23 +21,26 @@ use fleet_core::cache::{Cache, GroupRecord, ServerRecord};
 use fleet_core::manager::{
     ConnectionManager, ManagerConfig, ManagerEvent, ManagerHandle, ServerSpec, SshConnector,
 };
-use fleet_core::ssh::{HostKey, HostKeyStatus, SshOptions, SshTarget};
+use fleet_core::sftp::Sftp;
+use fleet_core::ssh::{HostKeyObservation, HostKeyStatus, SshConnection, SshOptions, SshTarget};
 use fleet_crypto::Zeroizing;
 use fleet_crypto::noise::StaticKeypair;
 use fleet_proto::{Actor, DeviceId, FleetId, Op, Payload, ServerId};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-/// Cache `settings` keys written by enrollment (16 raw bytes each).
-pub const SETTING_FLEET_ID: &str = "fleet_id";
-pub const SETTING_DEVICE_ID: &str = "device_id";
+pub use fleet_core::enroll::{SETTING_DEVICE_ID, SETTING_FLEET_ID};
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 
-type PendingKeys = Arc<Mutex<HashMap<ServerId, HostKey>>>;
+type PendingKeys = Arc<Mutex<HashMap<ServerId, HostKeyObservation>>>;
+/// Latest fleet-table figures per server (10 s telemetry).
+pub(crate) type LiveMetrics = Arc<Mutex<HashMap<ServerId, ServerMetricsRow>>>;
+type SftpCache = Mutex<HashMap<ServerId, (Arc<SshConnection>, Arc<Sftp>)>>;
 
 struct Running {
     handle: ManagerHandle,
@@ -39,19 +49,21 @@ struct Running {
 
 #[derive(uniffi::Object)]
 pub struct FleetCore {
-    cache: Mutex<Cache>,
-    keys: Arc<SignerAdapter>,
+    pub(crate) cache: Mutex<Cache>,
+    pub(crate) keys: Arc<SignerAdapter>,
     key_store: Box<dyn KeyStore>,
     kind: Mutex<SessionKind>,
     running: Mutex<Option<Running>>,
     pending_host_keys: PendingKeys,
+    pub(crate) live: LiveMetrics,
+    pub(crate) sftp: SftpCache,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn id16(cache: &Cache, key: &str) -> Result<[u8; 16], FleetError> {
+pub(crate) fn id16(cache: &Cache, key: &str) -> Result<[u8; 16], FleetError> {
     cache
         .setting(key)?
         .and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok())
@@ -59,7 +71,10 @@ fn id16(cache: &Cache, key: &str) -> Result<[u8; 16], FleetError> {
 }
 
 /// What the manager needs for `rec`, if the agent keys are pinned.
-fn spec_for(cache: &Cache, rec: &ServerRecord) -> Result<Option<ServerSpec>, FleetError> {
+pub(crate) fn spec_for(
+    cache: &Cache,
+    rec: &ServerRecord,
+) -> Result<Option<ServerSpec>, FleetError> {
     let Some(pins) = cache.pins(&rec.id)? else {
         return Ok(None);
     };
@@ -75,15 +90,38 @@ fn spec_for(cache: &Cache, rec: &ServerRecord) -> Result<Option<ServerSpec>, Fle
     }))
 }
 
+/// `user@host:port` hops, first hop first.
+fn jump_text(t: &SshTarget) -> Option<String> {
+    let mut hops = Vec::new();
+    let mut cur = t.proxy_jump.as_deref();
+    while let Some(j) = cur {
+        hops.push(format!("{}@{}:{}", j.user, j.host, j.port));
+        cur = j.proxy_jump.as_deref();
+    }
+    hops.reverse();
+    (!hops.is_empty()).then(|| hops.join(","))
+}
+
 impl FleetCore {
-    fn running(&self) -> Result<(ManagerHandle, tokio::runtime::Handle), FleetError> {
+    pub(crate) fn running(&self) -> Result<(ManagerHandle, tokio::runtime::Handle), FleetError> {
         lock(&self.running)
             .as_ref()
             .map(|r| (r.handle.clone(), r.rt.clone()))
             .ok_or(FleetError::NotStarted)
     }
 
-    fn noise_key(&self) -> Result<StaticKeypair, FleetError> {
+    /// Runs `fut` on the core runtime and awaits it from the caller's
+    /// executor.
+    pub(crate) async fn on_core<T, F>(&self, fut: F) -> Result<T, FleetError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, FleetError>> + Send + 'static,
+    {
+        let (_, rt) = self.running()?;
+        rt.spawn(fut).await.map_err(|_| FleetError::Stopped)?
+    }
+
+    pub(crate) fn noise_key(&self) -> Result<StaticKeypair, FleetError> {
         let keys = |e| FleetError::Keys { error: e };
         if let Some(raw) = self.key_store.load_noise_key().map_err(keys)? {
             let raw = Zeroizing::new(raw);
@@ -103,44 +141,73 @@ impl FleetCore {
         Ok(kp)
     }
 
-    async fn request(&self, server_id: String, op: Op) -> Result<Payload, FleetError> {
-        let id = validate::server_id(&server_id)?;
-        let (handle, rt) = self.running()?;
-        let task = rt.spawn(async move { handle.request(&id, op, Actor::Human, None).await });
-        let reply = task.await.map_err(|_| FleetError::Stopped)??;
+    /// Signs and sends `op` as the human operator; the verified payload.
+    pub(crate) async fn request(&self, server_id: &str, op: Op) -> Result<Payload, FleetError> {
+        let id = validate::server_id(server_id)?;
+        let (handle, _) = self.running()?;
+        let reply = self
+            .on_core(async move {
+                handle
+                    .request(&id, op, Actor::Human, None)
+                    .await
+                    .map_err(FleetError::from)
+            })
+            .await?;
         reply.result.map_err(|code| FleetError::Agent {
             code: format!("{code:?}"),
         })
     }
 
+    pub(crate) fn server_record(&self, id: &ServerId) -> Result<ServerRecord, FleetError> {
+        lock(&self.cache)
+            .server(id)?
+            .ok_or(FleetError::UnknownServer)
+    }
+
+    /// Hands a newly pinned server to the running manager.
+    pub(crate) fn connect_pinned(&self, id: &ServerId) -> Result<(), FleetError> {
+        let spec = {
+            let cache = lock(&self.cache);
+            let rec = cache.server(id)?.ok_or(FleetError::UnknownServer)?;
+            spec_for(&cache, &rec)?
+        };
+        if let (Some(spec), Some(r)) = (spec, lock(&self.running).as_ref()) {
+            r.handle.add_server(spec);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remember_host_key(&self, id: ServerId, obs: HostKeyObservation) {
+        lock(&self.pending_host_keys).insert(id, obs);
+    }
+
     fn row(&self, rec: ServerRecord, cache: &Cache, handle: Option<&ManagerHandle>) -> ServerRow {
-        let pinned = cache
-            .pins(&rec.id)
-            .ok()
-            .flatten()
-            .is_some_and(|p| p.agent_noise.is_some() && p.agent_signing.is_some());
+        let pins = cache.pins(&rec.id).ok().flatten().unwrap_or_default();
         let state = handle
             .and_then(|h| h.state(&rec.id))
             .map(ConnState::from)
             .unwrap_or(ConnState::Disconnected);
+        let live = lock(&self.live).get(&rec.id).cloned();
         ServerRow {
             id: rec.id.to_string(),
             name: rec.name,
+            proxy_jump: jump_text(&rec.target),
             host: rec.target.host,
             port: rec.target.port,
             user: rec.target.user,
             group_id: rec.group,
             tags: rec.tags,
             state,
-            agent_pinned: pinned,
-            cpu_percent: None,
-            mem_percent: None,
-            disk_percent: None,
+            host_key_pinned: pins.host_key.is_some(),
+            agent_pinned: pins.agent_noise.is_some() && pins.agent_signing.is_some(),
+            cpu_percent: live.as_ref().and_then(|l| l.cpu_percent),
+            mem_percent: live.as_ref().and_then(|l| l.mem_percent),
+            disk_percent: live.as_ref().and_then(|l| l.disk_percent),
             uptime_s: None,
             kernel: None,
             agent_version: None,
             pending_updates: None,
-            last_seen_ms: None,
+            last_seen_ms: live.map(|l| l.time_ms),
         }
     }
 }
@@ -163,6 +230,8 @@ impl FleetCore {
             kind: Mutex::new(SessionKind::Monitor),
             running: Mutex::new(None),
             pending_host_keys: Arc::default(),
+            live: Arc::default(),
+            sftp: Mutex::default(),
         }))
     }
 
@@ -170,6 +239,32 @@ impl FleetCore {
     pub fn is_enrolled(&self) -> bool {
         let c = lock(&self.cache);
         id16(&c, SETTING_FLEET_ID).is_ok() && id16(&c, SETTING_DEVICE_ID).is_ok()
+    }
+
+    /// Fleet name from enrollment.
+    pub fn fleet_name(&self) -> Option<String> {
+        lock(&self.cache)
+            .setting(fleet_core::enroll::SETTING_FLEET_NAME)
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
+    /// This Mac's SSH public key (`ecdsa-sha2-nistp256 …`), for the
+    /// operator to add to the admin user's `authorized_keys` before an
+    /// agent install. Only the public key crosses (rule 7).
+    pub fn ssh_public_key(&self) -> Result<String, FleetError> {
+        use fleet_core::signer::DeviceSigner as _;
+        let pk = self
+            .keys
+            .public_key(fleet_core::signer::KeyRole::Ssh)
+            .map_err(|e| FleetError::Keys { error: e.into() })?;
+        fleet_core::ssh::SshPublicKey::EcdsaP256(pk)
+            .to_openssh()
+            .map(|k| format!("{k} fleet"))
+            .map_err(|e| FleetError::Internal {
+                message: e.to_string(),
+            })
     }
 
     // ---- groups ----
@@ -227,22 +322,25 @@ impl FleetCore {
             .collect())
     }
 
-    /// Adds a server to the cache. It connects once the agent is installed
-    /// and its keys pinned (agent install flow, later phase).
+    /// Adds a server to the cache. It connects once its host key is
+    /// confirmed and the agent installed (`probe_host_key`,
+    /// `accept_host_key`, `install_agent`).
     pub fn add_server(&self, server: NewServer) -> Result<ServerRow, FleetError> {
         let group = server
             .group_id
             .as_deref()
             .map(validate::group_id)
             .transpose()?;
+        let mut target = SshTarget::new(
+            validate::host(&server.host)?,
+            validate::port(server.port)?,
+            validate::user(&server.user)?,
+        );
+        target.proxy_jump = validate::proxy_jump(server.proxy_jump.as_deref())?;
         let rec = ServerRecord {
             id: validate::server_id(&validate::random_id("srv_")?)?,
             name: validate::name(&server.name, "name")?,
-            target: SshTarget::new(
-                validate::host(&server.host)?,
-                validate::port(server.port)?,
-                validate::user(&server.user)?,
-            ),
+            target,
             group,
             tags: validate::tags(&server.tags)?,
         };
@@ -257,6 +355,8 @@ impl FleetCore {
             r.handle.remove_server(&id);
         }
         lock(&self.pending_host_keys).remove(&id);
+        lock(&self.live).remove(&id);
+        lock(&self.sftp).remove(&id);
         lock(&self.cache).delete_server(&id)?;
         Ok(())
     }
@@ -264,7 +364,8 @@ impl FleetCore {
     // ---- connection manager ----
 
     /// Starts the connection manager and connects every server with pinned
-    /// agent keys. `listener` receives state changes and events.
+    /// agent keys. `listener` receives state changes, events and live
+    /// fleet-table metrics.
     pub fn start(&self, listener: Box<dyn CoreListener>) -> Result<(), FleetError> {
         let mut running = lock(&self.running);
         if running.is_some() {
@@ -292,10 +393,12 @@ impl FleetCore {
         };
         let kind = *lock(&self.kind);
         let pending = self.pending_host_keys.clone();
+        let listener: Arc<dyn CoreListener> = Arc::from(listener);
         let (tx, rx) = std::sync::mpsc::channel();
+        let l = listener.clone();
         std::thread::Builder::new()
             .name("fleet-core".into())
-            .spawn(move || core_thread(connector, kind.into(), listener, pending, tx))
+            .spawn(move || core_thread(connector, kind.into(), l, pending, tx))
             .map_err(|e| FleetError::Internal {
                 message: e.to_string(),
             })?;
@@ -305,6 +408,11 @@ impl FleetCore {
                 message: "core thread failed to start".into(),
             })?
             .map_err(|message| FleetError::Internal { message })?;
+        rt.spawn(crate::streams::fleet_telemetry(
+            handle.clone(),
+            self.live.clone(),
+            listener,
+        ));
         for s in specs {
             handle.add_server(s);
         }
@@ -334,22 +442,30 @@ impl FleetCore {
     }
 
     /// Pins the first-use host key last reported for `server_id` (after the
-    /// operator compared fingerprints) and reconnects with it.
+    /// operator compared fingerprints), and any first-use jump host keys
+    /// seen on the same connection, then (re)connects with them.
     pub fn accept_host_key(&self, server_id: String) -> Result<(), FleetError> {
         let id = validate::server_id(&server_id)?;
-        let key = lock(&self.pending_host_keys)
+        let obs = lock(&self.pending_host_keys)
             .remove(&id)
             .ok_or(FleetError::UnknownServer)?;
-        let spec = {
-            let cache = lock(&self.cache);
-            cache.pin_host_key(&id, &key)?;
-            let rec = cache.server(&id)?.ok_or(FleetError::UnknownServer)?;
-            spec_for(&cache, &rec)?
-        };
-        if let (Some(spec), Some(r)) = (spec, lock(&self.running).as_ref()) {
-            r.handle.add_server(spec);
+        {
+            let mut cache = lock(&self.cache);
+            let mut rec = cache.server(&id)?.ok_or(FleetError::UnknownServer)?;
+            // Jump pins travel with the target (`jump_host_keys`).
+            let mut hop = rec.target.proxy_jump.as_deref_mut();
+            let mut seen = obs.via.as_deref();
+            while let (Some(h), Some(o)) = (hop, seen) {
+                if o.status == HostKeyStatus::FirstUse {
+                    h.host_key = Some(o.key.clone());
+                }
+                hop = h.proxy_jump.as_deref_mut();
+                seen = o.via.as_deref();
+            }
+            cache.upsert_server(&rec)?;
+            cache.pin_host_key(&id, &obs.key)?;
         }
-        Ok(())
+        self.connect_pinned(&id)
     }
 
     /// Forgets a first-use host key without pinning it.
@@ -365,7 +481,7 @@ impl FleetCore {
     // ---- requests ----
 
     pub async fn system_info(&self, server_id: String) -> Result<SystemInfoRow, FleetError> {
-        match self.request(server_id, Op::SystemInfo).await? {
+        match self.request(&server_id, Op::SystemInfo).await? {
             Payload::SystemInfo(v) => Ok(v.into()),
             _ => Err(FleetError::UnexpectedReply),
         }
@@ -373,7 +489,7 @@ impl FleetCore {
 
     /// Works on monitor sessions too (design §5.5).
     pub async fn agent_health(&self, server_id: String) -> Result<AgentHealthRow, FleetError> {
-        match self.request(server_id, Op::AgentHealth).await? {
+        match self.request(&server_id, Op::AgentHealth).await? {
             Payload::AgentHealth(v) => Ok(v.into()),
             _ => Err(FleetError::UnexpectedReply),
         }
@@ -385,7 +501,7 @@ type Started = Result<(ManagerHandle, tokio::runtime::Handle), String>;
 fn core_thread(
     connector: SshConnector,
     kind: fleet_core::manager::SessionKind,
-    listener: Box<dyn CoreListener>,
+    listener: Arc<dyn CoreListener>,
     pending: PendingKeys,
     started: std::sync::mpsc::Sender<Started>,
 ) {
@@ -414,7 +530,7 @@ fn core_thread(
 
 async fn forward(
     mut events: broadcast::Receiver<ManagerEvent>,
-    listener: Box<dyn CoreListener>,
+    listener: Arc<dyn CoreListener>,
     pending: PendingKeys,
 ) {
     loop {
@@ -423,6 +539,15 @@ async fn forward(
             Err(broadcast::error::RecvError::Lagged(_)) => listener.on_resync(),
             Err(broadcast::error::RecvError::Closed) => return,
         }
+    }
+}
+
+pub(crate) fn host_key_prompt(server: &ServerId, obs: &HostKeyObservation) -> HostKeyPrompt {
+    HostKeyPrompt {
+        server_id: server.to_string(),
+        algorithm: obs.key.algorithm(),
+        fingerprint: obs.key.fingerprint(),
+        via_jump_unpinned: obs.via.as_ref().is_some_and(|v| v.needs_confirmation()),
     }
 }
 
@@ -447,20 +572,8 @@ fn dispatch(ev: ManagerEvent, listener: &dyn CoreListener, pending: &PendingKeys
             server,
             observation,
         } => {
-            let via_jump_unpinned = observation
-                .via
-                .as_ref()
-                .is_some_and(|v| v.needs_confirmation());
-            let target_first_use = observation.status == HostKeyStatus::FirstUse;
-            let prompt = HostKeyPrompt {
-                server_id: server.to_string(),
-                algorithm: observation.key.algorithm(),
-                fingerprint: observation.key.fingerprint(),
-                via_jump_unpinned,
-            };
-            if target_first_use {
-                lock(pending).insert(server, observation.key);
-            }
+            let prompt = host_key_prompt(&server, &observation);
+            lock(pending).insert(server, observation);
             listener.on_host_key(prompt);
         }
     }
@@ -487,12 +600,13 @@ mod tests {
             Ok(())
         }
     }
-    struct Quiet;
+    pub(crate) struct Quiet;
     impl CoreListener for Quiet {
         fn on_state(&self, _: StateChange) {}
         fn on_host_key(&self, _: HostKeyPrompt) {}
         fn on_event(&self, _: AgentEventRow) {}
         fn on_resync(&self) {}
+        fn on_metrics(&self, _: ServerMetricsRow) {}
     }
 
     fn core(dir: &tempfile::TempDir) -> Arc<FleetCore> {
@@ -513,6 +627,7 @@ mod tests {
             user: "deploy".into(),
             group_id,
             tags: vec!["web".into()],
+            proxy_jump: Some("ops@bastion:2222".into()),
         }
     }
 
@@ -523,11 +638,12 @@ mod tests {
         let g = c.add_group("Production".into()).unwrap();
         let row = c.add_server(web(Some(g.id.clone()))).unwrap();
         assert_eq!(row.state, ConnState::Disconnected);
-        assert!(!row.agent_pinned);
+        assert!(!row.agent_pinned && !row.host_key_pinned);
         let rows = c.list_servers().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].group_id.as_deref(), Some(g.id.as_str()));
         assert_eq!(rows[0].tags, vec!["web".to_string()]);
+        assert_eq!(rows[0].proxy_jump.as_deref(), Some("ops@bastion:2222"));
 
         c.remove_group(g.id).unwrap();
         assert_eq!(c.list_servers().unwrap()[0].group_id, None);
@@ -541,6 +657,12 @@ mod tests {
         let c = core(&dir);
         let mut s = web(None);
         s.host = "-oProxyCommand=sh".into();
+        assert!(matches!(
+            c.add_server(s),
+            Err(FleetError::InvalidArgument { .. })
+        ));
+        let mut s = web(None);
+        s.proxy_jump = Some("x@-oProxyCommand=sh".into());
         assert!(matches!(
             c.add_server(s),
             Err(FleetError::InvalidArgument { .. })

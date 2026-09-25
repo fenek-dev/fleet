@@ -85,6 +85,8 @@ bollard = { version = "0.21.1", default-features = false, features = ["pipe"] }
 # SSH client (design §3.2). `ring` backend only: no RSA, no zlib, no aws-lc
 # C build. Fleet keys are ecdsa-sha2-nistp256 and ssh-ed25519.
 russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+# SFTP client over a russh channel (file browser, agent upload; design §2.3, §10.1).
+russh-sftp = { version = "3.0.0", default-features = false }
 # Local cache (design §7.4); bundled SQLite so the Mac build has no system dep.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Swift bindings (design §7.1), proc-macro mode. `cli` only for the

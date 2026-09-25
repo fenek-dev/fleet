@@ -59,6 +59,72 @@ impl Agent {
     }
 }
 
+/// Honest for `metrics.subscribe(1 s)`; injects an unsealed chunk for
+/// `metrics.subscribe(10 s)`; ends without a seal for anything else.
+async fn fake_stream(
+    a: &mut Agent,
+    id: u32,
+    cmd: &fleet_proto::SignedCommand,
+    server: &ServerId,
+    signing: &Ed25519Signer,
+) {
+    use fleet_crypto::stream::StreamSealer;
+    use fleet_proto::op::SampleInterval;
+    use fleet_proto::{Outcome, StreamChunk};
+    let op = cmd.decode_body().unwrap().op;
+    let mut sealer = StreamSealer::new(server.clone(), command_hash(cmd));
+    let mut seq = 0u64;
+    let mut send = |c: StreamChunk| {
+        let m = Message::StreamData {
+            id,
+            seq,
+            chunk: encode(&c),
+        };
+        seq += 1;
+        m
+    };
+    let mut out = Vec::new();
+    match op {
+        Op::MetricsSubscribe {
+            interval: SampleInterval::OneSecond,
+        } => {
+            for _ in 0..3 {
+                let d = encode(&Payload::Empty);
+                sealer.push(&d);
+                out.push(send(StreamChunk::Data(d)));
+            }
+            out.push(send(StreamChunk::Checkpoint(sealer.checkpoint(
+                Some(1),
+                now_ms(),
+                signing,
+            ))));
+            out.push(send(StreamChunk::Final(sealer.finish(
+                Some(2),
+                Outcome::Ok,
+                now_ms(),
+                signing,
+            ))));
+        }
+        Op::MetricsSubscribe { .. } => {
+            let d = encode(&Payload::Empty);
+            sealer.push(&d);
+            out.push(send(StreamChunk::Data(d.clone())));
+            // Injected by a "gate": not in the agent's chain.
+            out.push(send(StreamChunk::Data(d)));
+            out.push(send(StreamChunk::Checkpoint(sealer.checkpoint(
+                Some(1),
+                now_ms(),
+                signing,
+            ))));
+        }
+        _ => {}
+    }
+    for m in out {
+        a.send(&m).await;
+    }
+    a.send(&Message::StreamEnd { id, status: Ok(()) }).await;
+}
+
 async fn fake_agent(
     mut io: DuplexStream,
     key: StaticKeypair,
@@ -98,6 +164,13 @@ async fn fake_agent(
     loop {
         tokio::select! {
             m = a.recv() => {
+                if let Message::StreamOpen { id, cmd } = m {
+                    fake_stream(&mut a, id, &cmd, &server, &signing).await;
+                    continue;
+                }
+                if let Message::StreamCancel { .. } = m {
+                    continue;
+                }
                 let Message::Request { id, cmd } = m else { panic!("unexpected message") };
                 let result = Ok(match cmd.decode_body().unwrap().op {
                     Op::AgentHealth => Payload::AgentHealth(AgentHealth {
@@ -208,4 +281,130 @@ async fn bridged_session_next_event_is_cancel_safe() {
         .unwrap();
     assert_eq!(r.result, Ok(Payload::Empty));
     assert_eq!(s.rejected_events(), 0);
+}
+
+#[tokio::test]
+async fn streams_are_verified() {
+    use fleet_core::{StreamEvent, StreamFailure};
+    use fleet_crypto::stream::StreamError;
+    use fleet_proto::Outcome;
+    use fleet_proto::args::{JournalQuery, TimeRange};
+    use fleet_proto::op::SampleInterval;
+
+    let server = ServerId::new("srv_000002").unwrap();
+    let agent_noise = StaticKeypair::generate().unwrap();
+    let agent_signing = Ed25519Signer::from_seed(&[9; 32]);
+    let pinned_noise = agent_noise.public();
+    let pinned_signing = agent_signing.public();
+    let (client_io, agent_io) = tokio::io::duplex(1024);
+    let (_ev_tx, ev_rx) = mpsc::unbounded_channel();
+    tokio::spawn(fake_agent(
+        agent_io,
+        agent_noise,
+        agent_signing,
+        server.clone(),
+        ev_rx,
+    ));
+    let mac_noise = StaticKeypair::generate().unwrap();
+    let device = SoftwareP256Signer::generate().unwrap();
+    let cfg = SessionConfig {
+        mode: SessionMode::Normal,
+        noise: &mac_noise,
+        pinned_agent_noise: pinned_noise,
+        pinned_agent_signing: pinned_signing,
+        fleet_id: FleetId([1; 16]),
+        server_id: server.clone(),
+        device_id: DeviceId([2; 16]),
+        key: KeyKind::Device,
+        signer: CommandSigner::P256(&device),
+    };
+    let mut s = timeout(T, Session::connect_bridged(client_io, cfg))
+        .await
+        .unwrap()
+        .unwrap();
+
+    async fn drain(
+        s: &mut Session<'_, DuplexStream>,
+        mut rx: mpsc::Receiver<StreamEvent>,
+    ) -> Vec<StreamEvent> {
+        let mut got = Vec::new();
+        loop {
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(e) => {
+                        let end = matches!(e, StreamEvent::End(_));
+                        got.push(e);
+                        if end { return got; }
+                    }
+                    None => return got,
+                },
+                _ = s.next_event() => {}
+            }
+        }
+    }
+
+    let (_, rx) = s
+        .open_stream(
+            Op::MetricsSubscribe {
+                interval: SampleInterval::OneSecond,
+            },
+            Actor::Human,
+        )
+        .await
+        .unwrap();
+    let got = timeout(T, drain(&mut s, rx)).await.unwrap();
+    assert_eq!(
+        got,
+        vec![
+            StreamEvent::Item(Payload::Empty),
+            StreamEvent::Item(Payload::Empty),
+            StreamEvent::Item(Payload::Empty),
+            StreamEvent::Verified { count: 3 },
+            StreamEvent::End(Ok(Outcome::Ok)),
+        ]
+    );
+
+    let (_, rx) = s
+        .open_stream(
+            Op::MetricsSubscribe {
+                interval: SampleInterval::TenSeconds,
+            },
+            Actor::Human,
+        )
+        .await
+        .unwrap();
+    let got = timeout(T, drain(&mut s, rx)).await.unwrap();
+    assert_eq!(
+        got.last(),
+        Some(&StreamEvent::End(Err(StreamFailure::Verification(
+            StreamError::Chain
+        ))))
+    );
+
+    let q = JournalQuery {
+        units: vec![],
+        priority: None,
+        range: TimeRange::default(),
+        grep: None,
+        after_cursor: None,
+        limit: 10,
+    };
+    let (_, rx) = s
+        .open_stream(Op::JournalFollow(q), Actor::Human)
+        .await
+        .unwrap();
+    let got = timeout(T, drain(&mut s, rx)).await.unwrap();
+    assert_eq!(
+        got,
+        vec![StreamEvent::End(Err(StreamFailure::Unsigned {
+            claimed: None
+        }))]
+    );
+    // The session stays usable (queued cancels flush on the next write).
+    let r = s
+        .request(Op::SystemInfo, &server, Actor::Human, None)
+        .await
+        .unwrap();
+    assert_eq!(r.result, Ok(Payload::Empty));
+    assert_eq!(s.stream_count(), 0);
 }

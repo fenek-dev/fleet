@@ -342,6 +342,8 @@ pub enum SshError {
     ChannelRejected,
     #[error("bad key: {0}")]
     BadKey(String),
+    #[error("sftp: {0}")]
+    Sftp(String),
 }
 
 impl From<AuthSignError> for SshError {
@@ -529,13 +531,77 @@ impl SshConnection {
 
     /// Interactive shell on a PTY (terminal, Phase 2).
     pub async fn open_pty(&self, term: &str, cols: u32, rows: u32) -> Result<PtyChannel, SshError> {
+        self.open_pty_with(term, cols, rows, None).await
+    }
+
+    /// A PTY running `command` (a fixed string built by the caller from
+    /// validated tokens only; the server's shell parses it) or, with
+    /// `None`, the login shell.
+    pub async fn open_pty_with(
+        &self,
+        term: &str,
+        cols: u32,
+        rows: u32,
+        command: Option<&str>,
+    ) -> Result<PtyChannel, SshError> {
         let mut ch = self.open_session().await?;
         ch.request_pty(true, term, cols, rows, 0, 0, &[]).await?;
         self.wait_reply(&mut ch).await?;
-        ch.request_shell(true).await?;
+        match command {
+            Some(c) => ch.exec(true, c).await?,
+            None => ch.request_shell(true).await?,
+        }
         self.wait_reply(&mut ch).await?;
         let (read, write) = ch.split();
         Ok(PtyChannel { read, write })
+    }
+
+    /// SFTP subsystem channel on this connection (file browser, uploads).
+    pub async fn open_sftp(&self) -> Result<russh_sftp::client::SftpSession, SshError> {
+        let mut ch = self.open_session().await?;
+        ch.request_subsystem(true, "sftp").await?;
+        self.wait_reply(&mut ch).await?;
+        timeout(
+            self.opts.channel_timeout,
+            russh_sftp::client::SftpSession::new(ch.into_stream()),
+        )
+        .await
+        .map_err(|_| SshError::Timeout)?
+        .map_err(|e| SshError::Sftp(e.to_string()))
+    }
+
+    /// Runs `command` on an exec channel (no PTY) and collects its output,
+    /// each stream capped at `max_output` bytes (the rest is dropped), until
+    /// the channel closes or `limit` passes. `command` is parsed by the
+    /// remote shell: callers build it from validated tokens only.
+    pub async fn exec_capture(
+        &self,
+        command: &str,
+        max_output: usize,
+        limit: Duration,
+    ) -> Result<ExecOutput, SshError> {
+        let mut ch = self.open_session().await?;
+        ch.exec(true, command).await?;
+        let run = async {
+            let mut out = ExecOutput::default();
+            let mut replied = false;
+            loop {
+                match ch.wait().await {
+                    Some(ChannelMsg::Success) => replied = true,
+                    Some(ChannelMsg::Failure) if !replied => return Err(SshError::ChannelRejected),
+                    Some(ChannelMsg::Data { data }) => {
+                        cap_extend(&mut out.stdout, &data, max_output)
+                    }
+                    Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        cap_extend(&mut out.stderr, &data, max_output)
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => out.status = Some(exit_status),
+                    Some(ChannelMsg::Close) | None => return Ok(out),
+                    Some(_) => {}
+                }
+            }
+        };
+        timeout(limit, run).await.map_err(|_| SshError::Timeout)?
     }
 
     /// Sends a keepalive and waits for the answer.
@@ -556,6 +622,20 @@ impl SshConnection {
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
     }
+}
+
+/// Result of [`SshConnection::exec_capture`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// `None` when the server sent no exit status (killed by a signal).
+    pub status: Option<u32>,
+}
+
+fn cap_extend(buf: &mut Vec<u8>, data: &[u8], max: usize) {
+    let room = max.saturating_sub(buf.len());
+    buf.extend_from_slice(&data[..data.len().min(room)]);
 }
 
 /// Output of a PTY channel.

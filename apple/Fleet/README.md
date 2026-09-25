@@ -19,5 +19,7 @@ xcodebuild -project Fleet.xcodeproj -scheme Fleet -destination 'platform=macOS,a
 - **Signing:** keys live in the data protection keychain, which needs a signed build with the `keychain-access-groups` entitlement (set a development team). Unsigned builds (`CODE_SIGNING_ALLOWED=NO`) compile but can't store keys.
 - **No Secure Enclave** (VMs, CI): launch with `FLEET_SOFTWARE_KEYS=1` to use Keychain-stored software keys. The UI shows a warning. Development only.
 - **App Sandbox is off** for now (Hardened Runtime is on). The core opens outbound SSH itself; sandboxing waits until the MCP socket and file transfer paths are settled.
-- **Enrollment:** until `fleet_id` and `device_id` exist in the cache, servers are listed but nothing connects.
+- **Enrollment:** on first launch the app shows onboarding (fleet name, 24-word recovery code shown once, re-type 4 words, optional passphrase, Touch ID signs the genesis roster). Until then nothing connects.
+- **Adding a server:** authorize the Mac's SSH key (shown in the Add server sheet) for the admin user, confirm the host key fingerprint, then pick the agent `.deb` (or a bare `fleet-agent` binary for development) to install. Passwordless `sudo` is required.
+- **Packages:** SwiftTerm (Swift Package, resolved by Xcode) for terminals. It ships a build-info plugin: trust it once in Xcode, or pass `-skipPackagePluginValidation` to command-line `xcodebuild`.
 - Fonts: Geist isn't bundled yet; the UI uses system fonts at the spec's sizes.

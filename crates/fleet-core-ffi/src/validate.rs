@@ -2,6 +2,7 @@
 //! in an SSH target or the cache is checked here, not in the UI.
 
 use crate::types::FleetError;
+use fleet_core::ssh::SshTarget;
 use fleet_proto::ServerId;
 
 fn invalid(field: &str) -> FleetError {
@@ -71,6 +72,49 @@ pub fn tags(v: &[String]) -> Result<Vec<String>, FleetError> {
         }
     }
     Ok(out)
+}
+
+/// `user@host:port[,…]` (first hop first, like `ssh -J`; port optional,
+/// default 22; at most 4 hops) as a nested jump chain (first hop
+/// innermost). Empty means direct.
+pub fn proxy_jump(s: Option<&str>) -> Result<Option<Box<SshTarget>>, FleetError> {
+    let s = s.map(str::trim).unwrap_or("");
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let hops: Vec<&str> = s.split(',').map(str::trim).collect();
+    if hops.len() > 4 {
+        return Err(invalid("proxy_jump"));
+    }
+    let mut chain: Option<SshTarget> = None;
+    for hop in hops {
+        let (u, rest) = hop.split_once('@').ok_or_else(|| invalid("proxy_jump"))?;
+        let (h, p) = match rest.rsplit_once(':') {
+            // A bare IPv6 literal has colons of its own: needs the port.
+            Some((h, p)) if !h.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                (h, p.parse::<u16>().map_err(|_| invalid("proxy_jump"))?)
+            }
+            _ => (rest, 22),
+        };
+        let mut t = SshTarget::new(
+            host(h).map_err(|_| invalid("proxy_jump"))?,
+            port(p).map_err(|_| invalid("proxy_jump"))?,
+            user(u).map_err(|_| invalid("proxy_jump"))?,
+        );
+        t.proxy_jump = chain.take().map(Box::new);
+        chain = Some(t);
+    }
+    Ok(chain.map(Box::new))
+}
+
+/// Absolute local path (a file the operator picked in the app).
+pub fn local_path(s: &str) -> Result<std::path::PathBuf, FleetError> {
+    let p = std::path::PathBuf::from(s);
+    if p.is_absolute() && !s.contains('\0') && s.len() <= 4096 {
+        Ok(p)
+    } else {
+        Err(invalid("local_path"))
+    }
 }
 
 pub fn server_id(s: &str) -> Result<ServerId, FleetError> {
@@ -161,5 +205,35 @@ mod tests {
         assert!(group_id(&g).is_ok());
         assert!(group_id("grp_AB").is_err());
         assert!(server_id("srv_x").is_err());
+    }
+
+    #[test]
+    fn jumps() {
+        assert_eq!(proxy_jump(None).unwrap(), None);
+        assert_eq!(proxy_jump(Some("  ")).unwrap(), None);
+        let j = proxy_jump(Some("ops@bastion:2222,deploy@10.0.0.2"))
+            .unwrap()
+            .unwrap();
+        // Last listed hop is outermost; the first hop is innermost.
+        assert_eq!(
+            (j.user.as_str(), j.host.as_str(), j.port),
+            ("deploy", "10.0.0.2", 22)
+        );
+        let first = j.proxy_jump.as_ref().unwrap();
+        assert_eq!(
+            (first.user.as_str(), first.host.as_str(), first.port),
+            ("ops", "bastion", 2222)
+        );
+        for bad in [
+            "bastion",
+            "ops@-oProxyCommand=x",
+            "a@b,c@d,e@f,g@h,i@j",
+            "ops@h:0",
+            "Ops@h",
+        ] {
+            assert!(proxy_jump(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(local_path("/Users/x/fleet-agent.deb").is_ok());
+        assert!(local_path("relative").is_err());
     }
 }

@@ -6,16 +6,25 @@
 //! - [`manager`]: per-server connection state machine, backoff, handshake
 //!   limit, monitor/device sessions, request routing, event fan-out (§7.2).
 //! - [`cache`]: the local SQLite cache (§7.4).
+//! - [`enroll`]: first-Mac fleet bootstrap: genesis roster, recovery code
+//!   (§5.3, §5.11).
+//! - [`install`]: agent install over SSH (§10.1); [`policy`]: default
+//!   per-server policy (§5.4).
+//! - [`sftp`]: file browser over the server's SSH connection (§2.3).
 //! - [`signer`]: the Secure Enclave signing interface Swift implements (§7.1).
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod enroll;
+pub mod install;
 pub mod manager;
+pub mod policy;
 pub mod session;
+pub mod sftp;
 pub mod signer;
 pub mod ssh;
 
 pub use session::{
-    ClientError, CommandOpts, CommandSigner, HelloInfo, MAX_BUFFERED_EVENTS, Reply, Session,
-    SessionConfig, SessionMode, VerifiedStatus, now_ms,
+    ClientError, CommandOpts, CommandSigner, HelloInfo, MAX_BUFFERED_EVENTS, Reply, STREAM_QUEUE,
+    Session, SessionConfig, SessionMode, StreamEvent, StreamFailure, VerifiedStatus, now_ms,
 };

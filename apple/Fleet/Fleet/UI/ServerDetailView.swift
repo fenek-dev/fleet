@@ -20,6 +20,7 @@ struct ServerDetailView: View {
     @Environment(CoreBridge.self) private var core
     let serverId: String
     @State private var tab: ServerTab = .overview
+    @State private var installing = false
 
     private var server: ServerRow? { core.servers.first { $0.id == serverId } }
 
@@ -27,20 +28,40 @@ struct ServerDetailView: View {
         if let server {
             VStack(alignment: .leading, spacing: 0) {
                 header(server)
-                ScrollView {
-                    Group {
-                        switch tab {
-                        case .overview: OverviewTab(server: server)
-                        default: PlaceholderTab(name: tab.rawValue)
-                        }
-                    }
-                    .padding(24)
-                }
+                content(server)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
             .background(Color.window)
             .id(serverId)
+            .sheet(isPresented: $installing) { AddServerSheet(existing: server) }
         } else {
             ContentUnavailableView("Server removed", systemImage: "server.rack")
+        }
+    }
+
+    @ViewBuilder private func content(_ s: ServerRow) -> some View {
+        // Terminals and SFTP ride the agent session's SSH connection too.
+        if !s.agentPinned {
+            ContentUnavailableView {
+                Label("Agent not installed", systemImage: "shippingbox")
+            } description: {
+                Text("Install the Fleet agent to see live data and manage this server.")
+            } actions: {
+                Button("Install agent…") { installing = true }
+                    .buttonStyle(.borderedProminent).tint(.accent)
+            }
+        } else {
+            switch tab {
+            case .overview: OverviewTab(server: s)
+            case .terminal: TerminalTab(server: s)
+            case .files: FilesTab(server: s)
+            case .logs: LogsTab(server: s)
+            case .security: SecurityTab(server: s)
+            case .services: ServicesTab(server: s)
+            case .firewall: FirewallTab(server: s)
+            case .packages: PackagesTab(server: s)
+            case .docker, .cron, .config, .timeline: PlaceholderTab(name: tab.rawValue)
+            }
         }
     }
 
@@ -50,13 +71,18 @@ struct ServerDetailView: View {
                 Text(s.name).font(.serverTitle).foregroundStyle(Color.text)
                 StatusPill(label: s.state.label, tone: s.state.tone)
                 Spacer()
+                if !s.agentPinned {
+                    Button("Install agent…", systemImage: "shippingbox") { installing = true }
+                }
                 Button("Reconnect", systemImage: "arrow.clockwise") { core.reconnect(s.id) }
-                Button("Terminal", systemImage: "terminal") {}
-                    .disabled(true)
-                    .help("Terminal arrives with PTY support")
+                Button("Terminal", systemImage: "terminal") { tab = .terminal }
+                    .disabled(s.state != .ready)
             }
-            Text("\(s.user)@\(s.host):\(s.port)")
-                .font(.mono(12)).foregroundStyle(Color.textMuted)
+            HStack(spacing: 6) {
+                Text("\(s.user)@\(s.host):\(s.port)")
+                if let j = s.proxyJump { Text("via \(j)") }
+            }
+            .font(.mono(12)).foregroundStyle(Color.textMuted)
             if let failure = core.failures[s.id] {
                 Text(failure).font(.secondary).foregroundStyle(Tone.critical.text)
             }
@@ -78,125 +104,6 @@ struct ServerDetailView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 16)
         .background(Color.header)
-    }
-}
-
-/// `system.info` and `agent.health`, fetched on appear and on refresh.
-/// Every string here came from the server (untrusted, display only).
-private struct OverviewTab: View {
-    @Environment(CoreBridge.self) private var core
-    let server: ServerRow
-    @State private var info: SystemInfoRow?
-    @State private var health: AgentHealthRow?
-    @State private var error: String?
-    @State private var loading = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack {
-                Text("Resources").font(.system(size: 15, weight: .semibold))
-                Spacer()
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await load() } }
-                    .disabled(loading)
-            }
-            if let error {
-                Text(error).font(.base).foregroundStyle(Tone.warn.text)
-            }
-            HStack(alignment: .top, spacing: 16) {
-                section("System") {
-                    if let info {
-                        row("Hostname", info.hostname)
-                        row("OS", "\(info.osId) \(info.osVersion)")
-                        row("Kernel", info.kernel, mono: true)
-                        row("Architecture", info.arch)
-                        row("CPUs", "\(info.cpuCount)")
-                        row("Memory", Format.bytes(info.memTotalBytes))
-                        row("Uptime", Format.uptime(info.uptimeS))
-                    } else {
-                        placeholder
-                    }
-                }
-                section("Agent") {
-                    if let health {
-                        row("Version", health.agentVersion, mono: true)
-                        row("Protocol", "v\(health.protoVersion)")
-                        row("Uptime", Format.uptime(health.uptimeS))
-                        row("Gate memory", Format.bytes(health.gateRssBytes))
-                        row("Exec memory", Format.bytes(health.execRssBytes))
-                        row("Audit seq", "\(health.auditSeq)")
-                        row("Roster", "epoch \(health.rosterEpoch) · v\(health.rosterVersion)")
-                        row("Policy", "v\(health.policyVersion)")
-                        if health.recoveryPending {
-                            StatusPill(label: "Recovery pending", tone: .critical)
-                        }
-                    } else {
-                        placeholder
-                    }
-                }
-            }
-            HStack(alignment: .top, spacing: 16) {
-                section("Top processes") { Text("Arrives with telemetry streams.").foregroundStyle(Color.textMuted) }
-                section("Timeline") { Text("Arrives with the event history.").foregroundStyle(Color.textMuted) }
-            }
-        }
-        .task(id: server.id) { await load() }
-    }
-
-    private var placeholder: some View {
-        Text(loading ? "Loading…" : "No data").foregroundStyle(Color.textMuted)
-    }
-
-    private func load() async {
-        loading = true
-        defer { loading = false }
-        error = nil
-        // agent.health works on monitor sessions; system.info needs unlock.
-        do {
-            health = try await core.agentHealth(server.id)
-        } catch {
-            self.error = Self.describe(error)
-        }
-        do {
-            info = try await core.systemInfo(server.id)
-        } catch {
-            self.error = Self.describe(error)
-        }
-    }
-
-    static func describe(_ error: Error) -> String {
-        guard let e = error as? FleetError else { return "Request failed." }
-        switch e {
-        case .NotStarted, .NotEnrolled: return "Not connected: this Mac is not enrolled."
-        case .NotReady(let state): return "Not connected (\(state.label))."
-        case .Locked: return "Unlock to load system details."
-        case .Timeout: return "The server did not answer in time."
-        case .Agent(let code): return "The agent refused the request (\(code))."
-        case .UnknownServer: return "Server not managed yet (agent keys not pinned)."
-        default: return "Request failed."
-        }
-    }
-
-    private func section(_ title: String, @ViewBuilder _ content: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(Color.text)
-            content()
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .card()
-    }
-
-    private func row(_ label: String, _ value: String, mono: Bool = false) -> some View {
-        HStack {
-            Text(label).foregroundStyle(Color.textSecondary)
-            Spacer()
-            Text(value)
-                .font(mono ? .mono(12) : .base)
-                .foregroundStyle(Color.text)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-        }
-        .font(.base)
     }
 }
 
