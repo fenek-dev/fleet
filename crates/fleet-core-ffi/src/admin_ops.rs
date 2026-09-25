@@ -96,8 +96,10 @@ impl FleetCore {
                         &id,
                         op,
                         Actor::Human,
-                        approval,
-                        RequestOpts { expected_version },
+                        RequestOpts {
+                            approval,
+                            expected_version,
+                        },
                     )
                     .await
                     .map_err(FleetError::from)
@@ -505,7 +507,9 @@ impl FleetCore {
                 match autorevert::confirm_fresh(&handle, &id, cid, Actor::Human, budget).await {
                     Ok(()) => ConfirmOutcome::Confirmed,
                     Err(ConfirmError::Reverted) => ConfirmOutcome::Reverted,
-                    Err(ConfirmError::NoConnection) => ConfirmOutcome::NoConnection,
+                    Err(ConfirmError::NoConnection | ConfirmError::Reconnect(_)) => {
+                        ConfirmOutcome::NoConnection
+                    }
                     Err(ConfirmError::Agent(c)) => ConfirmOutcome::Failed {
                         message: format!("{c:?}"),
                     },

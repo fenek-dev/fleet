@@ -32,8 +32,8 @@
 //! Sync` and can be used from anywhere.
 
 use crate::session::{
-    ClientError, CommandSigner, PendingReply, Reply, Session, SessionConfig, SessionMode,
-    StreamEvent,
+    ClientError, CommandOpts, CommandSigner, PendingReply, Reply, Session, SessionConfig,
+    SessionMode, StreamEvent,
 };
 use crate::signer::{DeviceSigner, KeyRole, RoleSigner, SignerError};
 use crate::ssh::{
@@ -313,17 +313,17 @@ pub trait AgentLink {
         actor: Actor,
         approval: Option<RootApproval>,
     ) -> impl Future<Output = Result<PendingReply, ClientError>>;
-    /// [`AgentLink::start_request`] with [`RequestOpts`]. The default
-    /// refuses an `expected_version` it can't put in the envelope.
+    /// [`AgentLink::start_request`] with `expected_version` in the envelope.
+    /// Links that can't carry it refuse (`Unsupported`) rather than drop it.
     fn start_request_with(
         &mut self,
         op: Op,
         actor: Actor,
         approval: Option<RootApproval>,
-        opts: RequestOpts,
+        expected_version: Option<u64>,
     ) -> impl Future<Output = Result<PendingReply, ClientError>> {
         async move {
-            if opts.expected_version.is_some() {
+            if expected_version.is_some() {
                 return Err(ClientError::Rejected(ErrorCode::Unsupported));
             }
             self.start_request(op, actor, approval).await
@@ -366,11 +366,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentLink for Session<'_, S> {
         op: Op,
         actor: Actor,
         approval: Option<RootApproval>,
-        opts: RequestOpts,
+        expected_version: Option<u64>,
     ) -> Result<PendingReply, ClientError> {
-        let opts = crate::session::CommandOpts {
-            expected_version: opts.expected_version,
-            ..Default::default()
+        let opts = CommandOpts {
+            expected_version,
+            ..CommandOpts::default()
         };
         Session::start_request_with(self, op, actor, approval, &opts).await
     }
@@ -413,19 +413,12 @@ pub trait Connector: 'static {
     ) -> impl Future<Output = Result<ServeEnd, LinkError>>;
 }
 
-/// Per-request envelope options for [`ManagerHandle::request_with`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RequestOpts {
-    /// For ops that replace versioned state (`Op::requires_expected_version`).
-    pub expected_version: Option<u64>,
-}
-
 enum Work {
     Request {
         op: Op,
         actor: Actor,
         approval: Option<RootApproval>,
-        opts: RequestOpts,
+        expected_version: Option<u64>,
         reply: oneshot::Sender<Result<Reply, RequestError>>,
     },
     OpenStream {
@@ -602,7 +595,7 @@ impl LinkCtx<'_> {
                 work = w.requests.recv(), if room => {
                     let Some(work) = work else { return Ok(ServeEnd::Stopped) };
                     let res = match work {
-                        Work::Request { op, actor, approval, opts, reply } => {
+                        Work::Request { op, actor, approval, expected_version, reply } => {
                             // The caller gave up (timeout): don't run it late.
                             if reply.is_closed() {
                                 continue;
@@ -611,11 +604,9 @@ impl LinkCtx<'_> {
                                 let _ = reply.send(Err(RequestError::Locked));
                                 continue;
                             }
-                            let res = if opts == RequestOpts::default() {
-                                link.start_request(op, actor, approval).await
-                            } else {
-                                link.start_request_with(op, actor, approval, opts).await
-                            };
+                            let res = link
+                                .start_request_with(op, actor, approval, expected_version)
+                                .await;
                             w.emit_events(link.take_events());
                             match res {
                                 Ok(rx) => {
@@ -842,6 +833,16 @@ struct Shared {
     transports: Transports,
 }
 
+/// Envelope options for [`ManagerHandle::request_with`].
+#[derive(Debug, Clone, Default)]
+pub struct RequestOpts {
+    /// Root approval for Elevated (or escalated) ops.
+    pub approval: Option<RootApproval>,
+    /// `CommandBody::expected_version` (required by
+    /// `Op::requires_expected_version`).
+    pub expected_version: Option<u64>,
+}
+
 /// Thread-safe front of the manager. Cheap to clone.
 #[derive(Clone)]
 pub struct ManagerHandle {
@@ -990,19 +991,26 @@ impl ManagerHandle {
         actor: Actor,
         approval: Option<RootApproval>,
     ) -> Result<Reply, RequestError> {
-        self.request_with(id, op, actor, approval, RequestOpts::default())
-            .await
+        let opts = RequestOpts {
+            approval,
+            expected_version: None,
+        };
+        self.request_with(id, op, actor, opts).await
     }
 
-    /// [`ManagerHandle::request`] with envelope options (`expected_version`).
+    /// [`ManagerHandle::request`] with envelope options: a root approval
+    /// and/or `expected_version` (version-checked ops, design §2.6).
     pub async fn request_with(
         &self,
         id: &ServerId,
         op: Op,
         actor: Actor,
-        approval: Option<RootApproval>,
         opts: RequestOpts,
     ) -> Result<Reply, RequestError> {
+        let RequestOpts {
+            approval,
+            expected_version,
+        } = opts;
         let tx = self
             .slots()
             .get(id)
@@ -1014,7 +1022,7 @@ impl ManagerHandle {
             op,
             actor,
             approval,
-            opts,
+            expected_version,
             reply,
         };
         let fut = async {

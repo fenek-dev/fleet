@@ -4,18 +4,21 @@
 //! change stays only if `change.confirm` arrives over a session opened
 //! after the apply finished. [`confirm_fresh`] proves that: it drops the
 //! server's managed connection ([`ManagerHandle::reconnect`] opens a new
-//! SSH connection and Noise session, never a kept one), waits for Ready
-//! and sends the confirm there. Requests queued after `reconnect` are
-//! served by the new session (the worker handles the reconnect first).
+//! SSH connection and Noise session, never a kept one), waits for the new
+//! one to be Ready ([`reconnect_fresh`]) and sends the confirm there.
+//! Requests queued after `reconnect` are served by the new session (the
+//! worker handles the reconnect first). This is the one implementation;
+//! [`crate::confirm`] wraps it for bulk/provisioning/MCP callers.
 //!
 //! Exec answers `Busy` while the change is still applying (retried),
 //! `PolicyDenied` for a session that isn't new enough (one more
 //! reconnect), `NotFound` once the timer reverted it.
 
-use crate::manager::{ManagerHandle, RequestError, RequestOpts};
+use crate::manager::{ConnState, ManagerEvent, ManagerHandle, RequestError, RequestOpts};
 use fleet_proto::op::ChangeId;
 use fleet_proto::{Actor, ErrorCode, Op, Payload, ServerId};
 use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
 
 /// Why a change could not be confirmed.
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +29,10 @@ pub enum ConfirmError {
     /// No fresh session came up before the deadline; the timer will revert.
     #[error("no fresh connection before the deadline")]
     NoConnection,
+    /// The new login failed fatally (host key, SSH key refused): the
+    /// change will revert.
+    #[error("a new connection could not be made: {0}")]
+    Reconnect(String),
     #[error("agent refused: {0:?}")]
     Agent(ErrorCode),
     #[error(transparent)]
@@ -59,18 +66,18 @@ pub async fn confirm_fresh(
                 return Err(ConfirmError::NoConnection);
             }
             reconnects += 1;
-            handle.reconnect(id);
             need_new = false;
-            // Let the worker tear the old session down before waiting.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            handle.wait_ready(id, left).await;
+            match reconnect_fresh(handle, id, left).await {
+                Ok(()) => {}
+                Err(ReconnectError::Timeout) => return Err(ConfirmError::NoConnection),
+                Err(ReconnectError::Fatal(m)) => return Err(ConfirmError::Reconnect(m)),
+            }
         }
         let res = handle
             .request_with(
                 id,
                 Op::ChangeConfirm { change_id },
                 actor.clone(),
-                None,
                 RequestOpts::default(),
             )
             .await;
@@ -79,6 +86,70 @@ pub async fn confirm_fresh(
             Step::Fail(e) => return Err(e),
             Step::Retry => tokio::time::sleep(RETRY).await,
             Step::Reconnect => need_new = true,
+        }
+    }
+}
+
+/// Why [`reconnect_fresh`] gave up.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReconnectError {
+    #[error("timed out waiting for a new connection")]
+    Timeout,
+    /// Fatal connect failure (host key, SSH key refused), or the manager
+    /// stopped.
+    #[error("a new connection could not be made: {0}")]
+    Fatal(String),
+}
+
+/// Drops `id`'s connection and waits until a new one is Ready (a Ready
+/// seen only after the state left Ready). Fails early when the reconnect
+/// hits a fatal failure.
+pub async fn reconnect_fresh(
+    h: &ManagerHandle,
+    id: &ServerId,
+    timeout: Duration,
+) -> Result<(), ReconnectError> {
+    let mut events = h.subscribe();
+    h.reconnect(id);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut left_ready = false;
+    loop {
+        let ev = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .map_err(|_| ReconnectError::Timeout)?;
+        match ev {
+            Ok(ManagerEvent::State {
+                server,
+                state,
+                failure,
+                ..
+            }) if &server == id => {
+                if state == ConnState::Ready {
+                    if left_ready {
+                        return Ok(());
+                    }
+                } else {
+                    left_ready = true;
+                    if let Some(f) = failure
+                        && f.fatal
+                    {
+                        return Err(ReconnectError::Fatal(f.message));
+                    }
+                }
+            }
+            Ok(_) => {}
+            // Missed events: fall back to the state itself (a Ready seen
+            // after a lag may be the old link only if nothing happened,
+            // which the reconnect rules out).
+            Err(RecvError::Lagged(_)) => {
+                left_ready = true;
+                if h.state(id) == Some(ConnState::Ready) {
+                    return Ok(());
+                }
+            }
+            Err(RecvError::Closed) => {
+                return Err(ReconnectError::Fatal("manager stopped".into()));
+            }
         }
     }
 }

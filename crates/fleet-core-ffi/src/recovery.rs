@@ -337,8 +337,27 @@ impl RecoverySession {
 
     /// Restores synced records: roster copies first (verified from
     /// genesis; the latest must hold this code's recovery key), then
-    /// servers, pins and the rest.
-    pub fn restore(&self, records: Vec<CloudRecordRow>) -> Result<RestoreRow, FleetError> {
+    /// servers, pins and the rest. Without roster copies the roster comes
+    /// from the servers the records name (`roster.get` over recovery
+    /// sessions, `recovery_flow::roster_from_servers`).
+    pub async fn restore(
+        self: Arc<Self>,
+        records: Vec<CloudRecordRow>,
+    ) -> Result<RestoreRow, FleetError> {
+        blocking("fleet-recovery-restore", move || {
+            self.restore_blocking(records)
+        })
+        .await
+    }
+
+    /// Abandons recovery; the derived keys are wiped.
+    pub fn cancel(&self) {
+        lock(&self.st).keys.take();
+    }
+}
+
+impl RecoverySession {
+    fn restore_blocking(&self, records: Vec<CloudRecordRow>) -> Result<RestoreRow, FleetError> {
         let records: Vec<CloudRecord> = records.into_iter().map(Into::into).collect();
         let mut st = lock(&self.st);
         let key_bytes = st
@@ -355,7 +374,27 @@ impl RecoverySession {
         let fleet_id = st
             .fleet_id
             .ok_or_else(|| rec_err("open the escrow first"))?;
-        let chain = chain_from(&key, &records, fleet_id)?;
+        let chain = match chain_from(&key, &records, fleet_id) {
+            Ok(c) if !c.is_empty() => c,
+            // No roster copy synced: the servers hold it.
+            _ => {
+                let specs = rf::specs_from_records(&key, &records);
+                if specs.is_empty() {
+                    return Err(rec_err(
+                        "no roster copies and no servers with pinned keys in iCloud",
+                    ));
+                }
+                let keys = st
+                    .keys
+                    .as_ref()
+                    .ok_or_else(|| rec_err("session finished"))?;
+                let r = roster_via_servers(&self.core, keys, st.me, fleet_id, &specs)?;
+                if r.roster.fleet_id != fleet_id {
+                    return Err(rec_err("the servers' roster belongs to another fleet"));
+                }
+                vec![r]
+            }
+        };
         let latest = chain.last().ok_or_else(|| rec_err("no roster copies"))?;
         let r = &latest.roster;
         let ours = r.recovery_key == recovery.recovery_key
@@ -395,7 +434,10 @@ impl RecoverySession {
                 .collect(),
         })
     }
+}
 
+#[uniffi::export]
+impl RecoverySession {
     /// Creates this Mac's roster entry (its new enclave keys), a new
     /// recovery code, the epoch + 1 recovery roster, submits it to every
     /// restored server over the recovery SSH key, then enrolls this Mac,
@@ -422,11 +464,37 @@ impl RecoverySession {
         })
         .await
     }
+}
 
-    /// Abandons recovery; the derived keys are wiped.
-    pub fn cancel(&self) {
-        lock(&self.st).keys.take();
-    }
+/// `roster.get` from `specs` over recovery sessions (their own runtime,
+/// like `run_recovery`: sessions aren't `Send`).
+fn roster_via_servers(
+    core: &Arc<FleetCore>,
+    keys: &RecoveryKeys,
+    me: DeviceId,
+    fleet_id: FleetId,
+    specs: &[ServerSpec],
+) -> Result<SignedRoster, FleetError> {
+    let noise = core.noise_key()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(rec_err)?;
+    let transport = SshRecovery {
+        keys,
+        noise: &noise,
+        fleet_id,
+        device_id: me,
+        ssh: SshOptions::default(),
+        timeout: SERVER_TIMEOUT,
+    };
+    let local = tokio::task::LocalSet::new();
+    local
+        .block_on(
+            &rt,
+            rf::roster_from_servers(&transport, specs, &keys.publics()),
+        )
+        .map_err(rec_err)
 }
 
 /// Roster copies from the records, verified as a chain from genesis.

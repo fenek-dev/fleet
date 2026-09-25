@@ -12,6 +12,7 @@ members = [
     "crates/fleetctl-proto",
     "crates/fleetctl",
     "crates/fleet-debver",
+    "crates/fleet-cloudinit",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ fleet-ops = { path = "crates/fleet-ops" }
 fleetctl-proto = { path = "crates/fleetctl-proto" }
 fleet-debver = { path = "crates/fleet-debver" }
 fleet-hardening = { path = "crates/fleet-hardening" }
+fleet-cloudinit = { path = "crates/fleet-cloudinit" }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -56,6 +58,9 @@ ed25519-dalek = { version = "3.0.0", features = ["rand_core", "zeroize"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 snow = "0.10.0"
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+# SHA-512 crypt (`$6$`) of per-server sudo passwords, computed on the Mac
+# (design §5.9, §9.2); yescrypt has no mature pure-Rust implementation.
+sha-crypt = "0.6.0"
 hkdf = "0.13.0"
 sha2 = "0.11.0"
 zeroize = { version = "1.9.0", features = ["derive"] }

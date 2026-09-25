@@ -31,6 +31,7 @@ fn pkg(name: &str, version: &str, source: Option<&str>) -> Installed {
         name: name.into(),
         version: version.into(),
         source: source.map(Into::into),
+        source_version: None,
     }
 }
 
@@ -282,6 +283,22 @@ fn match_debian() {
     .unwrap();
     assert!(r.findings.is_empty());
     assert_eq!(r.highest, None);
+    // A separately versioned binary: the source version is compared (the
+    // tracker's fixed versions are source versions).
+    let mut bin = pkg("libcurl4", "1.0-1", Some("curl"));
+    bin.source_version = Some("7.88.1-10+deb12u4".into());
+    let r = match_packages(&target, &[bin.clone()], |p| {
+        db.lookup(Distro::Debian, "bookworm", p)
+    })
+    .unwrap();
+    assert!(r.findings.is_empty());
+    bin.source_version = Some("7.88.1-10+deb12u3".into());
+    let r = match_packages(&target, &[bin], |p| {
+        db.lookup(Distro::Debian, "bookworm", p)
+    })
+    .unwrap();
+    assert_eq!(r.findings.len(), 1);
+    assert_eq!(r.findings[0].package, "libcurl4");
 }
 
 #[test]

@@ -24,11 +24,12 @@
 //! list are never returned. Every command carries `Actor::Ai`.
 
 use crate::bulk::{
-    self, AgentHealthProbe, Approver, BulkExecutor, BulkOptions, BulkRequest, CancelToken, Failure,
-    Outcome, Output, Plan, SkipReason, StopReason,
+    self, AgentHealthProbe, Approver, BoxFut, BulkExecutor, BulkOptions, BulkRequest, CancelToken,
+    Failure, Outcome, Output, Plan, SkipReason, StopReason,
 };
 use crate::cache::McpClientRecord;
 use crate::opspec;
+use fleet_proto::ChangeId;
 use fleet_proto::args::{
     AbsPath, GrepPattern, JournalQuery, Priority, SearchQuery, SearchTerm, TimeRange,
 };
@@ -130,6 +131,33 @@ pub trait McpBackend: Send + Sync {
     fn servers(&self) -> Vec<ServerSummary>;
     fn paired(&self, key: &str) -> bool;
     fn save_pairing(&self, rec: McpClientRecord) -> Result<(), ProtoError>;
+    /// The `[actors]` AI limits of the policy this Mac last pushed to
+    /// `server` (there is no policy read op; the Mac's copy is what the
+    /// agent enforces). `None`: use [`McpConfig`]'s defaults.
+    fn ai_limits(&self, _server: &ServerId) -> Option<AiLimits> {
+        None
+    }
+    /// `change.confirm` of an auto-revert change over a fresh connection
+    /// (`crate::confirm`). Without it the change reverts on its own.
+    fn confirm_change(&self, _server: ServerId, _change: ChangeId) -> BoxFut<Result<(), String>> {
+        Box::pin(async { Err("confirmation not available".to_string()) })
+    }
+}
+
+/// AI limits from a policy's `[actors]` (design §5.4, §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiLimits {
+    pub commands_per_minute: u32,
+    pub bulk_confirm_above: usize,
+}
+
+impl AiLimits {
+    pub fn from_policy(p: &fleet_proto::Policy) -> Self {
+        Self {
+            commands_per_minute: p.actors.ai_commands_per_minute,
+            bulk_confirm_above: p.actors.ai_bulk_confirm_above as usize,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -302,8 +330,30 @@ impl McpHost {
         Ok(matches!(answer, Ok(Ok(true))))
     }
 
+    /// The strictest `ai_commands_per_minute` of the pushed policies (the
+    /// bucket is per client, calls can target any server).
+    fn per_minute(&self) -> u32 {
+        self.backend
+            .servers()
+            .iter()
+            .filter_map(|s| self.backend.ai_limits(&s.id))
+            .map(|l| l.commands_per_minute)
+            .min()
+            .unwrap_or(self.cfg.per_minute)
+    }
+
+    /// The strictest `ai_bulk_confirm_above` among `servers`' policies.
+    fn bulk_confirm_above(&self, servers: &[ServerId]) -> usize {
+        servers
+            .iter()
+            .filter_map(|s| self.backend.ai_limits(s))
+            .map(|l| l.bulk_confirm_above)
+            .min()
+            .unwrap_or(self.cfg.bulk_confirm_above)
+    }
+
     fn take_token(&self, key: &str) -> Result<(), ProtoError> {
-        let cap = f64::from(self.cfg.per_minute.max(1));
+        let cap = f64::from(self.per_minute().max(1));
         let rate = cap / 60.0;
         let mut m = lock(&self.limiter);
         let now = Instant::now();
@@ -532,11 +582,39 @@ impl McpHost {
         stop_on_failure: bool,
         concurrency: Option<u16>,
     ) -> Result<ToolOutput, ProtoError> {
+        self.change_with(
+            client,
+            tool,
+            actor,
+            servers,
+            op,
+            stop_on_failure,
+            concurrency,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    /// [`Self::change`] with the `expected_version`s the AI saw (servers
+    /// not listed read theirs before dispatch, `crate::versions`). Changes
+    /// answered with `ChangePending` are confirmed over a fresh connection.
+    #[allow(clippy::too_many_arguments)]
+    async fn change_with(
+        &self,
+        client: &str,
+        tool: &str,
+        actor: Actor,
+        servers: Vec<ServerId>,
+        op: Op,
+        stop_on_failure: bool,
+        concurrency: Option<u16>,
+        versions: HashMap<ServerId, u64>,
+    ) -> Result<ToolOutput, ProtoError> {
         op.check_args().map_err(|_| invalid("arguments"))?;
         let exec = self.backend.executor()?;
         let elevated = opspec::needs_approval(&op);
         let is_change = op.tier() != Tier::Read;
-        if elevated || (is_change && servers.len() > self.cfg.bulk_confirm_above) {
+        if elevated || (is_change && servers.len() > self.bulk_confirm_above(&servers)) {
             let (details, _) =
                 untrusted::truncate(&untrusted::escape_controls(&format!("{op:?}")), 2000);
             let ok = self
@@ -573,12 +651,15 @@ impl McpHost {
             dry_run: false,
         };
         let name = op.name();
-        let approver = if elevated {
+        // Also for may-escalate ops: exec's `ApprovalRequired` is answered
+        // with the root key (Touch ID) and one retry (`crate::escalate`).
+        let approver = if elevated || op.may_escalate() {
             self.backend.approver()
         } else {
             None
         };
-        let req = BulkRequest::uniform(servers, op, actor, options);
+        let mut req = BulkRequest::uniform(servers, op, actor, options);
+        req.expected_versions = versions;
         let report = bulk::run(exec, approver, req, CancelToken::new(), |_| {})
             .await
             .map_err(|e| invalid(&e.to_string()))?;
@@ -588,11 +669,26 @@ impl McpHost {
             let status = match outcome {
                 Outcome::Succeeded(out) => {
                     if let Output::Payload(p) = out
-                        && let Some(item) = payload_item(server, name, p)
+                        && let Some(item) = payload_item(server, name, p.result())
                     {
                         items.push(item);
                     }
-                    "succeeded".to_string()
+                    match out {
+                        Output::Payload(Payload::ChangePending { change, .. }) => {
+                            match self
+                                .backend
+                                .confirm_change(server.clone(), change.change_id)
+                                .await
+                            {
+                                Ok(()) => "succeeded (confirmed from a new connection)".into(),
+                                Err(e) => format!(
+                                    "applied, not confirmed ({}); reverts automatically",
+                                    untrusted::escape_controls(&e)
+                                ),
+                            }
+                        }
+                        _ => "succeeded".to_string(),
+                    }
                 }
                 Outcome::Failed(f) => format!("failed: {}", failure_code(f)),
                 Outcome::Skipped(r) => format!(
@@ -779,17 +875,16 @@ impl McpHost {
                     .await
             }
             Call::FirewallApply(a) => {
-                self.server(&a.server)?;
+                let server = self.server(&a.server)?;
                 let rules: fleet_proto::args::FirewallRuleSet =
                     serde_json::from_value(a.ruleset).map_err(|_| invalid("ruleset"))?;
-                Op::FirewallApply(rules)
-                    .check_args()
-                    .map_err(|_| invalid("ruleset"))?;
-                // Needs `expected_version` in the envelope, which the
-                // connection manager doesn't carry yet.
-                Err(ProtoError::Unsupported {
-                    what: "firewall_apply (version-checked commands not wired yet)".into(),
-                })
+                let op = Op::FirewallApply(rules);
+                op.check_args().map_err(|_| invalid("ruleset"))?;
+                // The version the AI read with `firewall_get`: a concurrent
+                // edit answers VersionConflict instead of being overwritten.
+                let versions = HashMap::from([(server.clone(), a.expected_version)]);
+                self.change_with(client, tool, actor, vec![server], op, true, None, versions)
+                    .await
             }
             Call::PackagesUpgrade(a) => {
                 let servers = self.servers_arg(&a.servers)?;

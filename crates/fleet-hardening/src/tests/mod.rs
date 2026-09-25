@@ -1,7 +1,7 @@
 //! Unit tests: modules against temp roots with a `FakeRunner` (exact
-//! argv), idempotence, profiles, plan hash, revert, cloud-init.
+//! argv), idempotence, profiles, plan hash, revert. cloud-init's tests
+//! live with it in `fleet-cloudinit`.
 
-mod cloudinit;
 mod engine;
 mod modules;
 mod profile;

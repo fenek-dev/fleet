@@ -237,8 +237,10 @@ impl Runner<'_> {
                 id,
                 op,
                 self.actor.clone(),
-                None,
-                RequestOpts { expected_version },
+                RequestOpts {
+                    approval: None,
+                    expected_version,
+                },
             )
             .await
             .map_err(|e: RequestError| step_err(id, step, e))?;
@@ -265,8 +267,8 @@ impl Runner<'_> {
                 id,
                 op.clone(),
                 self.actor.clone(),
-                None,
                 RequestOpts {
+                    approval: None,
                     expected_version: version
                         .or(Some(0))
                         .filter(|_| op.requires_expected_version()),

@@ -14,6 +14,9 @@ struct Backend {
     running: AtomicBool,
     paired: Mutex<HashSet<String>>,
     n: usize,
+    /// Pushed-policy AI limits (every server).
+    limits: Mutex<Option<AiLimits>>,
+    confirmed: Mutex<Vec<(ServerId, ChangeId)>>,
 }
 
 impl McpBackend for Backend {
@@ -51,6 +54,13 @@ impl McpBackend for Backend {
         lock(&self.paired).insert(rec.key);
         Ok(())
     }
+    fn ai_limits(&self, _server: &ServerId) -> Option<AiLimits> {
+        *lock(&self.limits)
+    }
+    fn confirm_change(&self, server: ServerId, change: ChangeId) -> BoxFut<Result<(), String>> {
+        lock(&self.confirmed).push((server, change));
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Answers prompts with `answer` (None: never answers).
@@ -84,6 +94,8 @@ fn harness(n: usize, cfg: McpConfig) -> Harness {
         running: AtomicBool::new(true),
         paired: Mutex::new(HashSet::new()),
         n,
+        limits: Mutex::new(None),
+        confirmed: Mutex::new(Vec::new()),
     });
     let host = McpHost::new(backend.clone(), cfg);
     let (tx, mut rx) = mpsc::unbounded_channel::<Prompt>();
@@ -491,7 +503,7 @@ async fn version_and_malformed_frames() {
     let out = h.host.handle_frame(&mut s, b"{not json").await;
     let resp: Response = decode_body(&out[4..]).unwrap();
     assert!(matches!(resp.body, Err(ProtoError::InvalidArgument { .. })));
-    // Firewall apply: validated, then refused until versions are wired.
+    // Firewall apply: an invalid ruleset is refused before anything runs.
     let mut s = paired_session(&h).await;
     let r = send(
         &h,
@@ -503,6 +515,91 @@ async fn version_and_malformed_frames() {
     )
     .await;
     assert!(matches!(r, Err(ProtoError::InvalidArgument { .. })));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn firewall_apply_carries_the_ai_version_and_is_confirmed() {
+    use fleet_proto::args::{FirewallMode, FirewallRuleSet};
+    use fleet_proto::payload::{ChangeKind, PendingChange};
+    let h = harness(1, McpConfig::default());
+    h.backend.exec.replies.lock().unwrap().insert(
+        "firewall.apply",
+        Payload::ChangePending {
+            change: PendingChange {
+                change_id: [3; 16],
+                kind: ChangeKind::Firewall,
+                op_tag: 401,
+                created_ms: 1,
+                deadline_ms: 2,
+                new_version: Some(8),
+            },
+            inner: None,
+        },
+    );
+    let mut s = paired_session(&h).await;
+    let ruleset = serde_json::to_value(FirewallRuleSet {
+        mode: FirewallMode::BansOnly,
+        rules: vec![],
+    })
+    .unwrap();
+    let r = send(
+        &h,
+        &mut s,
+        call(
+            "firewall_apply",
+            json!({"server": sid(0).to_string(), "ruleset": ruleset, "expected_version": 7}),
+        ),
+    )
+    .await;
+    let Ok(ResponseBody::Tool(out)) = r else {
+        panic!("{r:?}")
+    };
+    assert_eq!(out.summary["succeeded"], 1);
+    let status = out.summary["servers"][0]["status"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(status.contains("confirmed"), "{status}");
+    let sent = h.backend.exec.sent.lock().unwrap().clone();
+    assert_eq!(
+        sent,
+        vec![(sid(0), "firewall.apply".to_string(), Some(7), false)]
+    );
+    assert!(!h.backend.exec.calls().iter().any(|c| c.1 == "firewall.get"));
+    assert_eq!(*lock(&h.backend.confirmed), vec![(sid(0), [3; 16])]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pushed_policy_limits_apply() {
+    let h = harness(3, McpConfig::default());
+    *lock(&h.backend.limits) = Some(AiLimits {
+        commands_per_minute: 2,
+        bulk_confirm_above: 1,
+    });
+    let mut s = paired_session(&h).await;
+    let before = lock(&h.prompts).len();
+    // Two servers: above the policy's threshold of 1 (default 5).
+    let r = send(
+        &h,
+        &mut s,
+        call(
+            "service_action",
+            json!({"servers": [sid(0).to_string(), sid(1).to_string()], "unit": "nginx.service", "action": "reload"}),
+        ),
+    )
+    .await;
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(lock(&h.prompts).len(), before + 1);
+    // The policy's rate (2 per minute), not the default 60.
+    assert!(
+        send(&h, &mut s, call("fleet_list_servers", json!({})))
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        send(&h, &mut s, call("fleet_list_servers", json!({}))).await,
+        Err(ProtoError::RateLimited { .. })
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]

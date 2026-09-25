@@ -21,12 +21,16 @@
 //!    remaining Mac, `roster_mgmt::veto_command`).
 //! 6. The sync key is re-escrowed to the new code's escrow key.
 //!
-//! **Without iCloud** the server list is typed in by hand and host/agent
-//! keys would be trusted on first use. That path also needs the server's
-//! current roster (fleet id, epoch, a `prev_hash` of its epoch) to build a
-//! recovery roster, and recovery sessions can't read it today (only
-//! `Hello`, `system.info`, `roster.update`, `roster.pending` are allowed):
-//! [`RecoveryError::NeedsRosterCopy`]. See design §5.11 open item.
+//! **Without the synced roster chain** (no iCloud roster copies, or only
+//! the local cache's servers and pins): [`roster_from_servers`] reads the
+//! roster each server enforces with `roster.get` in a recovery session
+//! (allowed there, receipt-verified against the pinned agent key), keeps
+//! the newest one whose recovery key (current or rotated-out) is this
+//! code's and which lists its own hash in `epoch_hashes`, and the recovery
+//! roster chains to it (fleet id, epoch + 1, `prev_hash`). Servers are
+//! authoritative, so no copy is needed. Servers still need pinned host and
+//! agent keys: a receipt can't be checked against a key trusted on first
+//! use, so typing servers in by hand without their pins isn't supported.
 //!
 //! **Drill** ([`drill`]): on an enrolled Mac, derive from the code and
 //! check that the public keys equal the recovery keys the roster on each
@@ -43,6 +47,7 @@ use fleet_crypto::recovery::{KdfParams, RecoveryCode, RecoveryKeys, RecoveryPubl
 use fleet_crypto::roster::{
     RECOVERY_GRACE_MS, RecoveryClock, recovery_key_at, roster_hash, sign_recovery,
 };
+use fleet_proto::payload::RosterState;
 use fleet_proto::{
     Actor, Device, DeviceId, ErrorCode, FleetId, Hash32, KeyKind, Op, Payload, PrevRecovery,
     Roster, ServerId, SignedRoster, X25519Public,
@@ -56,7 +61,7 @@ pub enum RecoveryError {
     BadCode,
     #[error("crypto: {0}")]
     Crypto(#[from] fleet_crypto::Error),
-    #[error("no roster copy: recovery needs the fleet's roster chain (iCloud)")]
+    #[error("no roster: no synced copy and no server answered roster.get")]
     NeedsRosterCopy,
     #[error("the recovery code does not match this fleet's roster")]
     WrongCode,
@@ -158,6 +163,132 @@ pub trait RecoveryTransport {
         server: &ServerSpec,
         roster: &SignedRoster,
     ) -> impl Future<Output = Result<ServerRecovery, RecoveryError>>;
+
+    /// `roster.get` in a recovery session: the roster the agent enforces
+    /// and its epoch's hashes (receipt-verified against the pinned agent
+    /// key).
+    fn fetch_roster(
+        &self,
+        _server: &ServerSpec,
+    ) -> impl Future<Output = Result<RosterState, RecoveryError>> {
+        std::future::ready(Err(RecoveryError::NeedsRosterCopy))
+    }
+}
+
+/// Servers (address + pinned host and agent keys) from synced records,
+/// when no roster copy synced to verify their signatures against. Only the
+/// sync key (AEAD, opened from the escrow with the code) vouches for them:
+/// they are used to ask those servers for their roster ([`roster_from_servers`],
+/// whose answers are receipt-checked against these pins); once that
+/// roster is in the chain, the records are ingested and verified as usual.
+/// Newest record per server; servers without agent pins are skipped.
+pub fn specs_from_records(
+    key: &crate::sync::keys::SyncKey,
+    records: &[crate::sync::CloudRecord],
+) -> Vec<ServerSpec> {
+    use crate::sync::Collection;
+    use crate::sync::bridge::{PinsDoc, ServerDoc};
+    use std::collections::HashMap;
+    let mut newest: HashMap<(u8, String), crate::sync::SyncRecord> = HashMap::new();
+    for r in records {
+        let Ok(s) = key.open_record(r) else { continue };
+        let slot = match s.record.collection {
+            Collection::Servers => 0u8,
+            Collection::PinnedKeys => 1,
+            _ => continue,
+        };
+        let k = (slot, s.record.key.clone());
+        if newest.get(&k).is_none_or(|o| o.hlc < s.record.hlc) {
+            newest.insert(k, s.record);
+        }
+    }
+    let mut out = Vec::new();
+    for ((slot, id), rec) in &newest {
+        if *slot != 0 || rec.deleted {
+            continue;
+        }
+        let Ok(sid) = ServerId::new(id.clone()) else {
+            continue;
+        };
+        let Ok(doc) = fleet_proto::decode::<ServerDoc>(&rec.body) else {
+            continue;
+        };
+        let Ok(server) = doc.to_record(sid.clone()) else {
+            continue;
+        };
+        let Some(pins) = newest
+            .get(&(1, id.clone()))
+            .filter(|p| !p.deleted)
+            .and_then(|p| fleet_proto::decode::<PinsDoc>(&p.body).ok())
+            .and_then(|d| d.to_pins().ok())
+        else {
+            continue;
+        };
+        let (Some(agent_noise), Some(agent_signing)) = (pins.agent_noise, pins.agent_signing)
+        else {
+            continue;
+        };
+        out.push(ServerSpec {
+            id: sid,
+            target: server.target,
+            host_key: pins.host_key,
+            agent_noise,
+            agent_signing,
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// The newest roster the reachable `servers` hold that this code belongs
+/// to (current or rotated-out recovery key), for a recovery without the
+/// synced roster chain. The servers are authoritative (design §7.6); each
+/// answer comes over a session with pinned host and agent keys, and must
+/// list its own hash last in `epoch_hashes`. Rosters of another fleet or
+/// code are ignored; nothing matching is [`RecoveryError::WrongCode`].
+pub async fn roster_from_servers<T: RecoveryTransport>(
+    transport: &T,
+    servers: &[ServerSpec],
+    code: &RecoveryPublics,
+) -> Result<SignedRoster, RecoveryError> {
+    let mut best: Option<SignedRoster> = None;
+    let mut last_err = None;
+    let mut mismatched = false;
+    for s in servers {
+        let st = match transport.fetch_roster(s).await {
+            Ok(st) => st,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let r = &st.roster.roster;
+        let ours = r.recovery_key == code.recovery_key
+            || r.prev_recovery
+                .is_some_and(|p| p.recovery_key == code.recovery_key);
+        if !ours || st.epoch_hashes.last() != Some(&roster_hash(&st.roster)) {
+            mismatched = true;
+            continue;
+        }
+        if let Some(b) = &best
+            && b.roster.fleet_id != r.fleet_id
+        {
+            mismatched = true;
+            continue;
+        }
+        let newer = best
+            .as_ref()
+            .is_none_or(|b| (r.epoch, r.version) > (b.roster.epoch, b.roster.version));
+        if newer {
+            best = Some(st.roster);
+        }
+    }
+    match (best, mismatched, last_err) {
+        (Some(b), _, _) => Ok(b),
+        (None, true, _) => Err(RecoveryError::WrongCode),
+        (None, false, Some(e)) => Err(e),
+        (None, false, None) => Err(RecoveryError::NeedsRosterCopy),
+    }
 }
 
 /// Submits over SSH with the recovery SSH key and a recovery session.
@@ -177,6 +308,28 @@ impl RecoveryTransport for SshRecovery<'_> {
         server: &ServerSpec,
         roster: &SignedRoster,
     ) -> Result<ServerRecovery, RecoveryError> {
+        let op = Op::RosterUpdate {
+            roster: Box::new(roster.clone()),
+        };
+        outcome(self.request(server, op).await?)
+    }
+
+    async fn fetch_roster(&self, server: &ServerSpec) -> Result<RosterState, RecoveryError> {
+        match self.request(server, Op::RosterGet).await? {
+            Ok(Payload::RosterState(st)) => Ok(*st),
+            Ok(_) => Err(RecoveryError::Session(ClientError::Malformed)),
+            Err(code) => Err(RecoveryError::Refused(code)),
+        }
+    }
+}
+
+impl SshRecovery<'_> {
+    /// One op in a fresh recovery session (SSH with the recovery key).
+    async fn request(
+        &self,
+        server: &ServerSpec,
+        op: Op,
+    ) -> Result<Result<Payload, ErrorCode>, RecoveryError> {
         let (conn, obs) = SshConnection::connect_with(
             &server.target,
             &self.keys.ssh,
@@ -202,11 +355,8 @@ impl RecoveryTransport for SshRecovery<'_> {
                 signer: CommandSigner::Recovery(&self.keys.sign),
             };
             let mut s = Session::connect_bridged(stream, cfg).await?;
-            let op = Op::RosterUpdate {
-                roster: Box::new(roster.clone()),
-            };
             let reply = s.request(op, &server.id, Actor::Recovery, None).await?;
-            outcome(reply.result)
+            Ok(reply.result)
         };
         let res = tokio::time::timeout(self.timeout, run)
             .await
@@ -398,6 +548,19 @@ mod tests {
                 Err(e) => Err(RecoveryError::Refused(e.code())),
             }
         }
+
+        async fn fetch_roster(&self, server: &ServerSpec) -> Result<RosterState, RecoveryError> {
+            let cur = self
+                .rosters
+                .borrow()
+                .get(&server.id)
+                .cloned()
+                .ok_or(RecoveryError::Timeout)?;
+            Ok(RosterState {
+                epoch_hashes: vec![roster_hash(&cur)],
+                roster: cur,
+            })
+        }
     }
 
     fn spec(i: u8) -> ServerSpec {
@@ -583,6 +746,129 @@ mod tests {
     }
 
     const DEFAULT_DELAY: u32 = fleet_crypto::recovery::DEFAULT_DELAY_S;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_without_roster_copies_reads_the_servers() {
+        // The lost fleet synced servers and pins, but no roster copy.
+        let code = RecoveryCode::generate().unwrap();
+        let pass = "correct horse battery staple zebra";
+        let old = code.derive(pass, TINY).unwrap();
+        let a_keys = SoftwareDeviceSigner::generate().unwrap();
+        let a = DeviceId([1; 16]);
+        let fleet = FleetId([5; 16]);
+        let p = old.publics();
+        let g = sign_root(
+            Roster {
+                fleet_id: fleet,
+                epoch: 0,
+                version: 1,
+                prev_hash: [0; 32],
+                issued_at_ms: NOW,
+                devices: vec![device(a, &a_keys, X25519Public([1; 32]))],
+                recovery_key: p.recovery_key,
+                recovery_ssh_key: p.recovery_ssh_key,
+                recovery_escrow_key: p.recovery_escrow_key,
+                recovery_delay_s: delay_for(pass),
+                prev_recovery: None,
+            },
+            a,
+            &a_keys.root,
+        )
+        .unwrap();
+        let key = SyncKey::generate().unwrap();
+        let mut e = SyncEngine::new(
+            SyncStore::open_in_memory(&[0; 32]).unwrap(),
+            SyncKey::from_bytes(&key.to_bytes()).unwrap(),
+            a,
+        )
+        .unwrap();
+        for i in [1u8, 2] {
+            let s = spec(i);
+            let doc = ServerDoc {
+                name: format!("web-{i}"),
+                host: s.target.host.clone(),
+                port: 22,
+                user: "admin".into(),
+                jumps: vec![],
+                group: None,
+                tags: vec![],
+            };
+            e.put(
+                &a_keys.device,
+                Collection::Servers,
+                s.id.as_str(),
+                fleet_proto::encode(&doc),
+                NOW,
+            )
+            .unwrap();
+            let pins = PinsDoc {
+                host_key: None,
+                agent_noise: Some(s.agent_noise.0),
+                agent_signing: Some(s.agent_signing.0),
+            };
+            e.put(
+                &a_keys.device,
+                Collection::PinnedKeys,
+                s.id.as_str(),
+                fleet_proto::encode(&pins),
+                NOW,
+            )
+            .unwrap();
+        }
+        let cloud: Vec<CloudRecord> = e.outgoing().unwrap();
+        let servers = FakeServers {
+            rosters: RefCell::new([(spec(1).id, g.clone())].into_iter().collect()),
+        };
+
+        // Fresh Mac: the servers named by the records (sync key only)…
+        let typed = derive(&code.phrase(), pass, TINY).unwrap();
+        let restored = SyncKey::from_bytes(&key.to_bytes()).unwrap();
+        let specs = specs_from_records(&restored, &cloud);
+        assert_eq!(specs, vec![spec(1), spec(2)]);
+        // …answer roster.get (server 2 is unreachable here).
+        let latest = roster_from_servers(&servers, &specs, &typed.publics())
+            .await
+            .unwrap();
+        assert_eq!(latest, g);
+        // Another code's servers don't count as this fleet's.
+        let other = RecoveryCode::generate().unwrap().derive("", TINY).unwrap();
+        assert!(matches!(
+            roster_from_servers(&servers, &specs, &other.publics()).await,
+            Err(RecoveryError::WrongCode)
+        ));
+        // With that roster as the chain the records verify as usual.
+        let mut cache = Cache::open_in_memory().unwrap();
+        store_own(&cache, &latest).unwrap();
+        let chain = crate::roster_mgmt::chain(&cache).unwrap();
+        let mut engine = SyncEngine::new(
+            SyncStore::open_in_memory(&[1; 32]).unwrap(),
+            restored,
+            DeviceId([2; 16]),
+        )
+        .unwrap();
+        let rep = engine.apply_remote(&cloud, &chain, NOW).unwrap();
+        assert_eq!(rep.rejected, 0);
+        let mut applied = rep.applied.clone();
+        applied.sort_by_key(|r| r.collection);
+        for r in &applied {
+            apply_to_cache(&mut cache, r).unwrap();
+        }
+        assert_eq!(cache.servers().unwrap().len(), 2);
+        // And the recovery roster chains to it.
+        let b_keys = SoftwareDeviceSigner::generate().unwrap();
+        let next = NewCode::generate("", TINY).unwrap();
+        let rr = build_recovery_roster(
+            &latest,
+            device(DeviceId([2; 16]), &b_keys, X25519Public([2; 32])),
+            &typed,
+            &next.keys.publics(),
+            next.delay_s,
+            NOW + 1,
+        )
+        .unwrap();
+        let res = recover_all(&servers, &[spec(1)], &rr).await;
+        assert!(matches!(res[0].1, Ok(ServerRecovery::Installed)), "{res:?}");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn delayed_recovery_is_pending_and_drill_matches() {

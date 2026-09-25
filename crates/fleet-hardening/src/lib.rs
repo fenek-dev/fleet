@@ -17,13 +17,15 @@
 //! - [`revert`]: the auto-revert module for `ChangeKind::Profile`
 //!   (design §4.10): every file the profile's modules may write plus the
 //!   firewall table.
-//! - [`cloudinit`]: cloud-init export (design §9.7), pure.
+//! - [`cloudinit`]: cloud-init export (design §9.7), pure; the
+//!   `fleet-cloudinit` crate re-exported, so the Mac core can use it
+//!   without this crate's agent-side dependencies.
 //!
 //! No shell anywhere: every command is a fixed absolute path plus argv
 //! through `fleet_ops::CommandRunner`; files go through `fleet_ops::fswrite`.
 #![forbid(unsafe_code)]
 
-pub mod cloudinit;
+pub use fleet_cloudinit as cloudinit;
 pub mod engine;
 pub mod exec;
 pub mod facts;

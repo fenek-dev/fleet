@@ -15,8 +15,13 @@ use fleet_core::bulk::{
     self, AgentHealthProbe, Approver, BulkEvent, BulkExecutor, BulkOptions, BulkRequest,
     CancelToken, Outcome, Output, Plan, RootApprover, SkipReason, StopReason,
 };
+use fleet_core::confirm::ConfirmingExecutor;
 use fleet_core::enroll::{SETTING_DEVICE_ID, SETTING_FLEET_ID};
 use fleet_core::opspec;
+
+/// Reconnect + `change.confirm` of an auto-revert answer (default policy
+/// reverts after 60 s).
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(45);
 use fleet_core::runbook::{
     self, Runbook, RunbookEvent, RunbookParam, RunbookStep, Schedule, Snippet, StepCondition,
 };
@@ -661,14 +666,20 @@ impl FleetCore {
         let health = options.health_check;
         let mut opts = self::options(&options)?;
         let (handle, _) = self.running()?;
-        let exec: Arc<dyn BulkExecutor> = Arc::new(handle);
+        // Auto-revert answers are confirmed over a fresh connection.
+        let exec: Arc<dyn BulkExecutor> = Arc::new(ConfirmingExecutor {
+            handle,
+            timeout: CONFIRM_TIMEOUT,
+        });
         if health {
             opts.health = Some(Arc::new(AgentHealthProbe {
                 exec: exec.clone(),
                 actor: Actor::Human,
             }));
         }
-        let approver = if opspec::needs_approval(&op) && !opts.dry_run {
+        // May-escalate ops too: exec's `ApprovalRequired` gets one
+        // gathered Touch ID and a retry (`fleet_core::escalate`).
+        let approver = if (opspec::needs_approval(&op) || op.may_escalate()) && !opts.dry_run {
             Some(self.root_approver()?)
         } else {
             None
@@ -845,8 +856,14 @@ impl FleetCore {
             .map_err(|e| invalid(&e.to_string()))?;
         let ops = rb.ops(&values).map_err(|e| invalid(&e.to_string()))?;
         let (handle, _) = self.running()?;
-        let exec: Arc<dyn BulkExecutor> = Arc::new(handle);
-        let approver = if ops.iter().any(opspec::needs_approval) {
+        let exec: Arc<dyn BulkExecutor> = Arc::new(ConfirmingExecutor {
+            handle,
+            timeout: CONFIRM_TIMEOUT,
+        });
+        let approver = if ops
+            .iter()
+            .any(|op| opspec::needs_approval(op) || op.may_escalate())
+        {
             Some(self.root_approver()?)
         } else {
             None

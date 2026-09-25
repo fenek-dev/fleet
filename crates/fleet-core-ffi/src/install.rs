@@ -126,14 +126,19 @@ impl FleetCore {
             .await?;
 
             listener.on_progress(InstallProgress::step(InstallStep::Pinning));
-            lock(&core.cache).set_pins(
-                &id,
-                &PinnedKeys {
-                    host_key: Some(host_key),
-                    agent_noise: Some(installed.noise_static),
-                    agent_signing: Some(installed.signing_key),
-                },
-            )?;
+            {
+                let cache = lock(&core.cache);
+                cache.set_pins(
+                    &id,
+                    &PinnedKeys {
+                        host_key: Some(host_key),
+                        agent_noise: Some(installed.noise_static),
+                        agent_signing: Some(installed.signing_key),
+                    },
+                )?;
+                // The Mac's copy of what the agent enforces (MCP limits).
+                fleet_core::policy::remember_pushed(&cache, &id, &policy_toml)?;
+            }
             core.connect_pinned(&id)?;
             // Per-server sudo password (design §5.9): Keychain + sync.
             // Best effort: sync may not be set up yet.

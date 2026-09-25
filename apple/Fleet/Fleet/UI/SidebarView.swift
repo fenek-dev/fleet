@@ -60,7 +60,7 @@ struct SidebarView: View {
                     Label("Vulnerabilities", systemImage: "shield.lefthalf.filled")
                         .tag(NavItem.vulnerabilities)
                     Label("Snippets & Runbooks", systemImage: "list.bullet").tag(NavItem.runbooks)
-                    Label("Provision", systemImage: "plus.square").tag(NavItem.provision)
+                    Label("Provisioning", systemImage: "plus.square").tag(NavItem.provision)
                 }
                 Section("Groups") {
                     ForEach(core.groups, id: \.id) { g in

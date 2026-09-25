@@ -5,9 +5,16 @@
 //! password login. No bootstrap script: on the first SSH connection the
 //! Mac takes over and applies the full profile.
 //!
+//! The admin gets cloud-init's usual passwordless sudo
+//! (`/etc/sudoers.d/90-cloud-init-users`) so the Mac can install the agent
+//! (design §10.1 needs root or passwordless sudo); the profile's
+//! `sudo.policy` module removes that grant in phase 1 (Accounts), when
+//! the per-server sudo password is set.
+//!
 //! Pure. The YAML is built from a typed tree: keys are fixed identifiers
 //! and every value is emitted as a double-quoted scalar with full
 //! escaping, so no input can change the document's structure.
+#![forbid(unsafe_code)]
 
 use fleet_proto::args::{SshKeyAlgo, SshPublicKey, UserName};
 use std::fmt::Write as _;
@@ -212,6 +219,8 @@ pub fn document(c: &CloudInit) -> Result<Yaml, CloudInitError> {
     let user = Yaml::Map(vec![
         ("name", s(c.admin.as_str())),
         ("groups", s("sudo")),
+        // Until `sudo.policy` (phase 1) replaces it; see the module docs.
+        ("sudo", s("ALL=(ALL) NOPASSWD:ALL")),
         ("shell", s("/bin/bash")),
         ("lock_passwd", Yaml::Bool(true)),
         (
@@ -261,3 +270,6 @@ pub fn render(c: &CloudInit) -> Result<String, CloudInitError> {
     emit_block(&mut out, &doc, 0);
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests;

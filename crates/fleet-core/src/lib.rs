@@ -26,20 +26,27 @@
 //!   drill (§5.11); [`sudo`]: per-server sudo passwords (§5.9);
 //!   [`runner`]: the op-sending trait those flows share.
 //! - [`autorevert`]: confirming auto-revert changes from a fresh connection
-//!   (§4.10); [`mesh_orch`]: fleet-level WireGuard mesh (§2.5);
+//!   (§4.10), wrapped by [`confirm`] for bulk/provisioning/MCP;
+//!   [`mesh_orch`]: fleet-level WireGuard mesh (§2.5);
 //!   [`compose_check`]: the agent's pure Compose validator, compiled here
 //!   too so the Mac knows before signing whether a deploy needs Touch ID.
+//! - [`versions`]: `expected_version` reads for version-checked ops;
+//!   [`escalate`]: root approval on `ApprovalRequired` for may-escalate
+//!   ops; [`provision`]: the provisioning wizard's orchestration (§9.1).
 #![forbid(unsafe_code)]
 
 pub mod autorevert;
 pub mod bulk;
 pub mod cache;
 pub mod catchup;
+pub mod cloudinit_export;
 /// `fleet_ops::compose` (pure: `fleet-proto` + `yaml-rust2`), shared by
 /// path so the Mac core doesn't pull in the agent's system dependencies.
 #[path = "../../fleet-ops/src/compose.rs"]
 pub mod compose_check;
+pub mod confirm;
 pub mod enroll;
+pub mod escalate;
 pub mod fleetsearch;
 pub mod install;
 pub mod manager;
@@ -47,6 +54,7 @@ pub mod mcp_host;
 pub mod mesh_orch;
 pub mod opspec;
 pub mod policy;
+pub mod provision;
 pub mod recovery_flow;
 pub mod roster_mgmt;
 pub mod runbook;
@@ -58,6 +66,7 @@ pub mod ssh;
 pub mod sudo;
 pub mod sync;
 pub mod timeline;
+pub mod versions;
 pub mod vuln;
 
 pub use session::{

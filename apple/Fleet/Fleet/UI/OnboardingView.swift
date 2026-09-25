@@ -182,7 +182,7 @@ struct RecoverFleetView: View {
                 .privacySensitive()
             SecureField("Passphrase (optional)", text: $passphrase)
             if core.sync?.available != true {
-                Text("Recovery needs the fleet's iCloud data (server list, pinned keys, roster copies). Without iCloud each server would have to be entered by hand and trusted on first use, which isn't supported yet.")
+                Text("Recovery needs the fleet's iCloud data: the server list and pinned keys (roster copies are optional; the servers are asked for their roster). Servers entered by hand can't be recovered: their agent keys can't be verified without the pins.")
                     .font(.secondary).foregroundStyle(Tone.warn.text)
             }
             HStack {
@@ -264,7 +264,8 @@ struct RecoverFleetView: View {
                 }
                 _ = try s.openEscrow(escrow: escrow)
                 let all = try await cloud.changes(since: nil)
-                restored = try s.restore(records: all.records)
+                // Without roster copies this asks the servers (roster.get).
+                restored = try await s.restore(records: all.records)
                 session = s
                 words = ""
                 passphrase = ""

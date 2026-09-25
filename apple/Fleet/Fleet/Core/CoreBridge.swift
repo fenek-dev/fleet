@@ -333,6 +333,7 @@ extension Error {
         case .Roster(let reason): return "Roster: \(reason)."
         case .Sync(let reason): return "Sync: \(reason)."
         case .Recovery(let reason): return "Recovery: \(reason)."
+        case .Provision(let reason): return "Provisioning: \(reason)."
         default: return "Request failed."
         }
     }
