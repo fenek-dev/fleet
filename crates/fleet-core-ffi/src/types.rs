@@ -4,6 +4,7 @@
 //! from servers and are untrusted data (rule 6): the app shows them, never
 //! interprets them.
 
+use crate::text;
 use fleet_core::manager::{self, RequestError};
 use fleet_core::signer;
 use fleet_proto::{AgentHealth, Event, SystemInfo, alert::Severity};
@@ -34,7 +35,7 @@ impl From<signer::KeyRole> for KeyRole {
 /// Why Swift could not sign (or load a key). Fixed codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum SignerError {
-    /// Key missing, or not usable now (app locked).
+    /// Not usable now (app locked).
     #[error("key unavailable")]
     Unavailable,
     /// Touch ID cancelled or failed.
@@ -42,6 +43,14 @@ pub enum SignerError {
     Cancelled,
     #[error("signing failed")]
     Failed,
+    /// The key is not in the Keychain. For the root key this is never
+    /// "generate a new one": the roster lists the old key.
+    #[error("key missing")]
+    Missing,
+    /// The key exists but was invalidated (root key: enrolled fingerprints
+    /// changed). Distinct from `Cancelled`.
+    #[error("key invalidated")]
+    Invalidated,
 }
 
 impl From<uniffi::UnexpectedUniFFICallbackError> for SignerError {
@@ -56,6 +65,20 @@ impl From<SignerError> for signer::SignerError {
             SignerError::Unavailable => Self::Unavailable,
             SignerError::Cancelled => Self::Cancelled,
             SignerError::Failed => Self::Failed,
+            SignerError::Missing => Self::Missing,
+            SignerError::Invalidated => Self::Invalidated,
+        }
+    }
+}
+
+impl From<signer::SignerError> for SignerError {
+    fn from(e: signer::SignerError) -> Self {
+        match e {
+            signer::SignerError::Unavailable => Self::Unavailable,
+            signer::SignerError::Cancelled => Self::Cancelled,
+            signer::SignerError::Failed => Self::Failed,
+            signer::SignerError::Missing => Self::Missing,
+            signer::SignerError::Invalidated => Self::Invalidated,
         }
     }
 }
@@ -160,6 +183,22 @@ pub enum FleetError {
     /// The server's host key differs from the pinned one.
     #[error("host key changed")]
     HostKeyChanged,
+    /// The fingerprint the operator confirmed is not the one seen (or the
+    /// current pin is not the `old` one given to `replace_host_key`).
+    #[error("host key fingerprint mismatch")]
+    HostKeyMismatch,
+    /// `accept_host_key` on a server (or hop) that already has a pin:
+    /// changing a pin goes through `replace_host_key`.
+    #[error("host key already pinned")]
+    HostKeyAlreadyPinned,
+    /// A security-sensitive cache row failed its integrity check (`what`):
+    /// the database was modified outside the app. Hard error.
+    #[error("cache integrity: {what}")]
+    CacheIntegrity { what: String },
+    /// The cache integrity key is missing from the Keychain for an
+    /// enrolled cache: its pins can't be trusted. Hard error.
+    #[error("cache integrity key missing")]
+    CacheKeyMissing,
     #[error("ssh: {message}")]
     Ssh { message: String },
     /// A remote install step failed; `message` holds untrusted server text.
@@ -204,8 +243,12 @@ impl From<fleet_core::ssh::SshError> for FleetError {
         match e {
             E::AuthRejected => Self::SshKeyRefused,
             E::HostKeyChanged { .. } => Self::HostKeyChanged,
+            E::HostKeyUnconfirmed => Self::HostKeyNotConfirmed,
             E::Timeout => Self::Timeout,
             E::Signer(signer::SignerError::Cancelled) => Self::Cancelled,
+            E::Signer(s @ (signer::SignerError::Missing | signer::SignerError::Invalidated)) => {
+                Self::Keys { error: s.into() }
+            }
             E::Signer(_) => Self::Locked,
             other => Self::Ssh {
                 message: other.to_string(),
@@ -220,8 +263,9 @@ impl From<fleet_core::install::InstallError> for FleetError {
         match e {
             E::Ssh(s) => s.into(),
             E::Sftp(s) => s.into(),
+            // Carries untrusted server stderr.
             other => Self::Install {
-                message: other.to_string(),
+                message: text::line(other.to_string()),
             },
         }
     }
@@ -229,8 +273,13 @@ impl From<fleet_core::install::InstallError> for FleetError {
 
 impl From<fleet_core::cache::CacheError> for FleetError {
     fn from(e: fleet_core::cache::CacheError) -> Self {
-        Self::Cache {
-            message: e.to_string(),
+        match e {
+            fleet_core::cache::CacheError::Integrity(what) => Self::CacheIntegrity {
+                what: what.to_string(),
+            },
+            e => Self::Cache {
+                message: e.to_string(),
+            },
         }
     }
 }
@@ -314,11 +363,11 @@ pub struct SystemInfoRow {
 impl From<SystemInfo> for SystemInfoRow {
     fn from(v: SystemInfo) -> Self {
         Self {
-            hostname: v.hostname,
-            os_id: v.os_id,
-            os_version: v.os_version,
-            kernel: v.kernel,
-            arch: v.arch,
+            hostname: text::line(v.hostname),
+            os_id: text::line(v.os_id),
+            os_version: text::line(v.os_version),
+            kernel: text::line(v.kernel),
+            arch: text::line(v.arch),
             cpu_count: v.cpu_count,
             mem_total_bytes: v.mem_total_bytes,
             uptime_s: v.uptime_s,
@@ -377,8 +426,23 @@ pub struct HostKeyPrompt {
     pub algorithm: String,
     /// `SHA256:…`, as `ssh-keygen -lf` prints it.
     pub fingerprint: String,
-    /// A jump host was first-use too (not pinned by `accept_host_key` yet).
+    /// The target's own key is first-use (else it matched its pin and
+    /// only jump hops need confirming).
+    pub target_unpinned: bool,
+    /// A jump host was first-use too.
     pub via_jump_unpinned: bool,
+    /// First-use jump hops, first hop first: the operator compares each
+    /// and `accept_host_key` gets their fingerprints in this order.
+    pub jumps: Vec<JumpHostKeyRow>,
+}
+
+/// A first-use jump host key.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct JumpHostKeyRow {
+    pub host: String,
+    pub port: u16,
+    pub algorithm: String,
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -427,14 +491,14 @@ impl AgentEventRow {
                 subject,
                 ..
             } => Some(AlertInfo {
-                rule_id: rule_id.clone(),
-                subject: subject.clone(),
+                rule_id: text::line(rule_id.clone()),
+                subject: text::line(subject.clone()),
                 severity: Some((*severity).into()),
                 cleared: false,
             }),
             Event::AlertCleared { rule_id, subject } => Some(AlertInfo {
-                rule_id: rule_id.clone(),
-                subject: subject.clone(),
+                rule_id: text::line(rule_id.clone()),
+                subject: text::line(subject.clone()),
                 severity: None,
                 cleared: true,
             }),

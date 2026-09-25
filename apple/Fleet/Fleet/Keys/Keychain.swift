@@ -34,6 +34,14 @@ enum Keychain {
         guard status == errSecSuccess else { throw Failure.status(status) }
     }
 
+    /// Removes an item (only for derived state, never for key blobs).
+    static func delete(_ account: String) throws {
+        let status = SecItemDelete(base(account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw Failure.status(status)
+        }
+    }
+
     private static func base(_ account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
@@ -44,9 +52,12 @@ enum Keychain {
     }
 }
 
-/// The FFI `KeyStore`: the Noise static key (design §5.2, Keychain).
+/// The FFI `KeyStore`: the Noise static key (design §5.2) and the cache
+/// integrity key (MACs over pins and rosters in the local database), both
+/// in the Keychain, this device only.
 final class NoiseKeyStore: KeyStore {
     private static let account = "noise-static"
+    private static let cacheAccount = "cache-integrity"
 
     func loadNoiseKey() throws -> Data? {
         do { return try Keychain.load(Self.account) } catch { throw SignerError.Unavailable }
@@ -54,5 +65,13 @@ final class NoiseKeyStore: KeyStore {
 
     func storeNoiseKey(secret: Data) throws {
         do { try Keychain.add(Self.account, secret) } catch { throw SignerError.Failed }
+    }
+
+    func loadCacheKey() throws -> Data? {
+        do { return try Keychain.load(Self.cacheAccount) } catch { throw SignerError.Unavailable }
+    }
+
+    func storeCacheKey(secret: Data) throws {
+        do { try Keychain.add(Self.cacheAccount, secret) } catch { throw SignerError.Failed }
     }
 }

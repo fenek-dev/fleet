@@ -6,11 +6,22 @@ struct ContentView: View {
     @State private var selection: NavItem? = .fleet
 
     var body: some View {
-        if core.status == .notEnrolled {
-            EnrollmentView()
-                .frame(minWidth: 900, minHeight: 640)
-        } else {
-            main
+        @Bindable var core = core
+        Group {
+            if core.status == .notEnrolled {
+                EnrollmentView()
+                    .frame(minWidth: 900, minHeight: 640)
+            } else {
+                main
+            }
+        }
+        .alert("Security problem", isPresented: Binding(
+            get: { core.securityAlert != nil && !core.securityAlertSeen },
+            set: { if !$0 { core.securityAlertSeen = true } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(core.securityAlert ?? "")
         }
     }
 

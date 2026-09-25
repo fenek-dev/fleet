@@ -35,6 +35,7 @@ mod rows;
 mod signer;
 mod streams;
 mod terminal;
+mod text;
 mod types;
 mod validate;
 

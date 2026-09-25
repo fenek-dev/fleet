@@ -1,6 +1,5 @@
 use fleet_core::cache::{
-    AuditRow, Cache, CacheError, CheckpointRow, GroupRecord, METRICS_RETENTION_MS, PinnedKeys,
-    RosterRow, ServerRecord,
+    Cache, CacheError, CacheKey, GroupRecord, PinnedKeys, RosterRow, ServerRecord,
 };
 use fleet_core::ssh::{HostKey, SshSigner, SshTarget};
 use fleet_crypto::sig::Ed25519Signer;
@@ -13,6 +12,10 @@ fn sid(i: usize) -> ServerId {
 fn host_key(seed: u8) -> HostKey {
     let k = Ed25519Signer::from_seed(&[seed; 32]);
     HostKey::from_blob(&SshSigner::public_key(&k).blob().unwrap()).unwrap()
+}
+
+fn key(b: u8) -> CacheKey {
+    CacheKey::from_bytes([b; 32])
 }
 
 fn record(i: usize) -> ServerRecord {
@@ -32,7 +35,7 @@ fn record(i: usize) -> ServerRecord {
 #[test]
 fn servers_groups_tags_and_jump_chain_roundtrip() {
     let mut c = Cache::open_in_memory().unwrap();
-    assert_eq!(c.schema_version().unwrap(), 1);
+    assert_eq!(c.schema_version().unwrap(), 2);
     c.upsert_group(&GroupRecord {
         id: "g1".into(),
         name: "Web".into(),
@@ -64,6 +67,28 @@ fn servers_groups_tags_and_jump_chain_roundtrip() {
 }
 
 #[test]
+fn jump_pins_are_keyed_by_route() {
+    let mut c = Cache::open_in_memory().unwrap();
+    c.upsert_server(&record(1)).unwrap();
+    // Same second hop (10.0.0.1:2222) behind a different bastion: its pin
+    // does not carry over.
+    let first = SshTarget::new("bastion2.example", 22, "ops");
+    let second = SshTarget::new("10.0.0.1", 2222, "ops").via(first);
+    let r = ServerRecord {
+        target: SshTarget::new("10.0.1.6", 22, "admin").via(second),
+        ..record(2)
+    };
+    c.upsert_server(&r).unwrap();
+    let got = c.server(&sid(2)).unwrap().unwrap().target;
+    let hop2 = got.proxy_jump.unwrap();
+    assert_eq!(hop2.host, "10.0.0.1");
+    assert_eq!(hop2.host_key, None);
+    assert_eq!(hop2.proxy_jump.unwrap().host_key, None);
+    // The original route still has both pins.
+    assert_eq!(c.server(&sid(1)).unwrap().unwrap(), record(1));
+}
+
+#[test]
 fn pins() {
     let mut c = Cache::open_in_memory().unwrap();
     c.upsert_server(&record(1)).unwrap();
@@ -91,53 +116,6 @@ fn pins() {
 }
 
 #[test]
-fn audit_mirror_and_checkpoints() {
-    let mut c = Cache::open_in_memory().unwrap();
-    c.upsert_server(&record(1)).unwrap();
-    assert_eq!(c.last_audit_seq(&sid(1)).unwrap(), None);
-    let rows: Vec<AuditRow> = (1..=5)
-        .map(|s| AuditRow {
-            seq: s,
-            entry: vec![s as u8; 10],
-            entry_hash: [s as u8; 32],
-        })
-        .collect();
-    c.append_audit(&sid(1), &rows).unwrap();
-    c.append_audit(&sid(1), &rows[3..]).unwrap(); // idempotent
-    assert_eq!(c.last_audit_seq(&sid(1)).unwrap(), Some(5));
-    assert_eq!(c.audit_range(&sid(1), 2, 2).unwrap(), rows[1..3].to_vec());
-    let cp = CheckpointRow {
-        seq: 5,
-        checkpoint: vec![1, 2, 3],
-        verified_at_ms: 42,
-    };
-    c.set_checkpoint(&sid(1), &cp).unwrap();
-    assert_eq!(c.checkpoint(&sid(1)).unwrap(), Some(cp));
-    c.delete_server(&sid(1)).unwrap();
-    assert!(c.audit_range(&sid(1), 0, 100).unwrap().is_empty());
-    assert_eq!(c.checkpoint(&sid(1)).unwrap(), None);
-}
-
-#[test]
-fn metrics_rollups_and_pruning() {
-    let mut c = Cache::open_in_memory().unwrap();
-    c.upsert_server(&record(1)).unwrap();
-    let now = 1_800_000_000_000u64;
-    let old = now - METRICS_RETENTION_MS - 60_000;
-    c.put_metric(&sid(1), "cpu", old, 1.0).unwrap();
-    c.put_metric(&sid(1), "cpu", now - 61_000, 2.0).unwrap();
-    c.put_metric(&sid(1), "cpu", now - 60_500, 3.0).unwrap(); // same minute: replaces
-    c.put_metric(&sid(1), "mem", now, 9.0).unwrap();
-    let minute = |t: u64| t - t % 60_000;
-    assert_eq!(
-        c.metrics(&sid(1), "cpu", 0).unwrap(),
-        vec![(minute(old), 1.0), (minute(now - 61_000), 3.0)]
-    );
-    assert_eq!(c.prune_metrics(now).unwrap(), 1);
-    assert_eq!(c.metrics(&sid(1), "cpu", 0).unwrap().len(), 1);
-}
-
-#[test]
 fn settings_and_roster_chain() {
     let c = Cache::open_in_memory().unwrap();
     assert_eq!(c.setting("ai.paused").unwrap(), None);
@@ -157,16 +135,130 @@ fn settings_and_roster_chain() {
     assert_eq!(c.roster_chain().unwrap(), vec![r(1, 1), r(1, 2), r(2, 3)]);
 }
 
+fn raw(path: &std::path::Path, sql: &str) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+}
+
+#[test]
+fn tampered_rows_and_wrong_key_are_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite");
+    {
+        let mut c = Cache::open(&path, key(1)).unwrap();
+        c.upsert_server(&record(1)).unwrap();
+        c.set_pins(
+            &sid(1),
+            &PinnedKeys {
+                host_key: Some(host_key(6)),
+                agent_noise: Some(X25519Public([3; 32])),
+                agent_signing: Some(Ed25519Public([4; 32])),
+            },
+        )
+        .unwrap();
+        c.set_setting("fleet_id", &[7; 16]).unwrap();
+        c.put_roster(&RosterRow {
+            epoch: 0,
+            version: 1,
+            hash: [1; 32],
+            signed: vec![1, 2, 3],
+        })
+        .unwrap();
+    }
+    let integrity = |r: Result<_, CacheError>, what: &str| match r {
+        Err(CacheError::Integrity(w)) => assert_eq!(w, what),
+        Err(e) => panic!("{what}: {e}"),
+        Ok(_) => panic!("{what}: tampering not detected"),
+    };
+    // Wrong key: every protected read fails.
+    {
+        let c = Cache::open(&path, key(2)).unwrap();
+        integrity(c.server(&sid(1)).map(|_| ()), "server address");
+        integrity(c.pins(&sid(1)).map(|_| ()), "pinned keys");
+        integrity(c.setting("fleet_id").map(|_| ()), "setting");
+        integrity(c.roster_chain().map(|_| ()), "roster chain");
+    }
+    // Right key, edited rows.
+    raw(&path, "UPDATE servers SET host = 'evil.example'");
+    raw(&path, "UPDATE pinned_keys SET agent_noise = zeroblob(32)");
+    raw(&path, "UPDATE settings SET value = x'00'");
+    raw(&path, "UPDATE roster_chain SET signed = x'09'");
+    let c = Cache::open(&path, key(1)).unwrap();
+    integrity(c.server(&sid(1)).map(|_| ()), "server address");
+    integrity(c.pins(&sid(1)).map(|_| ()), "pinned keys");
+    integrity(c.setting("fleet_id").map(|_| ()), "setting");
+    integrity(c.roster_chain().map(|_| ()), "roster chain");
+    drop(c);
+    // Server row intact, jump pin swapped.
+    raw(&path, "DELETE FROM servers");
+    {
+        let mut c = Cache::open(&path, key(1)).unwrap();
+        c.upsert_server(&record(1)).unwrap();
+    }
+    raw(
+        &path,
+        "UPDATE jump_pins SET host_key = (SELECT host_key FROM jump_pins WHERE route != '')
+         WHERE route = ''",
+    );
+    let c = Cache::open(&path, key(1)).unwrap();
+    integrity(c.server(&sid(1)).map(|_| ()), "jump host pin");
+}
+
+#[test]
+fn v1_database_is_upgraded_and_sealed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.sqlite");
+    {
+        // A v1 database as the previous app version left it.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);
+             CREATE TABLE groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE servers (id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL,
+               port INTEGER NOT NULL, user TEXT NOT NULL, proxy_jump TEXT,
+               group_id TEXT REFERENCES groups(id) ON DELETE SET NULL);
+             CREATE TABLE server_tags (server_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (server_id, tag));
+             CREATE TABLE pinned_keys (server_id TEXT PRIMARY KEY, host_key BLOB, agent_noise BLOB,
+               agent_signing BLOB, updated_ms INTEGER NOT NULL);
+             CREATE TABLE jump_host_keys (host TEXT NOT NULL, port INTEGER NOT NULL, host_key BLOB NOT NULL,
+               PRIMARY KEY (host, port));
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             CREATE TABLE roster_chain (epoch INTEGER NOT NULL, version INTEGER NOT NULL, hash BLOB NOT NULL,
+               signed BLOB NOT NULL, PRIMARY KEY (epoch, version));
+             INSERT INTO schema_migrations VALUES (1, 0);
+             INSERT INTO servers VALUES ('srv_000001', 'a', 'h', 22, 'u', NULL, NULL);
+             INSERT INTO settings VALUES ('fleet_id', x'01');
+             INSERT INTO pinned_keys VALUES ('srv_000001', NULL, zeroblob(32), NULL, 0);
+             INSERT INTO roster_chain VALUES (0, 1, zeroblob(32), x'02');",
+        )
+        .unwrap();
+    }
+    let c = Cache::open(&path, key(3)).unwrap();
+    assert!(c.upgraded());
+    assert_eq!(c.schema_version().unwrap(), 2);
+    assert_eq!(c.server(&sid(1)).unwrap().unwrap().target.host, "h");
+    assert_eq!(c.setting("fleet_id").unwrap(), Some(vec![1]));
+    assert!(c.pins(&sid(1)).unwrap().is_some());
+    assert_eq!(c.roster_chain().unwrap().len(), 1);
+    drop(c);
+    let c = Cache::open(&path, key(3)).unwrap();
+    assert!(!c.upgraded());
+    assert!(c.server(&sid(1)).unwrap().is_some());
+}
+
 #[test]
 fn file_database_migrates_once_and_refuses_newer_schema() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.sqlite");
     {
-        let mut c = Cache::open(&path).unwrap();
+        let mut c = Cache::open(&path, key(1)).unwrap();
+        assert!(!c.upgraded());
         c.upsert_server(&record(1)).unwrap();
     }
-    let c = Cache::open(&path).unwrap();
-    assert_eq!(c.schema_version().unwrap(), 1);
+    let c = Cache::open(&path, key(1)).unwrap();
+    assert_eq!(c.schema_version().unwrap(), 2);
     assert_eq!(c.servers().unwrap().len(), 1);
     drop(c);
     {
@@ -182,10 +274,10 @@ fn file_database_migrates_once_and_refuses_newer_schema() {
         .unwrap();
     }
     assert!(matches!(
-        Cache::open(&path),
+        Cache::open(&path, key(1)),
         Err(CacheError::TooNew {
             found: 99,
-            supported: 1
+            supported: 2
         })
     ));
 }

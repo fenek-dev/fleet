@@ -23,8 +23,14 @@ final class CoreBridge {
     private(set) var failures: [String: String] = [:]
     private(set) var usesSoftwareKeys = false
     private(set) var fleetName: String?
+    /// A security failure that needs the operator (cache integrity, missing
+    /// or invalidated keys). Shown as an alert and a persistent banner.
+    private(set) var securityAlert: String?
+    /// The alert was dismissed (the banner stays).
+    var securityAlertSeen = false
 
     @ObservationIgnored private var core: FleetCore?
+    @ObservationIgnored private var keys: SecureEnclaveKeys?
 
     /// The Rust core, for typed calls from the server tabs. `nil` until
     /// `open` succeeded.
@@ -38,14 +44,19 @@ final class CoreBridge {
     /// Opens the cache and starts the manager. Errors land in `status`.
     func open(keys: SecureEnclaveKeys, keyStore: KeyStore) {
         usesSoftwareKeys = keys.usesSoftwareKeys
+        self.keys = keys
         do {
             let path = try Self.cachePath()
             let core = try FleetCore.open(cachePath: path, signer: keys, keyStore: keyStore)
             self.core = core
+            // Keys may be generated only before enrollment; afterwards a
+            // missing key is an error, never a silent replacement.
+            keys.creationAllowed = !core.isEnrolled()
             reload()
             startManager()
         } catch {
-            status = .failed(String(describing: error))
+            report(error)
+            status = .failed(error.fleetMessage)
         }
     }
 
@@ -55,13 +66,28 @@ final class CoreBridge {
         fleetName = core.fleetName()
         do {
             try core.start(listener: Listener(bridge: self))
+            keys?.creationAllowed = false
             status = .running
         } catch FleetError.NotEnrolled {
             status = .notEnrolled
         } catch FleetError.AlreadyStarted {
             status = .running
         } catch {
+            report(error)
             status = .failed(String(describing: error))
+        }
+    }
+
+    /// Raises the security alert for errors that mean tampering or lost
+    /// keys; other errors are left to the caller.
+    func report(_ error: Error) {
+        guard let e = error as? FleetError else { return }
+        switch e {
+        case .CacheIntegrity, .CacheKeyMissing, .Keys(error: .Missing), .Keys(error: .Invalidated):
+            securityAlert = e.fleetMessage
+            securityAlertSeen = false
+        default:
+            break
         }
     }
 
@@ -75,7 +101,8 @@ final class CoreBridge {
             servers = try core.listServers()
             groups = try core.listGroups()
         } catch {
-            status = .failed(String(describing: error))
+            report(error)
+            status = .failed(error.fleetMessage)
         }
     }
 
@@ -109,7 +136,14 @@ final class CoreBridge {
     func resolveHostKey(_ prompt: HostKeyPrompt, accept: Bool) {
         hostKeyPrompts.removeAll { $0 == prompt }
         if accept {
-            try? core?.acceptHostKey(serverId: prompt.serverId)
+            // Pins exactly the fingerprints this prompt showed.
+            do {
+                try core?.acceptHostKey(serverId: prompt.serverId, fingerprint: prompt.fingerprint,
+                                        jumpFingerprints: prompt.jumps.map(\.fingerprint))
+            } catch {
+                report(error)
+                failures[prompt.serverId] = error.fleetMessage
+            }
         } else {
             try? core?.rejectHostKey(serverId: prompt.serverId)
         }
@@ -228,6 +262,16 @@ extension Error {
         case .Enrollment(let reason): return "Enrollment: \(reason)."
         case .Stream(let m): return "Stream failed: \(m)"
         case .Session(let m): return "Session error: \(m)"
+        case .HostKeyMismatch: return "The host key differs from the fingerprint you confirmed. Nothing was pinned."
+        case .HostKeyAlreadyPinned: return "This server already has a pinned host key. Use Replace host key to change it."
+        case .CacheIntegrity(let what):
+            return "The local database was modified outside Fleet (\(what) failed its integrity check). Pins can't be trusted; restore it or re-enroll."
+        case .CacheKeyMissing:
+            return "The database integrity key is missing from the Keychain. Pins can't be verified; restore the Keychain item or re-enroll."
+        case .Keys(error: .Missing):
+            return "A Fleet key is missing from the Keychain. It was not replaced: restore it, or have another Mac (or the recovery code) enroll this Mac again."
+        case .Keys(error: .Invalidated):
+            return "The root key was invalidated (Touch ID fingerprints changed). Create a new root key and have another Mac or the recovery code approve it."
         case .Keys: return "Key store unavailable."
         default: return "Request failed."
         }

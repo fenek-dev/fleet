@@ -1,7 +1,11 @@
 //! FFI records for enrollment, install, terminals, files and the typed
 //! server operations. Every string that came from a server is untrusted
-//! (rule 6): the app displays it and never interprets it.
+//! (rule 6): the app displays it and never interprets it. Conversions run
+//! such strings through `crate::text` (controls and bidi overrides
+//! escaped); values the app passes back (paths, journal cursors) stay raw
+//! next to a display form.
 
+use crate::text;
 use fleet_core::install::InstallStage;
 use fleet_core::sftp::{EntryKind, RemoteEntry};
 use fleet_proto::payload::{
@@ -17,7 +21,7 @@ pub struct EnrollmentResult {
     /// `f_…` text form.
     pub fleet_id: String,
     pub device_id_hex: String,
-    /// 0 with a passphrase, 72 h without (design §5.3).
+    /// 0 with a strong passphrase, 72 h otherwise (design §5.3, §5.11).
     pub recovery_delay_s: u32,
 }
 
@@ -83,8 +87,13 @@ pub enum FileKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RemoteFileRow {
+    /// Display-safe (controls and bidi escaped, `crate::text`).
     pub name: String,
+    /// The raw path, for passing back to file calls only; show
+    /// `display_path`.
     pub path: String,
+    /// `path`, display-safe.
+    pub display_path: String,
     pub kind: FileKind,
     pub size: u64,
     /// Permission bits, e.g. `0o644`.
@@ -99,7 +108,8 @@ pub struct RemoteFileRow {
 impl From<RemoteEntry> for RemoteFileRow {
     fn from(e: RemoteEntry) -> Self {
         Self {
-            name: e.name,
+            name: text::line(e.name),
+            display_path: text::line(e.path.clone()),
             path: e.path,
             kind: match e.kind {
                 EntryKind::File => FileKind::File,
@@ -109,8 +119,8 @@ impl From<RemoteEntry> for RemoteFileRow {
             },
             size: e.size,
             mode: e.mode,
-            owner: e.user,
-            group: e.group,
+            owner: text::opt(e.user),
+            group: text::opt(e.group),
             uid: e.uid,
             gid: e.gid,
             mtime_s: e.mtime_s,
@@ -166,7 +176,7 @@ impl From<MetricSeries> for MetricSeriesRow {
     fn from(s: MetricSeries) -> Self {
         Self {
             id: s.id,
-            name: s.name,
+            name: text::line(s.name),
             unit: s.unit.into(),
         }
     }
@@ -289,9 +299,9 @@ impl From<ProcessInfo> for ProcessRow {
         Self {
             pid: p.pid,
             ppid: p.ppid,
-            user: p.user,
-            name: p.name,
-            cmdline: p.cmdline,
+            user: text::line(p.user),
+            name: text::line(p.name),
+            cmdline: text::line(p.cmdline),
             state: char::from(p.state).to_string(),
             nice: p.nice,
             threads: p.threads,
@@ -364,10 +374,10 @@ impl From<JournalEntries> for JournalPageRow {
                 .map(|e| JournalEntryRow {
                     time_us: e.time_us,
                     priority: e.priority,
-                    unit: e.unit,
-                    identifier: e.identifier,
+                    unit: text::opt(e.unit),
+                    identifier: text::opt(e.identifier),
                     pid: e.pid,
-                    message: e.message,
+                    message: text::line(e.message),
                 })
                 .collect(),
             cursor: j.cursor,
@@ -414,11 +424,11 @@ pub struct UnitRow {
 impl From<UnitInfo> for UnitRow {
     fn from(u: UnitInfo) -> Self {
         Self {
-            name: u.name,
-            description: u.description,
+            name: text::line(u.name),
+            description: text::line(u.description),
             active: u.active.into(),
-            sub: u.sub,
-            file_state: u.file_state,
+            sub: text::line(u.sub),
+            file_state: text::line(u.file_state),
         }
     }
 }
@@ -483,11 +493,11 @@ impl From<Upgradable> for UpgradableListRow {
                 .packages
                 .into_iter()
                 .map(|p| UpgradableRow {
-                    name: p.name,
-                    current: p.current,
-                    candidate: p.candidate,
+                    name: text::line(p.name),
+                    current: text::line(p.current),
+                    candidate: text::line(p.candidate),
                     security: p.security,
-                    origin: p.origin,
+                    origin: text::line(p.origin),
                 })
                 .collect(),
             reboot_required: u.reboot_required,
@@ -518,7 +528,7 @@ impl From<PackageChanges> for PackageChangesRow {
                 .changes
                 .into_iter()
                 .map(|c| PackageChangeRow {
-                    name: c.name,
+                    name: text::line(c.name),
                     action: match c.action {
                         PkgAction::Install => "install",
                         PkgAction::Upgrade => "upgrade",
@@ -529,8 +539,8 @@ impl From<PackageChanges> for PackageChangesRow {
                         PkgAction::Unhold => "unhold",
                     }
                     .into(),
-                    from: c.from,
-                    to: c.to,
+                    from: text::opt(c.from),
+                    to: text::opt(c.to),
                 })
                 .collect(),
             reboot_required: p.reboot_required,
@@ -558,7 +568,7 @@ impl From<LoginRecord> for LoginRow {
     fn from(l: LoginRecord) -> Self {
         Self {
             time_ms: l.time_ms,
-            user: l.user,
+            user: text::line(l.user),
             source: l.source.map(|a| a.to_string()),
             success: l.success,
             method: match l.method {
@@ -568,7 +578,7 @@ impl From<LoginRecord> for LoginRow {
                 LoginMethod::Other => "other",
             }
             .into(),
-            key_fingerprint: l.key_fingerprint,
+            key_fingerprint: text::opt(l.key_fingerprint),
             device_id_hex: l.device_id.map(|d| hex::encode(d.0)),
             session_end_ms: l.session_end_ms,
         }
@@ -641,8 +651,8 @@ impl From<ListeningPort> for PortRow {
             addr: p.addr.to_string(),
             port: p.port,
             pid: p.pid,
-            process: p.process,
-            user: p.user,
+            process: text::opt(p.process),
+            user: text::opt(p.user),
             reachable: p.reachable,
         }
     }
@@ -661,9 +671,9 @@ pub struct CertRow {
 impl From<CertInfo> for CertRow {
     fn from(c: CertInfo) -> Self {
         Self {
-            source: c.source,
-            subjects: c.subjects,
-            issuer: c.issuer,
+            source: text::line(c.source),
+            subjects: text::lines(c.subjects),
+            issuer: text::line(c.issuer),
             not_before_ms: c.not_before_ms,
             not_after_ms: c.not_after_ms,
             sha256_hex: hex::encode(c.sha256),
@@ -737,11 +747,11 @@ impl From<FirewallState> for FirewallRow {
                     rate_limit: r
                         .rate_limit
                         .map(|l| format!("{}/{}", l.per_minute, l.burst)),
-                    comment: r.comment.as_str().to_string(),
+                    comment: text::line(r.comment.as_str().to_string()),
                 })
                 .collect(),
             banned: f.banned,
-            foreign_ruleset: f.foreign_ruleset,
+            foreign_ruleset: text::text(f.foreign_ruleset),
         }
     }
 }

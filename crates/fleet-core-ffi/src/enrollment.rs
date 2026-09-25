@@ -22,6 +22,11 @@ use fleet_crypto::Zeroizing;
 use fleet_crypto::recovery::{KdfParams, RecoveryCode, delay_for};
 use fleet_proto::{DeviceId, FleetId};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// An unfinished enrollment's recovery entropy is dropped (zeroized) after
+/// this long, whether or not anyone calls in again.
+const DRAFT_TTL: Duration = Duration::from_secs(30 * 60);
 
 struct Draft {
     fleet_name: String,
@@ -32,6 +37,7 @@ struct Draft {
     words_shown: bool,
     challenge: Vec<u32>,
     confirmed: bool,
+    created: Instant,
 }
 
 #[derive(uniffi::Object)]
@@ -44,6 +50,15 @@ fn step(reason: &str) -> FleetError {
     FleetError::Enrollment {
         reason: reason.into(),
     }
+}
+
+/// The live draft; an expired one is dropped here.
+fn live(g: &mut Option<Draft>) -> Result<&mut Draft, FleetError> {
+    if g.as_ref().is_some_and(|d| d.created.elapsed() >= DRAFT_TTL) {
+        g.take();
+        return Err(step("expired"));
+    }
+    g.as_mut().ok_or_else(|| step("finished"))
 }
 
 impl From<EnrollError> for FleetError {
@@ -60,14 +75,14 @@ impl From<EnrollError> for FleetError {
     }
 }
 
-impl From<fleet_core::signer::SignerError> for crate::types::SignerError {
-    fn from(e: fleet_core::signer::SignerError) -> Self {
-        match e {
-            fleet_core::signer::SignerError::Unavailable => Self::Unavailable,
-            fleet_core::signer::SignerError::Cancelled => Self::Cancelled,
-            fleet_core::signer::SignerError::Failed => Self::Failed,
-        }
-    }
+/// Whether `passphrase` is strong enough for a zero recovery delay
+/// (`fleet_crypto::recovery::passphrase_is_strong`: ≥ 12 characters from
+/// ≥ 3 classes, or ≥ 5 distinct words of ≥ 3 letters). For the UI hint;
+/// `finish` decides with the same function.
+#[uniffi::export]
+pub fn recovery_passphrase_is_strong(passphrase: String) -> bool {
+    let p = Zeroizing::new(passphrase);
+    fleet_crypto::recovery::passphrase_is_strong(&p)
 }
 
 #[uniffi::export]
@@ -95,20 +110,36 @@ impl FleetCore {
             words_shown: false,
             challenge: Vec::new(),
             confirmed: false,
+            created: Instant::now(),
         };
-        Ok(Arc::new(Enrollment {
+        let e = Arc::new(Enrollment {
             core: self,
             draft: Mutex::new(Some(draft)),
-        }))
+        });
+        // Drop the entropy on timeout even if the app never calls again.
+        let weak = Arc::downgrade(&e);
+        let _ = std::thread::Builder::new()
+            .name("fleet-enroll-ttl".into())
+            .spawn(move || {
+                std::thread::sleep(DRAFT_TTL);
+                if let Some(e) = weak.upgrade() {
+                    let mut g = lock(&e.draft);
+                    let _ = live(&mut g);
+                }
+            });
+        Ok(e)
     }
 }
 
 #[uniffi::export]
 impl Enrollment {
-    /// The 24 recovery words. Returned once; later calls fail.
+    /// The 24 recovery words. Returned once; later calls fail. The phrase
+    /// is built in a zeroizing buffer; the returned strings are the only
+    /// other copies (lowered to Swift, which can't wipe them: the view
+    /// drops them).
     pub fn recovery_words(&self) -> Result<Vec<String>, FleetError> {
         let mut g = lock(&self.draft);
-        let d = g.as_mut().ok_or_else(|| step("finished"))?;
+        let d = live(&mut g)?;
         if d.words_shown {
             return Err(step("words already shown"));
         }
@@ -120,7 +151,7 @@ impl Enrollment {
     /// Four distinct 0-based word positions to re-type (new ones per call).
     pub fn challenge(&self) -> Result<Vec<u32>, FleetError> {
         let mut g = lock(&self.draft);
-        let d = g.as_mut().ok_or_else(|| step("finished"))?;
+        let d = live(&mut g)?;
         if !d.words_shown {
             return Err(step("words not shown yet"));
         }
@@ -133,11 +164,11 @@ impl Enrollment {
 
     /// Checks the re-typed words against the last `challenge`.
     pub fn confirm_words(&self, answers: Vec<String>) -> Result<bool, FleetError> {
+        // Wiped on every path out.
+        let answers: Vec<Zeroizing<String>> = answers.into_iter().map(Zeroizing::new).collect();
         let mut g = lock(&self.draft);
-        let d = g.as_mut().ok_or_else(|| step("finished"))?;
+        let d = live(&mut g)?;
         let ok = enroll::check_words(&d.code.phrase(), &d.challenge, &answers);
-        // Wipe the typed words.
-        answers.into_iter().for_each(|a| drop(Zeroizing::new(a)));
         d.confirmed = ok;
         Ok(ok)
     }
@@ -151,10 +182,8 @@ impl Enrollment {
         let passphrase = Zeroizing::new(passphrase);
         let draft = {
             let mut g = lock(&self.draft);
-            match g.as_ref() {
-                None => return Err(step("finished")),
-                Some(d) if !d.confirmed => return Err(step("recovery words not confirmed")),
-                Some(_) => {}
+            if !live(&mut g)?.confirmed {
+                return Err(step("recovery words not confirmed"));
             }
             g.take().expect("checked above")
         };

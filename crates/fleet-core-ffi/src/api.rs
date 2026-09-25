@@ -17,7 +17,7 @@ use crate::rows::ServerMetricsRow;
 use crate::signer::{CoreListener, DeviceSigner, KeyStore, SignerAdapter};
 use crate::types::*;
 use crate::validate;
-use fleet_core::cache::{Cache, GroupRecord, ServerRecord};
+use fleet_core::cache::{Cache, CacheError, CacheKey, GroupRecord, ServerRecord};
 use fleet_core::manager::{
     ConnectionManager, ManagerConfig, ManagerEvent, ManagerHandle, ServerSpec, SshConnector,
 };
@@ -88,6 +88,21 @@ pub(crate) fn spec_for(
         agent_noise,
         agent_signing,
     }))
+}
+
+/// Equal bytes, without an early exit on the first difference.
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn hop_count(t: &SshTarget) -> usize {
+    let mut n = 0;
+    let mut cur = t.proxy_jump.as_deref();
+    while let Some(j) = cur {
+        n += 1;
+        cur = j.proxy_jump.as_deref();
+    }
+    n
 }
 
 /// `user@host:port` hops, first hop first.
@@ -216,13 +231,48 @@ impl FleetCore {
 impl FleetCore {
     /// Opens (or creates) the cache at `cache_path`. Starts locked
     /// (monitor sessions) per design §5.10.
+    ///
+    /// The cache integrity key comes from the Keychain (`KeyStore`). On
+    /// first use (no key yet) one is generated and stored; a cache that
+    /// already holds MAC'd rows but has no key fails with
+    /// `CacheKeyMissing`, and rows that don't verify with
+    /// `CacheIntegrity`: both are hard errors for the app to show.
     #[uniffi::constructor]
     pub fn open(
         cache_path: String,
         signer: Box<dyn DeviceSigner>,
         key_store: Box<dyn KeyStore>,
     ) -> Result<Arc<Self>, FleetError> {
-        let cache = Cache::open(Path::new(&cache_path))?;
+        let keys = |e| FleetError::Keys { error: e };
+        let (key, fresh) = match key_store.load_cache_key().map_err(keys)? {
+            Some(raw) => {
+                let raw = Zeroizing::new(raw);
+                let b: [u8; 32] = raw
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| FleetError::CacheKeyMissing)?;
+                (CacheKey::from_bytes(b), false)
+            }
+            None => (
+                CacheKey::generate().map_err(|_| FleetError::Internal {
+                    message: "rng".into(),
+                })?,
+                true,
+            ),
+        };
+        let key_bytes = Zeroizing::new(*key.bytes());
+        let cache = Cache::open(Path::new(&cache_path), key)?;
+        // Probe a protected row: a wrong or lost key shows up now.
+        match cache.setting(SETTING_FLEET_ID) {
+            Err(CacheError::Integrity(_)) if fresh => return Err(FleetError::CacheKeyMissing),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {}
+        }
+        if fresh {
+            key_store
+                .store_cache_key(key_bytes.to_vec())
+                .map_err(keys)?;
+        }
         Ok(Arc::new(Self {
             cache: Mutex::new(cache),
             keys: Arc::new(SignerAdapter(signer)),
@@ -441,30 +491,114 @@ impl FleetCore {
         Ok(())
     }
 
-    /// Pins the first-use host key last reported for `server_id` (after the
-    /// operator compared fingerprints), and any first-use jump host keys
-    /// seen on the same connection, then (re)connects with them.
-    pub fn accept_host_key(&self, server_id: String) -> Result<(), FleetError> {
+    /// Pins the first-use host keys last reported for `server_id`, after
+    /// the operator compared them: `fingerprint` is the target's (`SHA256:…`
+    /// exactly as shown), `jump_fingerprints` those of the prompt's `jumps`,
+    /// in order. Each must equal what was seen (constant-time compare), or
+    /// nothing is pinned (`HostKeyMismatch`). A server or hop that already
+    /// has a pin is refused (`HostKeyAlreadyPinned`): changing a pin is
+    /// `replace_host_key`. Then (re)connects.
+    pub fn accept_host_key(
+        &self,
+        server_id: String,
+        fingerprint: String,
+        jump_fingerprints: Vec<String>,
+    ) -> Result<(), FleetError> {
         let id = validate::server_id(&server_id)?;
         let obs = lock(&self.pending_host_keys)
-            .remove(&id)
+            .get(&id)
+            .cloned()
             .ok_or(FleetError::UnknownServer)?;
         {
             let mut cache = lock(&self.cache);
             let mut rec = cache.server(&id)?.ok_or(FleetError::UnknownServer)?;
-            // Jump pins travel with the target (`jump_host_keys`).
-            let mut hop = rec.target.proxy_jump.as_deref_mut();
-            let mut seen = obs.via.as_deref();
-            while let (Some(h), Some(o)) = (hop, seen) {
-                if o.status == HostKeyStatus::FirstUse {
-                    h.host_key = Some(o.key.clone());
+            let pinned = cache.pins(&id)?.and_then(|p| p.host_key);
+            if obs.status == HostKeyStatus::FirstUse {
+                if pinned.is_some() {
+                    return Err(FleetError::HostKeyAlreadyPinned);
                 }
-                hop = h.proxy_jump.as_deref_mut();
+                if !ct_eq(fingerprint.as_bytes(), obs.key.fingerprint().as_bytes()) {
+                    return Err(FleetError::HostKeyMismatch);
+                }
+            } else if pinned.as_ref() != Some(&obs.key) {
+                // Matched at the time, but the pin changed since.
+                return Err(FleetError::HostKeyMismatch);
+            }
+            // First-use hops by depth from the target (1 = last hop).
+            let mut first_use: Vec<(usize, fleet_core::ssh::HostKey)> = Vec::new();
+            let mut depth = 0;
+            let mut seen = obs.via.as_deref();
+            while let Some(o) = seen {
+                depth += 1;
+                if o.status == HostKeyStatus::FirstUse {
+                    first_use.push((depth, o.key.clone()));
+                }
                 seen = o.via.as_deref();
             }
+            if depth != hop_count(&rec.target) || first_use.len() != jump_fingerprints.len() {
+                return Err(FleetError::HostKeyMismatch);
+            }
+            // The prompt lists hops first hop first.
+            let confirmed = first_use
+                .iter()
+                .rev()
+                .zip(&jump_fingerprints)
+                .all(|((_, k), fp)| ct_eq(fp.as_bytes(), k.fingerprint().as_bytes()));
+            if !confirmed {
+                return Err(FleetError::HostKeyMismatch);
+            }
+            // Jump pins travel with the target (`jump_pins`, by route).
+            let mut hop = rec.target.proxy_jump.as_deref_mut();
+            let mut d = 0;
+            while let Some(h) = hop {
+                d += 1;
+                if let Some((_, k)) = first_use.iter().find(|(fd, _)| *fd == d) {
+                    if h.host_key.is_some() {
+                        return Err(FleetError::HostKeyAlreadyPinned);
+                    }
+                    h.host_key = Some(k.clone());
+                }
+                hop = h.proxy_jump.as_deref_mut();
+            }
             cache.upsert_server(&rec)?;
+            if obs.status == HostKeyStatus::FirstUse {
+                cache.pin_host_key(&id, &obs.key)?;
+            }
+        }
+        lock(&self.pending_host_keys).remove(&id);
+        self.connect_pinned(&id)
+    }
+
+    /// Changes a pinned host key (the server was reinstalled, its key
+    /// rotated): the new key must have been seen by `probe_host_key`, the
+    /// current pin must be `old_fingerprint` and the probed key
+    /// `new_fingerprint` (both constant-time compared), else
+    /// `HostKeyMismatch`. Then reconnects.
+    pub fn replace_host_key(
+        &self,
+        server_id: String,
+        old_fingerprint: String,
+        new_fingerprint: String,
+    ) -> Result<(), FleetError> {
+        let id = validate::server_id(&server_id)?;
+        let obs = lock(&self.pending_host_keys)
+            .get(&id)
+            .cloned()
+            .ok_or(FleetError::HostKeyNotConfirmed)?;
+        {
+            let cache = lock(&self.cache);
+            let current = cache
+                .pins(&id)?
+                .and_then(|p| p.host_key)
+                .ok_or(FleetError::HostKeyNotConfirmed)?;
+            let old_ok = ct_eq(old_fingerprint.as_bytes(), current.fingerprint().as_bytes());
+            let new_ok = ct_eq(new_fingerprint.as_bytes(), obs.key.fingerprint().as_bytes());
+            if !(old_ok && new_ok) || obs.status != HostKeyStatus::FirstUse {
+                return Err(FleetError::HostKeyMismatch);
+            }
             cache.pin_host_key(&id, &obs.key)?;
         }
+        lock(&self.pending_host_keys).remove(&id);
         self.connect_pinned(&id)
     }
 
@@ -543,11 +677,27 @@ async fn forward(
 }
 
 pub(crate) fn host_key_prompt(server: &ServerId, obs: &HostKeyObservation) -> HostKeyPrompt {
+    let mut jumps = Vec::new();
+    let mut seen = obs.via.as_deref();
+    while let Some(o) = seen {
+        if o.status == HostKeyStatus::FirstUse {
+            jumps.push(JumpHostKeyRow {
+                host: crate::text::line(o.host.clone()),
+                port: o.port,
+                algorithm: o.key.algorithm(),
+                fingerprint: o.key.fingerprint(),
+            });
+        }
+        seen = o.via.as_deref();
+    }
+    jumps.reverse();
     HostKeyPrompt {
         server_id: server.to_string(),
         algorithm: obs.key.algorithm(),
         fingerprint: obs.key.fingerprint(),
-        via_jump_unpinned: obs.via.as_ref().is_some_and(|v| v.needs_confirmation()),
+        target_unpinned: obs.status == HostKeyStatus::FirstUse,
+        via_jump_unpinned: !jumps.is_empty(),
+        jumps,
     }
 }
 
@@ -588,15 +738,28 @@ mod tests {
         fn public_key(&self, _: KeyRole) -> Result<Vec<u8>, SignerError> {
             Err(SignerError::Unavailable)
         }
-        fn sign(&self, _: KeyRole, _: Vec<u8>) -> Result<Vec<u8>, SignerError> {
+        fn sign(&self, _: KeyRole, _: Vec<u8>, _: String) -> Result<Vec<u8>, SignerError> {
             Err(SignerError::Unavailable)
         }
     }
-    impl KeyStore for NoKeys {
+
+    /// Keychain stand-in; `cache_key` is what "the Keychain" holds.
+    #[derive(Clone, Default)]
+    struct MemStore {
+        cache_key: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+    impl KeyStore for MemStore {
         fn load_noise_key(&self) -> Result<Option<Vec<u8>>, SignerError> {
             Ok(None)
         }
         fn store_noise_key(&self, _: Vec<u8>) -> Result<(), SignerError> {
+            Ok(())
+        }
+        fn load_cache_key(&self) -> Result<Option<Vec<u8>>, SignerError> {
+            Ok(lock(&self.cache_key).clone())
+        }
+        fn store_cache_key(&self, k: Vec<u8>) -> Result<(), SignerError> {
+            *lock(&self.cache_key) = Some(k);
             Ok(())
         }
     }
@@ -610,13 +773,108 @@ mod tests {
     }
 
     fn core(dir: &tempfile::TempDir) -> Arc<FleetCore> {
+        core_with(dir, MemStore::default()).unwrap()
+    }
+
+    fn core_with(dir: &tempfile::TempDir, store: MemStore) -> Result<Arc<FleetCore>, FleetError> {
         let path = dir.path().join("cache.sqlite");
         FleetCore::open(
             path.to_string_lossy().into_owned(),
             Box::new(NoKeys),
-            Box::new(NoKeys),
+            Box::new(store),
         )
-        .unwrap()
+    }
+
+    #[test]
+    fn cache_key_is_created_once_and_required_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemStore::default();
+        let c = core_with(&dir, store.clone()).unwrap();
+        lock(&c.cache)
+            .set_setting(SETTING_FLEET_ID, &[1; 16])
+            .unwrap();
+        drop(c);
+        assert!(lock(&store.cache_key).is_some());
+        // Same key: fine.
+        core_with(&dir, store.clone()).unwrap();
+        // Key gone from the Keychain: hard error, never a silent new key.
+        assert!(matches!(
+            core_with(&dir, MemStore::default()),
+            Err(FleetError::CacheKeyMissing)
+        ));
+        // Another key: integrity failure.
+        let other = MemStore::default();
+        *lock(&other.cache_key) = Some(vec![9; 32]);
+        assert!(matches!(
+            core_with(&dir, other),
+            Err(FleetError::CacheIntegrity { .. })
+        ));
+    }
+
+    #[test]
+    fn host_key_confirmation_needs_the_seen_fingerprint() {
+        use fleet_core::ssh::{HostKey, SshSigner};
+        let hk = |seed: u8| {
+            let k = fleet_crypto::sig::Ed25519Signer::from_seed(&[seed; 32]);
+            HostKey::from_blob(&SshSigner::public_key(&k).blob().unwrap()).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let c = core(&dir);
+        let row = c.add_server(web(None)).unwrap();
+        let id = validate::server_id(&row.id).unwrap();
+        let obs = |key: HostKey, jump: HostKey| HostKeyObservation {
+            host: "203.0.113.14".into(),
+            port: 22,
+            key,
+            status: HostKeyStatus::FirstUse,
+            via: Some(Box::new(HostKeyObservation {
+                host: "bastion".into(),
+                port: 2222,
+                key: jump,
+                status: HostKeyStatus::FirstUse,
+                via: None,
+            })),
+        };
+        c.remember_host_key(id.clone(), obs(hk(1), hk(2)));
+        let p = host_key_prompt(&id, &obs(hk(1), hk(2)));
+        assert_eq!(p.jumps.len(), 1);
+        assert_eq!(p.jumps[0].host, "bastion");
+        let fp = hk(1).fingerprint();
+        let jfp = hk(2).fingerprint();
+        // Wrong target or jump fingerprint: nothing pinned.
+        assert_eq!(
+            c.accept_host_key(row.id.clone(), hk(3).fingerprint(), vec![jfp.clone()]),
+            Err(FleetError::HostKeyMismatch)
+        );
+        assert_eq!(
+            c.accept_host_key(row.id.clone(), fp.clone(), vec![fp.clone()]),
+            Err(FleetError::HostKeyMismatch)
+        );
+        assert_eq!(
+            c.accept_host_key(row.id.clone(), fp.clone(), vec![]),
+            Err(FleetError::HostKeyMismatch)
+        );
+        assert!(!c.list_servers().unwrap()[0].host_key_pinned);
+        c.accept_host_key(row.id.clone(), fp.clone(), vec![jfp.clone()])
+            .unwrap();
+        assert!(c.list_servers().unwrap()[0].host_key_pinned);
+        let rec = c.server_record(&id).unwrap();
+        assert_eq!(rec.target.proxy_jump.unwrap().host_key, Some(hk(2)));
+        // A second first-use prompt can't overwrite the pin...
+        c.remember_host_key(id.clone(), obs(hk(4), hk(2)));
+        assert_eq!(
+            c.accept_host_key(row.id.clone(), hk(4).fingerprint(), vec![jfp.clone()]),
+            Err(FleetError::HostKeyAlreadyPinned)
+        );
+        // ...only replace_host_key with the old and new fingerprints can.
+        assert_eq!(
+            c.replace_host_key(row.id.clone(), hk(9).fingerprint(), hk(4).fingerprint()),
+            Err(FleetError::HostKeyMismatch)
+        );
+        c.replace_host_key(row.id.clone(), fp, hk(4).fingerprint())
+            .unwrap();
+        let pins = lock(&c.cache).pins(&id).unwrap().unwrap();
+        assert_eq!(pins.host_key, Some(hk(4)));
     }
 
     fn web(group_id: Option<String>) -> NewServer {

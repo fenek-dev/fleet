@@ -33,6 +33,14 @@ use std::time::Duration;
 
 /// Where the package installs the agent (and the bridge command uses).
 pub const INSTALLED_AGENT: &str = "/usr/lib/fleet/fleet-agent";
+// Fixed binary paths (rule 4): nothing is looked up in the login user's
+// `PATH`, which that user controls. Debian 12+ / Ubuntu 22.04+ are
+// merged-/usr, so everything is under /usr/bin.
+const SUDO: &str = "/usr/bin/sudo";
+const SHA256SUM: &str = "/usr/bin/sha256sum";
+const DPKG: &str = "/usr/bin/dpkg";
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
+const RM: &str = "/usr/bin/rm";
 const MAX_OUTPUT: usize = 64 * 1024;
 const STEP_TIMEOUT: Duration = Duration::from_secs(300);
 /// Largest agent artifact accepted (budget: binary under 10 MB).
@@ -164,9 +172,26 @@ pub struct InstalledAgent {
     pub signing_key: Ed25519Public,
 }
 
+/// Longest stderr excerpt kept in an error.
+const MAX_STDERR: usize = 2000;
+
+/// `s` cut to at most `max` bytes on a char boundary (never panics).
+fn truncate_chars(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 fn remote_failure(step: &'static str, out: &ExecOutput) -> InstallError {
-    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    stderr.truncate(2000);
+    let stderr = truncate_chars(
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        MAX_STDERR,
+    );
     InstallError::Remote {
         step,
         status: out.status,
@@ -217,7 +242,14 @@ pub async fn install_agent(
     let local_hash = hex::encode(Sha256::digest(&artifact));
 
     progress(InstallStage::Connecting);
-    let (conn, _) = SshConnection::connect(req.target, ssh_key, Some(req.host_key.clone())).await?;
+    let (conn, obs) =
+        SshConnection::connect(req.target, ssh_key, Some(req.host_key.clone())).await?;
+    // Jump hops need their pins too; nothing is uploaded through an
+    // unconfirmed hop.
+    if !obs.all_matched() {
+        conn.disconnect().await;
+        return Err(SshError::HostKeyUnconfirmed.into());
+    }
     let result = async {
         let mut suffix = [0u8; 8];
         fleet_crypto::random_bytes(&mut suffix).map_err(|_| InstallError::Rng)?;
@@ -232,7 +264,7 @@ pub async fn install_agent(
         let sudo: &[&str] = if req.target.user == "root" {
             &[]
         } else {
-            &["sudo", "-n"]
+            &[SUDO, "-n"]
         };
 
         let outcome = async {
@@ -267,7 +299,7 @@ pub async fn install_agent(
             progress(InstallStage::Uploading { done: total, total });
 
             progress(InstallStage::Verifying);
-            let out = run(&conn, "sha256sum", &["sha256sum", "--", value(&bin)?]).await?;
+            let out = run(&conn, "sha256sum", &[SHA256SUM, "--", value(&bin)?]).await?;
             let remote_hash = String::from_utf8_lossy(&out.stdout)
                 .split_whitespace()
                 .next()
@@ -281,7 +313,7 @@ pub async fn install_agent(
             let agent = match kind {
                 ArtifactKind::Deb => {
                     let mut t = sudo.to_vec();
-                    t.extend(["dpkg", "-i", value(&bin)?]);
+                    t.extend([DPKG, "-i", value(&bin)?]);
                     run(&conn, "dpkg -i", &t).await?;
                     INSTALLED_AGENT.to_string()
                 }
@@ -306,7 +338,7 @@ pub async fn install_agent(
             progress(InstallStage::Starting);
             let mut t = sudo.to_vec();
             t.extend([
-                "systemctl",
+                SYSTEMCTL,
                 "enable",
                 "--now",
                 "fleet-exec.service",
@@ -322,7 +354,7 @@ pub async fn install_agent(
 
         progress(InstallStage::CleaningUp);
         // Best effort; the files are the login user's, no sudo needed.
-        let mut t = vec!["rm", "-f", "--"];
+        let mut t = vec![RM, "-f", "--"];
         for p in &temp {
             t.push(value(p)?);
         }
@@ -355,6 +387,17 @@ mod tests {
             "sudo -n dpkg -i /tmp/x.deb"
         );
         assert!(command_line(&["rm", "-f", "/tmp/a b"]).is_err());
+        for bin in [SUDO, SHA256SUM, DPKG, SYSTEMCTL, RM] {
+            assert!(bin.starts_with("/usr/bin/") && is_token(bin));
+        }
+    }
+
+    #[test]
+    fn stderr_truncates_on_char_boundary() {
+        let s = "é".repeat(MAX_STDERR); // 2 bytes each
+        let t = truncate_chars(format!("x{s}"), MAX_STDERR);
+        assert!(t.len() <= MAX_STDERR && t.starts_with('x'));
+        assert_eq!(truncate_chars("short".into(), MAX_STDERR), "short");
     }
 
     #[test]

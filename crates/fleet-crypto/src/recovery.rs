@@ -34,13 +34,65 @@ impl KdfParams {
     };
 }
 
-/// `recovery_delay_s` for a new code: 0 with a passphrase, 72 h without.
+/// `recovery_delay_s` for a new code: 0 only with a **strong** passphrase
+/// ([`passphrase_is_strong`]), 72 h otherwise. A weak passphrase is still
+/// mixed into the derivation; it just doesn't earn the zero delay, because
+/// paper plus a guessable passphrase must not beat a veto.
 pub fn delay_for(passphrase: &str) -> u32 {
-    if passphrase.is_empty() {
-        DEFAULT_DELAY_S
-    } else {
+    if passphrase_is_strong(passphrase) {
         0
+    } else {
+        DEFAULT_DELAY_S
     }
+}
+
+/// Minimum length (in characters) of a mixed-class passphrase.
+pub const STRONG_MIN_CHARS: usize = 12;
+/// Minimum character classes (lowercase, uppercase, digit, other).
+pub const STRONG_MIN_CLASSES: usize = 3;
+/// Minimum words of a passphrase made of words.
+pub const STRONG_MIN_WORDS: usize = 5;
+/// Minimum letters per counted word.
+pub const STRONG_MIN_WORD_LEN: usize = 3;
+
+/// Simple, documented strength estimate aiming at ~60 bits (design §5.11).
+/// On the NFKD-normalized, trimmed passphrase, either:
+///
+/// - at least [`STRONG_MIN_CHARS`] characters from at least
+///   [`STRONG_MIN_CLASSES`] of {lowercase, uppercase, digit, other}
+///   (12 × log2(~60) ≈ 70 bits for random choices; people choose worse,
+///   hence the margin), or
+/// - at least [`STRONG_MIN_WORDS`] distinct words of at least
+///   [`STRONG_MIN_WORD_LEN`] letters, separated by spaces, `-`, `_` or `.`
+///   (5 diceware words ≈ 64 bits).
+///
+/// This is a floor against "password1"-style input, not a guarantee.
+pub fn passphrase_is_strong(passphrase: &str) -> bool {
+    let norm = nfkd(passphrase);
+    let p = norm.trim();
+    let chars = p.chars().count();
+    let classes = [
+        p.chars().any(|c| c.is_lowercase()),
+        p.chars().any(|c| c.is_uppercase()),
+        p.chars().any(|c| c.is_numeric()),
+        p.chars().any(|c| !c.is_alphanumeric()),
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+    if chars >= STRONG_MIN_CHARS && classes >= STRONG_MIN_CLASSES {
+        return true;
+    }
+    let mut words: Vec<Zeroizing<String>> = Vec::new();
+    for w in p.split(|c: char| c.is_whitespace() || matches!(c, '-' | '_' | '.')) {
+        if w.chars().filter(|c| c.is_alphabetic()).count() >= STRONG_MIN_WORD_LEN {
+            let w = Zeroizing::new(w.to_lowercase());
+            if !words.iter().any(|x| **x == *w) {
+                words.push(w);
+            }
+        }
+    }
+    words.len() >= STRONG_MIN_WORDS
 }
 
 /// 256-bit recovery entropy, shown as 24 words. Zeroized on drop.
@@ -234,7 +286,33 @@ mod tests {
         assert_ne!(a, p);
         assert_ne!(a.recovery_key, a.recovery_ssh_key);
         assert_eq!(delay_for(""), DEFAULT_DELAY_S);
-        assert_eq!(delay_for("x"), 0);
+        assert_eq!(delay_for("x"), DEFAULT_DELAY_S);
+        assert_eq!(delay_for("Tr0ub4dor&3xyz"), 0);
+    }
+
+    #[test]
+    fn passphrase_strength() {
+        for weak in [
+            "",
+            "hunter2",
+            "password1234",          // 2 classes
+            "   Ab1   ",             // short after trim
+            "correct horse battery", // 3 words
+            "aa bb cc dd ee ff",     // words too short
+            "cat cat cat cat cat",   // not distinct
+        ] {
+            assert!(!passphrase_is_strong(weak), "{weak:?}");
+            assert_eq!(delay_for(weak), DEFAULT_DELAY_S);
+        }
+        for strong in [
+            "Password1234",
+            "correct horse battery staple zebra",
+            "correct-horse-battery-staple-zebra",
+            "  mañana: 12 Äpfel!  ",
+        ] {
+            assert!(passphrase_is_strong(strong), "{strong:?}");
+            assert_eq!(delay_for(strong), 0);
+        }
     }
 
     #[test]

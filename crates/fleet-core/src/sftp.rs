@@ -6,9 +6,9 @@
 //! protocol; names, owners and contents are shown, never interpreted.
 
 use crate::ssh::{SshConnection, SshError};
-use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as RawError;
-use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, Packet, StatusCode};
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -130,16 +130,64 @@ fn base_name(path: &str) -> String {
         .to_string()
 }
 
-/// One SFTP subsystem channel.
+/// `posix-rename@openssh.com` (replaces the target atomically; plain SFTP v3
+/// rename refuses an existing target).
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
+
+/// SSH `string` encoding.
+fn put_string(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// `dir` and base name of an absolute path.
+fn split_parent(path: &str) -> Result<(&str, &str), SftpError> {
+    let (dir, name) = path.rsplit_once('/').ok_or(SftpError::InvalidPath)?;
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(SftpError::InvalidPath);
+    }
+    Ok((if dir.is_empty() { "/" } else { dir }, name))
+}
+
+/// SFTP subsystem channels: the high-level session, plus a raw one for the
+/// `posix-rename@openssh.com` extension the high-level API lacks.
 pub struct Sftp {
     s: SftpSession,
+    raw: RawSftpSession,
+    posix_rename: bool,
 }
 
 impl Sftp {
     pub async fn open(conn: &SshConnection) -> Result<Self, SftpError> {
+        let s = conn.open_sftp().await?;
+        let raw = conn.open_raw_sftp().await?;
+        let version = raw.init().await?;
+        let posix_rename = version
+            .extensions
+            .get(POSIX_RENAME)
+            .is_some_and(|v| v == "1");
         Ok(Self {
-            s: conn.open_sftp().await?,
+            s,
+            raw,
+            posix_rename,
         })
+    }
+
+    /// Atomic replace: `from` takes `to`'s place in one step.
+    async fn posix_rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
+        if !self.posix_rename {
+            return Err(SftpError::Failed(
+                "server lacks posix-rename@openssh.com (atomic save)".into(),
+            ));
+        }
+        let mut data = Vec::with_capacity(8 + from.len() + to.len());
+        put_string(&mut data, from);
+        put_string(&mut data, to);
+        match self.raw.extended(POSIX_RENAME, data).await? {
+            Packet::Status(st) if st.status_code == StatusCode::Ok => Ok(()),
+            Packet::Status(st) => Err(RawError::Status(st).into()),
+            _ => Err(SftpError::Failed("unexpected reply to posix-rename".into())),
+        }
     }
 
     /// The login user's home (`realpath .`).
@@ -197,32 +245,66 @@ impl Sftp {
         Ok(buf)
     }
 
-    /// Replaces an existing file's contents. With `expect`, refuses when
-    /// the file's `(size, mtime)` changed since it was read.
+    /// Replaces an existing file's contents **atomically**: the data goes
+    /// to a new temp file in the same directory (`O_EXCL`), which gets the
+    /// original's mode and owner, and then replaces the file with
+    /// `posix-rename@openssh.com`. A crash or dropped connection leaves the
+    /// old file intact (and at worst a `.fleet-*.tmp` next to it). A
+    /// symlink is followed: its target is replaced, the link stays. With
+    /// `expect`, refuses when the file's `(size, mtime)` changed since it
+    /// was read. If the owner can't be kept (not root, file owned by
+    /// someone else), nothing is replaced.
     pub async fn write_file(
         &self,
         path: &str,
         data: &[u8],
         expect: Option<(u64, Option<u32>)>,
     ) -> Result<(), SftpError> {
-        let path = remote_path(path)?;
-        if let Some((size, mtime)) = expect {
-            let a = self.s.metadata(path.clone()).await?;
-            if a.size.unwrap_or(0) != size || a.mtime != mtime {
-                return Err(SftpError::Changed);
-            }
+        let path = remote_path(&self.s.canonicalize(remote_path(path)?).await?)?;
+        let orig = self.s.metadata(path.clone()).await?;
+        if let Some((size, mtime)) = expect
+            && (orig.size.unwrap_or(0) != size || orig.mtime != mtime)
+        {
+            return Err(SftpError::Changed);
         }
+        let (dir, name) = split_parent(&path)?;
+        let mut suffix = [0u8; 8];
+        fleet_crypto::random_bytes(&mut suffix).map_err(|_| SftpError::Failed("rng".into()))?;
+        let tmp = join(dir, &format!(".{name}.fleet-{}.tmp", hex::encode(suffix)))?;
+        let mut attrs = FileAttributes::empty();
+        attrs.permissions = Some(0o600);
         let mut f = self
             .s
-            .open_with_flags(path, OpenFlags::WRITE | OpenFlags::TRUNCATE)
+            .open_with_flags_and_attributes(
+                tmp.clone(),
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
+                attrs,
+            )
             .await?;
-        f.write_all(data)
-            .await
-            .map_err(|e| SftpError::Failed(e.to_string()))?;
-        f.shutdown()
-            .await
-            .map_err(|e| SftpError::Failed(e.to_string()))?;
-        Ok(())
+        let result = async {
+            f.write_all(data)
+                .await
+                .map_err(|e| SftpError::Failed(e.to_string()))?;
+            f.shutdown()
+                .await
+                .map_err(|e| SftpError::Failed(e.to_string()))?;
+            let written = self.s.metadata(tmp.clone()).await?;
+            if (orig.uid, orig.gid) != (written.uid, written.gid) {
+                let mut own = FileAttributes::empty();
+                own.uid = orig.uid;
+                own.gid = orig.gid;
+                self.s.set_metadata(tmp.clone(), own).await?;
+            }
+            let mut mode = FileAttributes::empty();
+            mode.permissions = Some(orig.permissions.unwrap_or(0o644) & 0o7777);
+            self.s.set_metadata(tmp.clone(), mode).await?;
+            self.posix_rename(&tmp, &path).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.s.remove_file(tmp).await;
+        }
+        result
     }
 
     pub async fn rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
@@ -297,10 +379,16 @@ impl Sftp {
         exclusive: bool,
         mut progress: impl FnMut(u64, u64) + Send,
     ) -> Result<u64, SftpError> {
-        let data = tokio::fs::read(local)
+        // Streamed in blocks: large files never sit in memory whole.
+        let mut file = tokio::fs::File::open(local)
             .await
             .map_err(|e| SftpError::Local(e.to_string()))?;
-        self.upload_bytes(&data, remote, mode, exclusive, &mut progress)
+        let total = file
+            .metadata()
+            .await
+            .map_err(|e| SftpError::Local(e.to_string()))?
+            .len();
+        self.upload_reader(&mut file, total, remote, mode, exclusive, &mut progress)
             .await
     }
 
@@ -308,6 +396,21 @@ impl Sftp {
     pub async fn upload_bytes(
         &self,
         data: &[u8],
+        remote: &str,
+        mode: Option<u32>,
+        exclusive: bool,
+        progress: &mut (dyn FnMut(u64, u64) + Send),
+    ) -> Result<u64, SftpError> {
+        let mut r = data;
+        self.upload_reader(&mut r, data.len() as u64, remote, mode, exclusive, progress)
+            .await
+    }
+
+    /// Copies `src` (about `total` bytes, for progress) to `remote`.
+    async fn upload_reader<R: tokio::io::AsyncRead + Unpin + Send>(
+        &self,
+        src: &mut R,
+        total: u64,
         remote: &str,
         mode: Option<u32>,
         exclusive: bool,
@@ -330,14 +433,21 @@ impl Sftp {
                 SftpError::Failed(m) if exclusive => SftpError::Failed(format!("{m} (exists?)")),
                 other => other,
             })?;
-        let total = data.len() as u64;
+        let mut buf = vec![0u8; COPY_BUF];
         let mut done = 0u64;
-        for block in data.chunks(COPY_BUF) {
-            f.write_all(block)
+        loop {
+            let n = src
+                .read(&mut buf)
+                .await
+                .map_err(|e| SftpError::Local(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            f.write_all(&buf[..n])
                 .await
                 .map_err(|e| SftpError::Failed(e.to_string()))?;
-            done += block.len() as u64;
-            progress(done, total);
+            done += n as u64;
+            progress(done, total.max(done));
         }
         f.shutdown()
             .await
@@ -365,5 +475,11 @@ mod tests {
         assert_eq!(base_name("/etc/hosts"), "hosts");
         assert_eq!(base_name("/etc/"), "etc");
         assert_eq!(base_name("/"), "/");
+        assert_eq!(split_parent("/etc/hosts").unwrap(), ("/etc", "hosts"));
+        assert_eq!(split_parent("/hosts").unwrap(), ("/", "hosts"));
+        assert!(split_parent("/etc/").is_err());
+        let mut v = Vec::new();
+        put_string(&mut v, "ab");
+        assert_eq!(v, [0, 0, 0, 2, b'a', b'b']);
     }
 }

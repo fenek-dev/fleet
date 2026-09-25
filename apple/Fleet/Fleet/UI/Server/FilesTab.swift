@@ -1,4 +1,5 @@
 import AppKit
+import CoreServices
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -323,17 +324,43 @@ struct FilesTab: View {
         await list()
     }
 
+    /// Downloads above this size need an explicit confirmation.
+    static let largeDownload: UInt64 = 1 << 30
+
+    /// Marks a file that came from a server as downloaded (Gatekeeper
+    /// checks it before it can be opened or run).
+    nonisolated static func quarantine(_ url: URL, from serverName: String) {
+        var u = url
+        var values = URLResourceValues()
+        values.quarantineProperties = [
+            kLSQuarantineAgentNameKey as String: "Fleet",
+            kLSQuarantineTypeKey as String: kLSQuarantineTypeOtherDownload as String,
+            kLSQuarantineOriginURLKey as String: "sftp://\(displaySafe(serverName, max: 200))",
+        ]
+        try? u.setResourceValues(values)
+    }
+
     private func download(_ e: RemoteFileRow) {
         guard let api = core.api else { return }
+        if e.size > Self.largeDownload {
+            let alert = NSAlert()
+            alert.messageText = "Download \(Format.bytes(e.size))?"
+            alert.informativeText = "\(e.name) is larger than 1 GiB."
+            alert.addButton(withTitle: "Download")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = e.name
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let id = transfers.begin(e.name)
         let listener = transfers.listener(id)
+        let serverName = server.name
         Task {
             do {
                 _ = try await api.fileDownload(serverId: server.id, remote: e.path,
                                                localPath: url.path, listener: listener)
+                Self.quarantine(url, from: serverName)
                 transfers.finish(id, error: nil)
             } catch {
                 transfers.finish(id, error: error.fleetMessage)
@@ -368,12 +395,16 @@ struct FilesTab: View {
         }
     }
 
-    /// Drag a remote file out: downloaded to a temporary file on drop.
+    /// Drag a remote file out: downloaded to a temporary file on drop and
+    /// quarantined. Files over 1 GiB can't be dragged (use Download…,
+    /// which asks first).
     private func dragProvider(_ e: RemoteFileRow) -> NSItemProvider {
         let provider = NSItemProvider()
-        guard e.kind == .file, let api = core.api else { return provider }
+        guard e.kind == .file, e.size <= Self.largeDownload, let api = core.api else {
+            return provider
+        }
         provider.suggestedName = e.name
-        let (serverId, path, name) = (server.id, e.path, e.name)
+        let (serverId, path, name, serverName) = (server.id, e.path, e.name, server.name)
         provider.registerFileRepresentation(forTypeIdentifier: UTType.data.identifier,
                                             fileOptions: [], visibility: .all) { done in
             let dirURL = FileManager.default.temporaryDirectory
@@ -384,6 +415,7 @@ struct FilesTab: View {
                     try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
                     _ = try await api.fileDownload(serverId: serverId, remote: path,
                                                    localPath: url.path, listener: nil)
+                    Self.quarantine(url, from: serverName)
                     done(url, false, nil)
                 } catch {
                     done(nil, false, error)
@@ -414,7 +446,8 @@ private struct FileEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(session.path).font(.mono(12)).foregroundStyle(Color.textSecondary).lineLimit(1)
+                Text(displaySafe(session.path, max: 4096)).font(.mono(12))
+                    .foregroundStyle(Color.textSecondary).lineLimit(1)
                 Spacer()
                 if reviewing {
                     Button("Back to editing") { reviewing = false }

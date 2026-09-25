@@ -2,8 +2,10 @@ import AppKit
 import LocalAuthentication
 import Observation
 
-/// App lock (design §5.10): locked on launch, on sleep/screen sleep, and
-/// after 15 minutes without operator input. Unlocking takes Touch ID.
+/// App lock (design §5.10): locked on launch, on sleep/screen sleep, screen
+/// lock or screensaver, and after 15 minutes without operator input.
+/// Unlocking takes Touch ID; its evaluated context is what device and SSH
+/// keys sign with (`KeyGate`).
 /// Locking switches every session to the monitor key; unlocking to the
 /// device key.
 @Observable
@@ -26,7 +28,6 @@ final class AppLock {
     var onChange: ((_ locked: Bool) -> Void)?
 
     let gate: KeyGate
-    @ObservationIgnored private var context: LAContext?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private var eventMonitor: Any?
     @ObservationIgnored private var idleTask: Task<Void, Never>?
@@ -41,6 +42,15 @@ final class AppLock {
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
                      NSWorkspace.sessionDidResignActiveNotification] {
             observers.append(ws.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.lock() }
+            })
+        }
+        // Screen locked (⌃⌘Q, hot corner) or screensaver started: the Mac
+        // is unattended even without sleeping.
+        let dist = DistributedNotificationCenter.default()
+        for name in ["com.apple.screenIsLocked", "com.apple.screensaver.didstart"] {
+            observers.append(dist.addObserver(forName: Notification.Name(name), object: nil,
+                                              queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.lock() }
             })
         }
@@ -68,9 +78,9 @@ final class AppLock {
     }
 
     func lock() {
-        context?.invalidate()
-        context = nil
-        gate.set(unlocked: false)
+        // Invalidating the unlock context makes the device and SSH keys
+        // unusable at once (their ACL needs it).
+        gate.lock()
         guard !isLocked else { return }
         isLocked = true
         onChange?(true)
@@ -91,10 +101,9 @@ final class AppLock {
             lastError = (error as? LAError)?.code == .userCancel ? nil : error.localizedDescription
             return
         }
-        context = ctx
         lastError = nil
         lastActivity = .now
-        gate.set(unlocked: true)
+        gate.unlock(with: ctx)
         isLocked = false
         onChange?(false)
     }

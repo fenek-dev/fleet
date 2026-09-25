@@ -221,6 +221,9 @@ struct StatusBanners: View {
             case .starting, .running:
                 EmptyView()
             }
+            if let alert = core.securityAlert {
+                banner(alert, tone: .critical)
+            }
             if core.usesSoftwareKeys {
                 banner("Software keys in use (no Secure Enclave). Development only.", tone: .warn)
             }
@@ -229,9 +232,16 @@ struct StatusBanners: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("New host key for \(serverName(p.serverId))")
                             .foregroundStyle(Tone.warn.text)
-                        Text("\(p.algorithm) \(p.fingerprint)").font(.mono(11))
-                            .foregroundStyle(Color.textSecondary)
-                            .textSelection(.enabled)
+                        if p.targetUnpinned {
+                            Text("\(p.algorithm) \(p.fingerprint)").font(.mono(11))
+                                .foregroundStyle(Color.textSecondary)
+                                .textSelection(.enabled)
+                        }
+                        ForEach(p.jumps, id: \.self) { j in
+                            Text("via \(j.host):\(j.port) \(j.algorithm) \(j.fingerprint)").font(.mono(11))
+                                .foregroundStyle(Color.textSecondary)
+                                .textSelection(.enabled)
+                        }
                     }
                     Spacer()
                     Button("Reject") { core.resolveHostKey(p, accept: false) }

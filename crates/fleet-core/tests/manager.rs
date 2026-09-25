@@ -5,7 +5,7 @@ use fleet_core::manager::{
     ManagerEvent, ManagerHandle, RequestError, ServeEnd, ServerSpec, SessionKind, backoff_delay,
 };
 use fleet_core::ssh::{SshError, SshTarget};
-use fleet_core::{ClientError, Reply};
+use fleet_core::{ClientError, PendingReply, Reply};
 use fleet_proto::{
     Actor, Ed25519Public, ErrorCode, Event, Op, Outcome, Receipt, RootApproval, ServerId,
     Signature, SignedReceipt, X25519Public,
@@ -72,6 +72,7 @@ impl Fake {
 struct FakeLink {
     kind: SessionKind,
     events: mpsc::UnboundedReceiver<Event>,
+    alive: std::rc::Rc<()>,
 }
 
 fn reply(result: Result<fleet_proto::Payload, ErrorCode>) -> Reply {
@@ -91,19 +92,38 @@ fn reply(result: Result<fleet_proto::Payload, ErrorCode>) -> Reply {
     }
 }
 
+/// How long the fake link takes to answer `pkg.refresh` (a slow op).
+const SLOW: Duration = Duration::from_millis(400);
+
 impl AgentLink for FakeLink {
-    async fn request(
+    async fn start_request(
         &mut self,
         op: Op,
         _: Actor,
         _: Option<RootApproval>,
-    ) -> Result<Reply, ClientError> {
+    ) -> Result<PendingReply, ClientError> {
         // Echo the session kind through the result so tests can see which
         // session served the request.
-        Ok(reply(match (op, self.kind) {
+        let r = reply(match (&op, self.kind) {
             (Op::AgentHealth, SessionKind::Monitor) => Err(ErrorCode::NotFound),
             _ => Ok(fleet_proto::Payload::Empty),
-        }))
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let delay = if matches!(op, Op::PkgRefresh) {
+            SLOW
+        } else {
+            Duration::ZERO
+        };
+        // Answers arrive later, like responses read off the wire, and only
+        // while the link lives (a real session drops its pending replies).
+        let alive = std::rc::Rc::downgrade(&self.alive);
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(delay).await;
+            if alive.upgrade().is_some() {
+                let _ = tx.send(Ok(r));
+            }
+        });
+        Ok(rx)
     }
 
     async fn next_event(&mut self) -> Result<(u64, Event), ClientError> {
@@ -158,7 +178,11 @@ impl Connector for FakeConnector {
         }
         let (tx, rx) = mpsc::unbounded_channel();
         self.feeds.borrow_mut().insert(server.id.clone(), tx);
-        let mut link = FakeLink { kind, events: rx };
+        let mut link = FakeLink {
+            kind,
+            events: rx,
+            alive: std::rc::Rc::new(()),
+        };
         ctx.serve(&mut link).await
     }
 }
@@ -389,4 +413,96 @@ async fn monitor_session_upgrades_on_unlock() {
             );
         })
         .await;
+}
+
+#[tokio::test]
+async fn slow_requests_run_concurrently_and_never_block_control() {
+    LocalSet::new()
+        .run_until(async {
+            let fake = std::rc::Rc::new(Fake::default());
+            let cfg = ManagerConfig {
+                max_in_flight: 2,
+                ..cfg()
+            };
+            let h = start(fake.clone(), cfg, SessionKind::Device);
+            h.add_server(spec(1));
+            wait_state(&h, &sid(1), ConnState::Ready).await;
+
+            // A slow op in flight doesn't hold up a fast one.
+            let t0 = std::time::Instant::now();
+            let h1 = h.clone();
+            let slow = tokio::task::spawn_local(async move {
+                h1.request(&sid(1), Op::PkgRefresh, Actor::Human, None)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            h.request(&sid(1), Op::SystemInfo, Actor::Human, None)
+                .await
+                .unwrap();
+            assert!(t0.elapsed() < SLOW, "fast request waited for the slow one");
+            slow.await.unwrap().unwrap();
+            assert!(t0.elapsed() >= SLOW);
+
+            // In-flight cap: 3 slow requests with a cap of 2 take two rounds.
+            let t0 = std::time::Instant::now();
+            let all: Vec<_> = (0..3)
+                .map(|_| {
+                    let h = h.clone();
+                    tokio::task::spawn_local(async move {
+                        h.request(&sid(1), Op::PkgRefresh, Actor::Human, None).await
+                    })
+                })
+                .collect();
+            for t in all {
+                t.await.unwrap().unwrap();
+            }
+            let took = t0.elapsed();
+            assert!(took >= SLOW * 2 && took < SLOW * 3, "{took:?}");
+
+            // Locking while a slow request is in flight takes effect at
+            // once; the request fails instead of blocking the switch.
+            let h1 = h.clone();
+            let slow = tokio::task::spawn_local(async move {
+                h1.request(&sid(1), Op::PkgRefresh, Actor::Human, None)
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let t0 = std::time::Instant::now();
+            h.set_session_kind(SessionKind::Monitor);
+            let r = slow.await.unwrap();
+            assert!(
+                matches!(r, Err(RequestError::NotReady(_))),
+                "{:?}",
+                r.map(|_| ())
+            );
+            assert!(t0.elapsed() < SLOW);
+            wait_state(&h, &sid(1), ConnState::Ready).await;
+            assert_eq!(
+                fake.kinds.borrow().last(),
+                Some(&(sid(1), SessionKind::Monitor))
+            );
+
+            // Removal isn't blocked either.
+            h.set_session_kind(SessionKind::Device);
+            wait_state(&h, &sid(1), ConnState::Ready).await;
+            let h1 = h.clone();
+            let slow = tokio::task::spawn_local(async move {
+                h1.request(&sid(1), Op::PkgRefresh, Actor::Human, None)
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let t0 = std::time::Instant::now();
+            h.remove_server(&sid(1));
+            assert!(slow.await.unwrap().is_err());
+            assert!(t0.elapsed() < SLOW);
+        })
+        .await;
+}
+
+#[test]
+fn long_ops_get_the_long_timeout() {
+    let c = ManagerConfig::default();
+    assert_eq!(c.timeout_for(&Op::SystemInfo), c.request_timeout);
+    assert_eq!(c.timeout_for(&Op::PkgRefresh), c.long_request_timeout);
+    assert!(c.long_request_timeout > c.request_timeout);
 }

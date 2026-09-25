@@ -124,8 +124,17 @@ struct AddServerSheet: View {
                         .textSelection(.enabled)
                 }
                 .card(padding: 12)
+                ForEach(prompt.jumps, id: \.self) { j in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Jump host \(j.host):\(j.port) · \(j.algorithm)")
+                            .font(.secondary).foregroundStyle(Color.textMuted)
+                        Text(j.fingerprint).font(.mono(13)).foregroundStyle(Color.text)
+                            .textSelection(.enabled)
+                    }
+                    .card(padding: 12)
+                }
                 if prompt.viaJumpUnpinned {
-                    StatusPill(label: "Jump host key is new too and will be pinned", tone: .warn)
+                    StatusPill(label: "Jump host keys above are new too and will be pinned", tone: .warn)
                 }
             }
             HStack {
@@ -287,9 +296,11 @@ struct AddServerSheet: View {
     }
 
     private func trust() {
-        guard let api = core.api, let id = serverId else { return }
+        guard let api = core.api, let id = serverId, let prompt else { return }
         do {
-            try api.acceptHostKey(serverId: id)
+            // Binds the pin to exactly the fingerprints shown above.
+            try api.acceptHostKey(serverId: id, fingerprint: prompt.fingerprint,
+                                  jumpFingerprints: prompt.jumps.map(\.fingerprint))
             core.reload()
             error = nil
             step = .install

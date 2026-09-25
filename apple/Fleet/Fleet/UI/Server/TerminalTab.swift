@@ -2,6 +2,56 @@ import AppKit
 import SwiftTerm
 import SwiftUI
 
+/// SwiftTerm view that never answers the server with what it knows about
+/// the Mac. Everything the *emulator* sends back (as opposed to typed
+/// keys, which go through `send(data:)`) passes `send(source: Terminal…)`;
+/// answer-backs that can leak state or be abused to inject input are
+/// dropped there:
+///
+/// - window/icon title reports (CSI 20t / 21t → `OSC L` / `OSC l`),
+/// - DECRQSS / XTGETTCAP replies (`DCS 0|1 $ r`, `DCS 0|1 + r`),
+/// - OSC 52 clipboard replies (the delegate never reads the clipboard
+///   either).
+///
+/// Device-status and cursor-position reports stay: shells and editors
+/// need them, and they carry nothing the server doesn't know.
+final class FleetTerminalView: TerminalView {
+    static func isBlockedReply(_ d: ArraySlice<UInt8>) -> Bool {
+        let b = Array(d.prefix(5))
+        guard b.count >= 3, b[0] == 0x1b else { return false }
+        switch b[1] {
+        case UInt8(ascii: "]"):
+            // OSC l / OSC L (title reports), OSC 52 (clipboard).
+            if b[2] == UInt8(ascii: "l") || b[2] == UInt8(ascii: "L") { return true }
+            return b.count >= 4 && b[2] == UInt8(ascii: "5") && b[3] == UInt8(ascii: "2")
+        case UInt8(ascii: "P"):
+            // DCS replies: DECRQSS (`0$r`/`1$r`), XTGETTCAP (`0+r`/`1+r`).
+            guard b.count >= 5 else { return false }
+            return (b[2] == UInt8(ascii: "0") || b[2] == UInt8(ascii: "1"))
+                && (b[3] == UInt8(ascii: "$") || b[3] == UInt8(ascii: "+"))
+                && b[4] == UInt8(ascii: "r")
+        default:
+            return false
+        }
+    }
+
+    override func send(source: Terminal, data: ArraySlice<UInt8>) {
+        if Self.isBlockedReply(data) { return }
+        super.send(source: source, data: data)
+    }
+}
+
+/// Server text shown in the tab bar: controls and bidi overrides removed.
+func displaySafe(_ s: String, max: Int) -> String {
+    let bidi: ClosedRange<UInt32> = 0x202A...0x202E
+    let isolates: ClosedRange<UInt32> = 0x2066...0x2069
+    let kept = s.unicodeScalars.filter {
+        !(CharacterSet.controlCharacters.contains($0) || bidi.contains($0.value)
+          || isolates.contains($0.value))
+    }
+    return String(String.UnicodeScalarView(kept).prefix(max))
+}
+
 /// One terminal: a SwiftTerm view bound to a Rust PTY channel on the
 /// server's SSH connection (design §2.3). Output arrives on the core
 /// thread and is fed to the view on the main actor; keystrokes and
@@ -20,7 +70,7 @@ final class TerminalController: NSObject, Identifiable {
     init(slot: UInt32) {
         self.slot = slot
         title = "fleet-\(slot)"
-        view = TerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 520))
+        view = FleetTerminalView(frame: NSRect(x: 0, y: 0, width: 900, height: 520))
         super.init()
         view.nativeBackgroundColor = NSColor(Self.bg)
         view.nativeForegroundColor = NSColor(Color(hex: 0xc9cbd0))
@@ -77,7 +127,7 @@ extension TerminalController: @preconcurrency TerminalViewDelegate {
 
     func setTerminalTitle(source: TerminalView, title: String) {
         // Untrusted text from the server: shown as a tab label only.
-        self.title = String(title.prefix(40))
+        self.title = displaySafe(title, max: 40)
         onChange?()
     }
 
@@ -90,20 +140,31 @@ extension TerminalController: @preconcurrency TerminalViewDelegate {
     func scrolled(source: TerminalView, position: Double) {}
 
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {
-        // Links come from the server: open only web URLs, after a click.
-        if let url = URL(string: link), ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+        // Links come from the server (OSC 8 text can show anything): open
+        // only web URLs, after a click, and only once the operator has seen
+        // the real host.
+        guard let url = URL(string: link),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host(percentEncoded: false), !host.isEmpty
+        else { return }
+        let alert = NSAlert()
+        alert.messageText = "Open link to \(displaySafe(host, max: 253))?"
+        alert.informativeText = "The server's terminal asked to open:\n\(displaySafe(url.absoluteString, max: 500))"
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
             NSWorkspace.shared.open(url)
         }
     }
 
     func bell(source: TerminalView) {}
 
-    func clipboardCopy(source: TerminalView, content: Data) {
-        if let s = String(data: content, encoding: .utf8) {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(s, forType: .string)
-        }
-    }
+    /// OSC 52 writes are ignored: a server must not be able to put text on
+    /// the Mac's clipboard (paste-jacking into another terminal).
+    func clipboardCopy(source: TerminalView, content: Data) {}
+
+    /// OSC 52 reads: never.
+    func clipboardRead(source: TerminalView) -> Data? { nil }
 
     func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
 

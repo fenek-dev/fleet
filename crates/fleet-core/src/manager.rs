@@ -9,9 +9,13 @@
 //! - **Degraded**: the last attempt failed; retrying with exponential
 //!   backoff (1–60 s, equal jitter). After `offline_after` consecutive
 //!   failures the state is **Offline** (still retrying at the backoff
-//!   ceiling). A *fatal* failure (host key changed, agent key mismatch, SSH
-//!   key refused, device not authorized) goes Offline and stops retrying
-//!   until [`ManagerHandle::reconnect`].
+//!   ceiling). A *fatal* failure (host key changed or not yet confirmed,
+//!   agent key mismatch, SSH key refused, device not authorized in a
+//!   signed answer) goes Offline and stops retrying until
+//!   [`ManagerHandle::reconnect`]. A first-use host key never gets past
+//!   the SSH layer: the connection is closed and the operator asked.
+//! - **Requests** run concurrently per server (up to `max_in_flight`),
+//!   each with its own timeout ([`ManagerConfig::timeout_for`]).
 //! - **Session kind**: every worker connects with the current
 //!   [`SessionKind`]. Switching Monitor → Device (unlock) or back (lock)
 //!   reconnects every Ready server with the new key, without backoff.
@@ -28,7 +32,8 @@
 //! Sync` and can be used from anywhere.
 
 use crate::session::{
-    ClientError, CommandSigner, Reply, Session, SessionConfig, SessionMode, StreamEvent,
+    ClientError, CommandSigner, PendingReply, Reply, Session, SessionConfig, SessionMode,
+    StreamEvent,
 };
 use crate::signer::{DeviceSigner, KeyRole, RoleSigner, SignerError};
 use crate::ssh::{
@@ -39,13 +44,14 @@ use fleet_proto::{
     Actor, DeviceId, Ed25519Public, ErrorCode, Event, FleetId, KeyKind, Op, RequestId,
     RootApproval, ServerId, X25519Public,
 };
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
@@ -87,8 +93,13 @@ pub struct ManagerConfig {
     pub offline_after: u32,
     /// Per request, including time queued while connecting.
     pub request_timeout: Duration,
+    /// Same, for long-running operations ([`is_long_op`]: package
+    /// upgrades, image pulls, deploys, scans).
+    pub long_request_timeout: Duration,
     /// Queued requests per server.
     pub request_queue: usize,
+    /// Requests in flight per server; more wait in the queue.
+    pub max_in_flight: usize,
     /// Broadcast buffer; slow subscribers skip ahead.
     pub event_capacity: usize,
 }
@@ -101,10 +112,51 @@ impl Default for ManagerConfig {
             backoff_max: Duration::from_secs(60),
             offline_after: 5,
             request_timeout: Duration::from_secs(30),
+            long_request_timeout: Duration::from_secs(30 * 60),
             request_queue: 64,
+            max_in_flight: 16,
             event_capacity: 4096,
         }
     }
+}
+
+impl ManagerConfig {
+    /// Timeout for `op`, including time queued while connecting.
+    pub fn timeout_for(&self, op: &Op) -> Duration {
+        if is_long_op(op) {
+            self.long_request_timeout.max(self.request_timeout)
+        } else {
+            self.request_timeout
+        }
+    }
+}
+
+/// Operations that may legitimately run for minutes.
+pub fn is_long_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::PkgRefresh
+            | Op::PkgUpgrade { .. }
+            | Op::PkgInstall { .. }
+            | Op::PkgRemove { .. }
+            | Op::DockerImagesPull { .. }
+            | Op::DockerImagesPrune { .. }
+            | Op::ComposeDeploy { .. }
+            | Op::ComposePull { .. }
+            | Op::ComposeRestart { .. }
+            | Op::ComposeDown { .. }
+            | Op::AuditRun { .. }
+            | Op::DuScan { .. }
+            | Op::FindLarge { .. }
+            | Op::ProfileCheck(..)
+            | Op::ProfilePlan(..)
+            | Op::ProfileApply { .. }
+            | Op::GameInstall { .. }
+            | Op::GameUpdate { .. }
+            | Op::GameBackup { .. }
+            | Op::GameRestore { .. }
+            | Op::AgentUpdateStage { .. }
+    )
 }
 
 /// Delay before retry number `attempt` (0-based): `min · 2^attempt`
@@ -149,8 +201,9 @@ pub enum ManagerEvent {
         seq: u64,
         event: Event,
     },
-    /// Connected to a hop without a pinned host key: show the fingerprint,
-    /// pin it on confirmation (`Cache::pin_host_key`, then `add_server`).
+    /// Connected to a hop without a pinned host key. The connection was
+    /// closed (fatal `HostKeyUnconfirmed`); show the fingerprint, pin it on
+    /// confirmation, then `add_server` / `reconnect`.
     HostKeyFirstUse {
         server: ServerId,
         observation: HostKeyObservation,
@@ -180,19 +233,25 @@ pub enum LinkError {
 }
 
 impl LinkError {
-    /// Retrying can't help until the operator acts.
+    /// Retrying can't help until the operator acts. Only authenticated
+    /// verdicts count: the SSH layer (pinned host key, our key refused),
+    /// the Noise identity, and the **signed** status read. Unsigned gate
+    /// answers (`Hello` naming another server or protocol range,
+    /// `DeviceAuth` refusals) retry with backoff, so a lying gate can't
+    /// park a server Offline.
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            LinkError::Ssh(SshError::HostKeyChanged { .. } | SshError::AuthRejected)
-                | LinkError::Client(
-                    ClientError::AgentKeyMismatch
-                        | ClientError::WrongServer
-                        | ClientError::ProtoVersion { .. }
-                        | ClientError::Rejected(
-                            ErrorCode::Unauthorized | ErrorCode::SignatureInvalid
-                        )
-                )
+            LinkError::Ssh(
+                SshError::HostKeyChanged { .. }
+                    | SshError::HostKeyUnconfirmed
+                    | SshError::AuthRejected
+            ) | LinkError::Client(
+                ClientError::AgentKeyMismatch
+                    | ClientError::StatusRejected(
+                        ErrorCode::Unauthorized | ErrorCode::SignatureInvalid
+                    )
+            )
         )
     }
 }
@@ -227,13 +286,17 @@ pub enum RequestError {
 
 /// A connected, authenticated agent session as the manager uses it.
 pub trait AgentLink {
-    fn request(
+    /// Signs and sends `op` without waiting for the answer. The verified
+    /// reply arrives on the receiver while [`AgentLink::next_event`] runs;
+    /// the receiver closes if the link goes away first.
+    fn start_request(
         &mut self,
         op: Op,
         actor: Actor,
         approval: Option<RootApproval>,
-    ) -> impl Future<Output = Result<Reply, ClientError>>;
-    /// Must be cancel-safe.
+    ) -> impl Future<Output = Result<PendingReply, ClientError>>;
+    /// Must be cancel-safe, and must keep routing responses to pending
+    /// requests while it waits.
     fn next_event(&mut self) -> impl Future<Output = Result<(u64, Event), ClientError>>;
     /// Events buffered while a request waited for its response.
     fn take_events(&mut self) -> Vec<(u64, Event)>;
@@ -255,14 +318,13 @@ pub trait AgentLink {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AgentLink for Session<'_, S> {
-    async fn request(
+    async fn start_request(
         &mut self,
         op: Op,
         actor: Actor,
         approval: Option<RootApproval>,
-    ) -> Result<Reply, ClientError> {
-        let server = self.server_id().clone();
-        Session::request(self, op, &server, actor, approval).await
+    ) -> Result<PendingReply, ClientError> {
+        Session::start_request(self, op, actor, approval).await
     }
 
     async fn next_event(&mut self) -> Result<(u64, Event), ClientError> {
@@ -413,6 +475,7 @@ pub struct LinkCtx<'w> {
     worker: &'w mut Worker,
     kind: SessionKind,
     permit: Option<OwnedSemaphorePermit>,
+    max_in_flight: usize,
 }
 
 impl LinkCtx<'_> {
@@ -441,9 +504,16 @@ impl LinkCtx<'_> {
 
     /// Marks the server Ready and serves requests and events until the
     /// link breaks (`Err`) or the manager wants it closed.
+    ///
+    /// Requests run concurrently: each is signed and sent here, and its
+    /// reply is awaited by its own local task (at most `max_in_flight` per
+    /// server; the rest wait in the queue). The loop itself never waits
+    /// for a response, so lock/unlock, removal and reconnects take effect
+    /// at once; requests still in flight then fail with `NotReady`.
     pub async fn serve<L: AgentLink>(mut self, link: &mut L) -> Result<ServeEnd, LinkError> {
         self.permit = None;
         let kind = self.kind;
+        let max_in_flight = self.max_in_flight.max(1);
         let w = self.worker;
         w.link += 1;
         let generation = w.link;
@@ -451,7 +521,10 @@ impl LinkCtx<'_> {
         w.set_state(ConnState::Ready, Some(kind), None);
         let mut chores = tokio::time::interval(HOUSEKEEPING);
         chores.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let in_flight = Rc::new(Cell::new(0usize));
+        let freed = Rc::new(Notify::new());
         loop {
+            let room = in_flight.get() < max_in_flight;
             tokio::select! {
                 biased;
                 r = w.ctl.changed() => {
@@ -468,7 +541,9 @@ impl LinkCtx<'_> {
                         return Ok(ServeEnd::KindChanged);
                     }
                 }
-                work = w.requests.recv() => {
+                // A slot freed up: re-evaluate `room`.
+                () = freed.notified(), if !room => {}
+                work = w.requests.recv(), if room => {
                     let Some(work) = work else { return Ok(ServeEnd::Stopped) };
                     let res = match work {
                         Work::Request { op, actor, approval, reply } => {
@@ -480,11 +555,17 @@ impl LinkCtx<'_> {
                                 let _ = reply.send(Err(RequestError::Locked));
                                 continue;
                             }
-                            let res = link.request(op, actor, approval).await;
+                            let res = link.start_request(op, actor, approval).await;
                             w.emit_events(link.take_events());
                             match res {
-                                Ok(r) => {
-                                    let _ = reply.send(Ok(r));
+                                Ok(rx) => {
+                                    in_flight.set(in_flight.get() + 1);
+                                    tokio::task::spawn_local(await_reply(
+                                        rx,
+                                        reply,
+                                        in_flight.clone(),
+                                        freed.clone(),
+                                    ));
                                     Ok(())
                                 }
                                 Err(e) => Err((e, Some(reply))),
@@ -553,6 +634,32 @@ impl LinkCtx<'_> {
     }
 }
 
+/// Waits for one request's reply and hands it to the caller; gives up when
+/// the caller does (its timeout), which abandons the request on the link.
+async fn await_reply(
+    rx: PendingReply,
+    reply: oneshot::Sender<Result<Reply, RequestError>>,
+    in_flight: Rc<Cell<usize>>,
+    freed: Rc<Notify>,
+) {
+    let mut reply = reply;
+    tokio::select! {
+        r = rx => {
+            let r = match r {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) if link_broken(&e) => Err(RequestError::NotReady(ConnState::Degraded)),
+                Ok(Err(e)) => Err(RequestError::Client(e)),
+                // The link went away before the answer.
+                Err(_) => Err(RequestError::NotReady(ConnState::Degraded)),
+            };
+            let _ = reply.send(r);
+        }
+        () = reply.closed() => {}
+    }
+    in_flight.set(in_flight.get().saturating_sub(1));
+    freed.notify_one();
+}
+
 /// How often the serve loop runs [`AgentLink::housekeeping`].
 const HOUSEKEEPING: Duration = Duration::from_secs(2);
 
@@ -590,6 +697,7 @@ async fn worker_loop<C: Connector>(
             worker: &mut w,
             kind,
             permit,
+            max_in_flight: cfg.max_in_flight,
         };
         let ran = connector.run(&spec, kind, ctx).await;
         w.transports
@@ -812,6 +920,7 @@ impl ManagerHandle {
             .map(|s| s.requests.clone())
             .ok_or(RequestError::UnknownServer)?;
         let (reply, rx) = oneshot::channel();
+        let limit = self.shared.cfg.timeout_for(&op);
         let req = Work::Request {
             op,
             actor,
@@ -822,7 +931,7 @@ impl ManagerHandle {
             tx.send(req).await.map_err(|_| RequestError::Stopped)?;
             rx.await.map_err(|_| RequestError::Stopped)?
         };
-        tokio::time::timeout(self.shared.cfg.request_timeout, fut)
+        tokio::time::timeout(limit, fut)
             .await
             .map_err(|_| RequestError::Timeout)?
     }
@@ -905,8 +1014,13 @@ impl Connector for SshConnector {
             &self.ssh,
         )
         .await?;
-        if observation.needs_confirmation() {
+        // A first-use key (any hop) blocks the connection: nothing but the
+        // fingerprint prompt happens until the operator pins it. Only an
+        // all-Matched connection is used or published.
+        if !observation.all_matched() {
+            conn.disconnect().await;
             ctx.host_key_first_use(observation);
+            return Err(LinkError::Ssh(SshError::HostKeyUnconfirmed));
         }
         let conn = Arc::new(conn);
         ctx.authenticating();

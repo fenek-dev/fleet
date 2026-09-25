@@ -117,6 +117,35 @@ async fn fake_stream(
                 signing,
             ))));
         }
+        // Data that no seal ever covers, then an unsigned end.
+        Op::JournalFollow(q) if q.limit == 7 => {
+            for _ in 0..2 {
+                let d = encode(&Payload::Empty);
+                sealer.push(&d);
+                out.push(send(StreamChunk::Data(d)));
+            }
+        }
+        // More sealed items than a consumer's queue holds.
+        Op::JournalFollow(q) if q.limit == 8 => {
+            for i in 1..=fleet_core::STREAM_QUEUE + 100 {
+                let d = encode(&Payload::Empty);
+                sealer.push(&d);
+                out.push(send(StreamChunk::Data(d)));
+                if i % 32 == 0 {
+                    out.push(send(StreamChunk::Checkpoint(sealer.checkpoint(
+                        Some(1),
+                        now_ms(),
+                        signing,
+                    ))));
+                }
+            }
+            out.push(send(StreamChunk::Final(sealer.finish(
+                Some(2),
+                Outcome::Ok,
+                now_ms(),
+                signing,
+            ))));
+        }
         _ => {}
     }
     for m in out {
@@ -390,7 +419,7 @@ async fn streams_are_verified() {
         limit: 10,
     };
     let (_, rx) = s
-        .open_stream(Op::JournalFollow(q), Actor::Human)
+        .open_stream(Op::JournalFollow(q.clone()), Actor::Human)
         .await
         .unwrap();
     let got = timeout(T, drain(&mut s, rx)).await.unwrap();
@@ -400,6 +429,46 @@ async fn streams_are_verified() {
             claimed: None
         }))]
     );
+    // Items never covered by a seal are never delivered.
+    let (_, rx) = s
+        .open_stream(
+            Op::JournalFollow(JournalQuery {
+                limit: 7,
+                ..q.clone()
+            }),
+            Actor::Human,
+        )
+        .await
+        .unwrap();
+    let got = timeout(T, drain(&mut s, rx)).await.unwrap();
+    assert_eq!(
+        got,
+        vec![StreamEvent::End(Err(StreamFailure::Unsigned {
+            claimed: None
+        }))]
+    );
+
+    // A consumer that doesn't read: the stream is stopped, and its End
+    // still arrives in the reserved slot.
+    let (_, mut rx) = s
+        .open_stream(
+            Op::JournalFollow(JournalQuery { limit: 8, ..q }),
+            Actor::Human,
+        )
+        .await
+        .unwrap();
+    let _ = timeout(Duration::from_millis(500), s.next_event()).await;
+    let mut items = 0;
+    let mut last = None;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, StreamEvent::Item(_)) {
+            items += 1;
+        }
+        last = Some(ev);
+    }
+    assert!(items <= fleet_core::STREAM_QUEUE);
+    assert_eq!(last, Some(StreamEvent::End(Err(StreamFailure::TooSlow))));
+
     // The session stays usable (queued cancels flush on the next write).
     let r = s
         .request(Op::SystemInfo, &server, Actor::Human, None)
@@ -407,4 +476,77 @@ async fn streams_are_verified() {
         .unwrap();
     assert_eq!(r.result, Ok(Payload::Empty));
     assert_eq!(s.stream_count(), 0);
+}
+
+#[tokio::test]
+async fn concurrent_requests_are_matched_by_id() {
+    let server = ServerId::new("srv_000003").unwrap();
+    let agent_noise = StaticKeypair::generate().unwrap();
+    let agent_signing = Ed25519Signer::from_seed(&[9; 32]);
+    let (pinned_noise, pinned_signing) = (agent_noise.public(), agent_signing.public());
+    let (client_io, agent_io) = tokio::io::duplex(1024);
+    let (_ev_tx, ev_rx) = mpsc::unbounded_channel();
+    tokio::spawn(fake_agent(
+        agent_io,
+        agent_noise,
+        agent_signing,
+        server.clone(),
+        ev_rx,
+    ));
+    let mac_noise = StaticKeypair::generate().unwrap();
+    let device = SoftwareP256Signer::generate().unwrap();
+    let cfg = SessionConfig {
+        mode: SessionMode::Normal,
+        noise: &mac_noise,
+        pinned_agent_noise: pinned_noise,
+        pinned_agent_signing: pinned_signing,
+        fleet_id: FleetId([1; 16]),
+        server_id: server.clone(),
+        device_id: DeviceId([2; 16]),
+        key: KeyKind::Device,
+        signer: CommandSigner::P256(&device),
+    };
+    let mut s = timeout(T, Session::connect_bridged(client_io, cfg))
+        .await
+        .unwrap()
+        .unwrap();
+    let a = s
+        .start_request(Op::SystemInfo, Actor::Human, None)
+        .await
+        .unwrap();
+    let b = s
+        .start_request(Op::AgentHealth, Actor::Human, None)
+        .await
+        .unwrap();
+    // One abandoned: its answer is dropped, nothing leaks.
+    let c = s
+        .start_request(Op::SystemInfo, Actor::Human, None)
+        .await
+        .unwrap();
+    drop(c);
+    assert_eq!(s.pending_requests(), 3);
+    let both = async {
+        let (mut a, mut b) = (a, b);
+        let (mut ra, mut rb) = (None, None);
+        while ra.is_none() || rb.is_none() {
+            tokio::select! {
+                r = &mut a, if ra.is_none() => ra = Some(r),
+                r = &mut b, if rb.is_none() => rb = Some(r),
+                _ = s.next_event() => {}
+            }
+        }
+        (ra.unwrap(), rb.unwrap())
+    };
+    let (ra, rb) = timeout(T, both).await.unwrap();
+    assert_eq!(ra.unwrap().unwrap().result, Ok(Payload::Empty));
+    assert!(matches!(
+        rb.unwrap().unwrap().result,
+        Ok(Payload::AgentHealth(_))
+    ));
+    // The abandoned one is gone once its answer arrived or on the next send.
+    let _ = s
+        .request(Op::SystemInfo, &server, Actor::Human, None)
+        .await
+        .unwrap();
+    assert_eq!(s.pending_requests(), 0);
 }

@@ -37,7 +37,7 @@ impl KeyRole {
 /// Why a signature could not be produced. Fixed codes; the app words them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SignerError {
-    /// Key missing, or not usable now (app locked for device/SSH keys).
+    /// Not usable now (app locked for device/SSH keys).
     #[error("key unavailable")]
     Unavailable,
     /// Touch ID cancelled or failed.
@@ -45,6 +45,14 @@ pub enum SignerError {
     Cancelled,
     #[error("signing failed")]
     Failed,
+    /// The key does not exist (Keychain item gone). Never silently
+    /// replaced for the root key: the roster lists it.
+    #[error("key missing")]
+    Missing,
+    /// The key was invalidated (root key: enrolled fingerprints changed,
+    /// design §5.2). A new key and a roster update are needed.
+    #[error("key invalidated")]
+    Invalidated,
 }
 
 /// The Mac's P-256 keys. FFI shape (UniFFI callback interface):
@@ -52,16 +60,26 @@ pub enum SignerError {
 /// ```text
 /// callback interface DeviceSigner {
 ///   [Throws=SignerError] bytes public_key(KeyRole role);  // 33-byte SEC1 compressed
-///   [Throws=SignerError] bytes sign(KeyRole role, bytes msg); // 64-byte r‖s over SHA-256(msg)
+///   // 64-byte r‖s over SHA-256(msg); `reason` is shown in the Touch ID prompt
+///   [Throws=SignerError] bytes sign(KeyRole role, bytes msg, string reason);
 /// };
 /// ```
 ///
 /// `sign` hashes with SHA-256 itself (CryptoKit `signature(for:)`) and may
 /// return high-S; callers normalize. Calls are blocking and may show Touch
-/// ID (root key), so they must not run on the UI thread.
+/// ID (root key), so they must not run on the UI thread. `reason` names the
+/// operation and how many servers it affects ([`root_reason`]) so the
+/// operator can't be tricked into approving something else (design §5.1).
 pub trait DeviceSigner: Send + Sync {
     fn public_key(&self, role: KeyRole) -> Result<P256Public, SignerError>;
-    fn sign(&self, role: KeyRole, msg: &[u8]) -> Result<Signature, SignerError>;
+    fn sign(&self, role: KeyRole, msg: &[u8], reason: &str) -> Result<Signature, SignerError>;
+}
+
+/// Touch ID prompt text for a root-key signature: what is approved and on
+/// how many servers.
+pub fn root_reason(what: &str, servers: usize) -> String {
+    let s = if servers == 1 { "" } else { "s" };
+    format!("approve {what} ({servers} server{s})")
 }
 
 /// One role of a [`DeviceSigner`] as a `fleet_crypto` [`Signer`]. The
@@ -70,12 +88,27 @@ pub struct RoleSigner<'a> {
     keys: &'a dyn DeviceSigner,
     role: KeyRole,
     public: P256Public,
+    reason: String,
 }
 
 impl<'a> RoleSigner<'a> {
     pub fn new(keys: &'a dyn DeviceSigner, role: KeyRole) -> Result<Self, SignerError> {
+        Self::with_reason(keys, role, String::new())
+    }
+
+    /// With the Touch ID prompt text passed to every `sign` (root key).
+    pub fn with_reason(
+        keys: &'a dyn DeviceSigner,
+        role: KeyRole,
+        reason: String,
+    ) -> Result<Self, SignerError> {
         let public = keys.public_key(role)?;
-        Ok(Self { keys, role, public })
+        Ok(Self {
+            keys,
+            role,
+            public,
+            reason,
+        })
     }
 
     pub fn role(&self) -> KeyRole {
@@ -91,7 +124,7 @@ impl Signer for RoleSigner<'_> {
     fn sign(&self, msg: &[u8]) -> Result<Signature, fleet_crypto::Error> {
         let raw = self
             .keys
-            .sign(self.role, msg)
+            .sign(self.role, msg, &self.reason)
             .map_err(|_| fleet_crypto::Error::Signer)?;
         sig::p256_normalize(&raw)
     }
@@ -130,7 +163,21 @@ impl DeviceSigner for SoftwareDeviceSigner {
         Ok(self.key(role).public())
     }
 
-    fn sign(&self, role: KeyRole, msg: &[u8]) -> Result<Signature, SignerError> {
+    fn sign(&self, role: KeyRole, msg: &[u8], _reason: &str) -> Result<Signature, SignerError> {
         self.key(role).sign(msg).map_err(|_| SignerError::Failed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_reason_names_op_and_count() {
+        assert_eq!(root_reason("roster v2", 1), "approve roster v2 (1 server)");
+        assert_eq!(
+            root_reason("pkg.upgrade", 12),
+            "approve pkg.upgrade (12 servers)"
+        );
     }
 }

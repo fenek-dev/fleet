@@ -22,20 +22,27 @@
 //! **Streams** ([`Session::open_stream`], design §6.3): each `StreamData`
 //! runs through a `fleet_crypto::stream::StreamVerifier` bound to the pinned
 //! agent key, this server and the exact `StreamOpen` command. Items are
-//! delivered as they arrive (provisional: the next signed checkpoint, at
-//! most `CHECKPOINT_EVERY` chunks or ~5 s later, covers them and is
-//! reported as [`StreamEvent::Verified`]); a seal that doesn't match ends
-//! the stream with [`StreamFailure::Verification`], so a tampering gate can
-//! at most delay the failure by one checkpoint window. A `StreamEnd`
-//! without a verified final seal is reported as
-//! [`StreamFailure::Unsigned`] ("outcome unknown"), never as success.
+//! **held** until the next signed checkpoint (at most `CHECKPOINT_EVERY`
+//! chunks or ~5 s later) or the final seal covers them, then delivered
+//! followed by [`StreamEvent::Verified`]: consumers only ever see verified
+//! items. A seal that doesn't match ends the stream with
+//! [`StreamFailure::Verification`] and the held items are dropped. A
+//! `StreamEnd` without a verified final seal is reported as
+//! [`StreamFailure::Unsigned`] ("outcome unknown"), never as success. Each
+//! stream reserves one queue slot for its [`StreamEvent::End`], so the end
+//! is delivered even to a consumer that fell behind.
 //! Stream frames are routed from every read loop (`send`, `next_event`),
 //! so streams keep flowing while requests wait for their responses.
+//!
+//! **Concurrent requests** ([`Session::start_request`]): the request is
+//! signed and sent at once; its response is matched by request id in any
+//! read loop and handed over on a oneshot after the receipt check, so
+//! several requests can be in flight on one session.
 
 use fleet_crypto::noise::{self, Handshake, StaticKeypair, Transport};
 use fleet_crypto::receipt::{verify_event, verify_response};
 use fleet_crypto::sig::{self, Ed25519Signer, Signer};
-use fleet_crypto::stream::{StreamError, StreamItem, StreamVerifier};
+use fleet_crypto::stream::{CHECKPOINT_EVERY, StreamError, StreamItem, StreamVerifier};
 use fleet_crypto::verify::{DEFAULT_SKEW_MS, DEFAULT_TTL_MS, command_hash};
 use fleet_proto::chunk::{NOISE_MAX_MSG, Reassembler, split_frame};
 use fleet_proto::{
@@ -47,21 +54,27 @@ use fleet_proto::{
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Events kept until [`Session::take_events`]; older ones are dropped.
 pub const MAX_BUFFERED_EVENTS: usize = 1024;
 
-/// Delivery queue per stream. A consumer that falls this far behind has
-/// its stream cancelled (the session never blocks on a slow consumer).
+/// Delivery queue per stream (plus one slot reserved for the end). A
+/// consumer that falls this far behind has its stream cancelled with
+/// [`StreamFailure::TooSlow`] (the session never blocks on a slow consumer).
 pub const STREAM_QUEUE: usize = 1024;
+
+/// Items held per stream while waiting for a checkpoint. The agent seals
+/// every `CHECKPOINT_EVERY` chunks, so more than this is a protocol
+/// violation ([`StreamFailure::CheckpointMissing`]).
+const MAX_UNVERIFIED: usize = 2 * CHECKPOINT_EVERY as usize;
 
 /// What a stream consumer receives, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
-    /// One decoded item. Provisional until a later `Verified` covers it.
+    /// One decoded item, already covered by a verified seal.
     Item(Payload),
-    /// A signed checkpoint covering every item so far verified.
+    /// A signed checkpoint covering every item delivered so far.
     Verified { count: u64 },
     /// The stream is over: `Ok` only with a verified final seal.
     End(Result<Outcome, StreamFailure>),
@@ -79,14 +92,41 @@ pub enum StreamFailure {
     /// A data chunk did not decode as a `Payload`.
     #[error("malformed stream item")]
     Malformed,
+    /// Too many items without a checkpoint.
+    #[error("stream items not sealed in time")]
+    CheckpointMissing,
+    /// The consumer fell more than [`STREAM_QUEUE`] events behind.
+    #[error("stream consumer too slow")]
+    TooSlow,
 }
 
 struct OpenStream {
     verifier: StreamVerifier,
     tx: mpsc::Sender<StreamEvent>,
+    /// Reserved slot for the final [`StreamEvent::End`].
+    end: Option<mpsc::OwnedPermit<StreamEvent>>,
+    /// Decoded items not yet covered by a seal.
+    unverified: Vec<Payload>,
     /// From the verified final seal, reported at `StreamEnd`.
     outcome: Option<Outcome>,
 }
+
+impl OpenStream {
+    fn finish(mut self, end: Result<Outcome, StreamFailure>) {
+        if let Some(p) = self.end.take() {
+            p.send(StreamEvent::End(end));
+        }
+    }
+}
+
+/// A request sent and waiting for its response.
+struct PendingRequest {
+    cmd: SignedCommand,
+    tx: oneshot::Sender<Result<Reply, ClientError>>,
+}
+
+/// The verified reply of a request started with [`Session::start_request`].
+pub type PendingReply = oneshot::Receiver<Result<Reply, ClientError>>;
 
 /// First byte on the agent socket (design §6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,14 +175,20 @@ pub enum ClientError {
     Crypto(fleet_crypto::Error),
     #[error("agent Noise key does not match the pinned key")]
     AgentKeyMismatch,
-    /// Session refused (unsigned, from the gate) or the signed status read
-    /// at connect failed.
+    /// Session refused by an **unsigned** answer (the gate at `DeviceAuth`).
+    /// A compromised gate can forge it, so it is never fatal on its own.
     #[error("session refused: {0:?}")]
     Rejected(ErrorCode),
+    /// The **signed** status read at connect failed with this code
+    /// (receipt verified: exec really said so).
+    #[error("session refused (signed): {0:?}")]
+    StatusRejected(ErrorCode),
     #[error("connection closed")]
     Closed,
     #[error("malformed frame from agent")]
     Malformed,
+    /// The unsigned `Hello` names another server (misrouted connection or a
+    /// lying gate); not fatal on its own, the signed reads decide.
     #[error("Hello is for another server")]
     WrongServer,
     #[error("agent supports protocol {min}..={max}, we speak {PROTO_VERSION}")]
@@ -233,6 +279,8 @@ pub struct Session<'a, S> {
     /// Streams to cancel on the agent (consumer gone or too slow), sent on
     /// the next write opportunity (reads never write: cancel safety).
     cancels: Vec<RequestId>,
+    /// Requests in flight, by id.
+    pending: HashMap<RequestId, PendingRequest>,
 }
 
 pub fn now_ms() -> u64 {
@@ -370,6 +418,7 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
             last_rekey: Instant::now(),
             streams: HashMap::new(),
             cancels: Vec::new(),
+            pending: HashMap::new(),
         };
         s.send_message(&auth).await?;
         loop {
@@ -433,7 +482,7 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
                 pending_recovery: p,
             }),
             Ok(_) => Err(ClientError::Malformed),
-            Err(code) => Err(ClientError::Rejected(code)),
+            Err(code) => Err(ClientError::StatusRejected(code)),
         }
     }
 
@@ -557,42 +606,85 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
     /// Sends a prepared envelope (possibly one built elsewhere) and checks
     /// the reply's receipt against the pinned key and this exact envelope.
     pub async fn send(&mut self, cmd: &SignedCommand) -> Result<Reply, ClientError> {
-        self.flush_cancels().await?;
-        let id = self.next_id();
-        self.send_message(&Message::Request {
-            id,
-            cmd: cmd.clone(),
-        })
-        .await?;
+        let mut rx = self.start_send(cmd.clone()).await?;
         loop {
-            match self.read_message().await? {
-                Message::Response {
-                    id: rid,
-                    result,
-                    receipt,
-                } if rid == id => {
-                    let receipt = self.check_receipt(cmd, &result, receipt)?;
-                    // A signed Replay (nonce or approval leaf already used)
-                    // doesn't mean the command failed: an earlier delivery
-                    // may have run with its answer dropped.
-                    if result == Err(ErrorCode::Replay) && changes_state(cmd) {
-                        return Err(ClientError::OutcomeUnknown {
-                            claimed: Some(ErrorCode::Replay),
-                        });
-                    }
-                    return Ok(Reply { result, receipt });
-                }
-                m => {
-                    self.dispatch(m);
-                }
+            match rx.try_recv() {
+                Ok(r) => return r,
+                Err(oneshot::error::TryRecvError::Closed) => return Err(ClientError::Closed),
+                Err(oneshot::error::TryRecvError::Empty) => {}
             }
+            let m = self.read_message().await?;
+            self.dispatch(m);
         }
     }
 
+    /// Signs and sends `op` without waiting: the verified reply arrives on
+    /// the returned receiver once any read loop of this session
+    /// (`next_event`, `send`) has seen the response. The receiver fails
+    /// (closed) if the session goes away first. Dropping it abandons the
+    /// request (its late response is ignored).
+    pub async fn start_request(
+        &mut self,
+        op: Op,
+        actor: Actor,
+        approval: Option<RootApproval>,
+    ) -> Result<PendingReply, ClientError> {
+        let server = self.cfg.server_id.clone();
+        let cmd = self.build_command(op, &server, actor, approval, &CommandOpts::default())?;
+        self.start_send(cmd).await
+    }
+
+    async fn start_send(&mut self, cmd: SignedCommand) -> Result<PendingReply, ClientError> {
+        self.flush_cancels().await?;
+        // Abandoned requests (caller timed out) leave nothing behind.
+        self.pending.retain(|_, p| !p.tx.is_closed());
+        let id = self.next_id();
+        let (tx, rx) = oneshot::channel();
+        let msg = Message::Request {
+            id,
+            cmd: cmd.clone(),
+        };
+        self.pending.insert(id, PendingRequest { cmd, tx });
+        if let Err(e) = self.send_message(&msg).await {
+            self.pending.remove(&id);
+            return Err(e);
+        }
+        Ok(rx)
+    }
+
+    /// Requests in flight.
+    pub fn pending_requests(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The verdict on a response to `cmd`.
+    fn verdict(
+        &self,
+        cmd: &SignedCommand,
+        result: Result<Payload, ErrorCode>,
+        receipt: Option<SignedReceipt>,
+    ) -> Result<Reply, ClientError> {
+        let receipt = self.check_receipt(cmd, &result, receipt)?;
+        // A signed Replay (nonce or approval leaf already used) doesn't
+        // mean the command failed: an earlier delivery may have run with
+        // its answer dropped.
+        if result == Err(ErrorCode::Replay) && changes_state(cmd) {
+            return Err(ClientError::OutcomeUnknown {
+                claimed: Some(ErrorCode::Replay),
+            });
+        }
+        Ok(Reply { result, receipt })
+    }
+
     fn next_id(&mut self) -> RequestId {
-        let id = self.next_request;
-        self.next_request = self.next_request.wrapping_add(1).max(1);
-        id
+        // Skip ids still in use by a request or a stream (after wrapping).
+        loop {
+            let id = self.next_request;
+            self.next_request = self.next_request.wrapping_add(1).max(1);
+            if !self.pending.contains_key(&id) && !self.streams.contains_key(&id) {
+                return id;
+            }
+        }
     }
 
     /// Signs `op` (a stream op, [`Op::is_stream`]) and sends `StreamOpen`.
@@ -608,7 +700,12 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         let server = self.cfg.server_id.clone();
         let cmd = self.build_command(op, &server, actor, None, &CommandOpts::default())?;
         let id = self.next_id();
-        let (tx, rx) = mpsc::channel(STREAM_QUEUE);
+        // One extra slot, reserved for the End event.
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE + 1);
+        let end = tx
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| ClientError::Closed)?;
         let verifier =
             StreamVerifier::new(self.cfg.pinned_agent_signing, server, command_hash(&cmd));
         self.streams.insert(
@@ -616,10 +713,15 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
             OpenStream {
                 verifier,
                 tx,
+                end: Some(end),
+                unverified: Vec::new(),
                 outcome: None,
             },
         );
-        self.send_message(&Message::StreamOpen { id, cmd }).await?;
+        if let Err(e) = self.send_message(&Message::StreamOpen { id, cmd }).await {
+            self.streams.remove(&id);
+            return Err(e);
+        }
         Ok((id, rx))
     }
 
@@ -644,12 +746,23 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         Ok(())
     }
 
-    /// Routes events and stream frames; returns anything else.
+    /// Routes responses, events and stream frames; returns anything else.
     fn dispatch(&mut self, m: Message) -> Option<Message> {
         match m {
             Message::Event(e) => self.accept_event(e),
             Message::StreamData { id, seq, chunk } => self.stream_data(id, seq, &chunk),
             Message::StreamEnd { id, status } => self.stream_end(id, status),
+            Message::Response {
+                id,
+                result,
+                receipt,
+            } => {
+                // Unknown ids (abandoned requests) are dropped.
+                if let Some(p) = self.pending.remove(&id) {
+                    let v = self.verdict(&p.cmd, result, receipt);
+                    let _ = p.tx.send(v);
+                }
+            }
             other => return Some(other),
         }
         None
@@ -659,28 +772,52 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         let Some(s) = self.streams.get_mut(&id) else {
             return;
         };
-        let ev = match s.verifier.accept(seq, chunk) {
-            Ok(StreamItem::Data(d)) => match decode::<Payload>(&d) {
-                Ok(p) => StreamEvent::Item(p),
-                Err(_) => return self.fail_stream(id, StreamFailure::Malformed),
-            },
-            Ok(StreamItem::Checkpoint { count }) => StreamEvent::Verified { count },
+        let checkpoint = match s.verifier.accept(seq, chunk) {
+            Ok(StreamItem::Data(d)) => {
+                let Ok(p) = decode::<Payload>(&d) else {
+                    return self.fail_stream(id, StreamFailure::Malformed);
+                };
+                if s.unverified.len() >= MAX_UNVERIFIED {
+                    return self.fail_stream(id, StreamFailure::CheckpointMissing);
+                }
+                // Held until a seal covers it.
+                s.unverified.push(p);
+                return;
+            }
+            Ok(StreamItem::Checkpoint { count }) => Some(count),
             Ok(StreamItem::Final { outcome, .. }) => {
                 s.outcome = Some(outcome);
-                return;
+                None
             }
             Err(e) => return self.fail_stream(id, StreamFailure::Verification(e)),
         };
-        if s.tx.try_send(ev).is_err() {
-            // Consumer gone or too slow: stop the stream.
+        // Everything held is now covered: deliver it, then the checkpoint.
+        let items = std::mem::take(&mut s.unverified);
+        let need = items.len() + usize::from(checkpoint.is_some());
+        if s.tx.is_closed() {
+            // Consumer gone: stop the stream quietly.
             self.streams.remove(&id);
             self.cancels.push(id);
+            return;
+        }
+        if s.tx.capacity() < need {
+            return self.fail_stream(id, StreamFailure::TooSlow);
+        }
+        let evs = items
+            .into_iter()
+            .map(StreamEvent::Item)
+            .chain(checkpoint.map(|count| StreamEvent::Verified { count }));
+        for ev in evs {
+            // Capacity checked above; the session is the only sender.
+            if s.tx.try_send(ev).is_err() {
+                return self.fail_stream(id, StreamFailure::TooSlow);
+            }
         }
     }
 
     fn fail_stream(&mut self, id: RequestId, f: StreamFailure) {
         if let Some(s) = self.streams.remove(&id) {
-            let _ = s.tx.try_send(StreamEvent::End(Err(f)));
+            s.finish(Err(f));
             self.cancels.push(id);
         }
     }
@@ -689,13 +826,14 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         let Some(s) = self.streams.remove(&id) else {
             return;
         };
+        // Items not covered by the final seal are never delivered.
         let end = match s.outcome {
             Some(o) => Ok(o),
             None => Err(StreamFailure::Unsigned {
                 claimed: status.err(),
             }),
         };
-        let _ = s.tx.try_send(StreamEvent::End(end));
+        s.finish(end);
     }
 
     /// A response counts only with a receipt from the pinned agent key for

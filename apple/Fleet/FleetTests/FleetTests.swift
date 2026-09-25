@@ -34,7 +34,21 @@ struct FleetTests {
     @Test func lockedGateRefusesDeviceAndSsh() throws {
         let gate = KeyGate()
         let keys = try SecureEnclaveKeys(gate: gate, environment: ["FLEET_SOFTWARE_KEYS": "1"])
-        #expect(throws: SignerError.Unavailable) { try keys.sign(role: .device, msg: Data("m".utf8)) }
-        #expect(throws: SignerError.Unavailable) { try keys.sign(role: .ssh, msg: Data("m".utf8)) }
+        #expect(throws: SignerError.Unavailable) { try keys.sign(role: .device, msg: Data("m".utf8), reason: "") }
+        #expect(throws: SignerError.Unavailable) { try keys.sign(role: .ssh, msg: Data("m".utf8), reason: "") }
+    }
+
+    /// Terminal answer-backs that could leak or inject are dropped; normal
+    /// status reports pass.
+    @Test func terminalRepliesAreFiltered() {
+        let blocked = ["\u{1b}]l title\u{1b}\\", "\u{1b}]L\u{1b}\\", "\u{1b}]52;c;aGk=\u{1b}\\",
+                       "\u{1b}P1$r0m\u{1b}\\", "\u{1b}P0$r\u{1b}\\", "\u{1b}P1+r544e\u{1b}\\"]
+        for s in blocked {
+            #expect(FleetTerminalView.isBlockedReply(ArraySlice(Array(s.utf8))), "\(s.debugDescription)")
+        }
+        for s in ["\u{1b}[5;10R", "\u{1b}[0n", "\u{1b}[?1;2c", "a", "\u{1b}]10;rgb:0/0/0\u{1b}\\"] {
+            #expect(!FleetTerminalView.isBlockedReply(ArraySlice(Array(s.utf8))), "\(s.debugDescription)")
+        }
+        #expect(displaySafe("a\u{202E}b\u{1b}c", max: 10) == "abc")
     }
 }

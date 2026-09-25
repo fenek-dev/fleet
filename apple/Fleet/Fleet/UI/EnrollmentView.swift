@@ -1,4 +1,24 @@
+import AppKit
 import SwiftUI
+
+/// Excludes the hosting window from screen capture while `active`
+/// (`NSWindow.sharingType = .none`), restoring it afterwards.
+private struct CaptureShield: NSViewRepresentable {
+    let active: Bool
+
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        let active = active
+        DispatchQueue.main.async {
+            view.window?.sharingType = active ? .none : .readOnly
+        }
+    }
+
+    static func dismantleNSView(_ view: NSView, coordinator: ()) {
+        view.window?.sharingType = .readOnly
+    }
+}
 
 /// First launch: create a fleet with this Mac as its first device
 /// (design §5.3 genesis roster, §5.11 recovery code).
@@ -49,6 +69,9 @@ struct EnrollmentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.window)
+        // Screenshots, screen recording and sharing see a blank window
+        // while the recovery words exist in the UI.
+        .background(CaptureShield(active: !words.isEmpty))
         .onDisappear { enrollment?.cancel() }
     }
 
@@ -159,8 +182,14 @@ struct EnrollmentView: View {
                 SecureField("Repeat", text: $passphraseAgain)
             }
             .formStyle(.grouped)
+            Text("For immediate recovery the passphrase must be strong: at least 12 characters using 3 of lowercase, uppercase, digits and symbols, or at least 5 different words of 3+ letters. A weaker passphrase still protects the code but keeps the 72 h delay.")
+                .font(.secondary).foregroundStyle(Color.textMuted)
             if passphrase.isEmpty {
                 StatusPill(label: "No passphrase: 72 h recovery delay", tone: .warn)
+            } else if recoveryPassphraseIsStrong(passphrase: passphrase) {
+                StatusPill(label: "Strong: no recovery delay", tone: .ok)
+            } else {
+                StatusPill(label: "Too weak for immediate recovery: 72 h delay", tone: .warn)
             }
             HStack {
                 Spacer()
@@ -187,7 +216,7 @@ struct EnrollmentView: View {
             if let result {
                 LabeledContent("Fleet", value: result.fleetId).font(.mono(12))
                 LabeledContent("Recovery delay",
-                               value: result.recoveryDelayS == 0 ? "none (passphrase set)" : "72 hours")
+                               value: result.recoveryDelayS == 0 ? "none (strong passphrase)" : "72 hours")
             }
             Text("Next: add a server and install the agent.")
                 .foregroundStyle(Color.textSecondary)

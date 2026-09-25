@@ -5,8 +5,8 @@
 //!    24 words are shown once and the operator re-types
 //!    [`CHALLENGE_WORDS`] randomly chosen ones ([`challenge`], [`check_words`]).
 //! 2. With the (optional) passphrase, the code derives the recovery public
-//!    keys (Argon2id, slow) and the delay (`0` with a passphrase, 72 h
-//!    without).
+//!    keys (Argon2id, slow) and the delay (`0` with a strong passphrase,
+//!    72 h otherwise).
 //! 3. [`build_genesis`] lists this Mac with its enclave public keys and
 //!    Noise key, and signs epoch 0 / version 1 with the **root key** (Touch
 //!    ID), then checks it with the agent's own `verify_genesis`.
@@ -17,12 +17,12 @@
 //! (`fleet_crypto::recovery`); only public keys leave this module.
 
 use crate::cache::{Cache, CacheError, RosterRow};
-use crate::signer::{DeviceSigner, KeyRole, RoleSigner, SignerError};
+use crate::signer::{DeviceSigner, KeyRole, RoleSigner, SignerError, root_reason};
 use fleet_crypto::recovery::RecoveryPublics;
 use fleet_crypto::roster::{RosterError, roster_hash, sign_root, verify_genesis};
 use fleet_proto::{
-    BoundedString, Device, DeviceId, FleetId, Role, Roster, SignedRoster, X25519Public, decode,
-    encode,
+    BoundedString, Device, DeviceId, FleetId, KeyRef, Role, Roster, SignedRoster, X25519Public,
+    decode, encode,
 };
 
 /// `settings` keys (raw bytes / UTF-8).
@@ -51,6 +51,9 @@ pub enum EnrollError {
     AlreadyEnrolled,
     #[error("no genesis roster in the cache")]
     NoGenesis,
+    /// The cached genesis doesn't list this Mac's keys (`what` differs).
+    #[error("genesis roster is not this Mac's ({0} differs)")]
+    NotOurs(&'static str),
 }
 
 pub struct GenesisInput {
@@ -103,11 +106,53 @@ pub fn build_genesis(
         recovery_delay_s: input.recovery_delay_s,
         prev_recovery: None,
     };
-    let root = RoleSigner::new(keys, KeyRole::Root)?;
+    let root = RoleSigner::with_reason(
+        keys,
+        KeyRole::Root,
+        root_reason("the new fleet's first roster (v1)", 0),
+    )?;
     let signed = sign_root(roster, input.device_id, &root)?;
     // The agent runs exactly this check at install; fail here instead.
     verify_genesis(&signed, input.now_ms).map_err(EnrollError::Roster)?;
     Ok(signed)
+}
+
+/// Before a genesis roster from the cache goes to a server: it must be a
+/// valid genesis whose only device is **this** Mac — every key equal to
+/// the enclave's and the Keychain Noise key — self-signed by our root key.
+/// A tampered cache could otherwise make an install trust someone else's
+/// keys.
+pub fn check_genesis_is_ours(
+    genesis: &SignedRoster,
+    keys: &dyn DeviceSigner,
+    noise_static: X25519Public,
+    device_id: DeviceId,
+    now_ms: u64,
+) -> Result<(), EnrollError> {
+    verify_genesis(genesis, now_ms).map_err(EnrollError::Roster)?;
+    let r = &genesis.roster;
+    let [d] = r.devices.as_slice() else {
+        return Err(EnrollError::NotOurs("device count"));
+    };
+    let checks = [
+        (d.id == device_id, "device id"),
+        (d.root_key == keys.public_key(KeyRole::Root)?, "root key"),
+        (
+            d.device_key == keys.public_key(KeyRole::Device)?,
+            "device key",
+        ),
+        (
+            d.monitor_key == keys.public_key(KeyRole::Monitor)?,
+            "monitor key",
+        ),
+        (d.ssh_key == keys.public_key(KeyRole::Ssh)?, "ssh key"),
+        (d.noise_static == noise_static, "noise key"),
+        (genesis.signer == KeyRef::Root(device_id), "signer"),
+    ];
+    match checks.iter().find(|(ok, _)| !ok) {
+        Some((_, what)) => Err(EnrollError::NotOurs(what)),
+        None => Ok(()),
+    }
 }
 
 /// Stores the genesis roster and the enrollment settings.
@@ -166,7 +211,7 @@ pub fn challenge() -> Result<Vec<u32>, fleet_crypto::Error> {
 
 /// Whether `answers[k]` is word `positions[k]` of `phrase` (trimmed,
 /// case-insensitive). Constant work per word; no early exit on a mismatch.
-pub fn check_words(phrase: &str, positions: &[u32], answers: &[String]) -> bool {
+pub fn check_words<A: AsRef<str>>(phrase: &str, positions: &[u32], answers: &[A]) -> bool {
     if positions.len() != answers.len() || positions.is_empty() {
         return false;
     }
@@ -174,7 +219,7 @@ pub fn check_words(phrase: &str, positions: &[u32], answers: &[String]) -> bool 
     let mut ok = true;
     for (p, a) in positions.iter().zip(answers) {
         let want = words.get(*p as usize).copied().unwrap_or("");
-        ok &= !want.is_empty() && a.trim().eq_ignore_ascii_case(want);
+        ok &= !want.is_empty() && a.as_ref().trim().eq_ignore_ascii_case(want);
     }
     ok
 }
@@ -192,10 +237,37 @@ mod tests {
         t: 1,
         p: 1,
     };
+    const STRONG: &str = "correct horse battery staple zebra";
+
+    #[test]
+    fn genesis_ownership_check() {
+        let keys = SoftwareDeviceSigner::generate().unwrap();
+        let g = genesis_for(&keys);
+        let now = crate::now_ms();
+        let noise = X25519Public([3; 32]);
+        let me = DeviceId([2; 16]);
+        check_genesis_is_ours(&g, &keys, noise, me, now).unwrap();
+        let other = SoftwareDeviceSigner::generate().unwrap();
+        assert!(matches!(
+            check_genesis_is_ours(&g, &other, noise, me, now),
+            Err(EnrollError::NotOurs("root key"))
+        ));
+        assert!(matches!(
+            check_genesis_is_ours(&g, &keys, X25519Public([4; 32]), me, now),
+            Err(EnrollError::NotOurs("noise key"))
+        ));
+        assert!(matches!(
+            check_genesis_is_ours(&g, &keys, noise, DeviceId([9; 16]), now),
+            Err(EnrollError::NotOurs("device id"))
+        ));
+        // A genesis signed by someone else's root key doesn't verify.
+        let foreign = genesis_for(&other);
+        assert!(check_genesis_is_ours(&foreign, &keys, noise, me, now).is_err());
+    }
 
     fn genesis_for(keys: &SoftwareDeviceSigner) -> SignedRoster {
         let code = RecoveryCode::generate().unwrap();
-        let rk = code.derive("pass", TINY).unwrap();
+        let rk = code.derive(STRONG, TINY).unwrap();
         build_genesis(
             keys,
             GenesisInput {
@@ -204,7 +276,7 @@ mod tests {
                 device_name: "MacBook Pro".into(),
                 noise_static: X25519Public([3; 32]),
                 recovery: rk.publics(),
-                recovery_delay_s: delay_for("pass"),
+                recovery_delay_s: delay_for(STRONG),
                 now_ms: crate::now_ms(),
             },
         )
@@ -272,6 +344,6 @@ mod tests {
         wrong[2] = "zzz".into();
         assert!(!check_words(&phrase, &pos, &wrong));
         assert!(!check_words(&phrase, &pos, &answers[..3]));
-        assert!(!check_words(&phrase, &[], &[]));
+        assert!(!check_words::<String>(&phrase, &[], &[]));
     }
 }

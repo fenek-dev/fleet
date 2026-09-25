@@ -122,6 +122,9 @@ pub enum HostKeyStatus {
 /// Host keys seen while connecting, final target first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostKeyObservation {
+    /// The hop this key is from.
+    pub host: String,
+    pub port: u16,
     pub key: HostKey,
     pub status: HostKeyStatus,
     /// The jump host's observation, if connected through one.
@@ -133,6 +136,12 @@ impl HostKeyObservation {
     pub fn needs_confirmation(&self) -> bool {
         self.status == HostKeyStatus::FirstUse
             || self.via.as_ref().is_some_and(|v| v.needs_confirmation())
+    }
+
+    /// Every hop matched its pin: the only state in which a connection may
+    /// be used for anything but showing the fingerprint.
+    pub fn all_matched(&self) -> bool {
+        !self.needs_confirmation()
     }
 }
 
@@ -334,6 +343,10 @@ pub enum SshError {
     /// The server presented a different host key than the pinned one.
     #[error("host key changed: expected {expected:?}, got {got:?}")]
     HostKeyChanged { expected: HostKey, got: HostKey },
+    /// A hop has no pinned host key: the operator must compare the
+    /// fingerprint and pin it before the connection is used.
+    #[error("host key needs confirmation")]
+    HostKeyUnconfirmed,
     #[error("server refused our key")]
     AuthRejected,
     #[error("signer: {0}")]
@@ -479,7 +492,13 @@ impl SshConnection {
                 opts: opts.clone(),
                 _jump: jump,
             },
-            HostKeyObservation { key, status, via },
+            HostKeyObservation {
+                host: target.host.clone(),
+                port: target.port,
+                key,
+                status,
+                via,
+            },
         ))
     }
 
@@ -568,6 +587,15 @@ impl SshConnection {
         .await
         .map_err(|_| SshError::Timeout)?
         .map_err(|e| SshError::Sftp(e.to_string()))
+    }
+
+    /// A second, raw SFTP channel (protocol extensions such as
+    /// `posix-rename@openssh.com`). The caller runs `init`.
+    pub async fn open_raw_sftp(&self) -> Result<russh_sftp::client::RawSftpSession, SshError> {
+        let mut ch = self.open_session().await?;
+        ch.request_subsystem(true, "sftp").await?;
+        self.wait_reply(&mut ch).await?;
+        Ok(russh_sftp::client::RawSftpSession::new(ch.into_stream()))
     }
 
     /// Runs `command` on an exec channel (no PTY) and collects its output,
@@ -662,7 +690,9 @@ impl PtyChannel {
         Ok(())
     }
 
-    /// Next output; `None` once the channel is closed.
+    /// Next output; `None` once the channel is closed. `Eof` only ends the
+    /// server's data: sshd sends `exit-status` after it, so reading goes on
+    /// until `Close` to surface [`PtyOutput::Exit`].
     pub async fn read(&mut self) -> Option<PtyOutput> {
         loop {
             match self.read.wait().await? {
@@ -672,7 +702,8 @@ impl PtyChannel {
                 ChannelMsg::ExitStatus { exit_status } => {
                     return Some(PtyOutput::Exit(exit_status));
                 }
-                ChannelMsg::Eof | ChannelMsg::Close => return None,
+                ChannelMsg::Close => return None,
+                // Eof, window adjustments, exit signals…
                 _ => {}
             }
         }

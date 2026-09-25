@@ -13,7 +13,7 @@ use fleet_core::install::{self, InstallRequest, InstallStage};
 use fleet_core::manager::ConnState as CoreState;
 use fleet_core::signer::{KeyRole, RoleSigner};
 use fleet_core::ssh::P256SshSigner;
-use fleet_proto::{Actor, FleetId, Op, Payload};
+use fleet_proto::{Actor, DeviceId, FleetId, Op, Payload};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,8 @@ fn ssh_signer(core: &FleetCore) -> Result<P256SshSigner<RoleSigner<'_>>, FleetEr
         .map(P256SshSigner)
         .map_err(|e| match e {
             fleet_core::signer::SignerError::Cancelled => FleetError::Cancelled,
+            s @ (fleet_core::signer::SignerError::Missing
+            | fleet_core::signer::SignerError::Invalidated) => FleetError::Keys { error: s.into() },
             _ => FleetError::Locked,
         })
 }
@@ -74,7 +76,7 @@ impl FleetCore {
         let rec = self.server_record(&id)?;
         let artifact = validate::local_path(&artifact_path)?;
         let admin = validate::user(admin_user.as_deref().unwrap_or(&rec.target.user))?;
-        let (host_key, genesis, policy_toml) = {
+        let (host_key, genesis, policy_toml, device_id) = {
             let cache = lock(&self.cache);
             let host_key = cache
                 .pins(&id)?
@@ -82,11 +84,21 @@ impl FleetCore {
                 .ok_or(FleetError::HostKeyNotConfirmed)?;
             let genesis = fleet_core::enroll::genesis(&cache)?;
             let fleet_id = FleetId(id16(&cache, crate::api::SETTING_FLEET_ID)?);
+            let device_id = DeviceId(id16(&cache, crate::api::SETTING_DEVICE_ID)?);
             let policy = fleet_core::policy::default_policy(fleet_id, id.clone());
             let toml = fleet_core::policy::to_toml(&policy)
                 .map_err(|message| FleetError::Internal { message })?;
-            (host_key, genesis, toml)
+            (host_key, genesis, toml, device_id)
         };
+        // The genesis a server will trust forever must be ours: every key
+        // this Mac's, self-signed by our root key (cache tampering guard).
+        fleet_core::enroll::check_genesis_is_ours(
+            &genesis,
+            &*self.keys,
+            self.noise_key()?.public(),
+            device_id,
+            fleet_core::now_ms(),
+        )?;
         let listener: Arc<dyn InstallListener> = Arc::from(listener);
         let core = self.clone();
         self.on_core(async move {

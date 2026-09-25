@@ -15,18 +15,24 @@ pub trait DeviceSigner: Send + Sync {
     /// 33-byte compressed SEC1 public key of `role`.
     fn public_key(&self, role: KeyRole) -> Result<Vec<u8>, SignerError>;
     /// 64-byte raw `r‖s` ECDSA signature over SHA-256(`msg`); high-S is
-    /// fine, the adapter normalizes.
-    fn sign(&self, role: KeyRole, msg: Vec<u8>) -> Result<Vec<u8>, SignerError>;
+    /// fine, the adapter normalizes. `reason` is the Touch ID prompt text
+    /// for root-key signatures (operation and server count); empty for
+    /// the other roles.
+    fn sign(&self, role: KeyRole, msg: Vec<u8>, reason: String) -> Result<Vec<u8>, SignerError>;
 }
 
-/// The X25519 Noise static key, kept in the Keychain (this device only).
-/// The enclave can't do X25519 (design §5.2), so this is the one secret
-/// that crosses the FFI; the core zeroizes its copy.
+/// Secrets kept in the Keychain (this device only). The enclave can't do
+/// X25519 (design §5.2), so the Noise static key crosses the FFI, as does
+/// the cache integrity key (MACs over pins and rosters in the local
+/// database, `fleet_core::cache`); the core zeroizes its copies.
 #[uniffi::export(callback_interface)]
 pub trait KeyStore: Send + Sync {
     /// The stored 32-byte secret, or `None` on first launch.
     fn load_noise_key(&self) -> Result<Option<Vec<u8>>, SignerError>;
     fn store_noise_key(&self, secret: Vec<u8>) -> Result<(), SignerError>;
+    /// The 32-byte cache integrity key, or `None` before first use.
+    fn load_cache_key(&self) -> Result<Option<Vec<u8>>, SignerError>;
+    fn store_cache_key(&self, secret: Vec<u8>) -> Result<(), SignerError>;
 }
 
 /// Receives manager output on the core thread. Implementations must return
@@ -56,8 +62,13 @@ impl signer::DeviceSigner for SignerAdapter {
         Ok(P256Public(bytes))
     }
 
-    fn sign(&self, role: signer::KeyRole, msg: &[u8]) -> Result<Signature, signer::SignerError> {
-        let raw = self.0.sign(role.into(), msg.to_vec())?;
+    fn sign(
+        &self,
+        role: signer::KeyRole,
+        msg: &[u8],
+        reason: &str,
+    ) -> Result<Signature, signer::SignerError> {
+        let raw = self.0.sign(role.into(), msg.to_vec(), reason.to_string())?;
         let bytes: [u8; 64] = raw
             .as_slice()
             .try_into()
@@ -87,13 +98,19 @@ mod tests {
             }
             Ok(v)
         }
-        fn sign(&self, role: KeyRole, msg: Vec<u8>) -> Result<Vec<u8>, SignerError> {
+        fn sign(
+            &self,
+            role: KeyRole,
+            msg: Vec<u8>,
+            reason: String,
+        ) -> Result<Vec<u8>, SignerError> {
             if role == KeyRole::Root {
+                assert_eq!(reason, "approve x (1 server)");
                 return Err(SignerError::Cancelled);
             }
             let s = self
                 .keys
-                .sign(role_back(role), &msg)
+                .sign(role_back(role), &msg, &reason)
                 .map_err(|_| SignerError::Failed)?;
             let mut v = s.0.to_vec();
             if self.truncate {
@@ -124,7 +141,7 @@ mod tests {
         let a = adapter(false);
         let pk = a.public_key(signer::KeyRole::Device).unwrap();
         assert!(pk.0[0] == 2 || pk.0[0] == 3);
-        let sig = a.sign(signer::KeyRole::Device, b"msg").unwrap();
+        let sig = a.sign(signer::KeyRole::Device, b"msg", "").unwrap();
         // Already low-S: normalizing again is the identity.
         assert_eq!(p256_normalize(&sig).unwrap(), sig);
     }
@@ -137,7 +154,7 @@ mod tests {
             Err(signer::SignerError::Failed)
         );
         assert_eq!(
-            a.sign(signer::KeyRole::Ssh, b"x"),
+            a.sign(signer::KeyRole::Ssh, b"x", ""),
             Err(signer::SignerError::Failed)
         );
     }
@@ -146,7 +163,11 @@ mod tests {
     fn maps_cancel() {
         let a = adapter(false);
         assert_eq!(
-            a.sign(signer::KeyRole::Root, b"x"),
+            a.sign(
+                signer::KeyRole::Root,
+                b"x",
+                &fleet_core::signer::root_reason("x", 1)
+            ),
             Err(signer::SignerError::Cancelled)
         );
     }

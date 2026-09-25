@@ -25,6 +25,7 @@ pub mod signer;
 pub mod ssh;
 
 pub use session::{
-    ClientError, CommandOpts, CommandSigner, HelloInfo, MAX_BUFFERED_EVENTS, Reply, STREAM_QUEUE,
-    Session, SessionConfig, SessionMode, StreamEvent, StreamFailure, VerifiedStatus, now_ms,
+    ClientError, CommandOpts, CommandSigner, HelloInfo, MAX_BUFFERED_EVENTS, PendingReply, Reply,
+    STREAM_QUEUE, Session, SessionConfig, SessionMode, StreamEvent, StreamFailure, VerifiedStatus,
+    now_ms,
 };
