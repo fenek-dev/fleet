@@ -120,6 +120,8 @@ fn env(groups: &'static str, fail: bool) -> Env {
             cfg.handlers.push((tag, h.clone()));
         }
         let r: Rc<dyn Revertible> = Rc::new(TestRevertible(l.clone()));
+        // Only the test modules: authorized keys stays the "no module" kind.
+        cfg.reverters = fleet_ops::Reverters::new();
         cfg.reverters.register(WireKind::Firewall, r.clone());
         cfg.reverters.register(WireKind::Mesh, r.clone());
         let mut restore = fleet_ops::Reverters::new();

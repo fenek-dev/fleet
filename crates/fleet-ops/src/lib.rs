@@ -23,9 +23,12 @@
 
 pub mod allowed;
 pub mod compose;
+pub mod cron;
 pub mod ctx;
+pub mod docker;
 pub mod escalation;
 pub mod firewall;
+pub mod fswrite;
 pub mod handler;
 pub mod logs;
 pub mod packages;
@@ -41,6 +44,7 @@ pub mod telemetry;
 pub(crate) mod test_util;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod users;
 
 pub use allowed::open_allowed;
 pub use ctx::{Clock, ManualClock, SysCtx, SystemClock};

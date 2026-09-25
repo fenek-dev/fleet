@@ -110,6 +110,11 @@ pub struct ComposeVerdict {
     /// Deny-listed features: deploying needs a root approval.
     pub requires_elevated: Vec<Finding>,
     pub errors: Vec<ComposeError>,
+    /// Host paths inside `/srv/<project>` the file uses (bind sources,
+    /// env/label/secret/config files, build contexts), lexically
+    /// normalized. The deploy handler refuses one that resolves through a
+    /// symlink.
+    pub host_paths: Vec<String>,
 }
 
 impl ComposeVerdict {
@@ -303,6 +308,7 @@ struct Check {
     service: Option<String>,
     findings: Vec<Finding>,
     errors: Vec<ComposeError>,
+    host_paths: Vec<String>,
 }
 
 impl Check {
@@ -335,6 +341,8 @@ impl Check {
         let p = normalize(base, raw);
         if !self.under_project(&p) {
             self.find(kind, key, raw);
+        } else if !self.host_paths.contains(&p) {
+            self.host_paths.push(p);
         }
     }
 
@@ -637,8 +645,8 @@ pub fn validate(project: &ComposeProject, yaml: &str) -> ComposeVerdict {
         Err(e) => {
             return ComposeVerdict {
                 ok: false,
-                requires_elevated: Vec::new(),
                 errors: vec![e],
+                ..ComposeVerdict::default()
             };
         }
     };
@@ -647,12 +655,14 @@ pub fn validate(project: &ComposeProject, yaml: &str) -> ComposeVerdict {
         service: None,
         findings: Vec::new(),
         errors: Vec::new(),
+        host_paths: Vec::new(),
     };
     c.top_level(&root);
     ComposeVerdict {
         ok: c.errors.is_empty(),
         requires_elevated: c.findings,
         errors: c.errors,
+        host_paths: c.host_paths,
     }
 }
 

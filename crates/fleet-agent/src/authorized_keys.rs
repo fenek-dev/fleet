@@ -2,16 +2,16 @@
 //!
 //! The file has a roster section, rewritten by exec from the roster, and an
 //! extra section (everything outside the markers), which is never touched
-//! here. Written atomically, root-owned, mode 0644.
+//! here. Written atomically, root-owned, mode 0644. The file format (markers,
+//! section split, [`merge`]) lives in `fleet_ops::users::authorized_keys`,
+//! shared with `authorized_keys.get/set`.
 
 use crate::fsutil;
 use crate::paths::AGENT_BIN;
 use fleet_crypto::roster::{RecoveryClock, recovery_ssh_keys_at};
+pub use fleet_ops::users::authorized_keys::{BEGIN, END, MergeError, merge};
 use fleet_proto::{Ed25519Public, P256Public, Roster};
 use std::path::Path;
-
-pub const BEGIN: &str = "# BEGIN fleet roster (managed by fleet-exec; edits are overwritten)";
-pub const END: &str = "# END fleet roster";
 
 /// OpenSSH options on the recovery key: it can only open the recovery bridge.
 pub fn recovery_options() -> String {
@@ -40,38 +40,6 @@ pub fn roster_section(roster: &Roster, clock: RecoveryClock) -> String {
     out.push_str(END);
     out.push('\n');
     out
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum MergeError {
-    /// A `BEGIN` marker without its `END`: where the managed block stops is
-    /// unknown, so the file is left alone rather than risk dropping (or
-    /// keeping stale) keys.
-    #[error("unterminated managed block (BEGIN without END)")]
-    Unterminated,
-}
-
-/// Removes every managed block from `existing` (including duplicates left by
-/// hand edits) and prepends `section`. Lines outside blocks are kept in
-/// order; stray `END` markers are dropped.
-pub fn merge(existing: &str, section: &str) -> Result<String, MergeError> {
-    let mut extra = String::new();
-    let mut inside = false;
-    for line in existing.lines() {
-        match (inside, line) {
-            (_, BEGIN) => inside = true,
-            (_, END) => inside = false,
-            (true, _) => {}
-            (false, _) => {
-                extra.push_str(line);
-                extra.push('\n');
-            }
-        }
-    }
-    if inside {
-        return Err(MergeError::Unterminated);
-    }
-    Ok(format!("{section}{extra}"))
 }
 
 /// Rewrites `<dir>/<user>` if the roster section changed. Returns whether

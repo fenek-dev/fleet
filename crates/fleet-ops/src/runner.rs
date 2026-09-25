@@ -33,8 +33,8 @@ pub struct CommandSpec {
     pub timeout: Duration,
     /// Bytes kept of stdout and of stderr each; the rest is read and dropped.
     pub output_cap: usize,
-    /// Written to the child's stdin, which is then closed; `None` is
-    /// `/dev/null`.
+    /// Written to the child's stdin, which is then closed; `None` means
+    /// `/dev/null` (e.g. `crontab -u <user> -`).
     pub stdin: Option<Vec<u8>>,
 }
 
@@ -426,6 +426,9 @@ mod tests {
             ),
         );
         assert_eq!(r, Err(RunError::Timeout));
+
+        let out = block(SystemRunner.run(CommandSpec::new("/bin/cat").stdin("in\n"))).unwrap();
+        assert_eq!(out.stdout, b"in\n");
 
         let r = block(SystemRunner.run(CommandSpec::new("relative")));
         assert_eq!(r, Err(RunError::NotAbsolute));

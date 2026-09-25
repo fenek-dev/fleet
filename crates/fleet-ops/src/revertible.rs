@@ -70,14 +70,17 @@ impl Reverters {
         Self::default()
     }
 
-    /// Every restore module in this crate (firewall so far). A kind without
-    /// one is unavailable (a revert is audited as failed, never as
-    /// restored).
+    /// Every restore module in this crate. Kinds without one are
+    /// unavailable (a revert is audited as failed, never as restored).
     pub fn with_generic() -> Self {
         let mut r = Self::new();
         r.register(
             ChangeKind::Firewall,
             Rc::new(crate::firewall::FirewallRevert),
+        );
+        r.register(
+            ChangeKind::AuthorizedKeys,
+            Rc::new(crate::users::authorized_keys::AuthorizedKeysReverter),
         );
         r
     }
