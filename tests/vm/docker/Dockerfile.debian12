@@ -1,0 +1,25 @@
+# Fleet integration test host: Debian 12 with systemd as PID 1 (design §13).
+# Not a VM: the kernel is Docker Desktop's. Run with
+#   docker run -d --privileged --cgroupns=private \
+#     --tmpfs /run --tmpfs /run/lock --tmpfs /tmp -p 127.0.0.1::22 <image>
+# (tests/vm/run.sh and crates/fleet-it do this).
+FROM debian:12
+
+ENV container=docker \
+    DEBIAN_FRONTEND=noninteractive
+
+# systemd + D-Bus (unit.list talks to systemd over the system bus), sshd,
+# sudo, nftables, tmux, journald (part of systemd), procps/iproute2 for
+# debugging. No recommends: keeps the image small and the unit list short.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        systemd systemd-sysv dbus libpam-systemd \
+        openssh-server sudo nftables tmux procps iproute2 ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY setup-image.sh /usr/local/sbin/fleet-it-setup-image
+RUN bash /usr/local/sbin/fleet-it-setup-image && rm /usr/local/sbin/fleet-it-setup-image
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
