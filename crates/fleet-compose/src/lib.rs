@@ -41,6 +41,7 @@
 //! `COMPOSE_FILE` from `.env` is merged in; and check that `/srv/<project>`
 //! contains no symlink a relative bind source could resolve through
 //! (lexical resolution here can't see the filesystem).
+#![forbid(unsafe_code)]
 
 use fleet_proto::args::ComposeProject;
 use std::collections::HashSet;

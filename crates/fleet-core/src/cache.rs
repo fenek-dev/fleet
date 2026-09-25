@@ -859,6 +859,41 @@ impl Cache {
         Ok(Some(value))
     }
 
+    /// Key for [`Cache::set_secret_setting`], derived from the cache key.
+    fn secret_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(blake3::derive_key(
+            "fleet cache secret settings v1",
+            self.key.bytes(),
+        ))
+    }
+
+    fn secret_aad(key: &str) -> Vec<u8> {
+        let mut a = b"fleet/cache-secret/v1".to_vec();
+        a.extend_from_slice(key.as_bytes());
+        a
+    }
+
+    /// A setting encrypted at rest (AES-256-GCM under a key derived from
+    /// the Keychain-held cache key, AAD = setting name), for secrets that
+    /// must survive a restart (a provisioning run's sudo password).
+    pub fn set_secret_setting(&self, key: &str, value: &[u8]) -> Result<(), CacheError> {
+        let sealed = fleet_crypto::aead::seal(&self.secret_key(), &Self::secret_aad(key), value)
+            .map_err(|_| CacheError::Corrupt("seal".into()))?;
+        self.set_setting(key, &sealed)
+    }
+
+    pub fn secret_setting(&self, key: &str) -> Result<Option<Zeroizing<Vec<u8>>>, CacheError> {
+        let Some(sealed) = self.setting(key)? else {
+            return Ok(None);
+        };
+        if sealed.is_empty() {
+            return Ok(None);
+        }
+        fleet_crypto::aead::open(&self.secret_key(), &Self::secret_aad(key), &sealed)
+            .map(|v| Some(Zeroizing::new(v)))
+            .map_err(|_| CacheError::Corrupt(format!("secret setting {key}")))
+    }
+
     // ---- roster chain copies (a cache; servers are authoritative) ----
 
     pub fn put_roster(&self, r: &RosterRow) -> Result<(), CacheError> {

@@ -7,8 +7,12 @@
 //! SSH connection and Noise session, never a kept one), waits for the new
 //! one to be Ready ([`reconnect_fresh`]) and sends the confirm there.
 //! Requests queued after `reconnect` are served by the new session (the
-//! worker handles the reconnect first). This is the one implementation;
-//! [`crate::confirm`] wraps it for bulk/provisioning/MCP callers.
+//! worker handles the reconnect first). This is the one implementation:
+//! [`confirm_pending`] (budget from the change's deadline, capped by
+//! [`CONFIRM_TIMEOUT`], skew-adjusted, past deadline = `Reverted`) for
+//! bulk, provisioning and MCP; [`crate::confirm`] only adapts it to bulk.
+//! A fresh link is recognized by its generation
+//! ([`ManagerHandle::link_generation`]), never by a Ready state alone.
 //!
 //! Exec answers `Busy` while the change is still applying (retried),
 //! `PolicyDenied` for a session that isn't new enough (one more
@@ -16,6 +20,7 @@
 
 use crate::manager::{ConnState, ManagerEvent, ManagerHandle, RequestError, RequestOpts};
 use fleet_proto::op::ChangeId;
+use fleet_proto::payload::PendingChange;
 use fleet_proto::{Actor, ErrorCode, Op, Payload, ServerId};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
@@ -73,14 +78,17 @@ pub async fn confirm_fresh(
                 Err(ReconnectError::Fatal(m)) => return Err(ConfirmError::Reconnect(m)),
             }
         }
-        let res = handle
-            .request_with(
+        let res = tokio::time::timeout_at(
+            until,
+            handle.request_with(
                 id,
                 Op::ChangeConfirm { change_id },
                 actor.clone(),
                 RequestOpts::default(),
-            )
-            .await;
+            ),
+        )
+        .await
+        .map_err(|_| ConfirmError::NoConnection)?;
         match classify(res) {
             Step::Done => return Ok(()),
             Step::Fail(e) => return Err(e),
@@ -101,18 +109,23 @@ pub enum ReconnectError {
     Fatal(String),
 }
 
-/// Drops `id`'s connection and waits until a new one is Ready (a Ready
-/// seen only after the state left Ready). Fails early when the reconnect
-/// hits a fatal failure.
+/// Drops `id`'s connection and waits until a new one is Ready: Ready with
+/// a link generation above the one current before the reconnect
+/// ([`ManagerHandle::link_generation`]), so neither the old link nor a
+/// lagged event stream can pass for a fresh one. Fails early when the
+/// reconnect hits a fatal failure.
 pub async fn reconnect_fresh(
     h: &ManagerHandle,
     id: &ServerId,
     timeout: Duration,
 ) -> Result<(), ReconnectError> {
     let mut events = h.subscribe();
+    let before = h.link_generation(id).unwrap_or(0);
     h.reconnect(id);
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut left_ready = false;
+    let fresh = |h: &ManagerHandle| {
+        h.state(id) == Some(ConnState::Ready) && h.link_generation(id).unwrap_or(0) > before
+    };
     loop {
         let ev = tokio::time::timeout_at(deadline, events.recv())
             .await
@@ -125,25 +138,19 @@ pub async fn reconnect_fresh(
                 ..
             }) if &server == id => {
                 if state == ConnState::Ready {
-                    if left_ready {
+                    if fresh(h) {
                         return Ok(());
                     }
-                } else {
-                    left_ready = true;
-                    if let Some(f) = failure
-                        && f.fatal
-                    {
-                        return Err(ReconnectError::Fatal(f.message));
-                    }
+                } else if let Some(f) = failure
+                    && f.fatal
+                {
+                    return Err(ReconnectError::Fatal(f.message));
                 }
             }
             Ok(_) => {}
-            // Missed events: fall back to the state itself (a Ready seen
-            // after a lag may be the old link only if nothing happened,
-            // which the reconnect rules out).
+            // Missed events: judge by the link generation itself.
             Err(RecvError::Lagged(_)) => {
-                left_ready = true;
-                if h.state(id) == Some(ConnState::Ready) {
+                if fresh(h) {
                     return Ok(());
                 }
             }
@@ -186,6 +193,54 @@ pub fn budget(deadline_ms: u64, now_ms: u64) -> Duration {
     Duration::from_millis(deadline_ms.saturating_sub(now_ms).saturating_sub(1_000))
 }
 
+/// Upper bound on one confirmation (reconnect plus confirm), whatever the
+/// change's own deadline says.
+pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// `deadline_ms` (agent clock) on the Mac clock: minus the skew measured
+/// at connect (agent − Mac), when known.
+pub fn local_deadline(deadline_ms: u64, skew_ms: Option<i64>) -> u64 {
+    match skew_ms {
+        Some(s) if s >= 0 => deadline_ms.saturating_sub(s.unsigned_abs()),
+        Some(s) => deadline_ms.saturating_add(s.unsigned_abs()),
+        None => deadline_ms,
+    }
+}
+
+/// Time to spend confirming a change due at `deadline_ms` (agent clock):
+/// `min(cap, budget)`, or `Reverted` when the deadline has passed (the
+/// agent's timer has put the old state back, or is about to).
+pub fn confirm_window(
+    deadline_ms: u64,
+    skew_ms: Option<i64>,
+    now_ms: u64,
+    cap: Duration,
+) -> Result<Duration, ConfirmError> {
+    let b = budget(local_deadline(deadline_ms, skew_ms), now_ms);
+    if b.is_zero() {
+        return Err(ConfirmError::Reverted);
+    }
+    Ok(b.min(cap))
+}
+
+/// Confirms a `ChangePending` answer over a fresh connection within the
+/// change's own deadline (capped by [`CONFIRM_TIMEOUT`], skew-adjusted).
+/// The one entry point for bulk, provisioning and MCP callers.
+pub async fn confirm_pending(
+    h: &ManagerHandle,
+    id: &ServerId,
+    change: &PendingChange,
+    actor: Actor,
+) -> Result<(), ConfirmError> {
+    let window = confirm_window(
+        change.deadline_ms,
+        h.clock_skew_ms(id),
+        crate::now_ms(),
+        CONFIRM_TIMEOUT,
+    )?;
+    confirm_fresh(h, id, change.change_id, actor, window).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +250,33 @@ mod tests {
         assert_eq!(budget(10_000, 4_000), Duration::from_millis(5_000));
         assert_eq!(budget(10_000, 9_500), Duration::ZERO);
         assert_eq!(budget(1_000, 5_000), Duration::ZERO);
+    }
+
+    #[test]
+    fn confirm_window_caps_skews_and_reverts_past_deadline() {
+        let cap = CONFIRM_TIMEOUT;
+        // Far deadline: capped.
+        assert_eq!(confirm_window(1_000_000, None, 0, cap).unwrap(), cap);
+        // Short deadline: its own budget.
+        assert_eq!(
+            confirm_window(11_000, None, 0, cap).unwrap(),
+            Duration::from_secs(10)
+        );
+        // Agent clock 5 s ahead: the local deadline is 5 s earlier.
+        assert_eq!(
+            confirm_window(11_000, Some(5_000), 0, cap).unwrap(),
+            Duration::from_secs(5)
+        );
+        // Agent 5 s behind: later.
+        assert_eq!(
+            confirm_window(11_000, Some(-5_000), 0, cap).unwrap(),
+            Duration::from_secs(15)
+        );
+        // Past the deadline: reverted, not a wait.
+        assert!(matches!(
+            confirm_window(10_000, None, 20_000, cap),
+            Err(ConfirmError::Reverted)
+        ));
     }
 
     #[test]

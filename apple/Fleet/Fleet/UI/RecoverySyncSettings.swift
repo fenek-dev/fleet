@@ -66,6 +66,16 @@ struct RecoverySettings: View {
             if let error { Text(error).foregroundStyle(Tone.critical.text) }
         }
         .formStyle(.grouped)
+        .onDisappear(perform: clearSecrets)
+    }
+
+    /// Drops every recovery word and passphrase this view holds (Swift
+    /// strings can't be wiped in place; this ends our references).
+    private func clearSecrets() {
+        words = ""
+        passphrase = ""
+        newPassphrase = ""
+        newWords = []
     }
 
     private func veto(_ p: PendingRecoveryRow) {

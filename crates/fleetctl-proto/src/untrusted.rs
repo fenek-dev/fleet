@@ -30,18 +30,71 @@ pub fn prepare(server: &str, source: &str, raw: &str, max_bytes: usize) -> Untru
     }
 }
 
-/// C0/C1 controls (except `\n`, `\t`) and bidi overrides as `\u{…}`.
+/// C0/C1 controls (except `\n`, `\t`), format characters (Cf: bidi
+/// overrides, zero-width characters, tag characters…), private-use (Co)
+/// and unassigned (Cn) code points as `\u{…}`. See [`must_escape`].
 pub fn escape_controls(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        let bidi = matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}');
-        if (c.is_control() && c != '\n' && c != '\t') || bidi {
+        if must_escape(c) {
             out.push_str(&format!("\\u{{{:x}}}", c as u32));
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// Characters that are invisible or have no meaning of their own, so a
+/// server could hide text from the operator (or instructions for a model)
+/// in them. Cc and Cf are exact (Unicode 15.1); Co is exact; Cn has no
+/// table here without a Unicode data crate, so it covers noncharacters and
+/// the unassigned planes 4–13 and 14 (except variation selectors), which
+/// is where invisible "free" code points live.
+pub fn must_escape(c: char) -> bool {
+    if c == '\n' || c == '\t' {
+        return false;
+    }
+    let u = c as u32;
+    c.is_control()
+        || is_format(u)
+        // Co: private use.
+        || matches!(u, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x10_0000..=0x10_FFFD)
+        // Cn: noncharacters.
+        || matches!(u, 0xFDD0..=0xFDEF)
+        || (u & 0xFFFE) == 0xFFFE
+        // Cn: unassigned planes 4–13; plane 14 outside the tag characters
+        // (Cf, above) and variation selectors (Mn).
+        || matches!(u, 0x4_0000..=0xD_FFFF)
+        || (matches!(u, 0xE_0000..=0xE_FFFF) && !matches!(u, 0xE_0100..=0xE_01EF))
+}
+
+/// General category Cf (format), Unicode 15.1.
+fn is_format(u: u32) -> bool {
+    matches!(
+        u,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
 }
 
 /// Cuts `s` to at most `max` bytes on a char boundary.
@@ -103,6 +156,51 @@ fn is_value_end(b: u8) -> bool {
     b.is_ascii_whitespace() || matches!(b, b'"' | b'\'' | b',' | b';' | b'&' | b'}' | b'`')
 }
 
+/// The secret value starting at `j`: a quoted string (to its closing
+/// quote, backslash escapes skipped, or the end of the line) or a bare
+/// word (to whitespace or a delimiter; with `yaml`, a `key: value` form,
+/// to the end of the line or a JSON delimiter, since YAML values may
+/// contain spaces).
+fn value_range(b: &[u8], j: usize, yaml: bool) -> Option<(usize, usize)> {
+    if j >= b.len() {
+        return None;
+    }
+    let (v, mut e) = if matches!(b[j], b'"' | b'\'') {
+        let q = b[j];
+        let mut e = j + 1;
+        while e < b.len() && b[e] != q && b[e] != b'\n' {
+            e += if b[e] == b'\\' && e + 1 < b.len() && b[e + 1] != b'\n' {
+                2
+            } else {
+                1
+            };
+        }
+        (j + 1, e.min(b.len()))
+    } else {
+        let mut e = j;
+        let end = |c: u8| {
+            if yaml {
+                matches!(c, b'\n' | b'\r' | b',' | b'}' | b']' | b'"' | b'\'')
+            } else {
+                is_value_end(c)
+            }
+        };
+        while e < b.len() && !end(b[e]) {
+            e += 1;
+        }
+        // No trailing blanks in the replaced range.
+        while e > j && matches!(b[e - 1], b' ' | b'\t') {
+            e -= 1;
+        }
+        (j, e)
+    };
+    // Never split a UTF-8 sequence.
+    while e < b.len() && (b[e] & 0xC0) == 0x80 {
+        e += 1;
+    }
+    (e > v).then_some((v, e))
+}
+
 /// Replaces private key blocks, secret-looking `key=value` pairs, bearer
 /// tokens, URL passwords and well-known token formats. Returns the text
 /// and the number of replacements.
@@ -152,28 +250,33 @@ pub fn redact(s: &str) -> (String, u32) {
             while j < b.len() && is_word(b[j]) {
                 j += 1;
             }
+            // CLI flag whose name ends with the key: `--password value`,
+            // `--db-token value` (`--password=value` is a key=value pair).
+            let mut ws = k;
+            while ws > 0 && is_word(b[ws - 1]) {
+                ws -= 1;
+            }
+            let flag = b[ws..].starts_with(b"--") && j == k + key.len();
             if j < b.len() && matches!(b[j], b'"' | b'\'') {
                 j += 1;
             }
-            while j < b.len() && b[j] == b' ' {
+            let after_key = j;
+            while j < b.len() && matches!(b[j], b' ' | b'\t') {
                 j += 1;
             }
-            if j >= b.len() || !matches!(b[j], b'=' | b':') {
+            let mut yaml = false;
+            if j < b.len() && matches!(b[j], b'=' | b':') {
+                // `key: value` (YAML, logs); not `key://` or `key::`.
+                yaml = b[j] == b':' && b.get(j + 1).is_some_and(|c| *c == b' ' || *c == b'\t');
+                j += 1;
+                while j < b.len() && matches!(b[j], b' ' | b'\t') {
+                    j += 1;
+                }
+            } else if !(flag && j > after_key && j < b.len() && b[j] != b'-') {
                 continue;
             }
-            j += 1;
-            while j < b.len() && b[j] == b' ' {
-                j += 1;
-            }
-            if j < b.len() && matches!(b[j], b'"' | b'\'') {
-                j += 1;
-            }
-            let v = j;
-            while j < b.len() && !is_value_end(b[j]) {
-                j += 1;
-            }
-            if j > v {
-                ranges.push((v, j, REDACTED));
+            if let Some((v, e)) = value_range(b, j, yaml) {
+                ranges.push((v, e, REDACTED));
             }
         }
     }
@@ -348,6 +451,74 @@ mod tests {
         // Words that merely contain a key aren't keys.
         assert_eq!(r("mypassword"), "mypassword");
         assert_eq!(r("no secrets here"), "no secrets here");
+    }
+
+    #[test]
+    fn redacts_quoted_env_yaml_and_cli_secrets() {
+        assert_eq!(
+            r("{\"password\": \"a b c\", \"user\": \"x\"}"),
+            "{\"password\": \"[REDACTED]\", \"user\": \"x\"}"
+        );
+        assert_eq!(
+            r("{\"password\":\"q\\\"z\"}"),
+            "{\"password\":\"[REDACTED]\"}"
+        );
+        assert_eq!(
+            r("password: hunter 2\nuser: bob"),
+            "password: [REDACTED]\nuser: bob"
+        );
+        assert_eq!(
+            r("{\"token\": 12345, \"n\": 1}"),
+            "{\"token\": [REDACTED], \"n\": 1}"
+        );
+        assert_eq!(r("  password: 'two words'\n"), "  password: '[REDACTED]'\n");
+        assert_eq!(r("PASSWORD=\"x y\"\n"), "PASSWORD=\"[REDACTED]\"\n");
+        assert_eq!(r("export API_KEY='k1 k2'"), "export API_KEY='[REDACTED]'");
+        assert_eq!(
+            r("mysql --password s3cr3t -h db"),
+            "mysql --password [REDACTED] -h db"
+        );
+        assert_eq!(
+            r("cli --token \"abc def\" --db-token t2"),
+            "cli --token \"[REDACTED]\" --db-token [REDACTED]"
+        );
+        assert_eq!(r("cli --password=pw1"), "cli --password=[REDACTED]");
+        // A following flag isn't a value; other flags aren't secrets.
+        assert_eq!(r("cli --password --verbose"), "cli --password --verbose");
+        assert_eq!(
+            r("cli --password-file /run/pw"),
+            "cli --password-file /run/pw"
+        );
+        assert_eq!(r("the password is"), "the password is");
+    }
+
+    #[test]
+    fn escapes_invisible_and_private_use() {
+        for c in [
+            '\u{200B}',
+            '\u{200D}',
+            '\u{2060}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{E0041}',
+            '\u{E0001}',
+            '\u{E000}',
+            '\u{F8FF}',
+            '\u{F0000}',
+            '\u{10FFFD}',
+            '\u{FDD0}',
+            '\u{FFFF}',
+            '\u{4FFFF}',
+            '\u{202E}',
+            '\u{1b}',
+            '\u{85}',
+        ] {
+            let e = escape_controls(&format!("a{c}b"));
+            assert_eq!(e, format!("a\\u{{{:x}}}b", c as u32), "{:x}", c as u32);
+        }
+        // Visible text, emoji and variation selectors stay.
+        let ok = "héllo 世界 😀\u{FE0F} \u{E0100}\n\tx";
+        assert_eq!(escape_controls(ok), ok);
     }
 
     #[test]

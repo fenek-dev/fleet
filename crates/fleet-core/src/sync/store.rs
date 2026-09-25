@@ -102,6 +102,15 @@ impl SyncStore {
         Ok(())
     }
 
+    /// Drops a row (it no longer verifies against the roster chain).
+    pub fn remove(&self, collection: Collection, key: &str) -> Result<(), SyncError> {
+        self.conn.execute(
+            "DELETE FROM records WHERE collection = ?1 AND key = ?2",
+            params![collection.tag(), key],
+        )?;
+        Ok(())
+    }
+
     pub fn get(&self, collection: Collection, key: &str) -> Result<Option<Row>, SyncError> {
         let c = collection.tag();
         let row: Option<(Vec<u8>, bool, Option<Vec<u8>>)> = self

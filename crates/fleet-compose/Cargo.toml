@@ -1,0 +1,18 @@
+[package]
+name = "fleet-compose"
+description = "Pure compose.deploy validator (design §4.2), shared by the agent (fleet-ops) and the Mac core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Pure: no I/O, no system dependencies, so the Mac core can link it.
+[dependencies]
+fleet-proto.workspace = true
+yaml-rust2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -75,12 +75,17 @@ final class IntelStore {
     /// change daily; package inventories change with upgrades).
     func startPeriodicScans(_ bridge: CoreBridge) {
         guard periodic == nil else { return }
-        periodic = Task { [weak self] in
+        // Weak captures, re-checked each round: strong references live only
+        // for one scan, never across the sleep, and the loop ends with them.
+        periodic = Task { [weak self, weak bridge] in
             try? await Task.sleep(for: .seconds(60))
             while !Task.isCancelled {
-                if let self, let api = bridge.api {
-                    self.refreshStatus()
-                    await self.scanFleet(api)
+                do {
+                    guard let self, let bridge else { return }
+                    if let api = bridge.api {
+                        self.refreshStatus()
+                        await self.scanFleet(api)
+                    }
                 }
                 try? await Task.sleep(for: .seconds(6 * 3600))
             }

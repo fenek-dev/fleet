@@ -13,6 +13,7 @@ members = [
     "crates/fleetctl",
     "crates/fleet-debver",
     "crates/fleet-cloudinit",
+    "crates/fleet-compose",
 ]
 
 [workspace.package]
@@ -40,6 +41,7 @@ fleetctl-proto = { path = "crates/fleetctl-proto" }
 fleet-debver = { path = "crates/fleet-debver" }
 fleet-hardening = { path = "crates/fleet-hardening" }
 fleet-cloudinit = { path = "crates/fleet-cloudinit" }
+fleet-compose = { path = "crates/fleet-compose" }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }

@@ -2,7 +2,11 @@
 
 use super::*;
 use crate::bulk::tests::healthy;
-use fleet_proto::payload::{AuditReport, ChangeKind, ModuleOutcome, PendingChange, ProfileApplied};
+use fleet_proto::alert::Severity;
+use fleet_proto::payload::{
+    AuditFinding, AuditReport, ChangeKind, ModuleOutcome, PendingChange, PendingChanges,
+    ProfileApplied,
+};
 use std::sync::{Arc, Mutex};
 
 const ADMIN: &str = "ops";
@@ -31,6 +35,20 @@ struct Fake {
     saved: Mutex<Vec<ProvisionState>>,
     approvals: Mutex<Vec<String>>,
     passwords: Mutex<Vec<bool>>,
+    /// Unconfirmed changes (`changes.list`).
+    pending: Mutex<Vec<PendingChange>>,
+    findings: Mutex<Vec<AuditFinding>>,
+}
+
+fn pending_change() -> PendingChange {
+    PendingChange {
+        change_id: [4; 16],
+        kind: ChangeKind::Profile,
+        op_tag: 1102,
+        created_ms: 1,
+        deadline_ms: 60_001,
+        new_version: None,
+    }
 }
 
 impl Fake {
@@ -58,6 +76,8 @@ impl Fake {
             saved: Mutex::new(Vec::new()),
             approvals: Mutex::new(Vec::new()),
             passwords: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
+            findings: Mutex::new(Vec::new()),
         })
     }
 
@@ -93,7 +113,13 @@ impl Fake {
                 self.log(format!("audit.run {}", self.score()));
                 Ok(Payload::AuditReport(AuditReport {
                     score: self.score(),
-                    findings: vec![],
+                    findings: self.findings.lock().unwrap().clone(),
+                }))
+            }
+            Op::ChangesList => {
+                self.log("changes.list");
+                Ok(Payload::PendingChanges(PendingChanges {
+                    changes: self.pending.lock().unwrap().clone(),
                 }))
             }
             Op::ProfilePlan(_) => {
@@ -141,15 +167,9 @@ impl Fake {
                     score_after: self.score(),
                 });
                 if phase == ProfilePhase::Access {
+                    self.pending.lock().unwrap().push(pending_change());
                     Ok(Payload::ChangePending {
-                        change: PendingChange {
-                            change_id: [4; 16],
-                            kind: ChangeKind::Profile,
-                            op_tag: 1102,
-                            created_ms: 1,
-                            deadline_ms: 60_001,
-                            new_version: None,
-                        },
+                        change: pending_change(),
                         inner: Some(Box::new(result)),
                     })
                 } else {
@@ -195,8 +215,14 @@ impl ProvisionBackend for Arc<Fake> {
         Ok(())
     }
 
-    fn confirm_change(&self, _: &ServerId, change: ChangeId) -> BoxFut<Result<(), ConfirmFailure>> {
-        assert_eq!(change, [4; 16]);
+    fn confirm_change(
+        &self,
+        _: &ServerId,
+        change: ChangeId,
+        deadline_ms: u64,
+    ) -> BoxFut<Result<(), ConfirmFailure>> {
+        assert_eq!((change, deadline_ms), ([4; 16], 60_001));
+        self.pending.lock().unwrap().clear();
         self.log("confirm (new connection)");
         *self.confirmed_as.lock().unwrap() = Some(self.ssh_user.lock().unwrap().clone());
         let r = self.confirm.lock().unwrap().clone();
@@ -375,6 +401,53 @@ async fn unconfirmed_access_goes_back_to_the_provider_user() {
     *fake.confirm.lock().unwrap() = Err(ConfirmFailure::Reverted);
     assert_eq!(run(&fake, &mut st).await, Err(ProvisionError::Reverted));
     assert_eq!(st.step, Step::Access);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resumed_access_confirms_a_change_still_pending() {
+    let fake = Fake::new();
+    let mut st = reviewed(&fake).await;
+    // An earlier run applied Accounts and Access, then stopped before it
+    // saved ConfirmAccess: the plan has nothing of Access left.
+    fake.remaining.lock().unwrap().retain(|c| {
+        !in_phase(&c.module, ProfilePhase::Access) && !in_phase(&c.module, ProfilePhase::Accounts)
+    });
+    fake.pending.lock().unwrap().push(pending_change());
+    st.step = Step::Access;
+    fake.log.lock().unwrap().clear();
+    let mut armed = None;
+    let r = advance(&fake, &mut st, &cfg(), |e| {
+        if let ProvisionEvent::RevertArmed { deadline_ms } = e {
+            armed = Some(deadline_ms);
+        }
+    })
+    .await;
+    assert_eq!(r, Ok(Step::Done));
+    assert_eq!(armed, Some(60_001));
+    let log = fake.logged();
+    let at = |s: &str| log.iter().position(|l| l == s).unwrap();
+    assert!(
+        at("changes.list") < at("confirm (new connection)"),
+        "{log:?}"
+    );
+    assert!(!log.iter().any(|l| l == "profile.apply Access"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn access_not_compliant_after_audit_goes_back_to_access() {
+    let fake = Fake::new();
+    let mut st = reviewed(&fake).await;
+    fake.findings.lock().unwrap().push(AuditFinding {
+        module: "ssh.hardening".into(),
+        status: fleet_proto::payload::ModuleStatus::Drifted,
+        severity: Severity::Critical,
+        title: "sshd".into(),
+        fixable: true,
+    });
+    let e = run(&fake, &mut st).await.unwrap_err();
+    assert!(matches!(e, ProvisionError::AccessNotCompliant(ref m) if m == "ssh.hardening"));
+    assert_eq!(st.step, Step::Access);
+    assert!(!fake.logged().iter().any(|l| l.starts_with("add ")));
 }
 
 #[tokio::test(flavor = "current_thread")]

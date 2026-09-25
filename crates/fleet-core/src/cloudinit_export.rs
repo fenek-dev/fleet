@@ -7,6 +7,14 @@
 //! recovery key (which must stay forced to their bridges) arrive with the
 //! roster section once the agent is installed. The host private key is in
 //! the returned YAML only; the Mac keeps just the public key as the pin.
+//!
+//! Handling the YAML (the app does this, `CloudInitExportSheet.swift`): the
+//! file is created 0600 from the start (`O_CREAT|O_EXCL` temp + rename),
+//! the operator is warned when saving into a synced folder (iCloud Drive,
+//! Dropbox, Google Drive, OneDrive, `~/Library/CloudStorage`), and told
+//! that the private key stays in the provider's stored user-data and in
+//! `/var/lib/cloud/instance/user-data.txt*` after first boot, so both
+//! should be deleted and the host key rotated.
 
 use crate::ssh::HostKey;
 use fleet_cloudinit::{CloudInit, HostKey as CiHostKey};

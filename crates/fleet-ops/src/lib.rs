@@ -22,7 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod allowed;
-pub mod compose;
+pub use fleet_compose as compose;
 pub mod confighist;
 pub mod cron;
 pub mod ctx;

@@ -133,6 +133,35 @@ impl Signer for RoleSigner<'_> {
     }
 }
 
+/// [`RoleSigner`] owning its [`DeviceSigner`], so a signature can run on
+/// another thread (`CommandSigner::Blocking`).
+pub struct SharedRoleSigner {
+    keys: std::sync::Arc<dyn DeviceSigner>,
+    role: KeyRole,
+    public: P256Public,
+}
+
+impl SharedRoleSigner {
+    pub fn new(keys: std::sync::Arc<dyn DeviceSigner>, role: KeyRole) -> Result<Self, SignerError> {
+        let public = keys.public_key(role)?;
+        Ok(Self { keys, role, public })
+    }
+}
+
+impl Signer for SharedRoleSigner {
+    fn public(&self) -> P256Public {
+        self.public
+    }
+
+    fn sign(&self, msg: &[u8]) -> Result<Signature, fleet_crypto::Error> {
+        let raw = self
+            .keys
+            .sign(self.role, msg, "")
+            .map_err(|_| fleet_crypto::Error::Signer)?;
+        sig::p256_normalize(&raw)
+    }
+}
+
 /// In-memory keys for tests, development and `fleetctl` without an enclave.
 pub struct SoftwareDeviceSigner {
     pub root: SoftwareP256Signer,

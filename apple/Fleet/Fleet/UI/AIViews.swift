@@ -14,7 +14,7 @@ struct AISettings: View {
             }
             Section("Paired clients") {
                 if ai.clients.isEmpty {
-                    Text("None yet. A client is paired the first time it connects, with Touch ID.")
+                    Text("None yet. A client is paired the first time it connects, with Touch ID. Clients started from a shell, a script interpreter or an unsigned program are asked on every connection and never listed here.")
                         .foregroundStyle(Color.textMuted)
                 }
                 ForEach(ai.clients, id: \.key) { c in
@@ -65,15 +65,26 @@ struct AIPromptSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             switch prompt.kind {
-            case .pairing(let name, let team, let parent):
+            case .pairing(let name, let team, let parent, let cdhash, let everyTime):
                 Label("New AI client", systemImage: "sparkles").font(.toolbarTitle)
                 Text("\(name) wants to use Fleet through fleetctl.")
                 LabeledContent("Launched by", value: parent)
                 LabeledContent("Team", value: team.isEmpty ? "unsigned" : team)
-                Text("Once paired it can call every operation the server policies allow. Elevated and wide actions still need your Touch ID each time. You can revoke it in Settings → AI.")
-                    .font(.secondary).foregroundStyle(Color.textSecondary)
-            case .approval(let client, let tool, let op, let details, let servers, let elevated):
-                Label(elevated ? "AI requests an elevated operation" : "AI requests a bulk action",
+                if !cdhash.isEmpty {
+                    LabeledContent("Code hash", value: String(cdhash.prefix(16)))
+                        .font(.caption11)
+                }
+                if everyTime {
+                    Label("fleetctl was started by an unsigned program, a shell or a script interpreter. Its signature doesn't say which program is really asking, so this approval covers this session only and you'll be asked again next time.",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.secondary).foregroundStyle(Tone.warn.text)
+                } else {
+                    Text("Once paired it can call every operation the server policies allow. Elevated and wide actions still need your Touch ID each time. You can revoke it in Settings → AI.")
+                        .font(.secondary).foregroundStyle(Color.textSecondary)
+                }
+            case .approval(let client, let tool, let op, let details, let servers, let elevated, let escalation):
+                Label(escalation ? "AI change needs root approval"
+                      : elevated ? "AI requests an elevated operation" : "AI requests a bulk action",
                       systemImage: elevated ? "exclamationmark.shield" : "square.stack.3d.up")
                     .font(.toolbarTitle)
                     .foregroundStyle(elevated ? Tone.warn.text : Color.text)
@@ -81,7 +92,8 @@ struct AIPromptSheet: View {
                 LabeledContent("Tool", value: tool)
                 LabeledContent("Operation", value: op)
                 LabeledContent("Servers", value: "\(servers.count)")
-                ScrollView {
+                // Everything the approval covers, never cut: scroll it.
+                ScrollView([.vertical, .horizontal]) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(servers.map(name).joined(separator: ", "))
                             .font(.secondary)
@@ -89,11 +101,16 @@ struct AIPromptSheet: View {
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(Color.textSecondary)
                             .textSelection(.enabled)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxHeight: 180)
-                Text(elevated
+                .frame(minHeight: 120, maxHeight: 320)
+                LabeledContent("Request digest", value: String(prompt.digest.prefix(16)))
+                    .font(.caption11)
+                Text(escalation
+                     ? "The server's policy asks for a root approval of this change. Approving asks the root key's Touch ID."
+                     : elevated
                      ? "Approving asks the root key's Touch ID once for all \(servers.count) servers."
                      : "Approving asks for Touch ID. The first server runs alone as a canary.")
                     .font(.caption11).foregroundStyle(Color.textMuted)
@@ -109,7 +126,7 @@ struct AIPromptSheet: View {
             .disabled(busy)
         }
         .padding(20)
-        .frame(width: 480)
+        .frame(width: 560)
     }
 
     private func name(_ id: String) -> String { core.servers.first { $0.id == id }?.name ?? id }

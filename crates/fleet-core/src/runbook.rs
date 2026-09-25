@@ -45,7 +45,7 @@ pub enum RunbookError {
     Step { step: usize, error: InvalidSpec },
     #[error("missing parameter {0}")]
     MissingParam(String),
-    #[error("scheduled runbooks can't contain elevated steps")]
+    #[error("scheduled runbooks can't contain elevated or may-escalate steps")]
     ScheduledElevated,
     #[error(transparent)]
     Bulk(#[from] bulk::BulkError),
@@ -327,7 +327,14 @@ impl Runbook {
                     "scheduled runbooks need parameter defaults",
                 ));
             }
-            if ops.iter().flatten().any(crate::opspec::needs_approval) {
+            // May-escalate ops (e.g. compose.deploy) would ask for the root
+            // key mid-run when exec answers `ApprovalRequired`: nobody is
+            // there to approve them either.
+            if ops
+                .iter()
+                .flatten()
+                .any(|op| crate::opspec::needs_approval(op) || op.may_escalate())
+            {
                 return Err(RunbookError::ScheduledElevated);
             }
         }
@@ -560,6 +567,21 @@ mod tests {
         r.schedule = None;
         r.targets.push("nope".into());
         assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn scheduled_runbooks_refuse_may_escalate_steps() {
+        let compose = OpSpec::ComposeDeploy {
+            project: "app".into(),
+            compose_yaml: "services: {}\n".into(),
+            pull: false,
+        };
+        let mut r = rb(vec![step(compose, StepCondition::Always)]);
+        let op = crate::opspec::to_op(&r.steps[0].op).unwrap();
+        assert!(op.may_escalate());
+        r.validate().unwrap();
+        r.schedule = Some(Schedule { every_minutes: 60 });
+        assert_eq!(r.validate(), Err(RunbookError::ScheduledElevated));
     }
 
     #[test]

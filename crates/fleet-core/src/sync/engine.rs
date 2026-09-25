@@ -25,8 +25,8 @@
 use super::keys::SyncKey;
 use super::store::{Row, SyncStore};
 use super::{
-    CloudRecord, Collection, Hlc, HlcClock, SignedRecord, SyncError, SyncRecord, sign_record,
-    verify_record,
+    CloudRecord, Collection, Hlc, HlcClock, MAX_HLC_DRIFT_MS, SignedRecord, SyncError, SyncRecord,
+    author_current, sign_record, verify_record,
 };
 use fleet_crypto::sig::Signer;
 use fleet_proto::{DeviceId, SignedRoster, decode, encode};
@@ -44,6 +44,10 @@ pub struct ApplyReport {
     pub rejected: u32,
     /// Sealed with a sync key this Mac doesn't hold (rotated: fetch the key box).
     pub other_key: u32,
+    /// Of `rejected`: stamped more than `MAX_HLC_DRIFT_MS` ahead.
+    pub future: u32,
+    /// Of `rejected`: new records by a Mac no longer in the roster.
+    pub removed_author: u32,
 }
 
 /// A parked text-document conflict.
@@ -204,6 +208,28 @@ impl SyncEngine {
             };
             if verify_record(&sr, chain).is_err() {
                 rep.rejected += 1;
+                continue;
+            }
+            // Stamped too far ahead: quarantined, never merged (it would
+            // win every later merge).
+            if sr.record.hlc.wall_ms > wall_ms.saturating_add(MAX_HLC_DRIFT_MS) {
+                rep.rejected += 1;
+                rep.future += 1;
+                continue;
+            }
+            // A removed Mac's records: only what this Mac already held
+            // before the removal was known (the exact signed record); its
+            // stamps are its own, so "written before removal" can't be
+            // trusted for anything new.
+            if !author_current(&sr.record.author, chain) {
+                let held = self
+                    .store
+                    .get(sr.record.collection, &sr.record.key)?
+                    .is_some_and(|l| l.signed == sr);
+                if !held {
+                    rep.rejected += 1;
+                    rep.removed_author += 1;
+                }
                 continue;
             }
             self.clock.observe(&sr.record.hlc, wall_ms);
@@ -391,6 +417,49 @@ impl SyncEngine {
         })?;
         self.put(device, Collection::PinnedKeys, key, body, wall_ms)?;
         Ok(())
+    }
+
+    /// Re-checks every stored row against `chain` (after a roster change):
+    /// rows that no longer verify (author removed before the row's stamp,
+    /// never listed) or stamped more than `MAX_HLC_DRIFT_MS` ahead of
+    /// `wall_ms` are dropped. Returns what was dropped.
+    pub fn reverify(
+        &mut self,
+        chain: &[SignedRoster],
+        wall_ms: u64,
+    ) -> Result<Vec<(Collection, String)>, SyncError> {
+        let mut dropped = Vec::new();
+        for row in self.store.rows(None)? {
+            let r = &row.signed.record;
+            let future = r.hlc.wall_ms > wall_ms.saturating_add(MAX_HLC_DRIFT_MS);
+            if future || verify_record(&row.signed, chain).is_err() {
+                self.store.remove(r.collection, &r.key)?;
+                dropped.push((r.collection, r.key.clone()));
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// Re-signs, as this Mac, every row whose author `keep` rejects (a Mac
+    /// being revoked or lost), so Macs that join later — which accept only
+    /// current roster members' records — still receive the data. Content
+    /// is unchanged; the new stamp makes other Macs take it.
+    pub fn readopt(
+        &mut self,
+        device: &dyn Signer,
+        keep: impl Fn(&DeviceId) -> bool,
+        wall_ms: u64,
+    ) -> Result<u32, SyncError> {
+        let mut n = 0;
+        for row in self.store.rows(None)? {
+            let r = row.signed.record;
+            if keep(&r.author) {
+                continue;
+            }
+            self.write_local(device, r.collection, &r.key, r.body, r.deleted, wall_ms)?;
+            n += 1;
+        }
+        Ok(n)
     }
 
     /// Switches to `new` (revocation, design §5.12): every record is

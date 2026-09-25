@@ -53,6 +53,8 @@ struct JoinFleetView: View {
     @State private var deviceName = Host.current().localizedName ?? "Mac"
     @State private var offer: PairingOfferRow?
     @State private var sas: String?
+    /// The operator confirmed the codes match on this Mac.
+    @State private var confirmed = false
     @State private var waiting = false
     @State private var error: String?
     @State private var poll: Task<Void, Never>?
@@ -66,10 +68,21 @@ struct JoinFleetView: View {
             }
             if let offer {
                 if let sas {
-                    Text("Check that the other Mac shows this code, then approve there:")
+                    Text("Check that the other Mac shows this code:")
                     Text(AddMacSheet.spaced(sas))
                         .font(.system(size: 34, weight: .semibold, design: .monospaced))
-                    ProgressView("Waiting for approval…")
+                    if confirmed {
+                        ProgressView("Codes match. Approve on the other Mac; waiting…")
+                    } else {
+                        Text("Only continue if both Macs show exactly the same code. A different code means the pairing was tampered with.")
+                            .font(.secondary).foregroundStyle(Color.textSecondary)
+                        HStack {
+                            Button("Codes differ", role: .cancel) { poll?.cancel(); back() }
+                            Spacer()
+                            Button("Codes match") { confirmCodes() }
+                                .buttonStyle(.borderedProminent).tint(.accent)
+                        }
+                    }
                 } else {
                     Text("On a Mac already in the fleet: Settings → Devices → Add Mac, then scan this code or paste it.")
                         .foregroundStyle(Color.textSecondary)
@@ -117,14 +130,28 @@ struct JoinFleetView: View {
         }
     }
 
+    private func confirmCodes() {
+        guard let api = core.api else { return }
+        do {
+            try api.confirmPairingCodes()
+            confirmed = true
+        } catch {
+            self.error = error.fleetMessage
+        }
+    }
+
     private func wait(_ o: PairingOfferRow) async {
         guard let api = core.api, let cloud = core.sync?.cloud else { return }
         while !Task.isCancelled {
             do {
                 if sas == nil, let r = try await cloud.fetch([o.responseRecord]).first {
-                    sas = try api.pairingVerificationCode(response: r)
+                    // The answer is fixed now: reveal the committed secret
+                    // so the other Mac can show its code.
+                    let code = try api.pairingVerificationCode(response: r)
+                    _ = try await cloud.save([code.reveal])
+                    sas = code.verificationCode
                 }
-                if sas != nil, let kb = try await cloud.fetch([o.keyboxRecord]).first {
+                if sas != nil, confirmed, let kb = try await cloud.fetch([o.keyboxRecord]).first {
                     let all = try await cloud.changes(since: nil)
                     try api.completePairing(keybox: kb, records: all.records)
                     core.startManager()
@@ -148,6 +175,8 @@ struct RecoverFleetView: View {
     @State private var passphrase = ""
     @State private var session: RecoverySession?
     @State private var restored: RestoreRow?
+    /// The operator compared the roster fingerprint.
+    @State private var fingerprintOK = false
     @State private var deviceName = Host.current().localizedName ?? "Mac"
     @State private var newPassphrase = ""
     @State private var result: RecoveryResultRow?
@@ -171,7 +200,18 @@ struct RecoverFleetView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.window)
-        .onDisappear { session?.cancel() }
+        .onDisappear {
+            session?.cancel()
+            clearSecrets()
+            result = nil
+        }
+    }
+
+    /// Drops the recovery words and passphrases this view holds.
+    private func clearSecrets() {
+        words = ""
+        passphrase = ""
+        newPassphrase = ""
     }
 
     private var codeStep: some View {
@@ -186,7 +226,10 @@ struct RecoverFleetView: View {
                     .font(.secondary).foregroundStyle(Tone.warn.text)
             }
             HStack {
-                Button("Back") { back() }
+                Button("Back") {
+                    clearSecrets()
+                    back()
+                }
                 Spacer()
                 Button("Open iCloud escrow") { openEscrow() }
                     .buttonStyle(.borderedProminent).tint(.accent)
@@ -199,6 +242,15 @@ struct RecoverFleetView: View {
         VStack(alignment: .leading, spacing: 12) {
             if let r = restored {
                 Text("Restored \(r.servers) servers and roster v\(r.rosterVersion). These Macs will be removed: \(r.devicesLost.joined(separator: ", ")).")
+                Text("\(r.serversConfirmed) server(s) confirmed this roster over their pinned keys. The escrow was sealed by “\(r.escrowSealedBy)”.")
+                    .font(.secondary).foregroundStyle(Color.textSecondary)
+                if !r.serversBehind.isEmpty {
+                    Text("Still on an older roster: \(r.serversBehind.joined(separator: ", ")).")
+                        .font(.secondary).foregroundStyle(Tone.warn.text)
+                }
+                Text(r.fromGenesis ? "Fleet fingerprint (genesis roster):" : "Roster fingerprint (from the servers):")
+                Text(r.rosterFingerprint).font(.mono(15)).textSelection(.enabled)
+                Toggle("This matches the fingerprint in my records (Settings → Devices on a former Mac, or noted with the recovery code)", isOn: $fingerprintOK)
             }
             Form {
                 TextField("This Mac", text: $deviceName)
@@ -211,7 +263,7 @@ struct RecoverFleetView: View {
                 Spacer()
                 Button("Recover") { recover() }
                     .buttonStyle(.borderedProminent).tint(.accent)
-                    .disabled(busy)
+                    .disabled(busy || !fingerprintOK)
             }
         }
     }
@@ -258,6 +310,12 @@ struct RecoverFleetView: View {
             defer { busy = false }
             do {
                 let s = try await api.beginRecovery(words: w, passphrase: p)
+                // Derived: the session holds the keys; drop the typed code.
+                // (A derivation error keeps it so a typo can be fixed.)
+                words = ""
+                passphrase = ""
+                session?.cancel()
+                session = s
                 guard let escrow = try await cloud.fetch([s.escrowRecordName()]).first else {
                     error = "No escrow for this code in iCloud."
                     return
@@ -266,9 +324,6 @@ struct RecoverFleetView: View {
                 let all = try await cloud.changes(since: nil)
                 // Without roster copies this asks the servers (roster.get).
                 restored = try await s.restore(records: all.records)
-                session = s
-                words = ""
-                passphrase = ""
                 step = .restored
                 error = nil
             } catch {
@@ -282,6 +337,7 @@ struct RecoverFleetView: View {
         busy = true
         core.allowKeyCreation(true)
         let (n, p) = (deviceName, newPassphrase)
+        newPassphrase = ""
         Task {
             defer { busy = false }
             do {

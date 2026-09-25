@@ -7,70 +7,159 @@
 //! byte stream (tests, tools).
 //!
 //! Per request, in order: protocol version, **pause switch** (rejects
-//! everything instantly), **pairing** (a client — parent code signature +
-//! MCP client name — is approved once in the app with Touch ID, revocable),
-//! **lock** (`Locked` while the app is locked), **rate limit** (per client,
-//! the policy's `ai_commands_per_minute`), then the tool. Arguments are
-//! validated with the protocol's types before anything is signed.
-//! **Approvals**: Elevated operations and bulk actions on more than
-//! `bulk_confirm_above` servers wait for the operator's decision in the app
-//! (the prompt names the client, operation, arguments and servers);
-//! Elevated runs then also get the root key's Touch ID (one approval for
-//! all targets). Multi-server changes from AI always run in canary mode.
+//! everything instantly), **pairing** (a client — parent code signature
+//! and cdhash + MCP client name — is approved once in the app with Touch
+//! ID, revocable; unsigned, shell or interpreter parents are asked on every
+//! connection and never persisted), **lock** (`Locked` while the app is
+//! locked), **rate limit** (per client, the policy's
+//! `ai_commands_per_minute`), then the tool. Arguments are validated with
+//! the protocol's types before anything is signed.
+//! **Approvals**: Elevated operations and changes on more than
+//! `bulk_confirm_above` servers (counting the distinct servers the client
+//! changed with the same op in the last 10 minutes) wait for the
+//! operator's decision in the app. The prompt carries the full details
+//! (never truncated: too large → `invalid_argument`) and a BLAKE3 digest
+//! the answer must echo. Elevated runs then also get the root key's Touch
+//! ID (one approval for all targets); may-escalate ops that exec answers
+//! with `ApprovalRequired` get an operator prompt first, then the root
+//! key. Root key prompts say "AI (<client>): …". Pausing declines open
+//! prompts and cancels running calls; the AI approver re-checks the pause
+//! right before Touch ID. Multi-server changes from AI always run in
+//! canary mode.
 //!
 //! Results: `summary` holds Mac-side data and fixed codes; everything a
-//! server sent goes into `untrusted` items, control characters escaped,
-//! secrets redacted and size-capped. Config files on a server's secret
-//! list are never returned. Every command carries `Actor::Ai`.
+//! server sent is rendered as plain text per payload type
+//! ([`render`]) and goes into `untrusted` items, invisible
+//! characters escaped, secrets redacted and size-capped. Config files on a
+//! server's secret list are never returned. Every command carries
+//! `Actor::Ai`.
 
 use crate::bulk::{
-    self, AgentHealthProbe, Approver, BoxFut, BulkExecutor, BulkOptions, BulkRequest, CancelToken,
-    Failure, Outcome, Output, Plan, SkipReason, StopReason,
+    self, AgentHealthProbe, ApproveError, Approver, BoxFut, BulkExecutor, BulkOptions, BulkRequest,
+    CancelToken, Failure, Outcome, Output, Plan, SkipReason, StopReason,
 };
 use crate::cache::McpClientRecord;
 use crate::opspec;
-use fleet_proto::ChangeId;
 use fleet_proto::args::{
     AbsPath, GrepPattern, JournalQuery, Priority, SearchQuery, SearchTerm, TimeRange,
 };
 use fleet_proto::op::{ProcessSort, Resolution, UpgradeScope};
-use fleet_proto::{Actor, BoundedString, Op, Payload, ServerId, Tier};
+use fleet_proto::payload::PendingChange;
+use fleet_proto::{
+    Actor, ApprovalItem, BoundedString, ErrorCode, Op, Payload, RootApproval, ServerId, Tier,
+};
 use fleetctl_proto::msg::*;
 use fleetctl_proto::untrusted::{self, MAX_ITEM_BYTES};
 use fleetctl_proto::{FrameError, PROTO_VERSION, decode_body, encode_frame, frame_len};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
+/// Default largest approval details shown to the operator (a maximal
+/// 256 KiB compose file fits, escaped). Larger requests are refused
+/// rather than shown cut.
+pub const MAX_APPROVAL_DETAILS: usize = 512 * 1024;
+/// Error field for a request whose approval details exceed the limit.
+pub const DETAILS_TOO_LARGE: &str = "approval_details_too_large";
+
 /// What Swift verified about the connecting process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PeerInfo {
     /// Team id of `fleetctl`'s parent process ("" if unsigned).
     pub parent_team: String,
     /// Signing identifier of the parent (bundle id or binary name).
     pub parent_signing_id: String,
+    /// The parent's cdhash (hex; "" when not available).
+    pub parent_cdhash: String,
+    /// Swift's verdict: ask the operator on every connection and never
+    /// persist the pairing (see [`PeerInfo::ask_every_time`]).
+    pub ask_every_time: bool,
 }
 
-/// Pairing identity: parent code signature + MCP client name.
+impl PeerInfo {
+    /// Unsigned (no team) or a shell/interpreter parent: its signature says
+    /// nothing about what runs inside it, so a pairing can't be remembered.
+    pub fn ask_every_time(&self) -> bool {
+        self.ask_every_time
+            || self.parent_team.is_empty()
+            || is_interpreter(&self.parent_signing_id)
+    }
+}
+
+/// Shells and script interpreters (by signing identifier, e.g.
+/// `com.apple.zsh`, or binary name).
+pub fn is_interpreter(signing_id: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "dash",
+        "ksh",
+        "tcsh",
+        "csh",
+        "env",
+        "node",
+        "nodejs",
+        "deno",
+        "bun",
+        "osascript",
+        "pwsh",
+        "powershell",
+        "tclsh",
+        "wish",
+        "expect",
+        "script",
+        "nohup",
+        "xargs",
+        "sudo",
+        "su",
+        "login",
+        "screen",
+        "tmux",
+        "lua",
+        "luajit",
+        "swift",
+    ];
+    // Followed only by a version (`python3`, `ruby3`, `perl5`).
+    const VERSIONED: &[&str] = &["python", "ruby", "perl", "php", "irb"];
+    let lower = signing_id.to_ascii_lowercase();
+    // `com.apple.zsh`, `/usr/bin/python3.12` (→ "python3", "12").
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    base.split(['.', '-', '_']).any(|c| {
+        EXACT.contains(&c)
+            || VERSIONED.iter().any(|p| {
+                c.strip_prefix(p)
+                    .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+            })
+    })
+}
+
+/// Pairing identity: parent code signature (team, identifier, cdhash) +
+/// MCP client name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientIdentity {
     pub client_name: String,
     pub parent_team: String,
     pub parent_signing_id: String,
+    /// Binds the pairing to this exact build of the parent (an update of
+    /// the MCP client pairs again). "" when unavailable.
+    pub parent_cdhash: String,
 }
 
 impl ClientIdentity {
     pub fn key(&self) -> String {
         let mut h = blake3::Hasher::new();
-        h.update(b"fleet-mcp-client-v1\0");
+        h.update(b"fleet-mcp-client-v2\0");
         for f in [
             &self.client_name,
             &self.parent_team,
             &self.parent_signing_id,
+            &self.parent_cdhash,
         ] {
             h.update(&(f.len() as u64).to_le_bytes());
             h.update(f.as_bytes());
@@ -86,23 +175,65 @@ impl ClientIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptKind {
     /// First connection of a new client; approve with Touch ID.
-    Pairing { identity: ClientIdentity },
+    Pairing {
+        identity: ClientIdentity,
+        /// Unsigned/shell/interpreter parent: asked on every connection,
+        /// not remembered; the UI shows a warning.
+        ask_every_time: bool,
+    },
     /// An AI call that needs the operator.
     Approval {
         client: String,
         tool: String,
         op: String,
-        /// Mac-rendered arguments (from the AI, validated).
+        /// Mac-rendered arguments (from the AI, validated), complete (at
+        /// most `McpConfig::max_approval_details`).
         details: String,
+        /// Every target.
         servers: Vec<String>,
+        /// The root key's Touch ID follows an approval.
         elevated: bool,
+        /// Exec asked for a root approval of a may-escalate op.
+        escalation: bool,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
     pub id: u64,
+    /// BLAKE3 (hex) over everything the prompt shows; the answer must
+    /// carry it ([`McpHost::resolve_prompt`]).
+    pub digest: String,
     pub kind: PromptKind,
+}
+
+/// Why an auto-revert change could not be confirmed, as fixed codes (no
+/// agent or transport text reaches the AI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmFailure {
+    /// The revert timer won: the previous state is back.
+    Reverted,
+    /// No fresh session before the deadline; the change reverts.
+    NoConnection,
+    /// The new login failed; the change reverts.
+    ReconnectFailed,
+    Agent(ErrorCode),
+    RequestFailed,
+    /// Confirmation isn't available (core not running).
+    Unavailable,
+}
+
+impl ConfirmFailure {
+    pub fn code(&self) -> String {
+        match self {
+            Self::Reverted => "reverted".into(),
+            Self::NoConnection => "no_connection".into(),
+            Self::ReconnectFailed => "reconnect_failed".into(),
+            Self::Agent(c) => format!("agent_{c:?}"),
+            Self::RequestFailed => "request_failed".into(),
+            Self::Unavailable => "unavailable".into(),
+        }
+    }
 }
 
 /// The app UI: shows prompts; answers through [`McpHost::resolve_prompt`]
@@ -138,9 +269,15 @@ pub trait McpBackend: Send + Sync {
         None
     }
     /// `change.confirm` of an auto-revert change over a fresh connection
-    /// (`crate::confirm`). Without it the change reverts on its own.
-    fn confirm_change(&self, _server: ServerId, _change: ChangeId) -> BoxFut<Result<(), String>> {
-        Box::pin(async { Err("confirmation not available".to_string()) })
+    /// (`crate::autorevert::confirm_pending`, budget from the change's
+    /// deadline), sent as `actor`. Without it the change reverts on its own.
+    fn confirm_change(
+        &self,
+        _server: ServerId,
+        _change: PendingChange,
+        _actor: Actor,
+    ) -> BoxFut<Result<(), ConfirmFailure>> {
+        Box::pin(async { Err(ConfirmFailure::Unavailable) })
     }
 }
 
@@ -166,6 +303,11 @@ pub struct McpConfig {
     pub per_minute: u32,
     pub prompt_timeout: Duration,
     pub app_version: String,
+    /// Window over which a client's changes with the same op count
+    /// together against `bulk_confirm_above` (distinct servers).
+    pub wide_window: Duration,
+    /// Approval details larger than this are refused, never cut.
+    pub max_approval_details: usize,
 }
 
 impl Default for McpConfig {
@@ -175,6 +317,8 @@ impl Default for McpConfig {
             per_minute: 60,
             prompt_timeout: Duration::from_secs(120),
             app_version: env!("CARGO_PKG_VERSION").into(),
+            wide_window: Duration::from_secs(10 * 60),
+            max_approval_details: MAX_APPROVAL_DETAILS,
         }
     }
 }
@@ -188,6 +332,23 @@ struct Paired {
     identity: ClientIdentity,
     key: String,
     actor: Actor,
+    /// False for ask-every-time clients (nothing stored to revoke).
+    persisted: bool,
+}
+
+/// The paired client behind one call.
+struct Caller {
+    key: String,
+    client: String,
+    actor: Actor,
+}
+
+struct PendingPrompt {
+    tx: oneshot::Sender<bool>,
+    digest: String,
+    /// Pairing and non-Elevated approvals: the app is the only check, so
+    /// the answer must say the operator passed Touch ID.
+    needs_user: bool,
 }
 
 /// One connection's state.
@@ -203,13 +364,105 @@ impl McpSession {
 }
 
 pub struct McpHost {
+    me: Weak<McpHost>,
     backend: Arc<dyn McpBackend>,
     ui: RwLock<Option<Arc<dyn McpUi>>>,
     paused: AtomicBool,
     cfg: McpConfig,
-    prompts: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+    prompts: Mutex<HashMap<u64, PendingPrompt>>,
     next_prompt: AtomicU64,
+    /// At most one pairing prompt open at a time.
+    pairing_open: AtomicBool,
     limiter: Mutex<HashMap<String, Bucket>>,
+    /// Cancel tokens of running calls (pause cancels them all).
+    runs: Mutex<HashMap<u64, CancelToken>>,
+    next_run: AtomicU64,
+    /// (client key, op) → recent change targets, for the wide-change check.
+    recent: Mutex<HashMap<(String, &'static str), RecentTargets>>,
+}
+
+/// When each target was changed, oldest first.
+type RecentTargets = VecDeque<(Instant, ServerId)>;
+
+/// Unregisters a call's cancel token.
+struct RunGuard<'a> {
+    host: &'a McpHost,
+    id: u64,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        lock(&self.host.runs).remove(&self.id);
+    }
+}
+
+/// Clears the open-pairing flag.
+struct PairingGuard<'a>(&'a AtomicBool);
+
+impl Drop for PairingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The root approver as used for AI calls: re-checks the pause right
+/// before Touch ID, asks the operator first for escalations (with the full
+/// details), and prefixes the root key's reason with the client.
+struct AiApprover {
+    host: Weak<McpHost>,
+    inner: Arc<dyn Approver>,
+    client: String,
+    tool: String,
+    op: Op,
+    /// May-escalate (not Elevated) op: every root approval is an
+    /// escalation the operator hasn't seen yet.
+    escalation: bool,
+    cancel: CancelToken,
+}
+
+impl Approver for AiApprover {
+    /// Runs on a blocking thread (the bulk engine and the escalation
+    /// batcher call approvers through `spawn_blocking`).
+    fn approve(
+        &self,
+        what: &str,
+        items: &[ApprovalItem],
+    ) -> Result<Vec<RootApproval>, ApproveError> {
+        let host = self.host.upgrade().ok_or(ApproveError::Unavailable)?;
+        let stopped = || host.paused() || self.cancel.is_cancelled();
+        if stopped() {
+            return Err(ApproveError::Cancelled);
+        }
+        if self.escalation {
+            let servers: Vec<ServerId> = items.iter().map(|i| i.server_id.clone()).collect();
+            let rt =
+                tokio::runtime::Handle::try_current().map_err(|_| ApproveError::Unavailable)?;
+            let ok = rt
+                .block_on(host.ask_approval(
+                    &self.client,
+                    &self.tool,
+                    &self.op,
+                    &servers,
+                    true,
+                    true,
+                ))
+                .unwrap_or(false);
+            if !ok {
+                return Err(ApproveError::Cancelled);
+            }
+        }
+        // Right before the root key's Touch ID.
+        if stopped() {
+            return Err(ApproveError::Cancelled);
+        }
+        let what = if what == bulk::APPROVAL_REFRESH_LABEL {
+            format!("{}: {what}", self.op.name())
+        } else {
+            what.to_string()
+        };
+        self.inner
+            .approve(&format!("AI ({}): {what}", self.client), items)
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -250,8 +503,50 @@ fn payload_item(server: &ServerId, source: &str, p: &Payload) -> Option<Untruste
     Some(untrusted::prepare(
         server.as_str(),
         source,
-        &format!("{p:#?}"),
+        &render::payload_text(p),
         MAX_ITEM_BYTES,
+    ))
+}
+
+/// Everything an approval prompt shows, and its digest. Refused (not cut)
+/// when the details exceed `max_details` bytes.
+fn approval_prompt(
+    client: &str,
+    tool: &str,
+    op: &Op,
+    servers: &[ServerId],
+    elevated: bool,
+    escalation: bool,
+    max_details: usize,
+) -> Result<(PromptKind, String), ProtoError> {
+    let details = untrusted::escape_controls(&format!("{op:#?}"));
+    if details.len() > max_details {
+        return Err(invalid(DETAILS_TOO_LARGE));
+    }
+    let servers: Vec<String> = servers.iter().map(|s| s.to_string()).collect();
+    let mut h = blake3::Hasher::new();
+    h.update(b"fleet-mcp-approval-v1\0");
+    h.update(&fleet_crypto::approval::op_digest(op, None));
+    for f in [client, tool, op.name(), details.as_str()]
+        .into_iter()
+        .chain(servers.iter().map(String::as_str))
+    {
+        h.update(&(f.len() as u64).to_le_bytes());
+        h.update(f.as_bytes());
+    }
+    h.update(&[u8::from(elevated), u8::from(escalation)]);
+    let digest = hex::encode(h.finalize().as_bytes());
+    Ok((
+        PromptKind::Approval {
+            client: client.to_string(),
+            tool: tool.to_string(),
+            op: op.name().to_string(),
+            details,
+            servers,
+            elevated,
+            escalation,
+        },
+        digest,
     ))
 }
 
@@ -263,14 +558,19 @@ fn range(since_ms: Option<u64>, until_ms: Option<u64>) -> Result<TimeRange, Prot
 
 impl McpHost {
     pub fn new(backend: Arc<dyn McpBackend>, cfg: McpConfig) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             backend,
             ui: RwLock::new(None),
             paused: AtomicBool::new(false),
             cfg,
             prompts: Mutex::new(HashMap::new()),
             next_prompt: AtomicU64::new(1),
+            pairing_open: AtomicBool::new(false),
             limiter: Mutex::new(HashMap::new()),
+            runs: Mutex::new(HashMap::new()),
+            next_run: AtomicU64::new(1),
+            recent: Mutex::new(HashMap::new()),
         })
     }
 
@@ -278,14 +578,19 @@ impl McpHost {
         *self.ui.write().unwrap_or_else(|e| e.into_inner()) = ui;
     }
 
-    /// Global pause: rejects every call and declines open prompts.
+    /// Global pause: rejects every call, declines open prompts and cancels
+    /// running calls (targets not yet dispatched are skipped; in-flight
+    /// ones report an unknown outcome).
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
         if paused {
-            let pending: Vec<(u64, oneshot::Sender<bool>)> = lock(&self.prompts).drain().collect();
+            for token in lock(&self.runs).values() {
+                token.cancel();
+            }
+            let pending: Vec<(u64, PendingPrompt)> = lock(&self.prompts).drain().collect();
             let ui = self.ui.read().unwrap_or_else(|e| e.into_inner()).clone();
-            for (id, tx) in pending {
-                let _ = tx.send(false);
+            for (id, p) in pending {
+                let _ = p.tx.send(false);
                 if let Some(ui) = &ui {
                     ui.close_prompt(id);
                 }
@@ -297,29 +602,68 @@ impl McpHost {
         self.paused.load(Ordering::SeqCst)
     }
 
-    /// The operator's answer to a prompt. False if it's gone.
-    pub fn resolve_prompt(&self, id: u64, approved: bool) -> bool {
-        match lock(&self.prompts).remove(&id) {
-            Some(tx) => tx.send(approved).is_ok(),
-            None => false,
-        }
+    /// The operator's answer to a prompt. `digest` is the one the prompt
+    /// carried (an answer for anything else is a denial); `user_verified`
+    /// says the app took the operator's Touch ID, required for pairing and
+    /// non-Elevated approvals (the Swift side does the Touch ID; this
+    /// catches a UI path that forgets it). True if the answer was taken as
+    /// given; false if the prompt is gone or the answer became a denial.
+    pub fn resolve_prompt(
+        &self,
+        id: u64,
+        approved: bool,
+        digest: &str,
+        user_verified: bool,
+    ) -> bool {
+        let Some(p) = lock(&self.prompts).remove(&id) else {
+            return false;
+        };
+        let ok = approved && p.digest == digest && (user_verified || !p.needs_user);
+        p.tx.send(ok).is_ok() && ok == approved
     }
 
     pub fn session(&self, peer: PeerInfo) -> McpSession {
         McpSession { peer, client: None }
     }
 
-    async fn ask(&self, kind: PromptKind, missing: ProtoError) -> Result<bool, ProtoError> {
+    fn register_run(&self) -> (RunGuard<'_>, CancelToken) {
+        let id = self.next_run.fetch_add(1, Ordering::Relaxed);
+        let token = CancelToken::new();
+        lock(&self.runs).insert(id, token.clone());
+        // A pause between the caller's check and here still cancels.
+        if self.paused() {
+            token.cancel();
+        }
+        (RunGuard { host: self, id }, token)
+    }
+
+    async fn ask(
+        &self,
+        kind: PromptKind,
+        digest: String,
+        needs_user: bool,
+        missing: ProtoError,
+    ) -> Result<bool, ProtoError> {
         let ui = self
             .ui
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .ok_or(missing)?;
+        if self.paused() {
+            return Err(ProtoError::Paused);
+        }
         let id = self.next_prompt.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        lock(&self.prompts).insert(id, tx);
-        ui.show_prompt(Prompt { id, kind });
+        lock(&self.prompts).insert(
+            id,
+            PendingPrompt {
+                tx,
+                digest: digest.clone(),
+                needs_user,
+            },
+        );
+        ui.show_prompt(Prompt { id, digest, kind });
         let answer = tokio::time::timeout(self.cfg.prompt_timeout, rx).await;
         if lock(&self.prompts).remove(&id).is_some() {
             ui.close_prompt(id);
@@ -330,26 +674,102 @@ impl McpHost {
         Ok(matches!(answer, Ok(Ok(true))))
     }
 
-    /// The strictest `ai_commands_per_minute` of the pushed policies (the
-    /// bucket is per client, calls can target any server).
+    /// An approval prompt with the full details; `Ok(false)` if declined.
+    async fn ask_approval(
+        &self,
+        client: &str,
+        tool: &str,
+        op: &Op,
+        servers: &[ServerId],
+        elevated: bool,
+        escalation: bool,
+    ) -> Result<bool, ProtoError> {
+        let (kind, digest) = approval_prompt(
+            client,
+            tool,
+            op,
+            servers,
+            elevated,
+            escalation,
+            self.cfg.max_approval_details,
+        )?;
+        self.ask(kind, digest, !elevated, ProtoError::ApprovalRequired)
+            .await
+    }
+
+    /// A server's AI limits: its pushed policy's, or the defaults.
+    fn limits(&self, server: &ServerId) -> AiLimits {
+        self.backend.ai_limits(server).unwrap_or(AiLimits {
+            commands_per_minute: self.cfg.per_minute,
+            bulk_confirm_above: self.cfg.bulk_confirm_above,
+        })
+    }
+
+    /// The strictest `ai_commands_per_minute` over every server (servers
+    /// without a pushed policy count with the default; the bucket is per
+    /// client, calls can target any server).
     fn per_minute(&self) -> u32 {
         self.backend
             .servers()
             .iter()
-            .filter_map(|s| self.backend.ai_limits(&s.id))
-            .map(|l| l.commands_per_minute)
+            .map(|s| self.limits(&s.id).commands_per_minute)
             .min()
             .unwrap_or(self.cfg.per_minute)
     }
 
-    /// The strictest `ai_bulk_confirm_above` among `servers`' policies.
-    fn bulk_confirm_above(&self, servers: &[ServerId]) -> usize {
+    /// The strictest `ai_bulk_confirm_above` among `servers` (missing
+    /// policy: the default).
+    fn bulk_confirm_above<'a>(&self, servers: impl IntoIterator<Item = &'a ServerId>) -> usize {
         servers
-            .iter()
-            .filter_map(|s| self.backend.ai_limits(s))
-            .map(|l| l.bulk_confirm_above)
+            .into_iter()
+            .map(|s| self.limits(s).bulk_confirm_above)
             .min()
             .unwrap_or(self.cfg.bulk_confirm_above)
+    }
+
+    /// `servers` plus the distinct servers this client changed with `op`
+    /// within the window: what the wide-change threshold is checked
+    /// against, so a wide change split into small calls still asks.
+    fn window_targets(
+        &self,
+        key: &str,
+        op: &'static str,
+        servers: &[ServerId],
+    ) -> BTreeSet<ServerId> {
+        let now = Instant::now();
+        let mut m = lock(&self.recent);
+        m.retain(|_, q| {
+            while q
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > self.cfg.wide_window)
+            {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+        let mut all: BTreeSet<ServerId> = servers.iter().cloned().collect();
+        if let Some(q) = m.get(&(key.to_string(), op)) {
+            all.extend(q.iter().map(|(_, s)| s.clone()));
+        }
+        all
+    }
+
+    /// Counts `servers` into the window (`approved`: the operator has
+    /// seen this client's recent changes with `op`; start over).
+    fn record_targets(&self, key: &str, op: &'static str, servers: &[ServerId], approved: bool) {
+        let mut m = lock(&self.recent);
+        let k = (key.to_string(), op);
+        if approved {
+            m.remove(&k);
+            return;
+        }
+        let now = Instant::now();
+        let q = m.entry(k).or_default();
+        q.extend(servers.iter().map(|s| (now, s.clone())));
+        // Bounded: only distinctness within the window matters.
+        while q.len() > 4096 {
+            q.pop_front();
+        }
     }
 
     fn take_token(&self, key: &str) -> Result<(), ProtoError> {
@@ -437,26 +857,32 @@ impl McpHost {
         match req.body {
             RequestBody::Hello(h) => self.hello(sess, h).await,
             RequestBody::Call(call) => {
-                let (key, actor, client) = match &sess.client {
+                let (caller, persisted) = match &sess.client {
                     Some(p) => (
-                        p.key.clone(),
-                        p.actor.clone(),
-                        p.identity.client_name.clone(),
+                        Caller {
+                            key: p.key.clone(),
+                            client: p.identity.client_name.clone(),
+                            actor: p.actor.clone(),
+                        },
+                        p.persisted,
                     ),
                     None => return Err(ProtoError::PairingRequired),
                 };
                 // Revocation takes effect on the next call.
-                if !self.backend.paired(&key) {
+                if persisted && !self.backend.paired(&caller.key) {
                     sess.client = None;
                     return Err(ProtoError::PairingRequired);
                 }
                 if self.backend.locked() {
                     return Err(ProtoError::Locked);
                 }
-                self.take_token(&key)?;
-                self.call(&client, actor, call)
-                    .await
-                    .map(ResponseBody::Tool)
+                self.take_token(&caller.key)?;
+                let out = self.call(&caller, call).await;
+                // Paused while running: the call was cancelled.
+                if self.paused() {
+                    return Err(ProtoError::Paused);
+                }
+                out.map(ResponseBody::Tool)
             }
         }
     }
@@ -475,30 +901,49 @@ impl McpHost {
             client_name: h.client_name.clone(),
             parent_team: sess.peer.parent_team.clone(),
             parent_signing_id: sess.peer.parent_signing_id.clone(),
+            parent_cdhash: sess.peer.parent_cdhash.clone(),
         };
         let key = identity.key();
-        if !self.backend.paired(&key) {
+        // Unsigned or shell/interpreter parents: asked every time, never
+        // stored (a stored pairing would cover any script they run).
+        let ask_every_time = sess.peer.ask_every_time();
+        let persisted = !ask_every_time;
+        if ask_every_time || !self.backend.paired(&key) {
             if self.backend.locked() {
                 return Err(ProtoError::Locked);
             }
+            if self
+                .pairing_open
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                // Another pairing prompt is open; the client retries.
+                return Err(ProtoError::PairingRequired);
+            }
+            let _open = PairingGuard(&self.pairing_open);
             let ok = self
                 .ask(
                     PromptKind::Pairing {
                         identity: identity.clone(),
+                        ask_every_time,
                     },
+                    key.clone(),
+                    true,
                     ProtoError::PairingRequired,
                 )
                 .await?;
             if !ok {
                 return Err(ProtoError::PairingDenied);
             }
-            self.backend.save_pairing(McpClientRecord {
-                key: key.clone(),
-                client_name: identity.client_name.clone(),
-                parent_team: identity.parent_team.clone(),
-                parent_signing_id: identity.parent_signing_id.clone(),
-                paired_ms: crate::now_ms(),
-            })?;
+            if persisted {
+                self.backend.save_pairing(McpClientRecord {
+                    key: key.clone(),
+                    client_name: identity.client_name.clone(),
+                    parent_team: identity.parent_team.clone(),
+                    parent_signing_id: identity.parent_signing_id.clone(),
+                    paired_ms: crate::now_ms(),
+                })?;
+            }
         }
         let actor = Actor::Ai {
             client: BoundedString::new(h.client_name.clone())
@@ -510,6 +955,7 @@ impl McpHost {
             identity,
             key,
             actor,
+            persisted,
         });
         Ok(ResponseBody::Welcome(Welcome {
             app_version: self.cfg.app_version.clone(),
@@ -559,10 +1005,13 @@ impl McpHost {
         }
         let exec = self.backend.executor()?;
         let name = op.name();
-        let p = exec
-            .execute(server.clone(), op, actor, None)
-            .await
-            .map_err(|f| agent_error(&server, &f))?;
+        let (_run, cancel) = self.register_run();
+        let p = tokio::select! {
+            r = exec.execute(server.clone(), op, actor, None) => {
+                r.map_err(|f| agent_error(&server, &f))?
+            }
+            _ = cancel.cancelled() => return Err(ProtoError::Paused),
+        };
         Ok(ToolOutput {
             summary: json!({ "server": server.as_str(), "op": name, "ok": true }),
             untrusted: payload_item(&server, name, &p).into_iter().collect(),
@@ -574,7 +1023,7 @@ impl McpHost {
     #[allow(clippy::too_many_arguments)]
     async fn change(
         &self,
-        client: &str,
+        caller: &Caller,
         tool: &str,
         actor: Actor,
         servers: Vec<ServerId>,
@@ -583,7 +1032,7 @@ impl McpHost {
         concurrency: Option<u16>,
     ) -> Result<ToolOutput, ProtoError> {
         self.change_with(
-            client,
+            caller,
             tool,
             actor,
             servers,
@@ -601,7 +1050,7 @@ impl McpHost {
     #[allow(clippy::too_many_arguments)]
     async fn change_with(
         &self,
-        client: &str,
+        caller: &Caller,
         tool: &str,
         actor: Actor,
         servers: Vec<ServerId>,
@@ -612,28 +1061,25 @@ impl McpHost {
     ) -> Result<ToolOutput, ProtoError> {
         op.check_args().map_err(|_| invalid("arguments"))?;
         let exec = self.backend.executor()?;
+        let client = caller.client.as_str();
         let elevated = opspec::needs_approval(&op);
         let is_change = op.tier() != Tier::Read;
-        if elevated || (is_change && servers.len() > self.bulk_confirm_above(&servers)) {
-            let (details, _) =
-                untrusted::truncate(&untrusted::escape_controls(&format!("{op:?}")), 2000);
+        let wide = is_change && {
+            let recent = self.window_targets(&caller.key, op.name(), &servers);
+            recent.len() > self.bulk_confirm_above(&recent)
+        };
+        if elevated || wide {
             let ok = self
-                .ask(
-                    PromptKind::Approval {
-                        client: client.to_string(),
-                        tool: tool.to_string(),
-                        op: op.name().to_string(),
-                        details,
-                        servers: servers.iter().map(|s| s.to_string()).collect(),
-                        elevated,
-                    },
-                    ProtoError::ApprovalRequired,
-                )
+                .ask_approval(client, tool, &op, &servers, elevated, false)
                 .await?;
             if !ok {
                 return Err(ProtoError::ApprovalDenied);
             }
         }
+        if is_change {
+            self.record_targets(&caller.key, op.name(), &servers, wide);
+        }
+        let (_run, cancel) = self.register_run();
         let canary = is_change && servers.len() > 1;
         let options = BulkOptions {
             concurrency: concurrency
@@ -653,14 +1099,26 @@ impl McpHost {
         let name = op.name();
         // Also for may-escalate ops: exec's `ApprovalRequired` is answered
         // with the root key (Touch ID) and one retry (`crate::escalate`).
+        // Escalations ask the operator first (full details), then the root
+        // key; every root prompt names the AI client.
         let approver = if elevated || op.may_escalate() {
-            self.backend.approver()
+            self.backend.approver().map(|inner| {
+                Arc::new(AiApprover {
+                    host: self.me.clone(),
+                    inner,
+                    client: client.to_string(),
+                    tool: tool.to_string(),
+                    op: op.clone(),
+                    escalation: !elevated,
+                    cancel: cancel.clone(),
+                }) as Arc<dyn Approver>
+            })
         } else {
             None
         };
-        let mut req = BulkRequest::uniform(servers, op, actor, options);
+        let mut req = BulkRequest::uniform(servers, op, actor.clone(), options);
         req.expected_versions = versions;
-        let report = bulk::run(exec, approver, req, CancelToken::new(), |_| {})
+        let report = bulk::run(exec, approver, req, cancel, |_| {})
             .await
             .map_err(|e| invalid(&e.to_string()))?;
         let mut rows = Vec::new();
@@ -677,13 +1135,16 @@ impl McpHost {
                         Output::Payload(Payload::ChangePending { change, .. }) => {
                             match self
                                 .backend
-                                .confirm_change(server.clone(), change.change_id)
+                                .confirm_change(server.clone(), change.clone(), actor.clone())
                                 .await
                             {
                                 Ok(()) => "succeeded (confirmed from a new connection)".into(),
+                                Err(ConfirmFailure::Reverted) => {
+                                    "applied, then reverted (reverted)".into()
+                                }
                                 Err(e) => format!(
                                     "applied, not confirmed ({}); reverts automatically",
-                                    untrusted::escape_controls(&e)
+                                    e.code()
                                 ),
                             }
                         }
@@ -730,7 +1191,8 @@ impl McpHost {
         })
     }
 
-    async fn call(&self, client: &str, actor: Actor, call: Call) -> Result<ToolOutput, ProtoError> {
+    async fn call(&self, caller: &Caller, call: Call) -> Result<ToolOutput, ProtoError> {
+        let actor = caller.actor.clone();
         let tool = call.tool_name();
         match call {
             Call::FleetListServers(a) => {
@@ -784,7 +1246,7 @@ impl McpHost {
                         untrusted: vec![],
                     });
                 }
-                self.change(client, tool, actor, servers, op, false, None)
+                self.change(caller, tool, actor, servers, op, false, None)
                     .await
             }
             Call::MetricsQuery(a) => {
@@ -867,7 +1329,7 @@ impl McpHost {
                 let unit = opspec::unit(&a.unit).map_err(|_| invalid("unit"))?;
                 let servers = self.servers_arg(&a.servers)?;
                 let op = opspec::unit_op(unit, a.action);
-                self.change(client, tool, actor, servers, op, true, None)
+                self.change(caller, tool, actor, servers, op, true, None)
                     .await
             }
             Call::FirewallGet(a) => {
@@ -883,7 +1345,7 @@ impl McpHost {
                 // The version the AI read with `firewall_get`: a concurrent
                 // edit answers VersionConflict instead of being overwritten.
                 let versions = HashMap::from([(server.clone(), a.expected_version)]);
-                self.change_with(client, tool, actor, vec![server], op, true, None, versions)
+                self.change_with(caller, tool, actor, vec![server], op, true, None, versions)
                     .await
             }
             Call::PackagesUpgrade(a) => {
@@ -895,14 +1357,14 @@ impl McpHost {
                         UpgradeScope::All
                     },
                 };
-                self.change(client, tool, actor, servers, op, true, None)
+                self.change(caller, tool, actor, servers, op, true, None)
                     .await
             }
             Call::DockerAction(a) => {
                 let c = opspec::container(&a.container).map_err(|_| invalid("container"))?;
                 let server = self.server(&a.server)?;
                 let op = opspec::container_op(c, a.action);
-                self.change(client, tool, actor, vec![server], op, true, None)
+                self.change(caller, tool, actor, vec![server], op, true, None)
                     .await
             }
             Call::ComposeDeploy(a) => {
@@ -913,7 +1375,7 @@ impl McpHost {
                 };
                 let op = opspec::to_op(&spec).map_err(|e| invalid(&e.to_string()))?;
                 let server = self.server(&a.server)?;
-                self.change(client, tool, actor, vec![server], op, true, None)
+                self.change(caller, tool, actor, vec![server], op, true, None)
                     .await
             }
             Call::ConfigDiff(a) => {
@@ -933,7 +1395,7 @@ impl McpHost {
                     path: AbsPath::new(a.path.as_str()).map_err(|_| invalid("path"))?,
                     version: a.version,
                 };
-                self.change(client, tool, actor, vec![server], op, true, None)
+                self.change(caller, tool, actor, vec![server], op, true, None)
                     .await
             }
             Call::BulkRun(a) => {
@@ -944,7 +1406,7 @@ impl McpHost {
                 }
                 // `change` enforces canary mode for every multi-server change.
                 self.change(
-                    client,
+                    caller,
                     tool,
                     actor,
                     servers,
@@ -958,7 +1420,7 @@ impl McpHost {
                 let servers = self.servers_arg(&a.servers)?;
                 let op = opspec::shell_exec(&a.user, &a.command, a.timeout_s)
                     .map_err(|e| invalid(&e.to_string()))?;
-                self.change(client, tool, actor, servers, op, true, None)
+                self.change(caller, tool, actor, servers, op, true, None)
                     .await
             }
             Call::ProfileCheck(a) => {
@@ -1013,6 +1475,9 @@ fn is_secret_match(path: &str, entry: &str) -> bool {
         _ => path == entry,
     }
 }
+
+#[path = "mcp_render.rs"]
+pub mod render;
 
 #[cfg(test)]
 #[path = "mcp_host_tests.rs"]

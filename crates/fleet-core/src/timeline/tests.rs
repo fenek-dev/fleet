@@ -27,12 +27,7 @@ fn signed(server: &ServerId, key: &Ed25519Signer, seq: u64, time: u64, e: Event)
     sign_event(server.clone(), RUN, seq, time, e, key)
 }
 
-fn block_on<F: Future>(f: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(f)
-}
+use crate::testutil::block_on;
 
 #[test]
 fn ingest_verifies_dedupes_and_moves_cursor() {

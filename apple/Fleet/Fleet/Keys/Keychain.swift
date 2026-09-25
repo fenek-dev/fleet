@@ -34,6 +34,21 @@ enum Keychain {
         guard status == errSecSuccess else { throw Failure.status(status) }
     }
 
+    /// Adds `data`, or replaces the existing item's data in place
+    /// (`SecItemUpdate`), so there's never a moment without an item. Only
+    /// for replaceable secrets (the sync key), never for key blobs.
+    static func set(_ account: String, _ data: Data) throws {
+        var query = base(account)
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        var status = SecItemAdd(query as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            status = SecItemUpdate(base(account) as CFDictionary,
+                                   [kSecValueData as String: data] as CFDictionary)
+        }
+        guard status == errSecSuccess else { throw Failure.status(status) }
+    }
+
     /// Removes an item (only for derived state, never for key blobs).
     static func delete(_ account: String) throws {
         let status = SecItemDelete(base(account) as CFDictionary)

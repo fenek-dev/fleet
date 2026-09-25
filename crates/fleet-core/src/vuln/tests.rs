@@ -141,15 +141,61 @@ fn failed_ingest_keeps_previous_rows() {
 
 #[test]
 fn reingest_replaces() {
-    let mut db = loaded();
-    let one = r#"{"curl":{"CVE-2023-38545":{"releases":{"bookworm":{"status":"resolved","fixed_version":"7.88.1-10+deb12u4","urgency":"high"}}}}}"#;
-    feed::ingest(&mut db, Source::DebianTracker, one.as_bytes()).unwrap();
+    let mut db = VulnDb::open_in_memory().unwrap();
+    let openssl = r#"{"openssl":{"CVE-2023-0001":{"releases":{"bookworm":{"status":"resolved","fixed_version":"3.0.11-1~deb12u1","urgency":"high"}}}}}"#;
+    let curl = r#"{"curl":{"CVE-2023-38545":{"releases":{"bookworm":{"status":"resolved","fixed_version":"7.88.1-10+deb12u4","urgency":"high"}}}}}"#;
+    feed::ingest(&mut db, Source::DebianTracker, openssl.as_bytes()).unwrap();
+    feed::ingest(&mut db, Source::DebianTracker, curl.as_bytes()).unwrap();
     assert_eq!(db.count(Distro::Debian).unwrap(), 1);
     assert!(
         db.lookup(Distro::Debian, "bookworm", "openssl")
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn shrunk_feed_is_refused() {
+    let mut db = loaded();
+    // 6 -> 1: more than half gone.
+    let one = r#"{"curl":{"CVE-2023-38545":{"releases":{"bookworm":{"status":"resolved","fixed_version":"7.88.1-10+deb12u4","urgency":"high"}}}}}"#;
+    assert!(matches!(
+        feed::ingest(&mut db, Source::DebianTracker, one.as_bytes()),
+        Err(FeedError::Shrunk {
+            previous: 6,
+            new: 1
+        })
+    ));
+    assert_eq!(db.count(Distro::Debian).unwrap(), 6);
+    assert!(!feed::shrank_too_much(0, 1));
+    assert!(!feed::shrank_too_much(6, 3));
+    assert!(feed::shrank_too_much(6, 2));
+}
+
+#[test]
+fn oversized_entry_fails() {
+    let big = format!(r#"{{"a":"{}","b":1}}"#, "x".repeat(200));
+    let r =
+        feed::for_each_entry_limited(
+            big.as_bytes(),
+            100,
+            |_: String, _: serde_json::Value| Ok(()),
+        );
+    assert!(matches!(r, Err(FeedError::EntryTooLarge)));
+    // Each entry under the limit, the document over it: fine.
+    let many = format!(
+        r#"{{{}}}"#,
+        (0..50)
+            .map(|i| format!(r#""k{i}":"{}""#, "y".repeat(40)))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let n =
+        feed::for_each_entry_limited(many.as_bytes(), 100, |_: String, _: serde_json::Value| {
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(n, 50);
 }
 
 #[test]

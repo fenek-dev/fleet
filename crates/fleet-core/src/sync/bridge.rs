@@ -232,6 +232,9 @@ pub fn apply_to_cache(cache: &mut Cache, r: &SyncRecord) -> Result<Bridged, Sync
                     epoch: s.roster.epoch,
                     version: s.roster.version,
                 }),
+                Err(roster_mgmt::RosterMgmtError::Fork { epoch, version }) => {
+                    Err(SyncError::RosterFork { epoch, version })
+                }
                 Err(_) => Err(SyncError::Signature),
             }
         }

@@ -19,9 +19,15 @@ fn is_bidi(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
+/// Controls, bidi, and the invisible or unassigned code points the MCP
+/// path escapes too (Cf such as zero-width and tag characters, Co private
+/// use, Cn noncharacters and unassigned planes: `fleetctl_proto`).
+fn dirty(c: char) -> bool {
+    c.is_control() || is_bidi(c) || fleetctl_proto::untrusted::must_escape(c)
+}
+
 fn escape(s: &str, keep_newlines: bool) -> String {
-    let clean =
-        |c: char| !(c.is_control() || is_bidi(c)) || (keep_newlines && matches!(c, '\n' | '\t'));
+    let clean = |c: char| !dirty(c) || (keep_newlines && matches!(c, '\n' | '\t'));
     if s.chars().all(clean) {
         return s.to_string();
     }
@@ -29,10 +35,10 @@ fn escape(s: &str, keep_newlines: bool) -> String {
     for c in s.chars() {
         if clean(c) {
             out.push(c);
-        } else if is_bidi(c) {
-            out.push_str(&format!("\\u{{{:04X}}}", c as u32));
-        } else {
+        } else if c.is_control() {
             out.push_str(&format!("\\x{:02X}", c as u32));
+        } else {
+            out.push_str(&format!("\\u{{{:04X}}}", c as u32));
         }
     }
     out
@@ -73,5 +79,9 @@ mod tests {
         assert_eq!(line("del\x7f".into()), "del\\x7F");
         assert_eq!(line("Ünïcödé 日本".into()), "Ünïcödé 日本");
         assert_eq!(text("a\n\tb\x07".into()), "a\n\tb\\x07");
+        // Zero-width, tag characters and private use are made visible.
+        assert_eq!(line("a\u{200B}b".into()), "a\\u{200B}b");
+        assert_eq!(line("t\u{E0041}".into()), "t\\u{E0041}");
+        assert_eq!(line("p\u{E000}".into()), "p\\u{E000}");
     }
 }

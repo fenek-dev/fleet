@@ -7,9 +7,11 @@ import Observation
 /// clients and the operator's prompts.
 ///
 /// Pairing a new client and approving a wide bulk action take Touch ID
-/// here before the answer goes to Rust. Elevated operations get their
-/// Touch ID from the root key itself when Rust signs the approval (the
-/// prompt names the operation and the server count), so this sheet only
+/// here before the answer goes to Rust (which refuses such approvals
+/// unless the answer says Touch ID was taken, and checks the prompt's
+/// digest). Elevated operations and escalations get their Touch ID from
+/// the root key itself when Rust signs the approval (the prompt names the
+/// AI client, the operation and the server count), so this sheet only
 /// confirms them.
 @Observable
 @MainActor
@@ -70,23 +72,30 @@ final class AIModel {
     }
 
     /// Touch ID first where this app is the only check (pairing, wide
-    /// non-Elevated bulk), then the answer to Rust.
+    /// non-Elevated bulk), then the answer to Rust with the prompt's digest
+    /// (Rust also refuses such approvals unless `userVerified`).
     func answer(_ prompt: McpPromptRow, approve: Bool) async {
         var ok = approve
+        var verified = false
         if approve, let reason = Self.touchIdReason(prompt) {
             ok = await Self.touchId(reason)
+            verified = ok
         }
-        _ = core?.mcpResolvePrompt(id: prompt.id, approved: ok)
+        _ = core?.mcpResolvePrompt(
+            id: prompt.id, approved: ok, digest: prompt.digest, userVerified: verified)
         prompts.removeAll { $0.id == prompt.id }
         if case .pairing = prompt.kind { reloadClients() }
     }
 
     private static func touchIdReason(_ p: McpPromptRow) -> String? {
         switch p.kind {
-        case .pairing(let name, _, let parent):
-            return "allow \(name) (\(parent)) to use Fleet"
-        case .approval(_, _, let op, _, let servers, let elevated):
-            return elevated ? nil : "approve \(op) on \(servers.count) servers for an AI agent"
+        case .pairing(let name, _, let parent, _, let everyTime):
+            return everyTime
+                ? "allow \(name) (\(parent)) to use Fleet for this session"
+                : "allow \(name) (\(parent)) to use Fleet"
+        case .approval(let client, _, let op, _, let servers, let elevated, _):
+            return elevated
+                ? nil : "approve \(op) on \(servers.count) servers for \(client)"
         }
     }
 
@@ -101,6 +110,15 @@ final class AIModel {
     }
 
     fileprivate func show(_ p: McpPromptRow) {
+        // One pairing prompt at a time (Rust enforces it too): a second
+        // one is declined rather than queued behind the first.
+        if case .pairing = p.kind, prompts.contains(where: {
+            if case .pairing = $0.kind { return true } else { return false }
+        }) {
+            _ = core?.mcpResolvePrompt(
+                id: p.id, approved: false, digest: p.digest, userVerified: false)
+            return
+        }
         prompts.append(p)
         NSApp.activate()
     }

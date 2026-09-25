@@ -482,7 +482,8 @@ fn signatures_encryption_and_names_are_enforced() {
     assert_eq!(rep.rejected, 4);
     assert!(rep.applied.is_empty());
 
-    // A revoked Mac: records stamped after its removal are refused.
+    // A revoked Mac: what B held before the removal stays; anything new
+    // from it is refused, even stamped (backdated) before the removal.
     let mut r2 = chain[0].roster.clone();
     r2.version = 2;
     r2.prev_hash = fleet_crypto::roster::roster_hash(&chain[0]);
@@ -490,39 +491,109 @@ fn signatures_encryption_and_names_are_enforced() {
     r2.devices.retain(|d| d.id != a.id);
     let s2 = sign_root(r2, b.id, &b.keys.root).unwrap();
     let chain2 = vec![chain[0].clone(), s2];
-    a.engine
-        .put(
-            &a.keys.device,
-            Collection::Settings,
-            "before",
-            b"1".to_vec(),
-            NOW + 50,
-        )
-        .unwrap();
-    a.engine
-        .put(
-            &a.keys.device,
-            Collection::Settings,
-            "after",
-            b"2".to_vec(),
-            NOW + 200,
-        )
-        .unwrap();
+    let put = |a: &mut Mac, k: &str, at: u64| {
+        a.engine
+            .put(&a.keys.device, Collection::Settings, k, b"1".to_vec(), at)
+            .unwrap();
+    };
+    put(&mut a, "before", NOW + 50);
+    a.sync(&mut cloud, &chain, NOW + 50);
+    b.sync(&mut cloud, &chain, NOW + 60);
+    put(&mut a, "backdated", NOW + 50);
+    put(&mut a, "after", NOW + 200);
     a.sync(&mut cloud, &chain, NOW + 200);
+    b.token = 0; // re-fetch everything, "before" included
     let rep = b.sync(&mut cloud, &chain2, NOW + 201);
-    assert_eq!(rep.rejected, 1);
+    // "after" fails the stamp rule, "backdated" the removed-author rule.
+    assert_eq!(rep.removed_author, 1, "{rep:?}");
+    let has = |b: &Mac, k: &str| b.engine.get(Collection::Settings, k).unwrap().is_some();
+    assert!(has(&b, "before"));
+    assert!(!has(&b, "backdated") && !has(&b, "after"));
+    // Re-verifying stored rows after the roster change keeps "before"
+    // (stamped before the removal) and drops nothing else of B's.
+    assert!(b.engine.reverify(&chain2, NOW + 201).unwrap().is_empty());
+}
+
+#[test]
+fn future_stamps_are_quarantined_and_reverify_drops_bad_rows() {
+    let (mut a, mut b, chain) = setup();
+    let mut cloud = MemoryCloud::default();
+    let far = NOW + MAX_HLC_DRIFT_MS + 60_000;
+    a.engine
+        .put(
+            &a.keys.device,
+            Collection::Settings,
+            "now",
+            b"y".to_vec(),
+            NOW,
+        )
+        .unwrap();
+    a.engine
+        .put(
+            &a.keys.device,
+            Collection::Settings,
+            "future",
+            b"x".to_vec(),
+            far,
+        )
+        .unwrap();
+    a.sync(&mut cloud, &chain, far);
+    let rep = b.sync(&mut cloud, &chain, NOW);
+    assert_eq!((rep.future, rep.rejected), (1, 1));
     assert!(
         b.engine
-            .get(Collection::Settings, "before")
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        b.engine
-            .get(Collection::Settings, "after")
+            .get(Collection::Settings, "future")
             .unwrap()
             .is_none()
     );
+    // A's own store still has it: re-verifying at NOW drops it.
+    let dropped = a.engine.reverify(&chain, NOW).unwrap();
+    assert_eq!(dropped, vec![(Collection::Settings, "future".to_string())]);
+    // A chain that doesn't list the author at all drops its rows.
+    let mut stranger_roster = chain[0].roster.clone();
+    stranger_roster.devices.retain(|d| d.id == b.id);
+    let other = vec![sign_root(stranger_roster, b.id, &b.keys.root).unwrap()];
+    assert_eq!(b.engine.reverify(&other, NOW).unwrap().len(), 1);
+}
+
+#[test]
+fn readopted_rows_reach_macs_that_trust_only_current_members() {
+    let (mut a, mut b, chain) = setup();
+    let mut cloud = MemoryCloud::default();
+    a.engine
+        .put(
+            &a.keys.device,
+            Collection::Servers,
+            "srv_1",
+            server_doc("w"),
+            NOW,
+        )
+        .unwrap();
+    a.sync(&mut cloud, &chain, NOW);
+    b.sync(&mut cloud, &chain, NOW);
+    // B revokes A and re-signs A's rows as its own.
+    let n = b
+        .engine
+        .readopt(&b.keys.device, |id| *id != a.id, NOW + 10)
+        .unwrap();
+    assert_eq!(n, 1);
+    let r = b.engine.get(Collection::Servers, "srv_1").unwrap().unwrap();
+    assert_eq!((r.author, r.body), (b.id, server_doc("w")));
+}
+
+#[test]
+fn agreement_keys_are_self_signed() {
+    let (a, b, _) = setup();
+    let agree = SoftwareP256Recipient::generate().unwrap();
+    let doc = keys::DeviceKeysDoc::sign(&a.id, agree.public().to_vec(), &a.keys.device).unwrap();
+    assert_eq!(
+        doc.verified(&device(a.id, &a.keys)).unwrap(),
+        &agree.public()[..]
+    );
+    // Written by another Mac for A, or signed for another id: refused.
+    let by_b = keys::DeviceKeysDoc::sign(&a.id, agree.public().to_vec(), &b.keys.device).unwrap();
+    assert!(by_b.verified(&device(a.id, &a.keys)).is_err());
+    assert!(doc.verified(&device(b.id, &a.keys)).is_err());
 }
 
 #[test]
@@ -551,6 +622,10 @@ fn rotation_with_key_boxes_and_escrow() {
         b.id,
         &b_agree.public(),
         keybox_record_name(&b.id, &b_agree.public()),
+        &keys::Sealer {
+            id: a.id,
+            device: &a.keys.device,
+        },
     )
     .unwrap();
     let (uploads, old) = a.engine.rotate(new).unwrap();
@@ -571,8 +646,30 @@ fn rotation_with_key_boxes_and_escrow() {
     let rep = b.sync(&mut cloud, &chain, NOW + 6);
     assert!(rep.other_key > 0);
     // B opens its key box with its enclave key and switches.
-    let (fid, k) = open_keybox(&boxed, b.id, &b_agree).unwrap();
+    let (fid, k, by) = open_keybox(&boxed, b.id, &b_agree).unwrap();
     assert_eq!(fid, fleet);
+    // Only a roster member may hand out a (rotated) key.
+    let latest = &chain.last().unwrap().roster;
+    assert_eq!(by.verify(latest).unwrap(), a.id);
+    let mut without_a = latest.clone();
+    without_a.devices.retain(|d| d.id != a.id);
+    assert!(matches!(by.verify(&without_a), Err(SyncError::Sealer)));
+    // A key box signed by a Mac outside the roster is refused.
+    let outsider = SoftwareDeviceSigner::generate().unwrap();
+    let forged = seal_keybox(
+        &SyncKey::generate().unwrap(),
+        fleet,
+        b.id,
+        &b_agree.public(),
+        keybox_record_name(&b.id, &b_agree.public()),
+        &keys::Sealer {
+            id: a.id,
+            device: &outsider.device,
+        },
+    )
+    .unwrap();
+    let (_, _, fby) = open_keybox(&forged, b.id, &b_agree).unwrap();
+    assert!(fby.verify(latest).is_err(), "right id, wrong key");
     assert!(
         open_keybox(&boxed, a.id, &b_agree).is_err(),
         "addressed to B only"

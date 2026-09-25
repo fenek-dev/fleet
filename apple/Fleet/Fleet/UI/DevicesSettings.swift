@@ -30,6 +30,10 @@ struct DevicesSettings: View {
                         }
                     }
                     Button("Add Mac…") { addShown = true }
+                    LabeledContent("Fleet fingerprint") {
+                        Text(status.fleetFingerprint).font(.mono(12)).textSelection(.enabled)
+                    }
+                    .help("Keep this with the recovery code: a recovery shows it for comparison.")
                 }
                 Section("Servers waiting for the latest roster") {
                     if status.pending.isEmpty {
@@ -125,6 +129,9 @@ struct AddMacSheet: View {
     @State private var mode: Mode = .scan
     @State private var pasted = ""
     @State private var prompt: AddMacPrompt?
+    /// Shown once the new Mac revealed its committed secret.
+    @State private var sas: String?
+    @State private var poll: Task<Void, Never>?
     @State private var result: RosterChangeResult?
     @State private var busy = false
     @State private var error: String?
@@ -136,9 +143,12 @@ struct AddMacSheet: View {
                 Text("Added. Roster v\(result.version) reached \(result.current) servers; \(result.queued) will get it when they reconnect.")
                 ForEach(result.failed, id: \.self) { Text($0).foregroundStyle(Tone.critical.text) }
                 HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
-            } else if let prompt {
+            } else if let prompt, sas == nil {
+                ProgressView("Waiting for “\(prompt.name)” to show its code…")
+                HStack { Spacer(); Button("Cancel") { dismiss() } }
+            } else if let prompt, let sas {
                 Text("Check that “\(prompt.name)” shows this code:")
-                Text(Self.spaced(prompt.verificationCode))
+                Text(Self.spaced(sas))
                     .font(.system(size: 34, weight: .semibold, design: .monospaced))
                     .padding(.vertical, 8)
                 Text("Only approve if the codes match exactly. A different code means the pairing code was swapped.")
@@ -181,6 +191,7 @@ struct AddMacSheet: View {
         }
         .padding(24)
         .frame(width: 520)
+        .onDisappear { poll?.cancel() }
     }
 
     private func begin(_ code: String) {
@@ -190,13 +201,30 @@ struct AddMacSheet: View {
             defer { busy = false }
             do {
                 let p = try api.beginAddMac(code: code)
-                // The new Mac fetches the answer by name to show its code.
+                // The new Mac fetches the answer by name, then reveals the
+                // secret its code committed to; only then is there a code.
                 await core.sync?.upload([p.response])
                 prompt = p
                 error = nil
+                poll = Task { await waitForReveal(p) }
             } catch {
                 self.error = error.fleetMessage
             }
+        }
+    }
+
+    private func waitForReveal(_ p: AddMacPrompt) async {
+        guard let api = core.api, let cloud = core.sync?.cloud else { return }
+        while !Task.isCancelled && sas == nil {
+            do {
+                if let r = try await cloud.fetch([p.revealRecord]).first {
+                    sas = try api.addMacVerificationCode(deviceId: p.deviceId, reveal: r)
+                    return
+                }
+            } catch {
+                self.error = error.fleetMessage
+            }
+            try? await Task.sleep(for: .seconds(3))
         }
     }
 
@@ -278,7 +306,7 @@ struct FleetAlertsSection: View {
 
     static func tone(_ k: FleetAlertKind) -> Tone {
         switch k {
-        case .removedFromFleet, .recoveryPending, .rosterPushFailed, .syncRejected: .critical
+        case .removedFromFleet, .recoveryPending, .rosterPushFailed, .syncRejected, .rosterFork: .critical
         case .macAdded, .macRevoked, .rosterChanged, .pinChange: .warn
         case .syncConflict, .waitingForRoster, .recoveryVetoed: .info
         }
@@ -297,6 +325,7 @@ struct FleetAlertsSection: View {
         case .pinChange: "Pins"
         case .syncConflict: "Conflict"
         case .syncRejected: "Sync"
+        case .rosterFork: "Roster fork"
         }
     }
 }

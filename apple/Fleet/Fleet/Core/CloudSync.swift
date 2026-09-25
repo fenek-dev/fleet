@@ -147,9 +147,14 @@ final class SyncCoordinator {
 
     func start() {
         guard timer == nil else { return }
+        // Weak self, re-checked each round: held only for one cycle, never
+        // across the sleep, and the loop ends once the store is gone.
         timer = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.cycle()
+                do {
+                    guard let self else { return }
+                    await self.cycle()
+                }
                 try? await Task.sleep(for: .seconds(60))
             }
         }

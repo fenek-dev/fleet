@@ -53,7 +53,7 @@ struct FeedStatusLine: View {
                 HStack(spacing: 6) {
                     Text(IntelFormat.feedName(f.key))
                     if let e = f.lastError {
-                        Text("failed: \(e)").foregroundStyle(Tone.warn.text).lineLimit(1)
+                        Text("failed: \(e)").foregroundStyle(Tone.warn.text).lineLimit(1).help(e)
                     } else {
                         Text("checked \(IntelFormat.ago(f.fetchedMs)) · \(f.rows) entries")
                     }

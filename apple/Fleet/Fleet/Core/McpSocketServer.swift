@@ -7,32 +7,45 @@ import Security
 ///
 /// Per connection: the peer must be our own signed `fleetctl`, checked by
 /// code signature from the socket's audit token (`LOCAL_PEERTOKEN`, no pid
-/// race). The code signature of `fleetctl`'s parent process (the MCP
-/// client) is read too and becomes part of the pairing identity; pairing,
-/// pause, lock, rate limits and approvals are enforced in Rust
-/// (`fleet_core::mcp_host`). Frames are a 4-byte big-endian length and a
-/// JSON body; each body goes to `McpConnection.handle`.
+/// race; the token's pid must match `LOCAL_PEERPID`). The code signature of
+/// `fleetctl`'s parent process (the MCP client) is validated
+/// (`SecCodeCheckValidity`) and read — team, identifier, cdhash — and
+/// becomes the pairing identity. The parent is looked up by pid, so its
+/// start time is read before and after the check and the connection is
+/// refused if it changed (pid reuse). Unsigned, invalid, shell or
+/// interpreter parents are marked "ask every time": no pairing is kept for
+/// them and the prompt warns. Pairing, pause, lock, rate limits and
+/// approvals are enforced in Rust (`fleet_core::mcp_host`). Frames are a
+/// 4-byte big-endian length and a JSON body; each body goes to
+/// `McpConnection.handle`.
 ///
-/// Blocking I/O on one thread per connection (a handful of MCP clients).
+/// Blocking I/O on one thread per connection, at most
+/// `maxConnections` at once.
 final class McpSocketServer: @unchecked Sendable {
     enum SocketError: Error {
         case pathTooLong
         case posix(String, Int32)
+        case unsafeDirectory(String)
     }
 
     /// Identifier `fleetctl` is signed with in release builds.
     static let fleetctlIdentifier = "dev.fleet.fleetctl"
+    /// Concurrent connections; more are closed at once.
+    static let maxConnections = 8
 
     let path: String
     private let connect: @Sendable (McpPeerRow) -> McpConnection
     private let lock = NSLock()
     private var listenFd: Int32 = -1
+    private var active = 0
 
     init(path: String, connect: @escaping @Sendable (McpPeerRow) -> McpConnection) {
         self.path = path
         self.connect = connect
     }
 
+    /// The socket path, in a directory that is ours alone: created 0700,
+    /// forced back to 0700, not a symlink, owned by this user.
     static func defaultPath() throws -> String {
         let dir = try FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
@@ -41,6 +54,21 @@ final class McpSocketServer: @unchecked Sendable {
         try FileManager.default.createDirectory(
             at: dir, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
+        var st = stat()
+        guard lstat(dir.path, &st) == 0 else {
+            throw SocketError.posix("lstat", errno)
+        }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else {
+            throw SocketError.unsafeDirectory("\(dir.path) is not a directory")
+        }
+        guard st.st_uid == getuid() else {
+            throw SocketError.unsafeDirectory("\(dir.path) is owned by another user")
+        }
+        if (st.st_mode & 0o777) != 0o700 {
+            guard chmod(dir.path, 0o700) == 0 else {
+                throw SocketError.posix("chmod", errno)
+            }
+        }
         return dir.appendingPathComponent("mcp.sock").path
     }
 
@@ -104,17 +132,34 @@ final class McpSocketServer: @unchecked Sendable {
                 if errno == EINTR { continue }
                 return
             }
+            let admitted = lock.withLock { () -> Bool in
+                guard active < Self.maxConnections else { return false }
+                active += 1
+                return true
+            }
+            guard admitted else {
+                close(client)
+                continue
+            }
             var one: Int32 = 1
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
             guard let peer = Self.verifyPeer(client) else {
                 close(client)
+                release()
                 continue
             }
             let conn = connect(peer)
-            let t = Thread { Self.serve(client, conn) }
+            let t = Thread { [self] in
+                Self.serve(client, conn)
+                release()
+            }
             t.name = "fleet-mcp-conn"
             t.start()
         }
+    }
+
+    private func release() {
+        lock.withLock { active -= 1 }
     }
 
     // MARK: peer checks
@@ -137,11 +182,43 @@ final class McpSocketServer: @unchecked Sendable {
 
         var pid: pid_t = 0
         var plen = socklen_t(MemoryLayout<pid_t>.size)
+        // The pid we look the parent up by is the audited process's.
         guard getsockopt(fd, solLocal, localPeerPid, &pid, &plen) == 0,
-              let ppid = parentPid(of: pid)
+              pid == pid_t(bitPattern: token.val.5),
+              let ppid = parentPid(of: pid),
+              let started = startTime(of: ppid)
         else { return nil }
-        let (team, ident) = signature(ofPid: ppid)
-        return McpPeerRow(parentTeam: team, parentSigningId: ident)
+        let sig = signature(ofPid: ppid)
+        // Pid reuse: the parent must be the same process after the check
+        // (same parent of fleetctl, same start time).
+        guard parentPid(of: pid) == ppid, startTime(of: ppid) == started else { return nil }
+        let askEveryTime = !sig.valid || sig.team.isEmpty
+            || isInterpreter(sig.ident) || isInterpreter(sig.executable)
+        return McpPeerRow(
+            parentTeam: sig.valid ? sig.team : "",
+            parentSigningId: sig.ident,
+            parentCdhash: sig.cdhash,
+            askEveryTime: askEveryTime)
+    }
+
+    /// Shells and script interpreters (their signature says nothing about
+    /// the script they run). Rust has the same check (`is_interpreter`).
+    static func isInterpreter(_ id: String) -> Bool {
+        let exact: Set<String> = [
+            "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "env", "node", "nodejs",
+            "deno", "bun", "osascript", "pwsh", "powershell", "tclsh", "wish", "expect", "script",
+            "nohup", "xargs", "sudo", "su", "login", "screen", "tmux", "lua", "luajit", "swift",
+        ]
+        let versioned = ["python", "ruby", "perl", "php", "irb"]
+        let base = id.lowercased().split(separator: "/").last.map(String.init) ?? ""
+        let parts = base.split(whereSeparator: { $0 == "." || $0 == "-" || $0 == "_" })
+        return parts.contains { part in
+            let p = String(part)
+            if exact.contains(p) { return true }
+            return versioned.contains { v in
+                p.hasPrefix(v) && p.dropFirst(v.count).allSatisfy { $0.isASCII && $0.isNumber }
+            }
+        }
     }
 
     private static func teamId(_ code: SecStaticCode) -> String? {
@@ -188,38 +265,65 @@ final class McpSocketServer: @unchecked Sendable {
         #endif
     }
 
-    private static func parentPid(of pid: pid_t) -> pid_t? {
+    private static func procInfo(_ pid: pid_t) -> kinfo_proc? {
         var info = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.stride
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
-        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
-        let ppid = info.kp_eproc.e_ppid
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0,
+              info.kp_proc.p_pid == pid
+        else { return nil }
+        return info
+    }
+
+    private static func parentPid(of pid: pid_t) -> pid_t? {
+        guard let ppid = procInfo(pid)?.kp_eproc.e_ppid else { return nil }
         return ppid > 1 ? ppid : nil
     }
 
-    /// Team id and signing identifier ("" / executable name if unsigned).
-    /// By pid: the parent can't hand us an audit token (pid reuse between
-    /// the lookup and here is possible but only mislabels the pairing).
-    private static func signature(ofPid pid: pid_t) -> (String, String) {
+    /// Process start time (µs since the epoch): a reused pid has another.
+    private static func startTime(of pid: pid_t) -> Int64? {
+        guard let info = procInfo(pid) else { return nil }
+        let t = info.kp_proc.p_un.__p_starttime
+        return Int64(t.tv_sec) * 1_000_000 + Int64(t.tv_usec)
+    }
+
+    struct ParentSignature {
+        var team = ""
+        var ident = "unknown"
+        var executable = ""
+        /// cdhash, hex.
+        var cdhash = ""
+        /// `SecCodeCheckValidity` passed on the running process.
+        var valid = false
+    }
+
+    /// Team id, signing identifier (executable name if unsigned), cdhash
+    /// and dynamic validity. By pid: the parent can't hand us an audit
+    /// token, so the caller brackets this with a start-time check.
+    private static func signature(ofPid pid: pid_t) -> ParentSignature {
+        var out = ParentSignature()
         var code: SecCode?
         var stat: SecStaticCode?
         let attrs = [kSecGuestAttributePid: pid] as CFDictionary
         guard SecCodeCopyGuestWithAttributes(nil, attrs, [], &code) == errSecSuccess, let code,
               SecCodeCopyStaticCode(code, [], &stat) == errSecSuccess, let stat
-        else { return ("", "unknown") }
+        else { return out }
+        out.valid = SecCodeCheckValidity(code, [], nil) == errSecSuccess
         var info: CFDictionary?
         _ = SecCodeCopySigningInformation(
             stat, SecCSFlags(rawValue: kSecCSSigningInformation), &info)
         let dict = (info as? [String: Any]) ?? [:]
-        let team = dict[kSecCodeInfoTeamIdentifier as String] as? String ?? ""
-        var ident = dict[kSecCodeInfoIdentifier as String] as? String ?? ""
-        if ident.isEmpty {
-            var url: CFURL?
-            if SecCodeCopyPath(stat, [], &url) == errSecSuccess, let url {
-                ident = (url as URL).lastPathComponent
-            }
+        out.team = dict[kSecCodeInfoTeamIdentifier as String] as? String ?? ""
+        if let unique = dict[kSecCodeInfoUnique as String] as? Data {
+            out.cdhash = unique.map { String(format: "%02x", $0) }.joined()
         }
-        return (team, ident.isEmpty ? "unknown" : ident)
+        var url: CFURL?
+        if SecCodeCopyPath(stat, [], &url) == errSecSuccess, let url {
+            out.executable = (url as URL).lastPathComponent
+        }
+        let ident = dict[kSecCodeInfoIdentifier as String] as? String ?? ""
+        out.ident = !ident.isEmpty ? ident : (out.executable.isEmpty ? "unknown" : out.executable)
+        return out
     }
 
     // MARK: frames

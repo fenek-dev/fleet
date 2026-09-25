@@ -35,8 +35,7 @@ final class SyncKeychain: SyncSecrets {
     /// Replaced on rotation (revocation, recovery).
     func storeSyncKey(key: Data) throws {
         do {
-            try Keychain.delete(Self.syncKeyAccount)
-            try Keychain.add(Self.syncKeyAccount, key)
+            try Keychain.set(Self.syncKeyAccount, key)
         } catch {
             throw SignerError.Failed
         }
@@ -104,17 +103,33 @@ final class SyncKeychain: SyncSecrets {
 
     // MARK: sudo passwords
 
+    /// Add-or-update, never delete-then-add: a failure midway can't lose
+    /// the stored password. A new item gets the user-presence ACL; an
+    /// existing one keeps its ACL and only its data is replaced.
     func storeSudoPassword(serverId: String, password: String) throws {
-        try? deleteSudoPassword(serverId: serverId)
         var error: Unmanaged<CFError>?
         guard let ac = SecAccessControlCreateWithFlags(
             nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.userPresence], &error)
         else { throw SignerError.Failed }
+        let data = Data(password.utf8)
         var q = Self.sudoQuery(serverId)
-        q[kSecValueData as String] = Data(password.utf8)
+        q[kSecValueData as String] = data
         q[kSecAttrAccessControl as String] = ac
-        let status = SecItemAdd(q as CFDictionary, nil)
-        guard status == errSecSuccess else { throw SignerError.Failed }
+        var status = SecItemAdd(q as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            let ctx = LAContext()
+            ctx.localizedReason = "replace the stored sudo password"
+            var match = Self.sudoQuery(serverId)
+            match[kSecUseAuthenticationContext as String] = ctx
+            status = SecItemUpdate(match as CFDictionary,
+                                   [kSecValueData as String: data] as CFDictionary)
+            ctx.invalidate()
+        }
+        switch status {
+        case errSecSuccess: return
+        case errSecUserCanceled, errSecAuthFailed: throw SignerError.Cancelled
+        default: throw SignerError.Failed
+        }
     }
 
     func deleteSudoPassword(serverId: String) throws {

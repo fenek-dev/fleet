@@ -72,7 +72,13 @@ struct EnrollmentView: View {
         // Screenshots, screen recording and sharing see a blank window
         // while the recovery words exist in the UI.
         .background(CaptureShield(active: !words.isEmpty))
-        .onDisappear { enrollment?.cancel() }
+        .onDisappear {
+            enrollment?.cancel()
+            words = []
+            answers = []
+            passphrase = ""
+            passphraseAgain = ""
+        }
     }
 
     private var header: some View {

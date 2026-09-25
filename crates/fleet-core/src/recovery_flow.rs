@@ -75,6 +75,14 @@ pub enum RecoveryError {
     Refused(ErrorCode),
     #[error("timed out")]
     Timeout,
+    #[error("servers report different rosters for the same version; refusing to pick one")]
+    Disagreement,
+    #[error("no server confirmed the restored roster")]
+    Unconfirmed,
+    #[error("a server enforces a newer roster than the synced copies")]
+    StaleCopies,
+    #[error("the escrowed sync key isn't signed by a Mac in the roster")]
+    EscrowSigner,
 }
 
 /// Argon2id + HKDF (slow: run off the main thread).
@@ -240,18 +248,61 @@ pub fn specs_from_records(
     out
 }
 
+/// The servers' answer for a recovery without the synced chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRoster {
+    pub roster: SignedRoster,
+    /// Servers whose (verified) roster is exactly `roster`.
+    pub agreeing: Vec<ServerId>,
+    /// Servers that answered with an older roster of this fleet (offline
+    /// during the latest change) — shown, not an error.
+    pub behind: Vec<ServerId>,
+}
+
+/// Whether `s`'s signature checks out on its own terms: a root-signed
+/// roster by a root key it lists (a Mac can't sign itself out, so the
+/// signer is always listed); a recovery-signed roster by the recovery
+/// key of this code or of another answer's roster from the epoch before
+/// (the key that must have signed it, rule 3).
+fn self_verifies(s: &SignedRoster, code: &RecoveryPublics, others: &[SignedRoster]) -> bool {
+    let msg = SignedRoster::signed_message(&s.roster);
+    match s.signer {
+        fleet_proto::KeyRef::Root(id) => s.roster.device(&id).is_some_and(|d| {
+            fleet_crypto::sig::p256_verify(&d.root_key, &msg, &s.signature).is_ok()
+        }),
+        fleet_proto::KeyRef::Recovery => {
+            let mut keys = vec![code.recovery_key];
+            for o in others
+                .iter()
+                .filter(|o| o.roster.epoch + 1 == s.roster.epoch)
+            {
+                keys.push(o.roster.recovery_key);
+                if let Some(p) = o.roster.prev_recovery {
+                    keys.push(p.recovery_key);
+                }
+            }
+            keys.iter()
+                .any(|k| fleet_crypto::sig::ed25519_verify(k, &msg, &s.signature).is_ok())
+        }
+    }
+}
+
 /// The newest roster the reachable `servers` hold that this code belongs
 /// to (current or rotated-out recovery key), for a recovery without the
 /// synced roster chain. The servers are authoritative (design §7.6); each
-/// answer comes over a session with pinned host and agent keys, and must
-/// list its own hash last in `epoch_hashes`. Rosters of another fleet or
-/// code are ignored; nothing matching is [`RecoveryError::WrongCode`].
+/// answer comes over a session with pinned host and agent keys, must list
+/// its own hash last in `epoch_hashes`, and must carry a valid signature
+/// ([`self_verifies`]). Every server is asked (at least two when there
+/// are two); two *different* rosters at the same `(epoch, version)` are
+/// [`RecoveryError::Disagreement`], never resolved by picking one. Rosters
+/// of another fleet or code are ignored; nothing matching is
+/// [`RecoveryError::WrongCode`].
 pub async fn roster_from_servers<T: RecoveryTransport>(
     transport: &T,
     servers: &[ServerSpec],
     code: &RecoveryPublics,
-) -> Result<SignedRoster, RecoveryError> {
-    let mut best: Option<SignedRoster> = None;
+) -> Result<ServerRoster, RecoveryError> {
+    let mut answers: Vec<(ServerId, SignedRoster)> = Vec::new();
     let mut last_err = None;
     let mut mismatched = false;
     for s in servers {
@@ -270,25 +321,100 @@ pub async fn roster_from_servers<T: RecoveryTransport>(
             mismatched = true;
             continue;
         }
-        if let Some(b) = &best
-            && b.roster.fleet_id != r.fleet_id
-        {
-            mismatched = true;
-            continue;
-        }
-        let newer = best
-            .as_ref()
-            .is_none_or(|b| (r.epoch, r.version) > (b.roster.epoch, b.roster.version));
-        if newer {
-            best = Some(st.roster);
+        answers.push((s.id.clone(), st.roster));
+    }
+    let all: Vec<SignedRoster> = answers.iter().map(|(_, r)| r.clone()).collect();
+    answers.retain(|(_, r)| {
+        let ok = self_verifies(r, code, &all);
+        mismatched |= !ok;
+        ok
+    });
+    // One fleet only.
+    if let Some((_, first)) = answers.first() {
+        let fleet = first.roster.fleet_id;
+        if answers.iter().any(|(_, r)| r.roster.fleet_id != fleet) {
+            return Err(RecoveryError::Disagreement);
         }
     }
-    match (best, mismatched, last_err) {
-        (Some(b), _, _) => Ok(b),
-        (None, true, _) => Err(RecoveryError::WrongCode),
-        (None, false, Some(e)) => Err(e),
-        (None, false, None) => Err(RecoveryError::NeedsRosterCopy),
+    let Some(best) = answers
+        .iter()
+        .map(|(_, r)| r)
+        .max_by_key(|r| (r.roster.epoch, r.roster.version))
+        .cloned()
+    else {
+        return Err(match (mismatched, last_err) {
+            (true, _) => RecoveryError::WrongCode,
+            (false, Some(e)) => e,
+            (false, None) => RecoveryError::NeedsRosterCopy,
+        });
+    };
+    let best_hash = roster_hash(&best);
+    let mut agreeing = Vec::new();
+    let mut behind = Vec::new();
+    for (id, r) in &answers {
+        let h = roster_hash(r);
+        if h == best_hash {
+            agreeing.push(id.clone());
+        } else if (r.roster.epoch, r.roster.version) == (best.roster.epoch, best.roster.version) {
+            return Err(RecoveryError::Disagreement);
+        } else {
+            behind.push(id.clone());
+        }
     }
+    Ok(ServerRoster {
+        roster: best,
+        agreeing,
+        behind,
+    })
+}
+
+/// Confirms `latest` (e.g. from synced copies) with the servers: at least
+/// one reachable server must enforce exactly this roster (`roster.get`
+/// over a recovery session with pinned host and agent keys). Returns how
+/// many do; a server enforcing a *newer* roster of this fleet means the
+/// copies are stale ([`RecoveryError::StaleCopies`]).
+pub async fn confirm_with_servers<T: RecoveryTransport>(
+    transport: &T,
+    servers: &[ServerSpec],
+    latest: &SignedRoster,
+) -> Result<usize, RecoveryError> {
+    let want = roster_hash(latest);
+    let mut matched = 0;
+    let mut last_err = None;
+    for s in servers {
+        match transport.fetch_roster(s).await {
+            Ok(st) => {
+                let r = &st.roster.roster;
+                if roster_hash(&st.roster) == want {
+                    matched += 1;
+                } else if r.fleet_id == latest.roster.fleet_id
+                    && (r.epoch, r.version) > (latest.roster.epoch, latest.roster.version)
+                {
+                    return Err(RecoveryError::StaleCopies);
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if matched == 0 {
+        return Err(match last_err {
+            Some(e) if servers.len() == 1 => e,
+            _ => RecoveryError::Unconfirmed,
+        });
+    }
+    Ok(matched)
+}
+
+/// Fingerprint the operator compares (genesis, or the latest roster when
+/// no chain from genesis exists): the first 16 bytes of its hash, hex in
+/// groups of four.
+pub fn roster_fingerprint(s: &SignedRoster) -> String {
+    let h = hex::encode(&roster_hash(s)[..16]);
+    h.as_bytes()
+        .chunks(4)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Submits over SSH with the recovery SSH key and a recovery session.
@@ -603,8 +729,12 @@ mod tests {
         .unwrap();
         // A's synced state in "iCloud": escrow + server, pins, roster copy.
         let key = SyncKey::generate().unwrap();
+        let sealer = crate::sync::keys::Sealer {
+            id: a,
+            device: &a_keys.device,
+        };
         let mut cloud: Vec<CloudRecord> =
-            vec![seal_escrow(&key, fleet, &p.recovery_escrow_key).unwrap()];
+            vec![seal_escrow(&key, fleet, &p.recovery_escrow_key, &sealer).unwrap()];
         {
             let mut e = SyncEngine::new(
                 SyncStore::open_in_memory(&[0; 32]).unwrap(),
@@ -665,8 +795,19 @@ mod tests {
         let typed = derive(&code.phrase(), pass, TINY).unwrap();
         let name = escrow_name(&typed);
         let escrow = cloud.iter().find(|r| r.name == name).unwrap();
-        let (fid, restored) = open_escrow(escrow, &typed.escrow.secret_bytes()).unwrap();
+        let (fid, restored, sealed_by) = open_escrow(
+            escrow,
+            &typed.escrow.secret_bytes(),
+            &typed.publics().recovery_escrow_key,
+        )
+        .unwrap();
         assert_eq!(fid, fleet);
+        // Authenticated against the roster: A (in it) sealed it; a roster
+        // without A refuses it.
+        assert_eq!(sealed_by.verify(&g.roster).unwrap(), a);
+        let mut without_a = g.roster.clone();
+        without_a.devices[0].id = DeviceId([9; 16]);
+        assert!(sealed_by.verify(&without_a).is_err());
         assert!(
             derive(&code.phrase(), "wrong", TINY)
                 .map(|k| escrow_name(&k))
@@ -739,9 +880,18 @@ mod tests {
             engine.key(),
             fleet,
             &next.keys.publics().recovery_escrow_key,
+            &crate::sync::keys::Sealer {
+                id: b,
+                device: &b_keys.device,
+            },
         )
         .unwrap();
-        let (_, k2) = open_escrow(&re, &next.keys.escrow.secret_bytes()).unwrap();
+        let (_, k2, _) = open_escrow(
+            &re,
+            &next.keys.escrow.secret_bytes(),
+            &next.keys.publics().recovery_escrow_key,
+        )
+        .unwrap();
         assert_eq!(k2.id, engine.key().id);
     }
 
@@ -826,10 +976,47 @@ mod tests {
         let specs = specs_from_records(&restored, &cloud);
         assert_eq!(specs, vec![spec(1), spec(2)]);
         // …answer roster.get (server 2 is unreachable here).
-        let latest = roster_from_servers(&servers, &specs, &typed.publics())
+        let found = roster_from_servers(&servers, &specs, &typed.publics())
             .await
             .unwrap();
-        assert_eq!(latest, g);
+        assert_eq!(found.roster, g);
+        assert_eq!(found.agreeing, vec![spec(1).id]);
+        let latest = found.roster;
+        // Confirmed by a server over the pinned session.
+        assert_eq!(
+            confirm_with_servers(&servers, &specs, &latest)
+                .await
+                .unwrap(),
+            1
+        );
+        // Two servers holding different rosters at the same version, or a
+        // forged signature, are refused rather than picked from.
+        let mut forged = g.clone();
+        forged.roster.issued_at_ms += 1;
+        let split = FakeServers {
+            rosters: RefCell::new(
+                [(spec(1).id, g.clone()), (spec(2).id, forged.clone())]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        // The forged (badly signed) answer is dropped, not picked.
+        let r = roster_from_servers(&split, &specs, &typed.publics())
+            .await
+            .unwrap();
+        assert_eq!((r.roster, r.agreeing), (g.clone(), vec![spec(1).id]));
+        let resigned = sign_root(forged.roster.clone(), a, &a_keys.root).unwrap();
+        let split = FakeServers {
+            rosters: RefCell::new(
+                [(spec(1).id, g.clone()), (spec(2).id, resigned)]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        assert!(matches!(
+            roster_from_servers(&split, &specs, &typed.publics()).await,
+            Err(RecoveryError::Disagreement)
+        ));
         // Another code's servers don't count as this fleet's.
         let other = RecoveryCode::generate().unwrap().derive("", TINY).unwrap();
         assert!(matches!(

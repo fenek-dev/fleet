@@ -48,6 +48,17 @@ pub struct RestoreRow {
     pub roster_epoch: u32,
     pub roster_version: u64,
     pub devices_lost: Vec<String>,
+    /// For the operator to compare with their records before going on:
+    /// the genesis roster's fingerprint (`from_genesis`), else the latest
+    /// roster's (restored from the servers alone).
+    pub roster_fingerprint: String,
+    pub from_genesis: bool,
+    /// Servers that confirmed the restored roster over pinned sessions.
+    pub servers_confirmed: u32,
+    /// Servers still on an older roster (warn; they catch up later).
+    pub servers_behind: Vec<String>,
+    /// The Mac that sealed the escrow (verified against the roster).
+    pub escrow_sealed_by: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -105,6 +116,8 @@ struct RecState {
     keys: Option<RecoveryKeys>,
     fleet_id: Option<FleetId>,
     key: Option<SyncKey>,
+    /// Who sealed the escrow: checked once the roster is known.
+    sealed_by: Option<keys::SealedBy>,
     me: DeviceId,
     fleet_name: String,
 }
@@ -146,6 +159,7 @@ impl FleetCore {
                 keys: Some(keys),
                 fleet_id: None,
                 key: None,
+                sealed_by: None,
                 me,
                 fleet_name: String::new(),
             }),
@@ -292,12 +306,28 @@ impl FleetCore {
         })
         .await?;
         let mut upload = Vec::new();
+        let device = fleet_core::signer::RoleSigner::new(&*self.keys, KeyRole::Device)
+            .map_err(|e| FleetError::Keys { error: e.into() })?;
+        let me = self.me()?;
         if let Some(e) = lock(&self.fleet.sync).as_ref() {
             let fid = self.fleet_id()?;
             upload.push(
-                keys::seal_escrow(e.key(), fid, &signed.roster.recovery_escrow_key)
-                    .map_err(sync_err)?,
+                keys::seal_escrow(
+                    e.key(),
+                    fid,
+                    &signed.roster.recovery_escrow_key,
+                    &keys::Sealer {
+                        id: me,
+                        device: &device,
+                    },
+                )
+                .map_err(sync_err)?,
             );
+        }
+        // The old code keeps opening its escrow only for its grace window:
+        // then the sync key rotates and the old escrow record goes.
+        if let Some(p) = signed.roster.prev_recovery {
+            self.schedule_escrow_retirement(p.recovery_escrow_key, p.valid_until_ms)?;
         }
         let mut change = self.clone().push_pending_rosters().await?;
         change.upload.extend(upload.into_iter().map(Into::into));
@@ -328,10 +358,15 @@ impl RecoverySession {
             .keys
             .as_ref()
             .ok_or_else(|| rec_err("session finished"))?;
-        let (fid, key) = keys::open_escrow(&escrow.into(), &k.escrow.secret_bytes())
-            .map_err(|_| rec_err("the escrow doesn't open with this code"))?;
+        let (fid, key, by) = keys::open_escrow(
+            &escrow.into(),
+            &k.escrow.secret_bytes(),
+            &k.publics().recovery_escrow_key,
+        )
+        .map_err(|_| rec_err("the escrow doesn't open with this code"))?;
         st.fleet_id = Some(fid);
         st.key = Some(key);
+        st.sealed_by = Some(by);
         Ok(hex::encode(fid.0))
     }
 
@@ -374,25 +409,52 @@ impl RecoverySession {
         let fleet_id = st
             .fleet_id
             .ok_or_else(|| rec_err("open the escrow first"))?;
-        let chain = match chain_from(&key, &records, fleet_id) {
-            Ok(c) if !c.is_empty() => c,
+        let specs = rf::specs_from_records(&key, &records);
+        let keys_ref = st
+            .keys
+            .as_ref()
+            .ok_or_else(|| rec_err("session finished"))?;
+        let (chain, from_genesis, confirmed, behind) = match chain_from(&key, &records, fleet_id) {
+            Ok(c) if !c.is_empty() => {
+                // Copies are only a cache: at least one server must enforce
+                // exactly the latest one (roster.get over pinned keys).
+                let latest = c.last().ok_or_else(|| rec_err("no roster copies"))?;
+                let q = ServerQuery::Confirm(latest);
+                let ServerAnswer::Confirmed(n) =
+                    ask_servers(&self.core, keys_ref, st.me, fleet_id, &specs, q)?
+                else {
+                    return Err(rec_err("unexpected answer"));
+                };
+                (c, true, n as u32, Vec::new())
+            }
+            Err(e @ FleetError::Roster { .. }) => return Err(e),
             // No roster copy synced: the servers hold it.
             _ => {
-                let specs = rf::specs_from_records(&key, &records);
                 if specs.is_empty() {
                     return Err(rec_err(
                         "no roster copies and no servers with pinned keys in iCloud",
                     ));
                 }
-                let keys = st
-                    .keys
-                    .as_ref()
-                    .ok_or_else(|| rec_err("session finished"))?;
-                let r = roster_via_servers(&self.core, keys, st.me, fleet_id, &specs)?;
-                if r.roster.fleet_id != fleet_id {
+                let ServerAnswer::Found(found) = ask_servers(
+                    &self.core,
+                    keys_ref,
+                    st.me,
+                    fleet_id,
+                    &specs,
+                    ServerQuery::Find,
+                )?
+                else {
+                    return Err(rec_err("unexpected answer"));
+                };
+                if found.roster.roster.fleet_id != fleet_id {
                     return Err(rec_err("the servers' roster belongs to another fleet"));
                 }
-                vec![r]
+                (
+                    vec![found.roster],
+                    false,
+                    found.agreeing.len() as u32,
+                    found.behind.iter().map(ToString::to_string).collect(),
+                )
             }
         };
         let latest = chain.last().ok_or_else(|| rec_err("no roster copies"))?;
@@ -403,6 +465,15 @@ impl RecoverySession {
         if !ours {
             return Err(rec_err("the code doesn't match the fleet's roster"));
         }
+        // The escrow must have been sealed by a Mac of this roster (for a
+        // one-Mac fleet: the genesis Mac, which is still in it).
+        let sealer = st
+            .sealed_by
+            .as_ref()
+            .ok_or_else(|| rec_err("open the escrow first"))?
+            .verify(r)
+            .map_err(|_| rec_err(rf::RecoveryError::EscrowSigner))?;
+        let fingerprint = rf::roster_fingerprint(chain.first().unwrap_or(latest));
         {
             let cache = lock(&self.core.cache);
             for s in &chain {
@@ -427,11 +498,19 @@ impl RecoverySession {
             servers,
             roster_epoch: r.epoch,
             roster_version: r.version,
+            escrow_sealed_by: r
+                .device(&sealer)
+                .map(|d| crate::text::line(d.name.as_str().to_string()))
+                .unwrap_or_default(),
             devices_lost: r
                 .devices
                 .iter()
                 .map(|d| crate::text::line(d.name.as_str().to_string()))
                 .collect(),
+            roster_fingerprint: fingerprint,
+            from_genesis,
+            servers_confirmed: confirmed,
+            servers_behind: behind,
         })
     }
 }
@@ -466,15 +545,30 @@ impl RecoverySession {
     }
 }
 
-/// `roster.get` from `specs` over recovery sessions (their own runtime,
-/// like `run_recovery`: sessions aren't `Send`).
-fn roster_via_servers(
+/// What a recovery session asks the servers (`roster.get` over the
+/// recovery SSH key with pinned host and agent keys).
+enum ServerQuery<'a> {
+    /// The newest verified roster (no synced copies).
+    Find,
+    /// At least one server enforces exactly this roster.
+    Confirm(&'a SignedRoster),
+}
+
+enum ServerAnswer {
+    Found(Box<rf::ServerRoster>),
+    Confirmed(usize),
+}
+
+/// Runs `q` over recovery sessions on its own runtime (like
+/// `run_recovery`: sessions aren't `Send`).
+fn ask_servers(
     core: &Arc<FleetCore>,
     keys: &RecoveryKeys,
     me: DeviceId,
     fleet_id: FleetId,
     specs: &[ServerSpec],
-) -> Result<SignedRoster, FleetError> {
+    q: ServerQuery<'_>,
+) -> Result<ServerAnswer, FleetError> {
     let noise = core.noise_key()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -489,29 +583,36 @@ fn roster_via_servers(
         timeout: SERVER_TIMEOUT,
     };
     let local = tokio::task::LocalSet::new();
-    local
-        .block_on(
-            &rt,
-            rf::roster_from_servers(&transport, specs, &keys.publics()),
-        )
-        .map_err(rec_err)
+    match q {
+        ServerQuery::Find => local
+            .block_on(
+                &rt,
+                rf::roster_from_servers(&transport, specs, &keys.publics()),
+            )
+            .map(|r| ServerAnswer::Found(Box::new(r))),
+        ServerQuery::Confirm(latest) => local
+            .block_on(&rt, rf::confirm_with_servers(&transport, specs, latest))
+            .map(ServerAnswer::Confirmed),
+    }
+    .map_err(rec_err)
 }
 
-/// Roster copies from the records, verified as a chain from genesis.
+/// Roster copies from the records, verified as a chain from genesis. A
+/// fork among the copies is an error, never resolved by picking one.
 fn chain_from(
     key: &SyncKey,
     records: &[CloudRecord],
     fleet_id: FleetId,
 ) -> Result<Vec<SignedRoster>, FleetError> {
-    let mut rosters: Vec<SignedRoster> = records
-        .iter()
-        .filter_map(|r| key.open_record(r).ok())
-        .filter(|s| s.record.collection == Collection::RosterChain && !s.record.deleted)
-        .filter_map(|s| decode::<SignedRoster>(&s.record.body).ok())
-        .filter(|r| r.roster.fleet_id == fleet_id)
-        .collect();
-    rosters.sort_by_key(|r| (r.roster.epoch, r.roster.version));
-    rosters.dedup_by_key(|r| (r.roster.epoch, r.roster.version));
+    let rosters = rm::order_copies(
+        records
+            .iter()
+            .filter_map(|r| key.open_record(r).ok())
+            .filter(|s| s.record.collection == Collection::RosterChain && !s.record.deleted)
+            .filter_map(|s| decode::<SignedRoster>(&s.record.body).ok())
+            .filter(|r| r.roster.fleet_id == fleet_id)
+            .collect(),
+    )?;
     let g = rosters
         .first()
         .ok_or_else(|| rec_err("no roster copies in iCloud"))?;
@@ -592,6 +693,7 @@ fn run_recovery(
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, rf::recover_all(&transport, &specs, &roster))
     };
+    let used_escrow = old.publics().recovery_escrow_key;
     drop(old);
     let any = results.iter().any(|(_, r)| r.is_ok());
     let rows: Vec<ServerRecoveryRow> = names
@@ -640,9 +742,15 @@ fn run_recovery(
         cache.set_setting(SETTING_FLEET_ID, &fleet_id.0)?;
     }
     // Lost Macs had the sync key: rotate it and escrow to the new code.
+    // Their rows are re-signed by this Mac first (Macs that join later
+    // accept only current members' records), and the used code's escrow
+    // record is deleted.
     let mut upload = Vec::new();
     let mut delete = Vec::new();
+    let device = fleet_core::signer::RoleSigner::new(&*core.keys, KeyRole::Device).map_err(keys)?;
     if let Some(e) = lock(&core.fleet.sync).as_mut() {
+        e.readopt(&device, |a| *a == me, fleet_core::now_ms())
+            .map_err(sync_err)?;
         let new = SyncKey::generate().map_err(sync_err)?;
         let secrets = core.secrets()?;
         secrets
@@ -652,9 +760,18 @@ fn run_recovery(
         upload = u;
         delete = d;
         upload.push(
-            keys::seal_escrow(e.key(), fleet_id, &next.keys.publics().recovery_escrow_key)
-                .map_err(sync_err)?,
+            keys::seal_escrow(
+                e.key(),
+                fleet_id,
+                &next.keys.publics().recovery_escrow_key,
+                &keys::Sealer {
+                    id: me,
+                    device: &device,
+                },
+            )
+            .map_err(sync_err)?,
         );
+        delete.push(keys::escrow_record_name(&used_escrow));
     }
     lock(&core.fleet.deletions).extend(delete.iter().cloned());
     Ok(RecoveryResultRow {

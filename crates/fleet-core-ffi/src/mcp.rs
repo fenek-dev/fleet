@@ -1,28 +1,33 @@
 //! MCP socket host for the app (design §5.10, §8).
 //!
-//! Swift owns `~/Library/Application Support/Fleet/mcp.sock` (mode 0600):
-//! it accepts connections, checks with `LOCAL_PEERTOKEN` that the peer is
-//! our own signed `fleetctl`, reads the code signature of its parent
-//! process, and opens an [`McpConnection`] with that [`McpPeerRow`]. It
-//! then passes each frame body (after checking the 4-byte length against
-//! [`mcp_max_frame`]) to [`McpConnection::handle`] and writes back the
-//! returned frame. Everything else — pause, pairing, lock, rate limit,
-//! approvals, validation, redaction — happens in `fleet_core::mcp_host`.
+//! Swift owns `~/Library/Application Support/Fleet/mcp.sock` (mode 0600,
+//! directory 0700 and owned by the user): it accepts connections (at most
+//! 8 at once), checks with `LOCAL_PEERTOKEN` that the peer is our own
+//! signed `fleetctl`, reads and validates the code signature of its parent
+//! process (with a pid-reuse check), and opens an [`McpConnection`] with
+//! that [`McpPeerRow`]. It then passes each frame body (after checking the
+//! 4-byte length against [`mcp_max_frame`]) to [`McpConnection::handle`]
+//! and writes back the returned frame. Everything else — pause, pairing,
+//! lock, rate limit, approvals, validation, redaction — happens in
+//! `fleet_core::mcp_host`.
 //!
 //! Prompts reach Swift through [`McpDelegate`]; the operator's answer comes
-//! back with `mcp_resolve_prompt` (after Touch ID for pairing and bulk
-//! approvals; Elevated runs then also get the root key's Touch ID).
+//! back with `mcp_resolve_prompt`, echoing the prompt's digest and saying
+//! whether Touch ID was taken (required for pairing and non-Elevated
+//! approvals; Elevated runs and escalations then get the root key's Touch
+//! ID).
 
 use crate::api::{FleetCore, lock};
 use crate::types::{FleetError, SessionKind};
+use fleet_core::autorevert::{self, ConfirmError};
 use fleet_core::bulk::{Approver, BoxFut, BulkExecutor};
 use fleet_core::cache::McpClientRecord;
-use fleet_core::confirm;
 use fleet_core::mcp_host::{
-    AiLimits, McpBackend, McpConfig, McpHost, McpSession, McpUi, PeerInfo, Prompt, PromptKind,
-    ServerSummary,
+    AiLimits, ConfirmFailure, McpBackend, McpConfig, McpHost, McpSession, McpUi, PeerInfo, Prompt,
+    PromptKind, ServerSummary,
 };
-use fleet_proto::{ChangeId, ServerId};
+use fleet_proto::payload::PendingChange;
+use fleet_proto::{Actor, ServerId};
 use fleetctl_proto::{MAX_FRAME, PROTO_VERSION, ProtoError, Response, encode_frame};
 use std::sync::{Arc, Weak};
 
@@ -34,6 +39,11 @@ pub struct McpPeerRow {
     pub parent_team: String,
     /// Its signing identifier.
     pub parent_signing_id: String,
+    /// Its cdhash, hex ("" when not available).
+    pub parent_cdhash: String,
+    /// Unsigned, shell or interpreter parent: ask on every connection,
+    /// never persist (Rust also checks team and identifier itself).
+    pub ask_every_time: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -42,20 +52,30 @@ pub enum McpPromptKindRow {
         client_name: String,
         parent_team: String,
         parent_signing_id: String,
+        parent_cdhash: String,
+        /// Show a warning: this client is asked on every connection.
+        ask_every_time: bool,
     },
     Approval {
         client: String,
         tool: String,
         op: String,
+        /// Complete (never cut); show scrollable.
         details: String,
         servers: Vec<String>,
+        /// The root key's Touch ID follows.
         elevated: bool,
+        /// Exec asked for a root approval of a may-escalate op.
+        escalation: bool,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct McpPromptRow {
     pub id: u64,
+    /// BLAKE3 (hex) of everything shown; pass it back to
+    /// `mcp_resolve_prompt`.
+    pub digest: String,
     pub kind: McpPromptKindRow,
 }
 
@@ -87,10 +107,15 @@ struct Ui(Box<dyn McpDelegate>);
 impl McpUi for Ui {
     fn show_prompt(&self, p: Prompt) {
         let kind = match p.kind {
-            PromptKind::Pairing { identity } => McpPromptKindRow::Pairing {
+            PromptKind::Pairing {
+                identity,
+                ask_every_time,
+            } => McpPromptKindRow::Pairing {
                 client_name: crate::text::line(identity.client_name),
                 parent_team: crate::text::line(identity.parent_team),
                 parent_signing_id: crate::text::line(identity.parent_signing_id),
+                parent_cdhash: crate::text::line(identity.parent_cdhash),
+                ask_every_time,
             },
             PromptKind::Approval {
                 client,
@@ -99,6 +124,7 @@ impl McpUi for Ui {
                 details,
                 servers,
                 elevated,
+                escalation,
             } => McpPromptKindRow::Approval {
                 client: crate::text::line(client),
                 tool,
@@ -106,9 +132,14 @@ impl McpUi for Ui {
                 details: crate::text::text(details),
                 servers,
                 elevated,
+                escalation,
             },
         };
-        self.0.on_prompt(McpPromptRow { id: p.id, kind });
+        self.0.on_prompt(McpPromptRow {
+            id: p.id,
+            digest: p.digest,
+            kind,
+        });
     }
 
     fn close_prompt(&self, id: u64) {
@@ -181,30 +212,37 @@ impl McpBackend for Backend {
         Some(AiLimits::from_policy(&p))
     }
 
-    fn confirm_change(&self, server: ServerId, change: ChangeId) -> BoxFut<Result<(), String>> {
+    fn confirm_change(
+        &self,
+        server: ServerId,
+        change: PendingChange,
+        actor: Actor,
+    ) -> BoxFut<Result<(), ConfirmFailure>> {
         let core = self.core();
         Box::pin(async move {
-            let core = core.map_err(|e| format!("{e:?}"))?;
-            let (h, rt) = core.running().map_err(|e| e.to_string())?;
+            let core = core.map_err(|_| ConfirmFailure::Unavailable)?;
+            let (h, rt) = core.running().map_err(|_| ConfirmFailure::Unavailable)?;
             rt.spawn(async move {
-                confirm::confirm_on_new_connection(
-                    &h,
-                    &server,
-                    change,
-                    fleet_proto::Actor::Human,
-                    CONFIRM_TIMEOUT,
-                )
-                .await
-                .map_err(|e| e.to_string())
+                autorevert::confirm_pending(&h, &server, &change, actor)
+                    .await
+                    .map_err(confirm_failure)
             })
             .await
-            .map_err(|_| "confirm task failed".to_string())?
+            .map_err(|_| ConfirmFailure::Unavailable)?
         })
     }
 }
 
-/// Reconnect + `change.confirm`, well inside the policy's revert window.
-const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// Fixed codes only: no agent or transport text goes to the AI.
+fn confirm_failure(e: ConfirmError) -> ConfirmFailure {
+    match e {
+        ConfirmError::Reverted => ConfirmFailure::Reverted,
+        ConfirmError::NoConnection => ConfirmFailure::NoConnection,
+        ConfirmError::Reconnect(_) => ConfirmFailure::ReconnectFailed,
+        ConfirmError::Agent(code) => ConfirmFailure::Agent(code),
+        ConfirmError::Request(_) => ConfirmFailure::RequestFailed,
+    }
+}
 
 /// One accepted socket connection.
 #[derive(uniffi::Object)]
@@ -294,9 +332,20 @@ impl FleetCore {
         self.mcp_host().paused()
     }
 
-    /// The operator's answer. False if the prompt is gone.
-    pub fn mcp_resolve_prompt(self: Arc<Self>, id: u64, approved: bool) -> bool {
-        self.mcp_host().resolve_prompt(id, approved)
+    /// The operator's answer to prompt `id`. `digest` is the prompt's (an
+    /// answer carrying another is a denial); `user_verified`: the app took
+    /// Touch ID for it (an approval of a pairing or non-Elevated prompt
+    /// without it is a denial). False if the prompt is gone or the
+    /// approval was turned into a denial.
+    pub fn mcp_resolve_prompt(
+        self: Arc<Self>,
+        id: u64,
+        approved: bool,
+        digest: String,
+        user_verified: bool,
+    ) -> bool {
+        self.mcp_host()
+            .resolve_prompt(id, approved, &digest, user_verified)
     }
 
     pub fn mcp_clients(&self) -> Result<Vec<McpClientRow>, FleetError> {
@@ -325,6 +374,8 @@ impl FleetCore {
         let session = host.session(PeerInfo {
             parent_team: peer.parent_team,
             parent_signing_id: peer.parent_signing_id,
+            parent_cdhash: peer.parent_cdhash,
+            ask_every_time: peer.ask_every_time,
         });
         Arc::new(McpConnection {
             core: self,

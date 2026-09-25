@@ -32,7 +32,11 @@
 //!   fresh connection and sends `change.confirm` there (`confirm`). If
 //!   that fails, the connection goes back to the provider user and the
 //!   change reverts on its own; a change already reverted when the
-//!   confirm arrives (`NotFound`) sends the flow back to Access.
+//!   confirm arrives (`NotFound`) sends the flow back to Access. A resumed
+//!   Access phase with nothing left to apply first asks `changes.list`: a
+//!   profile change still pending goes to ConfirmAccess instead of being
+//!   skipped (and reverting silently). AuditAfter checks the access
+//!   modules are compliant, else back to Access.
 //! - **System**: every other module and the roles; long-running
 //!   (`profile_apply_timeout`). `Busy` (dpkg lock held by
 //!   `unattended-upgrades`) is retried with a delay.
@@ -50,7 +54,9 @@ use crate::manager::RequestOpts;
 use fleet_crypto::approval::op_digest;
 use fleet_proto::args::{ProfileToml, SudoPasswordHash, UserName};
 use fleet_proto::op::{ProfileLevel, ProfilePhase, ProfileRole, ProfileSource, ProfileSpec};
-use fleet_proto::payload::{ModuleResult, PlannedChange, ProfileApplied, ProfilePlan};
+use fleet_proto::payload::{
+    AuditReport, ChangeKind, ModuleResult, ModuleStatus, PlannedChange, ProfileApplied, ProfilePlan,
+};
 use fleet_proto::{
     ApprovalItem, ChangeId, ErrorCode, Hash32, Op, Payload, RootApproval, ServerId, SignedRoster,
 };
@@ -395,6 +401,8 @@ pub enum ProvisionError {
     Backend(String),
     #[error("the operator hasn't approved the plan yet")]
     NeedsReview,
+    #[error("SSH/firewall settings are not in place after provisioning ({0}); apply them again")]
+    AccessNotCompliant(String),
 }
 
 fn describe_failure(f: &Failure) -> String {
@@ -452,12 +460,18 @@ pub trait ProvisionBackend: Send + Sync {
     fn verify_admin_login(&self, server: &ServerId, admin: &str) -> BoxFut<Result<(), String>>;
     /// Future connections to `server` log in as `user`.
     fn set_ssh_user(&self, server: &ServerId, user: &str) -> Result<(), String>;
-    /// `change.confirm` over a fresh connection (`confirm`).
+    /// `change.confirm` over a fresh connection, within the change's own
+    /// deadline (`deadline_ms`, agent clock; `autorevert::confirm_window`).
     fn confirm_change(
         &self,
         server: &ServerId,
         change: ChangeId,
+        deadline_ms: u64,
     ) -> BoxFut<Result<(), ConfirmFailure>>;
+    /// Agent clock minus ours (advisory `Hello` time), for countdowns.
+    fn clock_skew_ms(&self, _server: &ServerId) -> Option<i64> {
+        None
+    }
     fn add_to_fleet(
         &self,
         server: &ServerId,
@@ -605,24 +619,38 @@ where
             Ok(Step::Access)
         }
         Step::Access => {
-            match phase(b, st, server, spec, cfg, emit, ProfilePhase::Access, None).await? {
+            let applied = phase(b, st, server, spec, cfg, emit, ProfilePhase::Access, None).await?;
+            // Nothing left to apply may mean an earlier run applied it and
+            // stopped before saving: an unconfirmed change would then
+            // revert silently. Ask the agent before skipping.
+            let pending = match applied {
+                Some(p) => Some(p),
+                None => pending_access_change(b, server).await?,
+            };
+            match pending {
                 Some((change, deadline_ms)) => {
                     st.pending_change = Some(change);
                     st.pending_deadline_ms = Some(deadline_ms);
-                    emit(ProvisionEvent::RevertArmed { deadline_ms });
+                    let local =
+                        crate::autorevert::local_deadline(deadline_ms, b.clock_skew_ms(server));
+                    emit(ProvisionEvent::RevertArmed { deadline_ms: local });
                     Ok(Step::ConfirmAccess)
                 }
                 None => Ok(Step::System),
             }
         }
         Step::ConfirmAccess => {
-            let Some(change) = st.pending_change else {
+            let pending = match (st.pending_change, st.pending_deadline_ms) {
+                (Some(c), Some(d)) => Some((c, d)),
+                _ => pending_access_change(b, server).await?,
+            };
+            let Some((change, deadline_ms)) = pending else {
                 return Ok(Step::System);
             };
             // Root login is off now: the fresh connection is the admin's.
             b.set_ssh_user(server, &st.choice.admin_user)
                 .map_err(ProvisionError::Backend)?;
-            match b.confirm_change(server, change).await {
+            match b.confirm_change(server, change, deadline_ms).await {
                 Ok(()) => {
                     st.pending_change = None;
                     st.pending_deadline_ms = None;
@@ -646,7 +674,15 @@ where
             Ok(Step::AuditAfter)
         }
         Step::AuditAfter => {
-            st.score_after = Some(audit(b, server, st.choice.level_proto()).await?);
+            let report = audit_report(b, server, st.choice.level_proto()).await?;
+            st.score_after = Some(report.score);
+            // The SSH/firewall phase must have stuck (not reverted behind
+            // our back): otherwise apply it again.
+            let drifted = access_not_compliant(&report);
+            if !drifted.is_empty() {
+                st.step = Step::Access;
+                return Err(ProvisionError::AccessNotCompliant(drifted.join(", ")));
+            }
             Ok(Step::AddToFleet)
         }
         Step::AddToFleet => {
@@ -695,10 +731,56 @@ async fn audit<B: ProvisionBackend + ?Sized>(
     server: &ServerId,
     level: ProfileLevel,
 ) -> Result<u8, ProvisionError> {
+    Ok(audit_report(b, server, level).await?.score)
+}
+
+async fn audit_report<B: ProvisionBackend + ?Sized>(
+    b: &B,
+    server: &ServerId,
+    level: ProfileLevel,
+) -> Result<AuditReport, ProvisionError> {
     match call(b, server, Op::AuditRun { level }, RequestOpts::default()).await? {
-        Payload::AuditReport(r) => Ok(r.score),
+        Payload::AuditReport(r) => Ok(r),
         _ => Err(ProvisionError::Request {
             op: "audit.run",
+            why: "unexpected reply".into(),
+        }),
+    }
+}
+
+/// Access modules (sshd, firewall) the audit doesn't report as in place.
+fn access_not_compliant(r: &AuditReport) -> Vec<String> {
+    r.findings
+        .iter()
+        .filter(|f| ProfilePhase::is_access_module(&f.module))
+        .filter(|f| {
+            !matches!(
+                f.status,
+                ModuleStatus::Compliant
+                    | ModuleStatus::NotApplicable
+                    | ModuleStatus::Skipped
+                    | ModuleStatus::PendingReboot
+            )
+        })
+        .map(|f| f.module.clone())
+        .collect()
+}
+
+/// A `profile.apply` change still waiting for its confirm on the agent
+/// (`changes.list`), with its deadline.
+async fn pending_access_change<B: ProvisionBackend + ?Sized>(
+    b: &B,
+    server: &ServerId,
+) -> Result<Option<(ChangeId, u64)>, ProvisionError> {
+    match call(b, server, Op::ChangesList, RequestOpts::default()).await? {
+        Payload::PendingChanges(p) => Ok(p
+            .changes
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Profile)
+            .max_by_key(|c| c.created_ms)
+            .map(|c| (c.change_id, c.deadline_ms))),
+        _ => Err(ProvisionError::Request {
+            op: "changes.list",
             why: "unexpected reply".into(),
         }),
     }

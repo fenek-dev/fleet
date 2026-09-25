@@ -82,13 +82,22 @@ final class TerminalController: NSObject, Identifiable {
 
     func connect(api: FleetCore, serverId: String, tmux: Bool) async {
         let t = view.getTerminal()
+        let gen = UUID()
+        generation = gen
         do {
-            session = try await api.openTerminal(
+            let s = try await api.openTerminal(
                 serverId: serverId, slot: slot, tmux: tmux,
                 cols: UInt32(max(t.cols, 1)), rows: UInt32(max(t.rows, 1)),
-                sink: TerminalRelay(controller: self))
+                sink: TerminalRelay(controller: self, generation: gen))
+            // Closed or reconnected while opening: this session is stale.
+            guard generation == gen else {
+                s.close()
+                return
+            }
+            session = s
             closed = false
         } catch {
+            guard generation == gen else { return }
             feedNotice("\r\n[\(error.fleetMessage)]\r\n")
             closed = true
         }
@@ -96,15 +105,22 @@ final class TerminalController: NSObject, Identifiable {
     }
 
     func close() {
+        generation = UUID()
         session?.close()
         session = nil
     }
 
-    fileprivate func received(_ data: Data) {
+    /// The session callbacks are accepted from; replaced on every connect
+    /// and close.
+    private var generation = UUID()
+
+    fileprivate func received(_ data: Data, generation gen: UUID) {
+        guard gen == generation else { return }
         view.feed(byteArray: ArraySlice([UInt8](data)))
     }
 
-    fileprivate func ended(status: UInt32?, error: String?) {
+    fileprivate func ended(status: UInt32?, error: String?, generation gen: UUID) {
+        guard gen == generation else { return }
         session = nil
         closed = true
         if let error {
@@ -171,17 +187,27 @@ extension TerminalController: @preconcurrency TerminalViewDelegate {
     func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
 }
 
-/// Core-thread output → main actor.
-private final class TerminalRelay: TerminalSink {
-    private let controller: TerminalController
-    init(controller: TerminalController) { self.controller = controller }
+/// Core-thread output → main actor. Weak, so the core holding the sink
+/// doesn't keep the controller alive; tagged with the session it was made
+/// for, so callbacks from an earlier session are dropped.
+private final class TerminalRelay: TerminalSink, @unchecked Sendable {
+    private weak var controller: TerminalController?
+    private let generation: UUID
+    init(controller: TerminalController, generation: UUID) {
+        self.controller = controller
+        self.generation = generation
+    }
 
     func onOutput(data: Data) {
-        Task { @MainActor [controller] in controller.received(data) }
+        Task { @MainActor [weak controller, generation] in
+            controller?.received(data, generation: generation)
+        }
     }
 
     func onClosed(exitStatus: UInt32?, error: String?) {
-        Task { @MainActor [controller] in controller.ended(status: exitStatus, error: error) }
+        Task { @MainActor [weak controller, generation] in
+            controller?.ended(status: exitStatus, error: error, generation: generation)
+        }
     }
 }
 

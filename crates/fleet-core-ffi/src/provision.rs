@@ -17,6 +17,7 @@ use crate::api::{FleetCore, lock};
 use crate::approvals::approve_err;
 use crate::types::FleetError;
 use crate::validate;
+use fleet_core::autorevert;
 use fleet_core::bulk::{BoxFut, BulkExecutor, Failure};
 use fleet_core::cache::Cache;
 use fleet_core::manager::{ManagerHandle, RequestOpts};
@@ -32,14 +33,10 @@ use fleet_proto::args::SudoPasswordHash;
 use fleet_proto::op::{ProfileLevel, ProfilePhase, ProfileSource, ProfileSpec};
 use fleet_proto::payload::{ModuleStatus, ProfilePlan};
 use fleet_proto::{
-    Actor, ApprovalItem, ChangeId, Hash32, Op, Payload, RootApproval, ServerId,
-    SignedRoster, args::ModuleId,
+    Actor, ApprovalItem, ChangeId, Hash32, Op, Payload, RootApproval, ServerId, SignedRoster,
+    args::ModuleId,
 };
 use std::sync::Arc;
-use std::time::Duration;
-
-/// Reconnect + `change.confirm` (the default policy reverts after 60 s).
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(45);
 
 fn perr(e: impl std::fmt::Display) -> FleetError {
     FleetError::Provision {
@@ -199,15 +196,27 @@ pub struct AuditFixResultRow {
     pub confirmed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct CloudInitExportRow {
     /// Contains the new host **private** key: save it only where the
-    /// operator chose (save panel), never log it.
+    /// operator chose (save panel, file created 0600), never log it.
     pub yaml: String,
-    /// Pass to `pin_cloud_init_host_key` for the server created from it.
+    /// Pass to `pin_cloud_init_host_key` for the server created from it
+    /// (single use: consumed by the pin).
     pub export_id: String,
     /// SHA-256 fingerprint of the host key (`SHA256:…`).
     pub fingerprint: String,
+}
+
+/// Never prints the YAML (it holds the host private key).
+impl std::fmt::Debug for CloudInitExportRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudInitExportRow")
+            .field("yaml", &"<redacted>")
+            .field("export_id", &self.export_id)
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
 }
 
 // ---- conversions ----
@@ -334,7 +343,9 @@ fn groups(plan: &[pv::PlanChange]) -> Vec<PlanGroupRow> {
     out
 }
 
-fn state_row(st: &ProvisionState) -> ProvisionStateRow {
+/// `skew_ms`: agent clock minus ours, so the countdown shown for the
+/// agent's auto-revert deadline runs on this Mac's clock.
+fn state_row(st: &ProvisionState, skew_ms: Option<i64>) -> ProvisionStateRow {
     ProvisionStateRow {
         server_id: st.server_id.clone(),
         choice: choice_row(&st.choice),
@@ -351,7 +362,9 @@ fn state_row(st: &ProvisionState) -> ProvisionStateRow {
         score_before: st.score_before,
         score_after: st.score_after,
         profile_score: st.profile_score,
-        pending_deadline_ms: st.pending_deadline_ms,
+        pending_deadline_ms: st
+            .pending_deadline_ms
+            .map(|d| fleet_core::autorevert::local_deadline(d, skew_ms)),
         modules: st
             .modules
             .iter()
@@ -445,28 +458,50 @@ struct Adapter {
     handle: ManagerHandle,
 }
 
+/// Cache setting (encrypted at rest) holding the sudo password a
+/// provisioning run sends, so a resumed run sends the same one.
+pub(crate) fn sudo_secret_key(id: &ServerId) -> String {
+    format!("provision-sudo/{id}")
+}
+
 impl Adapter {
-    /// The server's sudo password: the synced one, else a new one (synced
-    /// if sync is set up, Keychain always). Plaintext only in memory.
+    /// The server's sudo password, chosen once per provisioning run: the
+    /// one saved by an earlier attempt, else the synced one, else a new
+    /// one. It is saved (encrypted cache) **before** it is ever sent, then
+    /// put into the Keychain and sync (idempotent), so a resumed run sends
+    /// the same password the Keychain holds. Plaintext only in memory.
     fn sudo_password(&self, id: &ServerId) -> Result<Zeroizing<String>, String> {
-        let _ = self.core.ensure_sudo_password(id.to_string());
-        let synced = lock(&self.core.fleet.sync)
-            .as_ref()
-            .and_then(|e| e.get(Collection::SudoPasswords, id.as_str()).ok().flatten())
-            .map(|r| Zeroizing::new(r.body));
-        if let Some(body) = synced {
-            let s = std::str::from_utf8(&body).map_err(|_| "bad sudo password record")?;
-            if fleet_core::sudo::is_valid(s) {
-                return Ok(Zeroizing::new(s.to_string()));
+        let key = sudo_secret_key(id);
+        let valid = |b: &[u8]| {
+            std::str::from_utf8(b)
+                .ok()
+                .filter(|s| fleet_core::sudo::is_valid(s))
+                .map(|s| Zeroizing::new(s.to_string()))
+        };
+        let saved = lock(&self.core.cache)
+            .secret_setting(&key)
+            .map_err(|e| e.to_string())?
+            .and_then(|b| valid(&b));
+        let pw = match saved {
+            Some(pw) => pw,
+            None => {
+                let synced = lock(&self.core.fleet.sync)
+                    .as_ref()
+                    .and_then(|e| e.get(Collection::SudoPasswords, id.as_str()).ok().flatten())
+                    .map(|r| Zeroizing::new(r.body));
+                let pw = match synced.and_then(|b| valid(&b)) {
+                    Some(pw) => pw,
+                    None => fleet_core::sudo::generate().map_err(|_| "rng")?,
+                };
+                lock(&self.core.cache)
+                    .set_secret_setting(&key, pw.as_bytes())
+                    .map_err(|e| format!("can't save the sudo password: {e}"))?;
+                pw
             }
-        }
-        // No sync: Keychain only (a resumed run sets a fresh one).
-        let pw = fleet_core::sudo::generate().map_err(|_| "rng")?;
+        };
         self.core
-            .secrets()
-            .map_err(|e| format!("can't store the sudo password: {e}"))?
-            .store_sudo_password(id.to_string(), pw.to_string())
-            .map_err(|e| format!("can't store the sudo password: {e:?}"))?;
+            .put_sudo_password(id, &pw)
+            .map_err(|e| format!("can't store the sudo password: {e}"))?;
         Ok(pw)
     }
 }
@@ -581,23 +616,31 @@ impl ProvisionBackend for Adapter {
         &self,
         server: &ServerId,
         change: ChangeId,
+        deadline_ms: u64,
     ) -> BoxFut<Result<(), ConfirmFailure>> {
         let h = self.handle.clone();
         let server = server.clone();
         Box::pin(async move {
-            fleet_core::confirm::confirm_on_new_connection(
-                &h,
-                &server,
-                change,
-                Actor::Human,
-                CONFIRM_TIMEOUT,
-            )
-            .await
-            .map_err(|e| match e {
-                fleet_core::confirm::ConfirmError::Reverted => ConfirmFailure::Reverted,
+            let res = match autorevert::confirm_window(
+                deadline_ms,
+                h.clock_skew_ms(&server),
+                fleet_core::now_ms(),
+                autorevert::CONFIRM_TIMEOUT,
+            ) {
+                Ok(window) => {
+                    autorevert::confirm_fresh(&h, &server, change, Actor::Human, window).await
+                }
+                Err(e) => Err(e),
+            };
+            res.map_err(|e| match e {
+                autorevert::ConfirmError::Reverted => ConfirmFailure::Reverted,
                 other => ConfirmFailure::Other(other.to_string()),
             })
         })
+    }
+
+    fn clock_skew_ms(&self, server: &ServerId) -> Option<i64> {
+        self.handle.clock_skew_ms(server)
     }
 
     fn add_to_fleet(
@@ -624,6 +667,10 @@ impl ProvisionBackend for Adapter {
                 .set_setting(&profile_key(server), &raw)
                 .map_err(|e| e.to_string())?;
         }
+        // The run is over: the Keychain and sync hold the password now.
+        cache
+            .set_setting(&sudo_secret_key(server), &[])
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -665,7 +712,7 @@ impl FleetCore {
         }
         let st = ProvisionState::new(&id, ch, &rec.target.user);
         save_state(&cache, &st)?;
-        Ok(state_row(&st))
+        Ok(state_row(&st, None))
     }
 
     /// The saved wizard state, if provisioning was started.
@@ -674,7 +721,10 @@ impl FleetCore {
         server_id: String,
     ) -> Result<Option<ProvisionStateRow>, FleetError> {
         let id = validate::server_id(&server_id)?;
-        Ok(load_state(&lock(&self.cache), &id)?.as_ref().map(state_row))
+        let skew = self.clock_skew(&id);
+        Ok(load_state(&lock(&self.cache), &id)?
+            .as_ref()
+            .map(|st| state_row(st, skew)))
     }
 
     /// Servers with provisioning started but not finished.
@@ -685,7 +735,7 @@ impl FleetCore {
             if let Some(st) = load_state(&cache, &s.id)?
                 && st.step != Step::Done
             {
-                out.push(state_row(&st));
+                out.push(state_row(&st, self.clock_skew(&s.id)));
             }
         }
         Ok(out)
@@ -703,7 +753,7 @@ impl FleetCore {
         let mut st = load_state(&cache, &id)?.ok_or_else(|| perr("not started"))?;
         st.approve_plan(&hash).map_err(perr)?;
         save_state(&cache, &st)?;
-        Ok(state_row(&st))
+        Ok(state_row(&st, None))
     }
 
     /// Forgets the wizard state (changes already applied stay).
@@ -726,6 +776,7 @@ impl FleetCore {
         let core = self.clone();
         let listener: Arc<dyn ProvisionListener> = Arc::from(listener);
         self.on_core(async move {
+            let skew = handle.clock_skew_ms(&id);
             let backend = Adapter { core, handle };
             let l = listener.clone();
             let r = pv::advance(&backend, &mut st, &ProvisionConfig::default(), move |e| {
@@ -733,7 +784,7 @@ impl FleetCore {
             })
             .await;
             match r {
-                Ok(_) => Ok(state_row(&st)),
+                Ok(_) => Ok(state_row(&st, skew)),
                 Err(e) => Err(perr(e)),
             }
         })
@@ -829,7 +880,7 @@ impl FleetCore {
         };
         let p = self.request_opts(&server_id, op, None).await?;
         let pending = match &p {
-            Payload::ChangePending { change, .. } => Some(change.change_id),
+            Payload::ChangePending { change, .. } => Some(change.clone()),
             _ => None,
         };
         let Payload::ProfileApplied(a) = p.result().clone() else {
@@ -840,15 +891,9 @@ impl FleetCore {
             let (h, _) = self.running()?;
             let sid = id.clone();
             self.on_core(async move {
-                fleet_core::confirm::confirm_on_new_connection(
-                    &h,
-                    &sid,
-                    change,
-                    Actor::Human,
-                    CONFIRM_TIMEOUT,
-                )
-                .await
-                .map_err(perr)
+                autorevert::confirm_pending(&h, &sid, &change, Actor::Human)
+                    .await
+                    .map_err(perr)
             })
             .await?;
             confirmed = true;
@@ -921,11 +966,18 @@ impl FleetCore {
             })?;
         let key = fleet_core::ssh::HostKey::from_blob(&blob)?;
         cache.pin_host_key(&id, &key)?;
+        // Single use: one exported host key, one server.
+        cache.set_setting(&format!("cloudinit/{export_id}"), &[])?;
         Ok(())
     }
 }
 
 impl FleetCore {
+    /// Agent clock minus ours on `id`'s current link, if connected.
+    fn clock_skew(&self, id: &ServerId) -> Option<i64> {
+        self.running().ok().and_then(|(h, _)| h.clock_skew_ms(id))
+    }
+
     /// The fix spec: the profile the server was provisioned with (so role
     /// exceptions, source ranges and the reboot window stay), plain
     /// Baseline otherwise; `only = [module]`.

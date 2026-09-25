@@ -13,6 +13,8 @@ workspace = true
 fleet-proto.workspace = true
 fleet-crypto.workspace = true
 fleet-debver.workspace = true
+# `compose` (the pure compose.deploy validator, shared with the Mac core).
+fleet-compose.workspace = true
 # process: child programs (fixed paths, argv only).
 tokio = { workspace = true, features = ["process"] }
 thiserror.workspace = true
@@ -26,7 +28,6 @@ toml.workspace = true
 x509-parser.workspace = true
 sha2.workspace = true
 blake3.workspace = true
-yaml-rust2.workspace = true
 miniz_oxide.workspace = true
 libc.workspace = true
 rustix.workspace = true

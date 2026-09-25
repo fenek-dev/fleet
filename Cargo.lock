@@ -1189,6 +1189,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-compose"
+version = "0.1.0"
+dependencies = [
+ "fleet-proto",
+ "proptest",
+ "yaml-rust2",
+]
+
+[[package]]
 name = "fleet-core"
 version = "0.1.0"
 dependencies = [
@@ -1196,6 +1205,7 @@ dependencies = [
  "bzip2",
  "flate2",
  "fleet-cloudinit",
+ "fleet-compose",
  "fleet-crypto",
  "fleet-debver",
  "fleet-proto",
@@ -1216,7 +1226,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
- "yaml-rust2",
 ]
 
 [[package]]
@@ -1304,6 +1313,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bollard",
+ "fleet-compose",
  "fleet-crypto",
  "fleet-debver",
  "fleet-proto",
@@ -1320,7 +1330,6 @@ dependencies = [
  "tokio",
  "toml",
  "x509-parser",
- "yaml-rust2",
  "zbus",
 ]
 

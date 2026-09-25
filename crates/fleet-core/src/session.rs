@@ -139,10 +139,14 @@ pub enum SessionMode {
 
 /// Signs `DeviceAuth` and commands. On a Mac the P-256 keys are Secure
 /// Enclave callbacks; the recovery key exists only in memory during recovery.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum CommandSigner<'a> {
     P256(&'a dyn Signer),
     Recovery(&'a Ed25519Signer),
+    /// A key behind a blocking callback (the Secure Enclave via Swift):
+    /// session paths sign it on tokio's blocking pool, so a slow or
+    /// prompting signature never stalls the core runtime.
+    Blocking(std::sync::Arc<dyn Signer + Send + Sync>),
 }
 
 impl CommandSigner<'_> {
@@ -150,6 +154,21 @@ impl CommandSigner<'_> {
         match self {
             CommandSigner::P256(s) => sig::p256_sign(*s, msg).map_err(ClientError::Crypto),
             CommandSigner::Recovery(k) => Ok(k.sign(msg)),
+            CommandSigner::Blocking(s) => sig::p256_sign(&**s, msg).map_err(ClientError::Crypto),
+        }
+    }
+
+    /// [`CommandSigner::sign`], off the runtime thread for `Blocking`.
+    async fn sign_async(&self, msg: Vec<u8>) -> Result<Signature, ClientError> {
+        match self {
+            CommandSigner::Blocking(s) => {
+                let s = s.clone();
+                tokio::task::spawn_blocking(move || sig::p256_sign(&*s, &msg))
+                    .await
+                    .map_err(|_| ClientError::Crypto(fleet_crypto::Error::Signer))?
+                    .map_err(ClientError::Crypto)
+            }
+            other => other.sign(&msg),
         }
     }
 }
@@ -384,7 +403,7 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         let auth = Message::DeviceAuth {
             device_id: cfg.device_id,
             key: cfg.key,
-            sig: cfg.signer.sign(&auth_msg)?,
+            sig: cfg.signer.sign_async(auth_msg).await?,
         };
         let mut s = Session {
             stream,
@@ -492,6 +511,15 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         &self.hello
     }
 
+    /// Agent clock minus ours at connect, from the advisory `Hello` time
+    /// (display and countdowns only; never a trust decision).
+    pub fn clock_skew_ms(&self) -> Option<i64> {
+        (self.hello.time_ms != 0).then(|| {
+            let d = i128::from(self.hello.time_ms) - i128::from(self.session_start_ms);
+            d.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        })
+    }
+
     /// Agent state verified at connect (see [`VerifiedStatus`]).
     pub fn status(&self) -> &VerifiedStatus {
         &self.status
@@ -570,6 +598,33 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         approval: Option<RootApproval>,
         opts: &CommandOpts,
     ) -> Result<SignedCommand, ClientError> {
+        let (body, msg) = self.command_message(op, server_id, actor, opts)?;
+        let signature = self.cfg.signer.sign(&msg)?;
+        Ok(self.envelope(body, signature, approval))
+    }
+
+    /// [`Session::build_command`], signing off the runtime thread when the
+    /// signer blocks ([`CommandSigner::Blocking`]).
+    async fn build_command_async(
+        &self,
+        op: Op,
+        server_id: &ServerId,
+        actor: Actor,
+        approval: Option<RootApproval>,
+        opts: &CommandOpts,
+    ) -> Result<SignedCommand, ClientError> {
+        let (body, msg) = self.command_message(op, server_id, actor, opts)?;
+        let signature = self.cfg.signer.sign_async(msg).await?;
+        Ok(self.envelope(body, signature, approval))
+    }
+
+    fn command_message(
+        &self,
+        op: Op,
+        server_id: &ServerId,
+        actor: Actor,
+        opts: &CommandOpts,
+    ) -> Result<(Vec<u8>, Vec<u8>), ClientError> {
         let mut nonce = [0u8; 16];
         fleet_crypto::random_bytes(&mut nonce)?;
         let body = encode(&CommandBody {
@@ -584,13 +639,22 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
             expected_version: opts.expected_version,
         });
         let msg = SignedCommand::signed_message(self.cfg.key, &self.cfg.device_id, &body);
-        Ok(SignedCommand {
-            signature: self.cfg.signer.sign(&msg)?,
+        Ok((body, msg))
+    }
+
+    fn envelope(
+        &self,
+        body: Vec<u8>,
+        signature: Signature,
+        approval: Option<RootApproval>,
+    ) -> SignedCommand {
+        SignedCommand {
+            signature,
             body,
             device_id: self.cfg.device_id,
             key: self.cfg.key,
             approval,
-        })
+        }
     }
 
     /// Signs and sends `op`, returning the verified reply.
@@ -601,7 +665,9 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         actor: Actor,
         approval: Option<RootApproval>,
     ) -> Result<Reply, ClientError> {
-        let cmd = self.build_command(op, server_id, actor, approval, &CommandOpts::default())?;
+        let cmd = self
+            .build_command_async(op, server_id, actor, approval, &CommandOpts::default())
+            .await?;
         self.send(&cmd).await
     }
 
@@ -645,7 +711,9 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
         opts: &CommandOpts,
     ) -> Result<PendingReply, ClientError> {
         let server = self.cfg.server_id.clone();
-        let cmd = self.build_command(op, &server, actor, approval, opts)?;
+        let cmd = self
+            .build_command_async(op, &server, actor, approval, opts)
+            .await?;
         self.start_send(cmd).await
     }
 
@@ -713,7 +781,9 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> Session<'a, S> {
     ) -> Result<(RequestId, mpsc::Receiver<StreamEvent>), ClientError> {
         self.flush_cancels().await?;
         let server = self.cfg.server_id.clone();
-        let cmd = self.build_command(op, &server, actor, None, &CommandOpts::default())?;
+        let cmd = self
+            .build_command_async(op, &server, actor, None, &CommandOpts::default())
+            .await?;
         let id = self.next_id();
         // One extra slot, reserved for the End event.
         let (tx, rx) = mpsc::channel(STREAM_QUEUE + 1);

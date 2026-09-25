@@ -183,12 +183,7 @@ mod tests {
         }
     }
 
-    fn block_on<F: Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(f)
-    }
+    use crate::testutil::block_on;
 
     #[test]
     fn fans_out_every_kind_to_every_server() {

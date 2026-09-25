@@ -18,10 +18,6 @@ use fleet_core::bulk::{
 use fleet_core::confirm::ConfirmingExecutor;
 use fleet_core::enroll::{SETTING_DEVICE_ID, SETTING_FLEET_ID};
 use fleet_core::opspec;
-
-/// Reconnect + `change.confirm` of an auto-revert answer (default policy
-/// reverts after 60 s).
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(45);
 use fleet_core::runbook::{
     self, Runbook, RunbookEvent, RunbookParam, RunbookStep, Schedule, Snippet, StepCondition,
 };
@@ -667,10 +663,7 @@ impl FleetCore {
         let mut opts = self::options(&options)?;
         let (handle, _) = self.running()?;
         // Auto-revert answers are confirmed over a fresh connection.
-        let exec: Arc<dyn BulkExecutor> = Arc::new(ConfirmingExecutor {
-            handle,
-            timeout: CONFIRM_TIMEOUT,
-        });
+        let exec: Arc<dyn BulkExecutor> = Arc::new(ConfirmingExecutor { handle });
         if health {
             opts.health = Some(Arc::new(AgentHealthProbe {
                 exec: exec.clone(),
@@ -856,10 +849,7 @@ impl FleetCore {
             .map_err(|e| invalid(&e.to_string()))?;
         let ops = rb.ops(&values).map_err(|e| invalid(&e.to_string()))?;
         let (handle, _) = self.running()?;
-        let exec: Arc<dyn BulkExecutor> = Arc::new(ConfirmingExecutor {
-            handle,
-            timeout: CONFIRM_TIMEOUT,
-        });
+        let exec: Arc<dyn BulkExecutor> = Arc::new(ConfirmingExecutor { handle });
         let approver = if ops
             .iter()
             .any(|op| opspec::needs_approval(op) || op.may_escalate())

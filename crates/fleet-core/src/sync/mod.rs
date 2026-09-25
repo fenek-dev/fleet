@@ -59,6 +59,15 @@ pub enum SyncError {
     TooLarge,
     #[error("no such conflict or pin change")]
     NotFound,
+    /// Key box or escrow not signed by a Mac in the current roster.
+    #[error("sealed sync key not signed by a Mac in the roster")]
+    Sealer,
+    /// Two different rosters with the same epoch and version.
+    #[error("roster fork at epoch {epoch} version {version}")]
+    RosterFork { epoch: u32, version: u64 },
+    /// Stamped implausibly far in the future (quarantined, not merged).
+    #[error("record stamped in the future")]
+    FutureStamp,
     #[error(transparent)]
     Cache(#[from] crate::cache::CacheError),
 }
@@ -171,8 +180,9 @@ impl HlcClock {
     }
 }
 
-/// One synced item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One synced item. `Debug` never prints the body (sudo passwords ride in
+/// records).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRecord {
     pub collection: Collection,
     pub key: String,
@@ -183,6 +193,20 @@ pub struct SyncRecord {
     pub author: DeviceId,
     pub deleted: bool,
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for SyncRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncRecord")
+            .field("collection", &self.collection)
+            .field("key", &self.key)
+            .field("hlc", &self.hlc)
+            .field("base", &self.base)
+            .field("author", &self.author)
+            .field("deleted", &self.deleted)
+            .field("body", &format_args!("<{} bytes>", self.body.len()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,10 +230,19 @@ pub fn sign_record(record: SyncRecord, device: &dyn Signer) -> Result<SignedReco
     Ok(SignedRecord { record, sig })
 }
 
+/// Whether `author` is listed in the latest roster of `chain`.
+pub fn author_current(author: &DeviceId, chain: &[SignedRoster]) -> bool {
+    chain
+        .last()
+        .is_some_and(|l| l.roster.device(author).is_some())
+}
+
 /// Checks the author's device-key signature against the roster chain
 /// (oldest first). The author must be listed in some roster; if it was
 /// later removed, only records stamped before the removing roster was
-/// issued are accepted.
+/// issued are accepted. (A removed author's *new* records are refused
+/// by the engine regardless of their stamp; this rule governs rows kept
+/// from before the removal.)
 pub fn verify_record(sr: &SignedRecord, chain: &[SignedRoster]) -> Result<(), SyncError> {
     let r = &sr.record;
     if r.hlc.node != r.author || r.body.len() > MAX_BODY {
@@ -243,21 +276,33 @@ pub struct CloudRecord {
 pub enum Blob {
     /// A [`SignedRecord`] sealed with the sync key `key_id`.
     Record { key_id: [u8; 8], sealed: Vec<u8> },
-    /// The sync key sealed to the recovery escrow key (design §5.11).
+    /// The sync key sealed to the recovery escrow key (design §5.11),
+    /// signed by the sealing Mac's device key ([`keys::SealedBy`]).
     Escrow {
         fleet_id: FleetId,
         key_id: [u8; 8],
         sealed: Sealed,
+        signer: DeviceId,
+        sig: Signature,
     },
-    /// The sync key sealed to one Mac's key-agreement key.
+    /// The sync key sealed to one Mac's key-agreement key, signed by the
+    /// sealing Mac's device key.
     KeyBox {
         fleet_id: FleetId,
         device_id: DeviceId,
         key_id: [u8; 8],
         sealed: Sealed,
+        signer: DeviceId,
+        sig: Signature,
     },
     /// Pairing answer (public data, checked by the SAS; design §5.12).
     Pairing(PairingResponse),
+    /// The joining Mac's revealed pairing secret (commit-reveal: the offer
+    /// carried only its hash; revealed after the answer was fixed).
+    PairingReveal {
+        offer_nonce: [u8; 16],
+        reveal: [u8; 16],
+    },
 }
 
 /// Signer of a roster: the device that made a change (for alerts).

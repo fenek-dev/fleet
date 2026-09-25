@@ -609,7 +609,7 @@ async fn confirm_goes_over_a_new_connection() {
             h.add_server(spec(1));
             wait_state(&h, &sid(1), ConnState::Ready).await;
             let before = fake.attempts.borrow()[&sid(1)];
-            fleet_core::confirm::confirm_on_new_connection(&h, &sid(1), [7; 16], Actor::Human, T)
+            fleet_core::autorevert::confirm_fresh(&h, &sid(1), [7; 16], Actor::Human, T)
                 .await
                 .unwrap();
             let sent = fake.sent.borrow().clone();

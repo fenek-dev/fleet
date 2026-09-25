@@ -32,11 +32,14 @@ use crate::cache::{Cache, CacheError, RosterRow};
 use crate::runner::{OpRunner, RunError};
 use crate::signer::{DeviceSigner, KeyRole, RoleSigner, SignerError, root_reason};
 use fleet_crypto::approval::{ApprovalParams, build_approvals, op_digest};
-use fleet_crypto::roster::{RecoveryClock, RosterError, evaluate, roster_hash, sign_root};
+use fleet_crypto::roster::{
+    RecoveryClock, RosterError, effective_recovery_delay_s, evaluate, roster_hash, sign_root,
+};
 use fleet_crypto::sig::p256_key;
 use fleet_proto::{
     Actor, ApprovalItem, BoundedString, Device, DeviceId, ErrorCode, FleetId, Hash32, KeyRef, Op,
-    P256Public, Payload, Role, Roster, ServerId, SignedRoster, X25519Public, decode, encode,
+    P256Public, Payload, Role, Roster, ServerId, Signature, SignedRoster, X25519Public, decode,
+    encode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +80,10 @@ pub enum RosterMgmtError {
     Cache(#[from] CacheError),
     #[error("no roster in the cache")]
     NoRoster,
+    /// Two different rosters claim the same position (design §5.3 rule 1
+    /// forbids it): someone signed conflicting updates.
+    #[error("roster fork: two different rosters at epoch {epoch} version {version}")]
+    Fork { epoch: u32, version: u64 },
 }
 
 /// What the new Mac shows (design §5.12 step 1).
@@ -92,12 +99,33 @@ pub struct PairingOffer {
     pub noise_static: X25519Public,
     /// Secure Enclave P-256 key-agreement key, uncompressed SEC1 (65 bytes).
     pub agreement_key: Vec<u8>,
+    /// Device key over the agreement key (`sync::keys::agreement_message`):
+    /// binds it to this Mac's identity.
+    pub agreement_sig: Signature,
+    /// Public: names the pairing records.
     pub nonce: [u8; 16],
+    /// Commitment to the secret revealed after the answer is fixed
+    /// ([`commit`]); the SAS covers the revealed secret too.
+    pub commit: Hash32,
     pub created_ms: u64,
 }
 
+/// An offer's `created_ms` may be at most this far ahead of our clock.
+pub const OFFER_FUTURE_SKEW_MS: u64 = 60 * 1000;
+const COMMIT_DOMAIN: &[u8] = b"fleet/pairing-commit/v1";
+
+/// `H(domain ‖ offer nonce ‖ reveal)`: what the offer commits to.
+pub fn commit(nonce: &[u8; 16], reveal: &[u8; 16]) -> Hash32 {
+    let mut m = COMMIT_DOMAIN.to_vec();
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(reveal);
+    fleet_crypto::blake3(&m)
+}
+
 impl PairingOffer {
-    /// Collects this Mac's public keys.
+    /// Collects this Mac's public keys (signing its agreement key with the
+    /// device key). Returns the offer and the secret to reveal once the
+    /// answer has arrived.
     pub fn build(
         keys: &dyn DeviceSigner,
         agreement_key: Vec<u8>,
@@ -105,9 +133,14 @@ impl PairingOffer {
         device_id: DeviceId,
         name: &str,
         now_ms: u64,
-    ) -> Result<Self, RosterMgmtError> {
+    ) -> Result<(Self, [u8; 16]), RosterMgmtError> {
         let mut nonce = [0u8; 16];
         fleet_crypto::random_bytes(&mut nonce)?;
+        let mut reveal = [0u8; 16];
+        fleet_crypto::random_bytes(&mut reveal)?;
+        let device = RoleSigner::new(keys, KeyRole::Device)?;
+        let doc = crate::sync::keys::DeviceKeysDoc::sign(&device_id, agreement_key, &device)
+            .map_err(|_| RosterMgmtError::BadKey)?;
         let o = Self {
             device_id,
             name: name.trim().to_string(),
@@ -117,12 +150,27 @@ impl PairingOffer {
             ssh_key: keys.public_key(KeyRole::Ssh)?,
             monitor_ssh_key: keys.public_key(KeyRole::MonitorSsh)?,
             noise_static,
-            agreement_key,
+            agreement_key: doc.agreement,
+            agreement_sig: doc.sig,
             nonce,
+            commit: commit(&nonce, &reveal),
             created_ms: now_ms,
         };
         o.check(now_ms)?;
-        Ok(o)
+        Ok((o, reveal))
+    }
+
+    /// Whether `reveal` opens this offer's commitment.
+    pub fn check_reveal(&self, reveal: &[u8; 16]) -> bool {
+        commit(&self.nonce, reveal) == self.commit
+    }
+
+    /// The self-signed agreement key, as a `DeviceKeys` record body.
+    pub fn device_keys_doc(&self) -> crate::sync::keys::DeviceKeysDoc {
+        crate::sync::keys::DeviceKeysDoc {
+            agreement: self.agreement_key.clone(),
+            sig: self.agreement_sig,
+        }
     }
 
     /// `FLEETPAIR1-` + uppercase hex of the encoding + 4-byte checksum
@@ -158,10 +206,13 @@ impl PairingOffer {
 
     fn check(&self, now_ms: u64) -> Result<(), RosterMgmtError> {
         if now_ms.saturating_sub(self.created_ms) > OFFER_TTL_MS
-            || self.created_ms > now_ms.saturating_add(OFFER_TTL_MS)
+            || self.created_ms > now_ms.saturating_add(OFFER_FUTURE_SKEW_MS)
         {
             return Err(RosterMgmtError::Expired);
         }
+        let agreement = crate::sync::keys::agreement_message(&self.device_id, &self.agreement_key);
+        fleet_crypto::sig::p256_verify(&self.device_key, &agreement, &self.agreement_sig)
+            .map_err(|_| RosterMgmtError::BadKey)?;
         bounded_name(&self.name)?;
         for k in [
             &self.root_key,
@@ -223,11 +274,16 @@ impl PairingResponse {
     }
 }
 
-/// The six-digit verification code both screens show (design §5.12 step 2).
-pub fn sas(offer: &PairingOffer, resp: &PairingResponse) -> String {
+/// The six-digit verification code both screens show (design §5.12 step
+/// 2), over the offer, the answer and the revealed secret. The offer
+/// commits to `reveal` before the answer's nonce is chosen, and `reveal`
+/// is disclosed only after the answer is fixed, so neither side (nor an
+/// attacker in the middle) can grind for a matching code.
+pub fn sas(offer: &PairingOffer, resp: &PairingResponse, reveal: &[u8; 16]) -> String {
     let mut m = SAS_DOMAIN.to_vec();
     m.extend_from_slice(&encode(offer));
     m.extend_from_slice(&encode(resp));
+    m.extend_from_slice(reveal);
     let h = fleet_crypto::blake3(&m);
     let n = u32::from_le_bytes([h[0], h[1], h[2], h[3]]) % 1_000_000;
     format!("{n:06}")
@@ -382,33 +438,77 @@ pub fn store_own(cache: &Cache, s: &SignedRoster) -> Result<(), RosterMgmtError>
     Ok(())
 }
 
+/// When a link is judged: `min(now, max(prev.issued_at, link.issued_at))`.
+/// Not the link's own claim alone (a backdated link could reopen a closed
+/// rotation window), never later than now (a link stamped in the future
+/// can't close one early), and never before its predecessor.
+pub fn link_eval_time(prev: &Roster, link: &Roster, now_ms: u64) -> u64 {
+    now_ms.min(prev.issued_at_ms.max(link.issued_at_ms))
+}
+
+/// `settings` key prefix of a recovery roster held back until a server
+/// reports it active (`roster_pending/<epoch>-<version>`).
+pub const PENDING_PREFIX: &str = "roster_pending/";
+
+fn pending_key(epoch: u32, version: u64) -> String {
+    format!("{PENDING_PREFIX}{epoch:010}-{version:020}")
+}
+
 /// Caches a roster copy from sync (or a server), after checking it links
 /// to a roster already in the chain: rule 1 for a normal update, rule 3
 /// against any roster of the previous epoch for a recovery roster. Judged
-/// at the roster's own `issued_at_ms`. Returns whether it was new.
+/// at [`link_eval_time`]. Returns whether it was added.
+///
+/// - A different roster with the same `(epoch, version)` as one already in
+///   the chain is a **fork**: [`RosterMgmtError::Fork`], never a silent drop.
+/// - A recovery roster that waits out a recovery delay on the servers is
+///   kept *pending* (not in the chain) until a server reports it active
+///   ([`set_seen`] → [`activate_pending`]): it may still be vetoed.
 pub fn store_chain_link(cache: &Cache, s: &SignedRoster) -> Result<bool, RosterMgmtError> {
+    store_chain_link_at(cache, s, crate::now_ms(), false)
+}
+
+fn store_chain_link_at(
+    cache: &Cache,
+    s: &SignedRoster,
+    now_ms: u64,
+    activated: bool,
+) -> Result<bool, RosterMgmtError> {
     let have = chain(cache)?;
     let (e, v) = (s.roster.epoch, s.roster.version);
-    if have
+    if let Some(same) = have
         .iter()
-        .any(|r| r.roster.epoch == e && r.roster.version == v)
+        .find(|r| r.roster.epoch == e && r.roster.version == v)
     {
+        if roster_hash(same) != roster_hash(s) {
+            return Err(RosterMgmtError::Fork {
+                epoch: e,
+                version: v,
+            });
+        }
         return Ok(false);
     }
-    let clock = RecoveryClock::at(s.roster.issued_at_ms);
     let ok = match s.signer {
         KeyRef::Root(_) => have
             .iter()
             .find(|r| r.roster.epoch == e && r.roster.version + 1 == v)
-            .map(|prev| evaluate(prev, &[], s, clock).map(|_| ())),
+            .map(|prev| {
+                let clock = RecoveryClock::at(link_eval_time(&prev.roster, &s.roster, now_ms));
+                evaluate(prev, &[], s, clock).map(|_| None)
+            }),
         KeyRef::Recovery => {
             let prev_epoch: Vec<&SignedRoster> =
                 have.iter().filter(|r| r.roster.epoch + 1 == e).collect();
             let hashes: Vec<Hash32> = prev_epoch.iter().map(|r| roster_hash(r)).collect();
             let mut last = None;
             for cur in &prev_epoch {
-                last = Some(evaluate(cur, &hashes, s, clock).map(|_| ()));
-                if matches!(last, Some(Ok(()))) {
+                let at = link_eval_time(&cur.roster, &s.roster, now_ms);
+                let clock = RecoveryClock::at(at);
+                last = Some(
+                    evaluate(cur, &hashes, s, clock)
+                        .map(|_| Some(effective_recovery_delay_s(&cur.roster, clock))),
+                );
+                if matches!(last, Some(Ok(_))) {
                     break;
                 }
             }
@@ -416,7 +516,12 @@ pub fn store_chain_link(cache: &Cache, s: &SignedRoster) -> Result<bool, RosterM
         }
     };
     match ok {
-        Some(Ok(())) => {
+        // A recovery that waits out a delay may still be vetoed: hold it.
+        Some(Ok(Some(delay))) if delay > 0 && !activated => {
+            cache.set_setting(&pending_key(e, v), &encode(s))?;
+            Ok(false)
+        }
+        Some(Ok(_)) => {
             cache.put_roster(&row(s))?;
             Ok(true)
         }
@@ -424,6 +529,51 @@ pub fn store_chain_link(cache: &Cache, s: &SignedRoster) -> Result<bool, RosterM
         // Its predecessor isn't here yet (sync order): not an error.
         None => Ok(false),
     }
+}
+
+/// Roster copies in chain order, identical duplicates removed; two
+/// different rosters at one `(epoch, version)` are a [`RosterMgmtError::Fork`].
+pub fn order_copies(mut rosters: Vec<SignedRoster>) -> Result<Vec<SignedRoster>, RosterMgmtError> {
+    rosters.sort_by_key(|r| (r.roster.epoch, r.roster.version));
+    let mut out: Vec<SignedRoster> = Vec::with_capacity(rosters.len());
+    for r in rosters {
+        if let Some(prev) = out.last()
+            && (prev.roster.epoch, prev.roster.version) == (r.roster.epoch, r.roster.version)
+        {
+            if roster_hash(prev) != roster_hash(&r) {
+                return Err(RosterMgmtError::Fork {
+                    epoch: r.roster.epoch,
+                    version: r.roster.version,
+                });
+            }
+            continue;
+        }
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// A recovery roster held back by [`store_chain_link`], if any.
+pub fn pending_link(
+    cache: &Cache,
+    epoch: u32,
+    version: u64,
+) -> Result<Option<SignedRoster>, RosterMgmtError> {
+    Ok(cache
+        .setting(&pending_key(epoch, version))?
+        .filter(|b| !b.is_empty())
+        .and_then(|b| decode(&b).ok()))
+}
+
+/// A server reported `(epoch, version)` as its roster: a held-back
+/// recovery roster with that position is active now and joins the chain.
+pub fn activate_pending(cache: &Cache, epoch: u32, version: u64) -> Result<bool, RosterMgmtError> {
+    let Some(s) = pending_link(cache, epoch, version)? else {
+        return Ok(false);
+    };
+    let added = store_chain_link_at(cache, &s, crate::now_ms(), true)?;
+    cache.set_setting(&pending_key(epoch, version), &[])?;
+    Ok(added)
 }
 
 /// Every roster after `(epoch, version)`, in order: what a server that
@@ -445,8 +595,13 @@ pub fn seen(cache: &Cache, server: &ServerId) -> Result<Option<(u32, u64)>, Cach
     }
 }
 
+/// Records what a server confirmed; a held-back recovery roster at that
+/// position is active on the server, so it joins the local chain
+/// ([`activate_pending`]; a failure there leaves it pending).
 pub fn set_seen(cache: &Cache, server: &ServerId, at: (u32, u64)) -> Result<(), CacheError> {
-    cache.set_setting(&format!("{SEEN_PREFIX}{server}"), &encode(&at))
+    cache.set_setting(&format!("{SEEN_PREFIX}{server}"), &encode(&at))?;
+    let _ = activate_pending(cache, at.0, at.1);
+    Ok(())
 }
 
 /// A server and the `(epoch, version)` it last confirmed, if any.
@@ -642,6 +797,10 @@ mod tests {
     }
 
     fn offer(m: &Mac, name: &str) -> PairingOffer {
+        offer_reveal(m, name).0
+    }
+
+    fn offer_reveal(m: &Mac, name: &str) -> (PairingOffer, [u8; 16]) {
         let agree = SoftwareP256Recipient::generate().unwrap();
         PairingOffer::build(&m.keys, agree.public().to_vec(), m.noise, m.id, name, NOW).unwrap()
     }
@@ -758,12 +917,72 @@ mod tests {
             Err(RosterMgmtError::Expired)
         ));
         assert!(PairingOffer::parse("FLEETPAIR1-00", NOW).is_err());
+        // Created more than a minute in our future: refused.
+        assert!(PairingOffer::parse(&code, NOW - OFFER_FUTURE_SKEW_MS + 1).is_ok());
+        assert!(matches!(
+            PairingOffer::parse(&code, NOW - OFFER_FUTURE_SKEW_MS - 1),
+            Err(RosterMgmtError::Expired)
+        ));
+        // The agreement key must be self-signed by the offered device key.
+        let mut forged = o.clone();
+        forged.agreement_key = SoftwareP256Recipient::generate().unwrap().public().to_vec();
+        assert!(matches!(
+            PairingOffer::parse(&forged.to_code(), NOW),
+            Err(RosterMgmtError::BadKey)
+        ));
     }
 
     #[test]
-    fn sas_binds_both_sides() {
+    fn forks_are_errors_and_link_time_is_bounded() {
+        let a = mac(1);
+        let g = genesis(&a);
+        let cache = Cache::open_in_memory().unwrap();
+        store_own(&cache, &g).unwrap();
+        let v2a = sign_next(
+            &a.keys,
+            a.id,
+            &g,
+            next_roster(&g, g.roster.devices.clone(), NOW + 10),
+            "x",
+            1,
+            NOW + 10,
+        )
+        .unwrap();
+        let v2b = sign_next(
+            &a.keys,
+            a.id,
+            &g,
+            next_roster(&g, g.roster.devices.clone(), NOW + 20),
+            "y",
+            1,
+            NOW + 20,
+        )
+        .unwrap();
+        assert!(store_chain_link(&cache, &v2a).unwrap());
+        assert!(
+            !store_chain_link(&cache, &v2a).unwrap(),
+            "same roster: no-op"
+        );
+        assert!(matches!(
+            store_chain_link(&cache, &v2b),
+            Err(RosterMgmtError::Fork {
+                epoch: 0,
+                version: 2
+            })
+        ));
+        // Evaluation time: never before the predecessor, never after now.
+        let (mut p, mut l) = (g.roster.clone(), g.roster.clone());
+        p.issued_at_ms = 100;
+        l.issued_at_ms = 50;
+        assert_eq!(link_eval_time(&p, &l, 1_000), 100);
+        l.issued_at_ms = 5_000;
+        assert_eq!(link_eval_time(&p, &l, 1_000), 1_000);
+    }
+
+    #[test]
+    fn sas_binds_both_sides_and_the_revealed_secret() {
         let (a, b) = (mac(1), mac(2));
-        let o = offer(&b, "New");
+        let (o, reveal) = offer_reveal(&b, "New");
         let r = PairingResponse::new(
             &o,
             FleetId([9; 16]),
@@ -773,15 +992,21 @@ mod tests {
             a.keys.root.public(),
         )
         .unwrap();
-        let code = sas(&o, &r);
+        // Commit-reveal: only the committed secret opens the offer.
+        assert!(o.check_reveal(&reveal));
+        assert!(!o.check_reveal(&[0; 16]));
+        let code = sas(&o, &r, &reveal);
         assert_eq!(code.len(), 6);
         assert!(code.bytes().all(|c| c.is_ascii_digit()));
-        assert_eq!(sas(&o, &r), code, "deterministic");
+        assert_eq!(sas(&o, &r, &reveal), code, "deterministic");
         let swapped = offer(&mac(3), "Evil");
-        assert_ne!(sas(&swapped, &r), code);
+        assert_ne!(sas(&swapped, &r, &reveal), code);
         let mut r2 = r.clone();
         r2.by_root_key = b.keys.root.public();
-        assert_ne!(sas(&o, &r2), code);
+        assert_ne!(sas(&o, &r2, &reveal), code);
+        let mut other = reveal;
+        other[0] ^= 1;
+        assert_ne!(sas(&o, &r, &other), code);
         assert_ne!(
             pairing_record_name(&o.nonce, "response"),
             pairing_record_name(&o.nonce, "keybox")

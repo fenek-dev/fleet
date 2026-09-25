@@ -28,8 +28,8 @@
 //! - [`autorevert`]: confirming auto-revert changes from a fresh connection
 //!   (§4.10), wrapped by [`confirm`] for bulk/provisioning/MCP;
 //!   [`mesh_orch`]: fleet-level WireGuard mesh (§2.5);
-//!   [`compose_check`]: the agent's pure Compose validator, compiled here
-//!   too so the Mac knows before signing whether a deploy needs Touch ID.
+//!   [`compose_check`]: the agent's pure Compose validator (`fleet-compose`),
+//!   linked here too so the Mac knows before signing whether a deploy needs Touch ID.
 //! - [`versions`]: `expected_version` reads for version-checked ops;
 //!   [`escalate`]: root approval on `ApprovalRequired` for may-escalate
 //!   ops; [`provision`]: the provisioning wizard's orchestration (§9.1).
@@ -40,10 +40,10 @@ pub mod bulk;
 pub mod cache;
 pub mod catchup;
 pub mod cloudinit_export;
-/// `fleet_ops::compose` (pure: `fleet-proto` + `yaml-rust2`), shared by
-/// path so the Mac core doesn't pull in the agent's system dependencies.
-#[path = "../../fleet-ops/src/compose.rs"]
-pub mod compose_check;
+/// The `fleet-compose` crate (also `fleet_ops::compose`; pure:
+/// `fleet-proto` + `yaml-rust2`), so the Mac core doesn't pull in the
+/// agent's system dependencies.
+pub use fleet_compose as compose_check;
 pub mod confirm;
 pub mod enroll;
 pub mod escalate;
@@ -65,6 +65,8 @@ pub mod signer;
 pub mod ssh;
 pub mod sudo;
 pub mod sync;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod timeline;
 pub mod versions;
 pub mod vuln;
