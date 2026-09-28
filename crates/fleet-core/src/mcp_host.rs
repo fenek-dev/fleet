@@ -1093,6 +1093,7 @@ impl McpHost {
                 }) as Arc<dyn bulk::HealthProbe>
             }),
             stop_on_failure,
+            batch_barrier: false,
             per_server_timeout: None,
             dry_run: false,
         };

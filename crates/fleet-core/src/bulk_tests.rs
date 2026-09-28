@@ -755,3 +755,72 @@ async fn approval_close_to_expiry_is_renewed_for_the_rest() {
     );
     assert!(exec.calls().iter().all(|(_, _, approved)| *approved));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn batch_barrier_waits_for_the_whole_batch() {
+    // Canary 0, batch 1 = {1, 2, 3} (1 is slow), batch 2 = {4, 5, 6}.
+    let exec = FakeExec::with(&[(1, Behave::Ok(80))]);
+    let opts = BulkOptions {
+        concurrency: 3,
+        canary: true,
+        batch_barrier: true,
+        ..Default::default()
+    };
+    let req = BulkRequest::uniform(targets(7), restart(), Actor::Human, opts);
+    let probe = exec.clone();
+    let sample = async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        probe.calls().len()
+    };
+    let (run, at_40ms) = tokio::join!(go(exec.clone(), None, req, CancelToken::new()), sample);
+    // Canary + first batch only; server 4 has not started.
+    assert_eq!(at_40ms, 4);
+    assert_eq!(run.0.summary.succeeded, 7);
+    assert!(exec.max_in_flight.load(Ordering::SeqCst) <= 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_holds_new_servers_until_resumed() {
+    let b: Vec<(usize, Behave)> = (0..6).map(|i| (i, Behave::Ok(20))).collect();
+    let exec = FakeExec::with(&b);
+    let opts = BulkOptions {
+        concurrency: 2,
+        ..Default::default()
+    };
+    let req = BulkRequest::uniform(targets(6), restart(), Actor::Human, opts);
+    let cancel = CancelToken::new();
+    let c = cancel.clone();
+    let probe = exec.clone();
+    let control = async move {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        c.pause();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let while_paused = probe.calls().len();
+        c.resume();
+        while_paused
+    };
+    let (run, while_paused) = tokio::join!(go(exec.clone(), None, req, cancel), control);
+    assert_eq!(while_paused, 2);
+    assert_eq!(run.0.summary.succeeded, 6);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_ends_a_paused_run() {
+    let exec = FakeExec::with(&[]);
+    let opts = BulkOptions {
+        concurrency: 1,
+        ..Default::default()
+    };
+    let req = BulkRequest::uniform(targets(4), restart(), Actor::Human, opts);
+    let cancel = CancelToken::new();
+    cancel.pause();
+    let c = cancel.clone();
+    let stopper = async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        c.cancel();
+    };
+    let (run, ()) = tokio::join!(go(exec.clone(), None, req, cancel), stopper);
+    assert_eq!(run.0.summary.stop, Some(StopReason::Cancelled));
+    assert_eq!(run.0.summary.skipped, 4);
+    assert!(exec.calls().is_empty());
+}

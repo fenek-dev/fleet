@@ -231,6 +231,10 @@ pub struct BulkOptionsRow {
     /// 0 = the manager's per-operation timeout.
     pub per_server_timeout_s: u32,
     pub dry_run: bool,
+    /// Roll out in batches of `concurrency`: a batch starts only when the
+    /// previous one finished (after the canary).
+    #[uniffi(default = false)]
+    pub batched: bool,
 }
 
 /// What the sheet shows before running.
@@ -317,6 +321,19 @@ impl BulkRunHandle {
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
+
+    /// Stops starting new servers; running ones finish.
+    pub fn pause(&self) {
+        self.cancel.pause();
+    }
+
+    pub fn resume(&self) {
+        self.cancel.resume();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.cancel.is_paused()
+    }
 }
 
 fn clip(s: String) -> String {
@@ -344,10 +361,50 @@ fn stop_text(r: &StopReason) -> String {
     }
 }
 
+/// "Upgraded 3 packages · reboot required" and one line per change (the
+/// first line is what the rollout table shows; names come from the server
+/// and are escaped).
+fn package_summary(verb: &str, c: &fleet_proto::payload::PackageChanges) -> String {
+    use fleet_proto::payload::PkgAction;
+    let n = c.changes.len();
+    if n == 0 {
+        return "Already up to date".into();
+    }
+    let mut s = format!("{verb} {n} package{}", if n == 1 { "" } else { "s" });
+    if c.reboot_required {
+        s.push_str(" · reboot required");
+    }
+    for ch in &c.changes {
+        let action = match ch.action {
+            PkgAction::Install => "install",
+            PkgAction::Upgrade => "upgrade",
+            PkgAction::Downgrade => "downgrade",
+            PkgAction::Remove => "remove",
+            PkgAction::Purge => "purge",
+            PkgAction::Hold => "hold",
+            PkgAction::Unhold => "unhold",
+        };
+        let v = match (&ch.from, &ch.to) {
+            (Some(f), Some(t)) => format!(" {} → {}", text::line(f.clone()), text::line(t.clone())),
+            (None, Some(t)) => format!(" {}", text::line(t.clone())),
+            (Some(f), None) => format!(" {}", text::line(f.clone())),
+            (None, None) => String::new(),
+        };
+        s.push_str(&format!("\n{action} {}{v}", text::line(ch.name.clone())));
+    }
+    s
+}
+
 fn outcome_row(o: &Outcome) -> (BulkStatusRow, String) {
     match o {
         Outcome::Succeeded(Output::Payload(Payload::Empty)) => {
             (BulkStatusRow::Succeeded, String::new())
+        }
+        Outcome::Succeeded(Output::Payload(Payload::PackageChanges(c))) => {
+            (BulkStatusRow::Succeeded, clip(package_summary("Upgraded", c)))
+        }
+        Outcome::Planned(Plan::Fetched(Payload::PackageChanges(c))) => {
+            (BulkStatusRow::Planned, clip(package_summary("Would upgrade", c)))
         }
         Outcome::Succeeded(Output::Payload(p)) => {
             (BulkStatusRow::Succeeded, clip(format!("{p:#?}")))
@@ -459,6 +516,7 @@ fn options(o: &BulkOptionsRow) -> Result<BulkOptions, FleetError> {
         canary: o.canary,
         health: None,
         stop_on_failure: o.stop_on_failure,
+        batch_barrier: o.batched,
         per_server_timeout: (o.per_server_timeout_s > 0)
             .then(|| Duration::from_secs(u64::from(o.per_server_timeout_s))),
         dry_run: o.dry_run,
@@ -897,6 +955,38 @@ impl FleetCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_changes_read_as_a_summary_line_then_details() {
+        use fleet_proto::payload::{PackageChange, PackageChanges, PkgAction};
+        let c = PackageChanges {
+            changes: vec![
+                PackageChange {
+                    name: "openssl".into(),
+                    action: PkgAction::Upgrade,
+                    from: Some("3.0.1".into()),
+                    to: Some("3.0.2".into()),
+                },
+                PackageChange {
+                    name: "libssl3".into(),
+                    action: PkgAction::Upgrade,
+                    from: None,
+                    to: Some("3.0.2".into()),
+                },
+            ],
+            reboot_required: true,
+        };
+        let s = package_summary("Upgraded", &c);
+        let mut lines = s.lines();
+        assert_eq!(lines.next(), Some("Upgraded 2 packages · reboot required"));
+        assert_eq!(lines.next(), Some("upgrade openssl 3.0.1 → 3.0.2"));
+        assert_eq!(lines.next(), Some("upgrade libssl3 3.0.2"));
+        let none = PackageChanges {
+            changes: vec![],
+            reboot_required: false,
+        };
+        assert_eq!(package_summary("Upgraded", &none), "Already up to date");
+    }
 
     #[test]
     fn op_rows_round_trip_through_specs() {

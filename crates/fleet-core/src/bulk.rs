@@ -315,7 +315,7 @@ impl Approver for RootApprover {
 
 /// Cooperative cancellation shared with the UI.
 #[derive(Clone, Default)]
-pub struct CancelToken(Arc<(AtomicBool, Notify)>);
+pub struct CancelToken(Arc<(AtomicBool, Notify)>, Arc<(AtomicBool, Notify)>);
 
 impl CancelToken {
     pub fn new() -> Self {
@@ -340,6 +340,32 @@ impl CancelToken {
             notified.await;
         }
     }
+
+    /// Stops admitting new servers (running ones finish); [`Self::resume`]
+    /// continues. Cancelling overrides a pause.
+    pub fn pause(&self) {
+        self.1.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.1.0.store(false, Ordering::SeqCst);
+        self.1.1.notify_waiters();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.1.0.load(Ordering::SeqCst)
+    }
+
+    /// Completes once not paused.
+    pub async fn resumed(&self) {
+        loop {
+            let notified = self.1.1.notified();
+            if !self.is_paused() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -349,6 +375,9 @@ pub struct BulkOptions {
     /// Run after the canary succeeds (canary mode only).
     pub health: Option<Arc<dyn HealthProbe>>,
     pub stop_on_failure: bool,
+    /// Rollout in batches: `concurrency` servers start together and the next
+    /// batch waits until all of them finished (after the canary, if any).
+    pub batch_barrier: bool,
     /// Per server; `None` leaves it to the executor (manager timeouts).
     pub per_server_timeout: Option<Duration>,
     pub dry_run: bool,
@@ -361,6 +390,7 @@ impl Default for BulkOptions {
             canary: false,
             health: None,
             stop_on_failure: true,
+            batch_barrier: false,
             per_server_timeout: None,
             dry_run: false,
         }
@@ -890,7 +920,15 @@ where
     let mut inflight = FuturesUnordered::new();
     let mut running: Vec<usize> = Vec::new();
     loop {
-        while stop.is_none() && !cancel.is_cancelled() && next < n && inflight.len() < conc {
+        // A batch fills only when nothing is in flight.
+        let fill = !opts.batch_barrier || inflight.is_empty();
+        while fill
+            && stop.is_none()
+            && !cancel.is_cancelled()
+            && !cancel.is_paused()
+            && next < n
+            && inflight.len() < conc
+        {
             emit(BulkEvent::Running {
                 server: targets[next].clone(),
             });
@@ -899,6 +937,14 @@ where
             next += 1;
         }
         if inflight.is_empty() {
+            if stop.is_none() && next < n && cancel.is_paused() && !cancel.is_cancelled() {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {}
+                    _ = cancel.resumed() => {}
+                }
+                continue;
+            }
             if cancel.is_cancelled() && stop.is_none() && next < n {
                 stop = Some(StopReason::Cancelled);
             }
