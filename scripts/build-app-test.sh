@@ -5,6 +5,7 @@
 #
 #   scripts/build-app-test.sh            # build
 #   scripts/build-app-test.sh test [xcodebuild args...]   # run UI tests
+#                                   (serialized machine-wide, see below)
 #
 # App: build/DerivedData/Build/Products/Debug/Fleet.app
 set -euo pipefail
@@ -20,7 +21,25 @@ if [[ "${1:-}" == "test" ]]; then
     shift
 fi
 
-exec xcodebuild -project Fleet.xcodeproj -scheme Fleet -configuration Debug \
+# UI tests drive the one shared desktop (focus, keyboard), so only one
+# XCUITest run at a time machine-wide, across all worktrees. Waits for the
+# lock; a lock whose owner died is taken over.
+if [[ "$action" == "test" ]]; then
+    lock=/tmp/fleet-uitest.lock
+    while ! mkdir "$lock" 2>/dev/null; do
+        owner="$(cat "$lock/pid" 2>/dev/null || true)"
+        if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$lock"
+            continue
+        fi
+        echo "waiting for UI test lock (held by pid ${owner:-?})" >&2
+        sleep 15
+    done
+    echo $$ >"$lock/pid"
+    trap 'rm -rf "$lock"' EXIT
+fi
+
+xcodebuild -project Fleet.xcodeproj -scheme Fleet -configuration Debug \
     -destination 'platform=macOS,arch=arm64' \
     -derivedDataPath "$root/build/DerivedData" \
     -skipPackagePluginValidation \
