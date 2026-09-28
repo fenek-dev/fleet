@@ -50,6 +50,7 @@ mod terminal;
 mod text;
 mod timeline;
 mod types;
+mod ui_shell;
 mod validate;
 mod vuln;
 
@@ -75,6 +76,7 @@ pub use streams::{JournalSink, MetricsSink, StreamHandle};
 pub use terminal::{TerminalSession, TerminalSink};
 pub use timeline::*;
 pub use types::*;
+pub use ui_shell::*;
 pub use vuln::*;
 
 uniffi::setup_scaffolding!("fleet_core");

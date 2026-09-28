@@ -1,10 +1,17 @@
+import IOKit.ps
 import SwiftUI
 
-/// Settings → Devices (design §5.12, §7.5): the roster's Macs, servers still
-/// waiting for the latest roster, roster alerts, add and revoke.
+/// Settings → Devices (design §5.12, §7.5, Settings.dc.html): roster
+/// status, the roster's Macs, and summaries of recovery, AI and sync.
 struct DevicesSettings: View {
     @Environment(CoreBridge.self) private var core
+    @Environment(AIModel.self) private var ai
+    @Environment(\.fleetLocked) private var locked
+    var goTo: (SettingsSection) -> Void = { _ in }
+
     @State private var status: RosterStatusRow?
+    @State private var extras: RosterExtrasRow?
+    @State private var aiToday: UInt32?
     @State private var error: String?
     @State private var addShown = false
     @State private var revoking: DeviceRow?
@@ -12,60 +19,49 @@ struct DevicesSettings: View {
     @State private var lastResult: RosterChangeResult?
 
     var body: some View {
-        Form {
+        SettingsPage("Devices",
+                     subtitle: "Each Mac holds its own Secure Enclave keys. All devices are full admins.") {
+            Button { addShown = true } label: { Label("Add a Mac", systemImage: "plus") }
+                .buttonStyle(.fleetPrimary)
+                .disabled(locked)
+                .accessibilityIdentifier("devices.addMac")
+        } content: {
             if let status {
-                Section("Macs (roster v\(status.version), epoch \(status.epoch))") {
-                    ForEach(status.devices, id: \.id) { d in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(d.name + (d.thisMac ? " (this Mac)" : ""))
-                                Text("Added \(Self.date(d.addedAtMs)) by \(d.addedBy)")
-                                    .font(.secondary).foregroundStyle(Color.textMuted)
-                            }
-                            Spacer()
-                            if !d.thisMac {
-                                Button("Revoke…", role: .destructive) { revoking = d }
-                                    .accessibilityIdentifier("devices.revoke")
-                                    .disabled(busy)
-                            }
+                rosterCard(status)
+                VStack(spacing: 10) {
+                    ForEach(status.devices, id: \.id) { deviceRow($0) }
+                }
+                SettingsCard {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Fleet fingerprint").font(.base.weight(.medium)).foregroundStyle(Color.text)
+                            Text("Keep this with the recovery code: a recovery shows it for comparison.")
+                                .font(.secondary).foregroundStyle(Color.textMuted)
                         }
-                    }
-                    Button("Add Mac…") { addShown = true }
-                        .accessibilityIdentifier("devices.addMac")
-                    LabeledContent("Fleet fingerprint") {
+                        Spacer()
                         Text(status.fleetFingerprint).font(.mono(12)).textSelection(.enabled)
+                            .accessibilityIdentifier("devices.fingerprint")
                     }
-                    .help("Keep this with the recovery code: a recovery shows it for comparison.")
                 }
-                Section("Servers waiting for the latest roster") {
-                    if status.pending.isEmpty {
-                        Text("All servers are up to date.").foregroundStyle(Color.textMuted)
-                    } else {
-                        Text("Until they get it, these servers still trust any Mac removed since.")
-                            .font(.secondary).foregroundStyle(Tone.warn.text)
-                        ForEach(status.pending, id: \.serverId) { p in
-                            LabeledContent(p.name.isEmpty ? p.serverId : p.name,
-                                           value: p.seenVersion.map { "has v\($0)" } ?? "not confirmed")
+                if let r = lastResult {
+                    SettingsCard {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Last change").font(.base.weight(.medium))
+                            Text("Roster v\(r.version): \(r.current) servers updated, \(r.queued) queued.")
+                                .foregroundStyle(Color.textSecondary)
+                            ForEach(r.failed, id: \.self) { Text($0).foregroundStyle(Tone.critical.text) }
                         }
-                        Button("Push now") { push() }.disabled(busy)
-                            .accessibilityIdentifier("devices.pushNow")
                     }
                 }
-            }
-            if let r = lastResult {
-                Section("Last change") {
-                    Text("Roster v\(r.version): \(r.current) servers updated, \(r.queued) queued.")
-                    ForEach(r.failed, id: \.self) { Text($0).foregroundStyle(Tone.critical.text) }
-                }
+                summaries
+            } else if error == nil {
+                ProgressView().controlSize(.small)
             }
             FleetAlertsSection()
-            if let error {
-                Text(error).foregroundStyle(Tone.critical.text)
-            }
+            if let error { Text(error).foregroundStyle(Tone.critical.text) }
         }
-        .formStyle(.grouped)
-        .task(id: core.fleetRevision) { load() }
-        .sheet(isPresented: $addShown, onDismiss: load) { AddMacSheet() }
+        .task(id: core.fleetRevision) { await load() }
+        .sheet(isPresented: $addShown, onDismiss: { Task { await load() } }) { AddMacSheet() }
         .confirmationDialog(
             "Revoke \(revoking?.name ?? "")?",
             isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } })
@@ -79,13 +75,182 @@ struct DevicesSettings: View {
         }
     }
 
-    private func load() {
+    // MARK: roster
+
+    private var managedCount: Int { core.servers.filter(\.agentPinned).count }
+
+    private func rosterCard(_ s: RosterStatusRow) -> some View {
+        let pending = s.pending
+        let updated = max(0, managedCount - pending.count)
+        return SettingsCard {
+            HStack(spacing: 14) {
+                Image(systemName: "checkmark.shield").font(.system(size: 18))
+                    .foregroundStyle(Color.textSecondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Device roster v\(s.version)").font(.base.weight(.medium))
+                        .foregroundStyle(Color.text)
+                        .accessibilityIdentifier("devices.rosterTitle")
+                    Text(rosterSubtitle(updated: updated))
+                        .font(.secondary).foregroundStyle(Color.textMuted)
+                }
+                Spacer()
+                if pending.isEmpty {
+                    StatusPill(label: "All servers up to date", tone: .ok)
+                } else {
+                    StatusPill(label: pendingLabel(pending), tone: .warn)
+                    Button("Push now") { push() }
+                        .buttonStyle(.fleetSecondary)
+                        .disabled(busy || locked)
+                        .accessibilityIdentifier("devices.pushNow")
+                }
+            }
+        }
+    }
+
+    private func rosterSubtitle(updated: Int) -> String {
+        var parts: [String] = []
+        if let e = extras {
+            parts.append("Signed by \(e.signedBy) · \(Self.dateTime(e.issuedAtMs))")
+        }
+        parts.append("\(updated) of \(managedCount) servers updated")
+        return parts.joined(separator: " · ")
+    }
+
+    private func pendingLabel(_ p: [PendingServerRow]) -> String {
+        let first = p[0].name.isEmpty ? p[0].serverId : p[0].name
+        let offline = core.servers.first { $0.id == p[0].serverId }.map { $0.state == .offline || $0.state == .disconnected } ?? false
+        let base = p.count == 1 ? "\(first) pending" : "\(first) and \(p.count - 1) more pending"
+        return offline && p.count == 1 ? base + " · offline" : base
+    }
+
+    private func deviceRow(_ d: DeviceRow) -> some View {
+        SettingsCard {
+            HStack(spacing: 16) {
+                Image(systemName: Self.isLaptop(d) ? "laptopcomputer" : "desktopcomputer")
+                    .font(.system(size: 18))
+                    .foregroundStyle(Color(hex: 0xc3c6cb))
+                    .frame(width: 40, height: 40)
+                    .background(Color.control, in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(d.name).font(.base.weight(.semibold)).foregroundStyle(Color.text)
+                        if d.thisMac { Chip(text: "This Mac", tone: .info) }
+                    }
+                    Text(meta(d)).font(.secondary).foregroundStyle(Color.textMuted)
+                }
+                Spacer(minLength: 12)
+                HStack(spacing: 6) {
+                    Chip(text: "Secure Enclave keys")
+                    Chip(text: "Full admin")
+                }
+                Text(activity(d)).font(.secondary).foregroundStyle(Color.textSecondary)
+                    .frame(minWidth: 110, alignment: .trailing)
+                if !d.thisMac {
+                    Button("Revoke") { revoking = d }
+                        .buttonStyle(.fleetDestructive)
+                        .disabled(busy || locked)
+                        .accessibilityIdentifier("devices.revoke")
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("devices.row.\(d.name)")
+    }
+
+    private func meta(_ d: DeviceRow) -> String {
+        let added = "Added \(Self.date(d.addedAtMs))"
+        return d.addedBy == d.name ? "\(added) · first device" : "\(added) · approved by \(d.addedBy)"
+    }
+
+    private func activity(_ d: DeviceRow) -> String {
+        if d.thisMac { return "Active now" }
+        guard let ms = extras?.devices.first(where: { $0.deviceId == d.id })?.lastActiveMs else {
+            return "No activity seen"
+        }
+        return "Active " + Date(timeIntervalSince1970: Double(ms) / 1000)
+            .formatted(.relative(presentation: .named))
+    }
+
+    static func isLaptop(_ d: DeviceRow) -> Bool {
+        if d.thisMac { return HostModel.isLaptop }
+        let n = d.name.lowercased()
+        return n.contains("macbook") || n.contains("laptop") || n.contains("air") || n.contains("book")
+    }
+
+    // MARK: summaries (Recovery, AI agents, Sync)
+
+    private var summaries: some View {
+        VStack(spacing: 14) {
+            SectionCard(icon: "key", title: "Recovery code", pill: recoveryPill) {
+                Text("24 words on paper, plus an optional passphrase. \(recoveryCreated)")
+                    .font(.base).foregroundStyle(Color.textSecondary)
+                Button("Run recovery drill") { goTo(.recovery) }
+                    .buttonStyle(.fleetSecondary)
+                    .accessibilityIdentifier("devices.recoveryDrill")
+            }
+            SectionCard(icon: "sparkles", title: "AI agents",
+                        pill: ai.paused ? ("Paused", Tone.warn) : ("Full access", Tone.info)) {
+                Text(aiSummary).font(.base).foregroundStyle(Color.textSecondary)
+                Text("Keys, roster and policies always need Touch ID.")
+                    .font(.secondary).foregroundStyle(Color.textMuted)
+                Button { ai.setPaused(!ai.paused) } label: {
+                    Label(ai.paused ? "Resume AI agents" : "Pause AI agents",
+                          systemImage: ai.paused ? "play" : "pause")
+                }
+                .buttonStyle(.fleetSecondary)
+                .accessibilityIdentifier("devices.aiPause")
+            }
+            SectionCard(icon: "icloud", title: "Sync", pill: syncPill) {
+                Text("iCloud, end-to-end encrypted with a key only your Macs hold. Apple stores ciphertext only.")
+                    .font(.base).foregroundStyle(Color.textSecondary)
+                Text(syncedList + ".").font(.secondary).foregroundStyle(Color.textMuted)
+                Button("Sync now") { Task { await core.sync?.cycle() } }
+                    .buttonStyle(.fleetSecondary)
+                    .disabled(core.sync?.running ?? false)
+                    .accessibilityIdentifier("devices.syncNow")
+            }
+        }
+    }
+
+    private var recoveryPill: (String, Tone) {
+        guard let ms = extras?.lastDrillMs else { return ("Never tested", Tone.warn) }
+        return ("Tested " + Date(timeIntervalSince1970: Double(ms) / 1000)
+            .formatted(.relative(presentation: .named)), Tone.ok)
+    }
+
+    private var recoveryCreated: String {
+        extras.map { "Created \(Self.date($0.recoveryCreatedMs))." } ?? ""
+    }
+
+    private var aiSummary: String {
+        AIActivity.summary(clients: ai.clients, actionsToday: aiToday)
+    }
+
+    private var syncPill: (String, Tone) {
+        guard let sync = core.sync, sync.available else { return ("Unavailable", Tone.neutral) }
+        guard let last = sync.lastSync else { return ("Never synced", Tone.warn) }
+        return (last.formatted(.relative(presentation: .named)), Tone.ok)
+    }
+
+    private var syncedList: String {
+        let c = syncedCollections()
+        guard let last = c.last, c.count > 1 else { return c.first ?? "" }
+        return c.dropLast().joined(separator: ", ") + " and " + last.lowercased()
+    }
+
+    // MARK: actions
+
+    private func load() async {
+        guard let api = core.api else { return }
         do {
-            status = try core.api?.rosterStatus()
+            status = try api.rosterStatus()
             error = nil
         } catch {
             self.error = error.fleetMessage
         }
+        extras = await Task.detached { try? api.rosterExtras() }.value
+        aiToday = await AIActivity.actionsToday(api)
+        ai.reloadClients()
     }
 
     private func revoke(_ d: DeviceRow) {
@@ -97,7 +262,7 @@ struct DevicesSettings: View {
                 let r = try await api.revokeMac(deviceId: d.id)
                 await core.sync?.upload(r.upload, delete: r.delete)
                 lastResult = r
-                load()
+                await load()
             } catch {
                 self.error = error.fleetMessage
             }
@@ -111,7 +276,7 @@ struct DevicesSettings: View {
             defer { busy = false }
             do {
                 lastResult = try await api.pushPendingRosters()
-                load()
+                await load()
             } catch {
                 self.error = error.fleetMessage
             }
@@ -121,178 +286,60 @@ struct DevicesSettings: View {
     static func date(_ ms: UInt64) -> String {
         Date(timeIntervalSince1970: Double(ms) / 1000).formatted(date: .abbreviated, time: .omitted)
     }
-}
 
-/// Enrolled Mac side of adding a Mac: scan or paste the code, compare the
-/// six digits, approve with Touch ID.
-struct AddMacSheet: View {
-    @Environment(CoreBridge.self) private var core
-    @Environment(\.dismiss) private var dismiss
-
-    private enum Mode: String, CaseIterable { case scan = "Scan QR code", paste = "Paste code" }
-    @State private var mode: Mode = .scan
-    @State private var pasted = ""
-    @State private var prompt: AddMacPrompt?
-    /// Shown once the new Mac revealed its committed secret.
-    @State private var sas: String?
-    @State private var poll: Task<Void, Never>?
-    @State private var result: RosterChangeResult?
-    @State private var busy = false
-    @State private var error: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Add a Mac").font(.sectionTitle)
-            if let result {
-                Text("Added. Roster v\(result.version) reached \(result.current) servers; \(result.queued) will get it when they reconnect.")
-                ForEach(result.failed, id: \.self) { Text($0).foregroundStyle(Tone.critical.text) }
-                HStack {
-                    Spacer()
-                    Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
-                        .accessibilityIdentifier("addMac.done")
-                }
-            } else if let prompt, sas == nil {
-                ProgressView("Waiting for “\(prompt.name)” to show its code…")
-                HStack { Spacer(); Button("Cancel") { dismiss() } }
-            } else if let prompt, let sas {
-                Text("Check that “\(prompt.name)” shows this code:")
-                Text(Self.spaced(sas))
-                    .font(.system(size: 34, weight: .semibold, design: .monospaced))
-                    .padding(.vertical, 8)
-                Text("Only approve if the codes match exactly. A different code means the pairing code was swapped.")
-                    .font(.secondary).foregroundStyle(Color.textSecondary)
-                HStack {
-                    Button("Codes differ", role: .cancel) { dismiss() }
-                        .accessibilityIdentifier("addMac.codesDiffer")
-                    Spacer()
-                    Button("Codes match — Approve") { approve(prompt) }
-                        .accessibilityIdentifier("addMac.approve")
-                        .buttonStyle(.borderedProminent).tint(.accent)
-                        .disabled(busy)
-                }
-            } else {
-                Text("On the new Mac, choose “Join an existing fleet”. It shows a QR code and a pairing code.")
-                    .foregroundStyle(Color.textSecondary)
-                Picker("", selection: $mode) {
-                    ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .accessibilityIdentifier("addMac.mode")
-                switch mode {
-                case .scan:
-                    QRScannerView { code in begin(code) }
-                        .frame(height: 260)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                case .paste:
-                    TextEditor(text: $pasted)
-                        .font(.mono(12))
-                        .frame(height: 120)
-                        .border(Color.borderControl)
-                        .accessibilityIdentifier("addMac.pasteCode")
-                    HStack {
-                        Spacer()
-                        Button("Continue") { begin(pasted) }
-                            .accessibilityIdentifier("addMac.continue")
-                            .disabled(pasted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy)
-                    }
-                }
-                HStack { Spacer(); Button("Cancel") { dismiss() } }
-            }
-            if let error {
-                Text(error).foregroundStyle(Tone.critical.text)
-            }
+    static func dateTime(_ ms: UInt64) -> String {
+        let d = Date(timeIntervalSince1970: Double(ms) / 1000)
+        if Calendar.current.isDateInToday(d) {
+            return "today " + d.formatted(date: .omitted, time: .shortened)
         }
-        .padding(24)
-        .frame(width: 520)
-        .onDisappear { poll?.cancel() }
-    }
-
-    private func begin(_ code: String) {
-        guard prompt == nil, let api = core.api else { return }
-        busy = true
-        Task {
-            defer { busy = false }
-            do {
-                let p = try api.beginAddMac(code: code)
-                // The new Mac fetches the answer by name, then reveals the
-                // secret its code committed to; only then is there a code.
-                await core.sync?.upload([p.response])
-                prompt = p
-                error = nil
-                poll = Task { await waitForReveal(p) }
-            } catch {
-                self.error = error.fleetMessage
-            }
-        }
-    }
-
-    private func waitForReveal(_ p: AddMacPrompt) async {
-        guard let api = core.api, let cloud = core.sync?.cloud else { return }
-        while !Task.isCancelled && sas == nil {
-            do {
-                if let r = try await cloud.fetch([p.revealRecord]).first {
-                    sas = try api.addMacVerificationCode(deviceId: p.deviceId, reveal: r)
-                    return
-                }
-            } catch {
-                self.error = error.fleetMessage
-            }
-            try? await Task.sleep(for: .seconds(3))
-        }
-    }
-
-    private func approve(_ p: AddMacPrompt) {
-        guard let api = core.api else { return }
-        busy = true
-        Task {
-            defer { busy = false }
-            do {
-                let r = try await api.approveAddMac(deviceId: p.deviceId)
-                await core.sync?.upload(r.upload)
-                await core.sync?.cycle()
-                result = r
-            } catch {
-                self.error = error.fleetMessage
-            }
-        }
-    }
-
-    static func spaced(_ code: String) -> String {
-        guard code.count == 6 else { return code }
-        return "\(code.prefix(3)) \(code.suffix(3))"
+        return d.formatted(date: .abbreviated, time: .shortened)
     }
 }
 
-/// Fleet alerts with their one-click actions.
+/// Whether this Mac is a laptop: it has a battery.
+enum HostModel {
+    static let isLaptop: Bool = {
+        let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+        let list = IOPSCopyPowerSourcesList(info).takeRetainedValue() as [CFTypeRef]
+        return !list.isEmpty
+    }()
+}
+
+/// Fleet alerts (roster, recovery, sync) with their one-click actions.
 struct FleetAlertsSection: View {
     @Environment(CoreBridge.self) private var core
     @State private var error: String?
 
     var body: some View {
-        Section("Roster and sync alerts") {
-            if core.fleetAlerts.isEmpty {
-                Text("None.").foregroundStyle(Color.textMuted)
-            }
-            ForEach(Array(core.fleetAlerts.enumerated()), id: \.offset) { _, a in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        StatusPill(label: Self.label(a.kind), tone: Self.tone(a.kind))
-                        Text(a.title)
-                    }
-                    Text(a.detail).font(.secondary).foregroundStyle(Color.textSecondary)
-                    HStack {
-                        if a.kind == .macAdded, let id = a.deviceId {
-                            Button("Revoke this Mac", role: .destructive) { revoke(id, a) }
+        if !core.fleetAlerts.isEmpty || error != nil {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Roster and sync alerts").font(Typeface.ui(14, .semibold)).foregroundStyle(Color.text)
+                ForEach(Array(core.fleetAlerts.enumerated()), id: \.offset) { _, a in
+                    SettingsCard {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                StatusPill(label: Self.label(a.kind), tone: Self.tone(a.kind))
+                                Text(a.title)
+                            }
+                            Text(a.detail).font(.secondary).foregroundStyle(Color.textSecondary)
+                            HStack {
+                                if a.kind == .macAdded, let id = a.deviceId {
+                                    Button("Revoke this Mac") { revoke(id, a) }
+                                        .buttonStyle(.fleetDestructive)
+                                }
+                                if a.kind == .recoveryPending, let s = a.serverId, let h = a.pendingHash {
+                                    Button("Veto with Touch ID") { veto(s, h, a) }
+                                        .buttonStyle(.fleetDestructive)
+                                }
+                                Spacer()
+                                Button("Dismiss") { core.dismissFleetAlert(a) }
+                                    .buttonStyle(.fleetSecondary)
+                            }
                         }
-                        if a.kind == .recoveryPending, let s = a.serverId, let h = a.pendingHash {
-                            Button("Veto with Touch ID", role: .destructive) { veto(s, h, a) }
-                        }
-                        Spacer()
-                        Button("Dismiss") { core.dismissFleetAlert(a) }
                     }
                 }
+                if let error { Text(error).foregroundStyle(Tone.critical.text) }
             }
-            if let error { Text(error).foregroundStyle(Tone.critical.text) }
         }
     }
 

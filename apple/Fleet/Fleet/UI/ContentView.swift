@@ -1,10 +1,27 @@
 import SwiftUI
 
+/// Bulk run requested from outside a bulk screen (the palette).
+private struct BulkRequest: Identifiable {
+    let id = UUID()
+    let targets: [String]
+    let draft: OpDraft
+}
+
+extension Notification.Name {
+    /// ⌘,: show the Settings screen.
+    static let openSettings = Notification.Name("dev.fleet.openSettings")
+}
+
 struct ContentView: View {
     @Environment(CoreBridge.self) private var core
     @Environment(AIModel.self) private var ai
+    @Environment(AppLock.self) private var lock
     @Binding var paletteShown: Bool
     @State private var selection: NavItem? = .fleet
+    @State private var acks = AlertAcks()
+    @State private var bulk: BulkRequest?
+    /// Redraws the tree when the accent changes (colors read a static).
+    @AppStorage(Appearance.accentKey) private var accent = Int(Appearance.defaultAccent)
 
     var body: some View {
         @Bindable var core = core
@@ -16,6 +33,10 @@ struct ContentView: View {
                 main
             }
         }
+        .environment(acks)
+        .environment(\.fleetLocked, lock.isLocked)
+        .tint(Color.accent)
+        .id(accent)
         .alert("Security problem", isPresented: Binding(
             get: { core.securityAlert != nil && !core.securityAlertSeen },
             set: { if !$0 { core.securityAlertSeen = true } }
@@ -30,14 +51,20 @@ struct ContentView: View {
             AIPromptSheet(prompt: prompt)
                 .interactiveDismissDisabled()
         }
+        .sheet(item: $bulk) { req in
+            BulkRunSheet(targets: req.targets, draft: req.draft)
+        }
     }
 
     private var main: some View {
         NavigationSplitView {
             SidebarView(selection: $selection) { paletteShown = true }
-                .navigationSplitViewColumnWidth(240)
+                .navigationSplitViewColumnWidth(Layout.sidebarWidth)
         } detail: {
-            detail
+            VStack(spacing: 0) {
+                if lock.isLocked { LockedBanner() }
+                detail
+            }
         }
         .overlay(alignment: .top) {
             if paletteShown {
@@ -45,8 +72,10 @@ struct ContentView: View {
                     Color.black.opacity(0.35)
                         .ignoresSafeArea()
                         .onTapGesture { paletteShown = false }
-                    CommandPalette(isPresented: $paletteShown, selection: $selection)
-                        .padding(.top, 80)
+                    CommandPalette(isPresented: $paletteShown, selection: $selection) { targets, draft in
+                        bulk = BulkRequest(targets: targets, draft: draft)
+                    }
+                    .padding(.top, 80)
                 }
             }
         }
@@ -54,6 +83,9 @@ struct ContentView: View {
         .background(Color.window)
         .onReceive(NotificationCenter.default.publisher(for: .fleetSearch)) { _ in
             selection = .search
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
+            selection = .settings
         }
     }
 
@@ -65,77 +97,51 @@ struct ContentView: View {
             FleetTableView(groupId: id, selection: $selection).id(id)
         case .server(let id):
             ServerDetailView(serverId: id)
+        case .tag(let t):
+            TagView(tag: t, selection: $selection).id(t)
         case .alerts:
-            AlertsView()
+            AlertsView(selection: $selection)
         case .timeline:
             FleetTimelineView(selection: $selection)
         case .search:
-            FleetSearchView(selection: $selection)
+            VStack(spacing: 0) {
+                ScreenHeader("Search")
+                FleetSearchView(selection: $selection)
+            }
         case .vulnerabilities:
             FleetVulnerabilitiesView(selection: $selection)
         case .runbooks:
             RunbooksView()
+                .disabled(lock.isLocked)
         case .provision:
             ProvisionView(selection: $selection)
+                .disabled(lock.isLocked)
+        case .settings:
+            SettingsView(selection: $selection)
         }
     }
 }
 
-/// Alerts inbox: open alerts from agent events (app-only, design §2.2).
-struct AlertsView: View {
-    @Environment(CoreBridge.self) private var core
+/// Shown on every screen while only the monitor key is usable.
+private struct LockedBanner: View {
+    @Environment(AppLock.self) private var lock
 
     var body: some View {
-        let alerts = core.alerts.values.sorted { $0.seq > $1.seq }
-        VStack(spacing: 0) {
-            // Roster, recovery and sync alerts (design §5.10) first.
-            if !core.fleetAlerts.isEmpty {
-                Form { FleetAlertsSection() }
-                    .formStyle(.grouped)
-                    .scrollContentBackground(.hidden)
-                    .frame(maxHeight: 320)
-            }
-            if alerts.isEmpty {
-                ContentUnavailableView("No open alerts", systemImage: "checkmark.seal")
-                    .accessibilityIdentifier("alerts.empty")
-            } else {
-                List(alerts, id: \.self) { e in
-                    HStack(spacing: 12) {
-                        let tone = tone(e.alert?.severity)
-                        StatusPill(label: label(e.alert?.severity), tone: tone)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(e.alert?.ruleId ?? e.name).foregroundStyle(Color.text)
-                                .accessibilityIdentifier("alerts.rule")
-                            Text("\(serverName(e.serverId)) · \(e.alert?.subject ?? "")")
-                                .font(.secondary).foregroundStyle(Color.textMuted)
-                        }
-                    }
-                }
-                .scrollContentBackground(.hidden)
-                .accessibilityIdentifier("alerts.list")
-            }
+        HStack(spacing: 10) {
+            Image(systemName: "lock.fill")
+            Text("Locked: telemetry and events only. Changes need Touch ID.")
+                .font(.secondary)
+            Spacer()
+            Button("Unlock") { Task { await lock.unlock() } }
+                .buttonStyle(.fleetPrimary)
+                .accessibilityIdentifier("locked.unlock")
         }
-        .background(Color.window)
-        .navigationTitle("Alerts")
-    }
-
-    private func serverName(_ id: String) -> String {
-        core.servers.first { $0.id == id }?.name ?? id
-    }
-
-    private func tone(_ s: AlertSeverity?) -> Tone {
-        switch s {
-        case .critical: .critical
-        case .warning: .warn
-        case .info, .none: .info
-        }
-    }
-
-    private func label(_ s: AlertSeverity?) -> String {
-        switch s {
-        case .critical: "Critical"
-        case .warning: "Warning"
-        case .info, .none: "Info"
-        }
+        .foregroundStyle(Tone.warn.text)
+        .padding(.horizontal, 24)
+        .frame(height: 44)
+        .background(Tone.warn.bg)
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.border).frame(height: 1) }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("locked.banner")
     }
 }

@@ -1235,6 +1235,7 @@ version = "0.1.0"
 dependencies = [
  "fleet-core",
  "fleet-crypto",
+ "fleet-hardening",
  "fleet-proto",
  "fleetctl-proto",
  "futures-util",
