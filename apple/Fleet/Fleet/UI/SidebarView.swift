@@ -35,12 +35,14 @@ struct SidebarView: View {
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.borderControl))
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("sidebar.palette")
             .padding(.horizontal, 12)
             .padding(.top, 8)
 
             List(selection: $selection) {
                 Section {
                     Label("Fleet", systemImage: "server.rack").tag(NavItem.fleet)
+                        .accessibilityIdentifier("sidebar.fleet")
                     Label {
                         HStack {
                             Text("Alerts")
@@ -55,12 +57,18 @@ struct SidebarView: View {
                         Image(systemName: "bell")
                     }
                     .tag(NavItem.alerts)
+                    .accessibilityIdentifier("sidebar.alerts")
                     Label("Timeline", systemImage: "clock").tag(NavItem.timeline)
+                        .accessibilityIdentifier("sidebar.timeline")
                     Label("Search", systemImage: "magnifyingglass").tag(NavItem.search)
+                        .accessibilityIdentifier("sidebar.search")
                     Label("Vulnerabilities", systemImage: "shield.lefthalf.filled")
                         .tag(NavItem.vulnerabilities)
+                        .accessibilityIdentifier("sidebar.vulnerabilities")
                     Label("Snippets & Runbooks", systemImage: "list.bullet").tag(NavItem.runbooks)
+                        .accessibilityIdentifier("sidebar.runbooks")
                     Label("Provisioning", systemImage: "plus.square").tag(NavItem.provision)
+                        .accessibilityIdentifier("sidebar.provisioning")
                 }
                 Section("Groups") {
                     ForEach(core.groups, id: \.id) { g in
@@ -71,6 +79,7 @@ struct SidebarView: View {
                                 .font(.caption11).foregroundStyle(Color.textMuted)
                         }
                         .tag(NavItem.group(g.id))
+                        .accessibilityIdentifier("sidebar.group.\(g.name)")
                     }
                 }
                 Section("Servers") {
@@ -81,6 +90,7 @@ struct SidebarView: View {
                         }
                         .accessibilityLabel("\(s.name), \(s.state.label)")
                         .tag(NavItem.server(s.id))
+                        .accessibilityIdentifier("sidebar.server.\(s.name)")
                     }
                 }
             }
@@ -119,6 +129,7 @@ private struct LockFooter: View {
                     }
                 }
                 .controlSize(.small)
+                .accessibilityIdentifier("sidebar.lock")
             }
         }
     }

@@ -107,6 +107,16 @@ final class SyncKeychain: SyncSecrets {
     /// the stored password. A new item gets the user-presence ACL; an
     /// existing one keeps its ACL and only its data is replaced.
     func storeSudoPassword(serverId: String, password: String) throws {
+        #if FLEET_TEST_HOOKS
+        if let dir = TestHooks.dataDir {
+            _ = TestHooks.approve("sudo-store: replace the stored sudo password")
+            do {
+                _ = try TestHooks.FileKeychain.store(
+                    dir, Self.sudoService, serverId, Data(password.utf8), replace: true)
+            } catch { throw SignerError.Failed }
+            return
+        }
+        #endif
         var error: Unmanaged<CFError>?
         guard let ac = SecAccessControlCreateWithFlags(
             nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.userPresence], &error)
@@ -133,6 +143,12 @@ final class SyncKeychain: SyncSecrets {
     }
 
     func deleteSudoPassword(serverId: String) throws {
+        #if FLEET_TEST_HOOKS
+        if let dir = TestHooks.dataDir {
+            TestHooks.FileKeychain.delete(dir, Self.sudoService, serverId)
+            return
+        }
+        #endif
         let status = SecItemDelete(Self.sudoQuery(serverId) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw SignerError.Failed }
     }
@@ -140,6 +156,11 @@ final class SyncKeychain: SyncSecrets {
     /// Whether `serverId` has a sudo password in this Mac's Keychain
     /// (doesn't read it, so no Touch ID).
     static func hasSudoPassword(_ serverId: String) -> Bool {
+        #if FLEET_TEST_HOOKS
+        if let dir = TestHooks.dataDir {
+            return TestHooks.FileKeychain.exists(dir, sudoService, serverId)
+        }
+        #endif
         var q = sudoQuery(serverId)
         let ctx = LAContext()
         ctx.interactionNotAllowed = true
@@ -152,7 +173,16 @@ final class SyncKeychain: SyncSecrets {
     /// Reads the password; the item's ACL shows Touch ID first. Runs off
     /// the main thread.
     static func revealSudoPassword(_ serverId: String, serverName: String) async throws -> String {
-        try await Task.detached {
+        #if FLEET_TEST_HOOKS
+        if let dir = TestHooks.dataDir {
+            guard TestHooks.approve("sudo-reveal: reveal the sudo password for \(serverName)")
+            else { throw SignerError.Cancelled }
+            guard let d = TestHooks.FileKeychain.load(dir, sudoService, serverId),
+                  let s = String(data: d, encoding: .utf8) else { throw SignerError.Missing }
+            return s
+        }
+        #endif
+        return try await Task.detached {
             let ctx = LAContext()
             ctx.localizedReason = "reveal the sudo password for \(serverName)"
             var q = sudoQuery(serverId)

@@ -42,7 +42,9 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.fleet.Fleet
         PRODUCT_NAME: Fleet
         INFOPLIST_FILE: Fleet/Info.plist
-        CODE_SIGN_ENTITLEMENTS: Fleet/Fleet.entitlements
+        # scripts/build-app-test.sh overrides this for ad-hoc test builds.
+        FLEET_ENTITLEMENTS: Fleet/Fleet.entitlements
+        CODE_SIGN_ENTITLEMENTS: $(FLEET_ENTITLEMENTS)
         ENABLE_HARDENED_RUNTIME: YES
         # App Sandbox is off for now: the core opens outbound SSH itself and
         # reads nothing outside the app container, but sandboxing (with the
@@ -57,6 +59,11 @@ targets:
         SWIFT_STRICT_CONCURRENCY: complete
         GENERATE_INFOPLIST_FILE: NO
         COMBINE_HIDPI_IMAGES: YES
+      configs:
+        Debug:
+          # Test hooks (data dir override, test signer): Debug only.
+          # See apple/Fleet/TESTING.md and scripts/check-release-hooks.sh.
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG FLEET_TEST_HOOKS"
     preBuildScripts:
       - name: Build Rust core
         script: |
@@ -88,12 +95,27 @@ targets:
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/Fleet.app/Contents/MacOS/Fleet
         BUNDLE_LOADER: $(TEST_HOST)
 
+  FleetUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: FleetUITests
+    dependencies:
+      - target: Fleet
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.fleet.FleetUITests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Fleet
+
 schemes:
   Fleet:
     build:
       targets:
         Fleet: all
         FleetTests: [test]
+        FleetUITests: [test]
     test:
       targets:
         - FleetTests
+        - FleetUITests

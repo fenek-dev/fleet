@@ -61,6 +61,7 @@ struct EnrollmentView: View {
                     }
                     if let error {
                         Text(error).font(.base).foregroundStyle(Tone.critical.text)
+                            .accessibilityIdentifier("onboarding.error")
                     }
                 }
                 .frame(maxWidth: 640, alignment: .leading)
@@ -109,7 +110,9 @@ struct EnrollmentView: View {
             Text("Names").font(.sectionTitle)
             Form {
                 TextField("Fleet name", text: $fleetName, prompt: Text("Production"))
+                    .accessibilityIdentifier("onboarding.fleetName")
                 TextField("This Mac", text: $deviceName)
+                    .accessibilityIdentifier("onboarding.deviceName")
             }
             .formStyle(.grouped)
             Text("Next you get a 24-word recovery code. It is the only way back in if every Mac is lost. Write it down by hand.")
@@ -117,6 +120,7 @@ struct EnrollmentView: View {
             HStack {
                 Spacer()
                 Button("Continue") { begin() }
+                    .accessibilityIdentifier("onboarding.continue")
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .disabled(fleetName.trimmingCharacters(in: .whitespaces).isEmpty
                               || deviceName.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -136,6 +140,7 @@ struct EnrollmentView: View {
                         Text("\(i + 1)").font(.mono(11)).foregroundStyle(Color.textMuted)
                             .frame(width: 20, alignment: .trailing)
                         Text(w).font(.mono(13)).foregroundStyle(Color.text)
+                            .accessibilityIdentifier("onboarding.word.\(i + 1)")
                     }
                     .padding(.vertical, 6).padding(.horizontal, 8)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -147,6 +152,7 @@ struct EnrollmentView: View {
             HStack {
                 Spacer()
                 Button("I wrote them down") { newChallenge() }
+                    .accessibilityIdentifier("onboarding.wroteDown")
                     .buttonStyle(.borderedProminent).tint(.accent)
             }
         }
@@ -164,6 +170,7 @@ struct EnrollmentView: View {
                         set: { if answers.indices.contains(i) { answers[i] = $0 } }))
                         .autocorrectionDisabled()
                         .font(.mono(13))
+                        .accessibilityIdentifier("onboarding.verify.\(i)")
                 }
             }
             .formStyle(.grouped)
@@ -172,6 +179,7 @@ struct EnrollmentView: View {
                     .disabled(words.isEmpty)
                 Spacer()
                 Button("Check") { verify() }
+                    .accessibilityIdentifier("onboarding.check")
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .keyboardShortcut(.defaultAction)
             }
@@ -185,7 +193,9 @@ struct EnrollmentView: View {
                 .font(.base).foregroundStyle(Color.textSecondary)
             Form {
                 SecureField("Passphrase", text: $passphrase)
+                    .accessibilityIdentifier("onboarding.passphrase")
                 SecureField("Repeat", text: $passphraseAgain)
+                    .accessibilityIdentifier("onboarding.passphraseAgain")
             }
             .formStyle(.grouped)
             Text("For immediate recovery the passphrase must be strong: at least 12 characters using 3 of lowercase, uppercase, digits and symbols, or at least 5 different words of 3+ letters. A weaker passphrase still protects the code but keeps the 72 h delay.")
@@ -200,6 +210,7 @@ struct EnrollmentView: View {
             HStack {
                 Spacer()
                 Button("Create fleet") { finish() }
+                    .accessibilityIdentifier("onboarding.createFleet")
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .disabled(passphrase != passphraseAgain)
             }
@@ -229,6 +240,7 @@ struct EnrollmentView: View {
             HStack {
                 Spacer()
                 Button("Open fleet") { core.startManager() }
+                    .accessibilityIdentifier("onboarding.openFleet")
                     .buttonStyle(.borderedProminent).tint(.accent)
             }
         }

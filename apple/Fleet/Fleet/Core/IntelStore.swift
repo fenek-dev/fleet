@@ -99,13 +99,6 @@ final class IntelStore {
     }
 
     private static func dbPath() throws -> String {
-        let dir = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true
-        ).appendingPathComponent("Fleet", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
-        return dir.appendingPathComponent("vulns.sqlite").path
+        try AppPaths.vulnsPath()
     }
 }

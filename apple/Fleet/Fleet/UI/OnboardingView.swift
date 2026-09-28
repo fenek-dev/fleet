@@ -20,8 +20,11 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 20) {
             Text("Welcome to Fleet").font(.sectionTitle)
             choice("Create a new fleet", "This Mac becomes the fleet's first device.", "plus.circle") { path = .create }
+                .accessibilityIdentifier("onboarding.create")
             choice("Join an existing fleet", "Another Mac in your fleet approves this one.", "laptopcomputer.and.arrow.down") { path = .join }
+                .accessibilityIdentifier("onboarding.join")
             choice("Recover fleet", "Every Mac is lost: use the 24-word recovery code.", "key") { path = .recover }
+                .accessibilityIdentifier("onboarding.recover")
         }
         .frame(maxWidth: 560)
         .padding(40)
@@ -78,8 +81,10 @@ struct JoinFleetView: View {
                             .font(.secondary).foregroundStyle(Color.textSecondary)
                         HStack {
                             Button("Codes differ", role: .cancel) { poll?.cancel(); back() }
+                                .accessibilityIdentifier("onboarding.join.codesDiffer")
                             Spacer()
                             Button("Codes match") { confirmCodes() }
+                                .accessibilityIdentifier("onboarding.join.codesMatch")
                                 .buttonStyle(.borderedProminent).tint(.accent)
                         }
                     }
@@ -99,11 +104,16 @@ struct JoinFleetView: View {
                     ProgressView("Waiting for the other Mac…")
                 }
             } else {
-                Form { TextField("This Mac", text: $deviceName) }.formStyle(.grouped)
+                Form {
+                    TextField("This Mac", text: $deviceName)
+                        .accessibilityIdentifier("onboarding.join.deviceName")
+                }.formStyle(.grouped)
                 HStack {
                     Button("Back") { back() }
+                        .accessibilityIdentifier("onboarding.join.back")
                     Spacer()
                     Button("Show pairing code") { start() }
+                        .accessibilityIdentifier("onboarding.join.showCode")
                         .buttonStyle(.borderedProminent).tint(.accent)
                         .disabled(deviceName.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
@@ -220,7 +230,9 @@ struct RecoverFleetView: View {
                 .foregroundStyle(Color.textSecondary)
             TextEditor(text: $words).font(.mono(13)).frame(height: 90).border(Color.borderControl)
                 .privacySensitive()
+                .accessibilityIdentifier("onboarding.recover.words")
             SecureField("Passphrase (optional)", text: $passphrase)
+                .accessibilityIdentifier("onboarding.recover.passphrase")
             if core.sync?.available != true {
                 Text("Recovery needs the fleet's iCloud data: the server list and pinned keys (roster copies are optional; the servers are asked for their roster). Servers entered by hand can't be recovered: their agent keys can't be verified without the pins.")
                     .font(.secondary).foregroundStyle(Tone.warn.text)
@@ -232,6 +244,7 @@ struct RecoverFleetView: View {
                 }
                 Spacer()
                 Button("Open iCloud escrow") { openEscrow() }
+                    .accessibilityIdentifier("onboarding.recover.openEscrow")
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .disabled(busy || words.split(whereSeparator: \.isWhitespace).count != 24)
             }
@@ -262,6 +275,7 @@ struct RecoverFleetView: View {
             HStack {
                 Spacer()
                 Button("Recover") { recover() }
+                    .accessibilityIdentifier("onboarding.recover.go")
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .disabled(busy || !fingerprintOK)
             }

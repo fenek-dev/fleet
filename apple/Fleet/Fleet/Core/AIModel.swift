@@ -100,6 +100,7 @@ final class AIModel {
     }
 
     private static func touchId(_ reason: String) async -> Bool {
+        if TestHooks.approve("mcp-approval: " + reason) { return true }
         let ctx = LAContext()
         do {
             return try await ctx.evaluatePolicy(
@@ -110,6 +111,10 @@ final class AIModel {
     }
 
     fileprivate func show(_ p: McpPromptRow) {
+        if TestHooks.autoPairing, case .pairing = p.kind {
+            Task { @MainActor [weak self] in await self?.answer(p, approve: true) }
+            return
+        }
         // One pairing prompt at a time (Rust enforces it too): a second
         // one is declined rather than queued behind the first.
         if case .pairing = p.kind, prompts.contains(where: {

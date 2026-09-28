@@ -13,14 +13,14 @@ enum CloudInitExports {
     private static let key = "fleet.cloudInitExports"
 
     static var recent: [Entry] {
-        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        guard let data = AppPaths.defaults.data(forKey: key) else { return [] }
         return (try? JSONDecoder().decode([Entry].self, from: data)) ?? []
     }
 
     static func remember(_ e: Entry) {
         let list = [e] + recent.filter { $0.id != e.id }
         if let data = try? JSONEncoder().encode(Array(list.prefix(10))) {
-            UserDefaults.standard.set(data, forKey: key)
+            AppPaths.defaults.set(data, forKey: key)
         }
     }
 }

@@ -167,16 +167,16 @@ final class SyncCoordinator {
 
     private var token: CKServerChangeToken? {
         get {
-            guard let d = UserDefaults.standard.data(forKey: Self.tokenKey) else { return nil }
+            guard let d = AppPaths.defaults.data(forKey: Self.tokenKey) else { return nil }
             return try? NSKeyedUnarchiver.unarchivedObject(ofClass: CKServerChangeToken.self, from: d)
         }
         set {
             if let t = newValue,
                let d = try? NSKeyedArchiver.archivedData(withRootObject: t, requiringSecureCoding: true)
             {
-                UserDefaults.standard.set(d, forKey: Self.tokenKey)
+                AppPaths.defaults.set(d, forKey: Self.tokenKey)
             } else {
-                UserDefaults.standard.removeObject(forKey: Self.tokenKey)
+                AppPaths.defaults.removeObject(forKey: Self.tokenKey)
             }
         }
     }
