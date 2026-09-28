@@ -188,6 +188,8 @@ struct AutoRevertBanner: View {
             .padding(12)
             .background(tone.bg, in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(tone.dot.opacity(0.5)))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("autorevert.banner")
         }
     }
 
@@ -206,7 +208,7 @@ struct AutoRevertBanner: View {
     private var title: String {
         switch model.phase {
         case .idle: ""
-        case .confirming: "Change applied · confirming within \(countdown)"
+        case .confirming: "Change applied · confirm within \(countdown)"
         case .confirmed: "Change confirmed"
         case .reverted: "Change reverted"
         case .noConnection: "Could not reconnect · reverts in \(countdown)"
@@ -218,7 +220,7 @@ struct AutoRevertBanner: View {
         switch model.phase {
         case .idle: ""
         case .confirming:
-            "\(what). Fleet is opening a fresh connection to prove access still works; otherwise the previous state comes back automatically."
+            "\(what). Fleet is confirming from a fresh connection; if that fails, the previous state comes back automatically."
         case .confirmed: "\(what). A fresh connection worked, so the change stays."
         case .reverted: "\(what) did not stay: the server restored the previous state."
         case .noConnection:

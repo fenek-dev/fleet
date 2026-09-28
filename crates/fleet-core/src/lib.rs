@@ -50,6 +50,7 @@ pub mod confirm;
 pub mod enroll;
 pub mod escalate;
 pub mod fleetsearch;
+pub mod fw_history;
 pub mod install;
 pub mod manager;
 pub mod mcp_host;

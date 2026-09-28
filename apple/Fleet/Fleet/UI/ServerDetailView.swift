@@ -61,6 +61,10 @@ struct ServerDetailView: View {
             }
             .background(Color.window)
             .id(serverId)
+            .onReceive(NotificationCenter.default.publisher(for: .fleetSelectServerTab)) { n in
+                if n.userInfo?["serverId"] as? String == serverId,
+                   let raw = n.userInfo?["tab"] as? String, let t = ServerTab(rawValue: raw) { tab = t }
+            }
             .sheet(isPresented: $installing) { AddServerSheet(existing: server) }
             .sheet(isPresented: $running) { BulkRunSheet(targets: [server.id]) }
             .task(id: "\(serverId)/\(server.agentPinned)/\(server.state == .ready)") {

@@ -109,6 +109,7 @@ struct VulnerabilitiesSection: View {
     @State private var loading = false
     @State private var error: String?
     @State private var showUnfixed = false
+    @State private var upgrading = false
 
     private static let shownMax = 300
 
@@ -116,11 +117,17 @@ struct VulnerabilitiesSection: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("Vulnerabilities").font(.system(size: 13, weight: .semibold))
+                if let r = intel.reports[server.id], r.distro != nil, !r.noData {
+                    Text("Matched on this Mac · \(IntelFormat.ago(r.scannedMs))")
+                        .font(.secondary).foregroundStyle(Color.textMuted)
+                }
                 if loading { ProgressView().controlSize(.small) }
                 Spacer()
                 Toggle("Include unfixed", isOn: $showUnfixed).toggleStyle(.checkbox)
+                    .accessibilityIdentifier("vulns.includeUnfixed")
                 Button("Scan") { Task { await scan() } }
                     .disabled(loading || server.state != .ready)
+                    .accessibilityIdentifier("vulns.scan")
             }
             if let error {
                 Text(error).font(.secondary).foregroundStyle(Tone.warn.text)
@@ -134,6 +141,9 @@ struct VulnerabilitiesSection: View {
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .card()
+        .sheet(isPresented: $upgrading, onDismiss: { Task { await scan() } }) {
+            BulkRunSheet(targets: [server.id], draft: OpDraft())
+        }
         .task(id: server.id) {
             if intel.reports[server.id] == nil, server.state == .ready { await scan() }
         }
@@ -165,6 +175,19 @@ struct VulnerabilitiesSection: View {
             if shown.isEmpty {
                 Text("No known vulnerabilities with available fixes.")
                     .font(.secondary).foregroundStyle(Tone.ok.text)
+            }
+            HStack {
+                Text("Source: \(r.distro == "ubuntu" ? "Ubuntu security notices" : "Debian security tracker"). Agents never fetch this data themselves.")
+                    .font(.caption11).foregroundStyle(Color.textMuted)
+                Spacer()
+                if r.vulnerablePackages > 0 {
+                    Button("Upgrade \(r.vulnerablePackages) package\(r.vulnerablePackages == 1 ? "" : "s")") {
+                        upgrading = true
+                    }
+                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .disabled(server.state != .ready)
+                    .accessibilityIdentifier("vulns.upgrade")
+                }
             }
             if r.distro == "debian" {
                 Text("Debian matches by package name; binaries named differently from their source package (for example libssl3) are not matched yet.")

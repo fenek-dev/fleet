@@ -51,6 +51,7 @@ mod text;
 mod timeline;
 mod types;
 mod ui_fleet;
+mod ui_security;
 mod ui_server;
 mod validate;
 mod vuln;
