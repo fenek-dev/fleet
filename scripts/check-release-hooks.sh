@@ -28,13 +28,32 @@ fi
 
 [ -f "$bin" ] || { echo "missing $bin" >&2; exit 1; }
 
-# The markers are assembled here so this script's own text is not what
-# matches; `strings -a` covers every section, and the raw grep catches
-# UTF-16 or oddly-sectioned literals.
+# Heuristic: absence of these strings is evidence, not proof, that the hooks
+# are compiled out (obfuscated or computed literals would not match). Each
+# marker is scanned as ASCII (`strings -a` and raw grep) and UTF-16LE (raw
+# bytes with NULs stripped via `tr -d '\000'`, portable to macOS grep).
+# A scanner error (not just "no match") fails the check.
 markers=(FLEET_TEST_SIGNER FLEET_DATA_DIR TEST-APPROVE FLEET_TEST_AGENT_ARTIFACT FLEET_TEST_AUTO_PAIR approvals.log ssh_pubkey)
+
+scan_err() { echo "FAIL: scanner error ($1) on $bin" >&2; exit 1; }
+
+# grep -c: 0 matches => rc 1 (fine); rc >=2 => error. Prints the count.
+count_grep() { # count_grep <marker> ; reads stdin
+    local c rc=0
+    c="$(LC_ALL=C grep -aFc -- "$1")" || rc=$?
+    [ "$rc" -le 1 ] || scan_err "grep rc=$rc"
+    echo "$c"
+}
+
+strings_out="$(strings -a "$bin")" || scan_err "strings rc=$?"
+[ -n "$strings_out" ] || scan_err "strings produced no output"
+
 fail=0
 for m in "${markers[@]}"; do
-    if strings -a "$bin" | grep -q -- "$m" || grep -aq -- "$m" "$bin"; then
+    hits="$(count_grep "$m" <<<"$strings_out")"
+    raw="$(count_grep "$m" <"$bin")"
+    u16="$(LC_ALL=C tr -d '\000' <"$bin" | count_grep "$m")"
+    if [ "$hits" != 0 ] || [ "$raw" != 0 ] || [ "$u16" != 0 ]; then
         echo "FAIL: Release binary contains \"$m\"" >&2
         fail=1
     fi

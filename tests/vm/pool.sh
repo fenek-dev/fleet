@@ -31,20 +31,38 @@ distro="debian12"
 count=""
 names=()
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --json) json=1 ;;
-        --key)
-            [ $# -ge 2 ] || usage
-            keys+=("$2")
+case "$cmd" in
+    up)
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --json) json=1 ;;
+                --key)
+                    [ $# -ge 2 ] || usage
+                    keys+=("$2")
+                    shift
+                    ;;
+                debian12 | ubuntu24) distro="$1" ;;
+                [0-9]*) count="$1" ;;
+                *) usage ;;
+            esac
             shift
-            ;;
-        debian12 | ubuntu24) distro="$1" ;;
-        [0-9]*) count="$1" ;;
-        *) names+=("$1") ;;
-    esac
-    shift
-done
+        done
+        case "$count" in '' | *[!0-9]*) usage ;; esac
+        ;;
+    list)
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --json) json=1 ;;
+                *) usage ;;
+            esac
+            shift
+        done
+        ;;
+    down)
+        names=("$@")
+        ;;
+    *) usage ;;
+esac
 
 info() { docker inspect -f '{{index .Config.Labels "fleet-pool-distro"}}' "$1"; }
 
@@ -129,10 +147,28 @@ case "$cmd" in
         if [ "${#names[@]}" -eq 0 ]; then
             while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(pool_names)
         fi
-        if [ "${#names[@]}" -gt 0 ]; then
-            docker rm -f "${names[@]}" >/dev/null
+        ids=()
+        refused=0
+        for n in ${names[@]+"${names[@]}"}; do
+            label="$(docker inspect --type container -f '{{index .Config.Labels "fleet-pool"}}' "$n" 2>/dev/null || true)"
+            if [ "$label" != "1" ]; then
+                echo "refusing $n: not a fleet-pool container (label fleet-pool=1 missing)" >&2
+                refused=$((refused + 1))
+                continue
+            fi
+            cid="$(docker inspect --type container -f '{{.Id}}' "$n" 2>/dev/null || true)"
+            if [ -z "$cid" ]; then
+                echo "refusing $n: cannot resolve container id" >&2
+                refused=$((refused + 1))
+                continue
+            fi
+            ids+=("$cid")
+        done
+        if [ "${#ids[@]}" -gt 0 ]; then
+            docker rm -f "${ids[@]}" >/dev/null
         fi
-        echo "removed ${#names[@]} container(s)" >&2
+        echo "removed ${#ids[@]} container(s), refused $refused" >&2
+        [ "$refused" -eq 0 ] || exit 1
         ;;
     *) usage ;;
 esac
