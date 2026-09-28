@@ -8,6 +8,7 @@ tests/vm/run.sh ubuntu24     # Ubuntu 24.04
 tests/vm/run.sh debian12 metrics   # only tests matching "metrics"
 FLEET_IT_KEEP=1 tests/vm/run.sh    # keep the container for debugging
 FLEET_IT_DEB=1 tests/vm/run.sh     # install through scripts/build-deb.sh's package
+FLEET_TARGET_VOLUME=mine tests/vm/run.sh   # override the per-checkout build volume name
 ```
 
 It also builds a second agent (`FLEET_AGENT_VERSION=0.2.0`, into

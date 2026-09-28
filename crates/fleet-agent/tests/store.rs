@@ -80,6 +80,98 @@ fn audit_tamper_detected() {
     assert!(matches!(a2.verify_chain(1), Err(ChainError::HeadMismatch)));
 }
 
+/// Intents 1..=n (times 1_001..), results for all but the last.
+fn chain(a: &fleet_agent::store::AuditLog<'_>, n: u8) {
+    for i in 1..=n {
+        let s = a.append_intent(intent(i)).unwrap();
+        if i < n {
+            a.append_result(s, 1_000 + u64::from(i), Outcome::Ok).unwrap();
+        }
+    }
+}
+
+#[test]
+fn audit_archive_prunes_and_keeps_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let arch = dir.path().join("audit-archive");
+    let server = ServerId::new("srv_test01").unwrap();
+    let s = open(&dir);
+    let a = s.audit();
+    chain(&a, 4); // seqs 1..=7, seq 7 an open intent (time 1_004)
+    assert_eq!(a.anchor().unwrap(), None);
+    // Nothing old enough.
+    assert!(a.archive_before(&arch, &server, 1_000, 100).unwrap().is_none());
+    // Entries with time < 1_003: seqs 1..=4 (intent 1, result 1, intent 2,
+    // result 2), then intent 3 (time 1_003) stops it.
+    let r = a.archive_before(&arch, &server, 1_003, 100).unwrap().unwrap();
+    assert_eq!((r.from_seq, r.to_seq), (1, 4));
+    let head = a.head().unwrap();
+    assert_eq!(a.verify_chain(1).unwrap(), head, "verifies across the anchor");
+    assert_eq!(a.verify_chain(3).unwrap(), head);
+    assert!(a.get(4).unwrap().is_none());
+    assert_eq!(a.entries_since(0, 10).unwrap()[0].seq, 5);
+    let anchor = a.anchor().unwrap().unwrap();
+    assert_eq!(anchor.seq, 4);
+    assert_eq!(anchor.archives, vec![r.clone()]);
+    // The file: mode 0600, hash recorded, entries chain to the anchor.
+    let path = arch.join(&r.file);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let (prev, entries) = fleet_agent::store::read_archive(&arch, &r).unwrap();
+    assert_eq!(prev, [0; 32]);
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[3].entry_hash(), anchor.entry_hash);
+    // Open intents are never archived; the rest follows in a second file.
+    let r2 = a.archive_before(&arch, &server, u64::MAX, 100).unwrap().unwrap();
+    assert_eq!((r2.from_seq, r2.to_seq), (5, 6));
+    assert_eq!(a.verify_chain(1).unwrap(), a.head().unwrap());
+    assert_eq!(a.anchor().unwrap().unwrap().archives.len(), 2);
+    // Appending after archiving still chains.
+    a.append_result(7, 9_000, Outcome::Ok).unwrap();
+    assert_eq!(a.verify_chain(1).unwrap().seq, 8);
+    // A changed archive file is detected.
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(fleet_agent::store::read_archive(&arch, &r).is_err());
+}
+
+#[test]
+fn audit_archive_refuses_broken_chain_and_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let arch = dir.path().join("audit-archive");
+    let server = ServerId::new("srv_test01").unwrap();
+    {
+        let s = open(&dir);
+        let a = s.audit();
+        chain(&a, 3);
+        let mut e = a.get(2).unwrap().unwrap();
+        e.actor = Actor::Recovery;
+        a.tamper_for_test(&e).unwrap();
+        assert!(a.archive_before(&arch, &server, u64::MAX, 100).is_err());
+        assert_eq!(a.anchor().unwrap(), None, "nothing archived");
+    }
+    // Everything archived (idle server): head == anchor, still verifies,
+    // across a reopen.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = open(&dir);
+        let a = s.audit();
+        let i = a.append_intent(intent(1)).unwrap();
+        a.append_result(i, 1_001, Outcome::Ok).unwrap();
+        a.archive_before(&arch, &server, u64::MAX, 1).unwrap().unwrap();
+        a.archive_before(&arch, &server, u64::MAX, 1).unwrap().unwrap();
+        assert!(a.entries_since(0, 10).unwrap().is_empty());
+    }
+    let s = open(&dir);
+    let a = s.audit();
+    assert_eq!(a.verify_chain(1).unwrap(), a.head().unwrap());
+    assert_eq!(a.head().unwrap().seq, 2);
+}
+
 #[test]
 fn audit_interrupted_marking_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();

@@ -24,6 +24,8 @@
 
 pub mod authorized_keys;
 pub mod parse;
+/// `search.users`.
+pub mod search;
 #[cfg(test)]
 mod tests;
 
@@ -415,4 +417,5 @@ pub fn register(r: &mut Registry, sink: Rc<dyn EventSink>) {
     for t in [tag::AUTHORIZED_KEYS_GET, tag::AUTHORIZED_KEYS_SET] {
         r.register(t, keys.clone());
     }
+    r.register(tag::SEARCH_USERS, Rc::new(search::SearchUsersHandler));
 }

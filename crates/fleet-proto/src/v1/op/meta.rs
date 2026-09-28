@@ -78,7 +78,8 @@ impl Op {
             | Op::AgentHealth
             | Op::RosterPending
             | Op::RosterGet
-            | Op::AlertRulesGet => Tier::Read,
+            | Op::AlertRulesGet
+            | Op::AuditQuery { .. } => Tier::Read,
 
             Op::ProcessSignal { .. }
             | Op::ProcessRenice { .. }
@@ -296,10 +297,20 @@ impl Op {
                 at_most(series, 256, "series")
             }
             Op::ProcessesList { limit, .. } => ensure((1..=1000).contains(limit), "limit"),
-            Op::ProcessesHistory { range }
-            | Op::LoginsQuery { range, .. }
-            | Op::WeblogQuery { range, .. } => range.validate(),
-            Op::EventsQuery { limit, .. } => ensure((1..=1000).contains(limit), "limit"),
+            Op::ProcessesHistory { range } | Op::LoginsQuery { range, .. } => range.validate(),
+            Op::WeblogQuery {
+                range,
+                limit,
+                status,
+                ..
+            } => {
+                range.validate()?;
+                ensure((1..=1000).contains(limit), "limit")?;
+                ensure(status.is_none_or(|s| s.is_valid()), "status range")
+            }
+            Op::EventsQuery { limit, .. } | Op::AuditQuery { limit, .. } => {
+                ensure((1..=1000).contains(limit), "limit")
+            }
             Op::PkgHistory { range, limit } => {
                 range.validate()?;
                 ensure((1..=10_000).contains(limit), "limit")

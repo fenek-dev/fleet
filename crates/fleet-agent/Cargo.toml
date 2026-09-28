@@ -17,6 +17,8 @@ fleet-hardening.workspace = true
 serde.workspace = true
 postcard.workspace = true
 blake3.workspace = true
+# Audit archive files (DEFLATE, pure Rust).
+miniz_oxide.workspace = true
 redb.workspace = true
 # io-std: bridge relays SSH channel stdin/stdout.
 tokio = { workspace = true, features = ["io-std"] }

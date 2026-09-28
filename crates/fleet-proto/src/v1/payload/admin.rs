@@ -337,3 +337,27 @@ pub struct ConfigPaths {
     /// `expected_version` for the next `config.paths.set`.
     pub version: u64,
 }
+
+// ---- audit (design §5.8) ----
+
+/// Where the agent's stored chain starts after archiving: entries up to
+/// and including `seq` were moved to archive files; `entry_hash` is the
+/// hash of entry `seq` (the next entry's `prev_hash`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditAnchor {
+    pub seq: u64,
+    pub entry_hash: Hash32,
+}
+
+/// `audit.query`: entries after the requested seq, oldest first, and a
+/// checkpoint of the chain head signed with the agent key when answering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditPage {
+    pub entries: Vec<crate::v1::AuditEntry>,
+    /// Archive anchor; entries at or below it are no longer served.
+    pub anchor: Option<AuditAnchor>,
+    /// Chain head when answering (`seq`, `entry_hash`), signed.
+    pub checkpoint: crate::v1::SignedCheckpoint,
+    /// More entries follow the last one returned.
+    pub more: bool,
+}

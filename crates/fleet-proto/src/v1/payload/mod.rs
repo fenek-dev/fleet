@@ -168,6 +168,9 @@ tagged_enum! {
 
         // agent
         AlertRules(v: AlertRuleSet) = ALERT_RULES(160, "alert_rules"),
+        /// `audit.query` (design §5.8).
+        /// Boxed: the inline checkpoint would grow every `Payload`.
+        AuditPage(v: Box<AuditPage>) = AUDIT_PAGE(161, "audit_page"),
 
         // shell
         ShellResult(v: ShellResult) = SHELL_RESULT(170, "shell_result"),

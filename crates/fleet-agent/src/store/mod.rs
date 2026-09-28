@@ -8,6 +8,7 @@
 //! (`crate::pending`) so the separate `revert` process can read them.
 
 mod audit;
+mod audit_archive;
 mod config;
 mod events;
 mod meta;
@@ -17,6 +18,10 @@ pub mod schema;
 mod security;
 
 pub use audit::{AuditLog, ChainError, ChainHead, CheckpointSigner, Intent};
+pub use audit_archive::{
+    AUDIT_RETENTION_MS, AnchorState, ArchiveError, ArchiveRecord, MAX_ARCHIVE_ENTRIES,
+    read_archive,
+};
 pub use config::ConfigDb;
 pub use events::{EventLog, MAX_EVENTS, RETENTION_MS as EVENT_RETENTION_MS, StoredEvent};
 pub use meta::{Meta, MetaKey};

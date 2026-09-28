@@ -29,6 +29,22 @@ pub trait AttributionContext {
     fn busy(&self) -> bool;
     /// Op tag of the operation with audit intent `seq`, if exec knows it.
     fn op_tag(&self, seq: u64) -> Option<u16>;
+    /// A write to `path` that a running (or just finished) exec operation
+    /// announced before writing: `(op tag, audit seq)`. Exec registers the
+    /// fixed targets of its own handlers; a pid-less watch event on such a
+    /// path is then `Fleet`, anything else stays as [`attribute`] decides.
+    fn expected_write(&self, _path: &str) -> Option<(u16, u64)> {
+        None
+    }
+}
+
+/// Classifies a pid-less watch event on `path`: an announced exec write,
+/// else [`attribute`] without a pid.
+pub fn attribute_path(ctx: &SysCtx, path: &str, att: &dyn AttributionContext) -> ChangeSource {
+    match att.expected_write(path) {
+        Some((op_tag, audit_seq)) => ChangeSource::Fleet { op_tag, audit_seq },
+        None => attribute(ctx, None, att),
+    }
 }
 
 /// No knowledge of exec's operations: every pid-less change is `Unknown`.
@@ -209,5 +225,37 @@ mod tests {
         );
         assert_eq!(attribute(&c, None, &running), ChangeSource::Unknown);
         assert_eq!(attribute(&c, None, &Unattributed), ChangeSource::Unknown);
+    }
+
+    #[test]
+    fn announced_writes() {
+        struct Announced;
+        impl AttributionContext for Announced {
+            fn exec_pid(&self) -> u32 {
+                1
+            }
+            fn current_op(&self) -> Option<(u16, u64)> {
+                None
+            }
+            fn busy(&self) -> bool {
+                true
+            }
+            fn op_tag(&self, _: u64) -> Option<u16> {
+                None
+            }
+            fn expected_write(&self, path: &str) -> Option<(u16, u64)> {
+                (path == "/etc/passwd").then_some((801, 5))
+            }
+        }
+        let c = crate::testutil::ctx_empty();
+        assert_eq!(
+            attribute_path(&c, "/etc/passwd", &Announced),
+            ChangeSource::Fleet {
+                op_tag: 801,
+                audit_seq: 5
+            }
+        );
+        assert_eq!(attribute_path(&c, "/etc/hosts", &Announced), ChangeSource::Unknown);
+        assert_eq!(attribute_path(&c, "/etc/passwd", &Unattributed), ChangeSource::Unknown);
     }
 }

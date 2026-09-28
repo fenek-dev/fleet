@@ -31,6 +31,11 @@ pub enum MetaKey {
     AdminUser,
     /// `postcard(SignedCheckpoint)`: the latest hourly checkpoint.
     Checkpoint,
+    /// `postcard(AnchorState)`: the audit chain's archive anchor (last
+    /// archived seq and entry hash) and every archive file with its hash
+    /// (design §5.8). Written in the same transaction that removes the
+    /// archived entries.
+    AuditAnchor,
 }
 
 impl MetaKey {
@@ -44,8 +49,22 @@ impl MetaKey {
             Self::ServerId => "server_id",
             Self::AdminUser => "admin_user",
             Self::Checkpoint => "checkpoint",
+            Self::AuditAnchor => "audit_anchor",
         }
     }
+}
+
+/// Reads `key` inside another table group's transaction.
+pub(super) fn get_in(tx: &redb::ReadTransaction, key: MetaKey) -> Result<Option<Vec<u8>>> {
+    let t = tx.open_table(META)?;
+    Ok(t.get(key.as_str())?.map(|v| v.value().to_vec()))
+}
+
+/// Sets `key` inside another table group's write transaction (one commit
+/// with that group's changes).
+pub(super) fn set_in(tx: &WriteTransaction, key: MetaKey, value: &[u8]) -> Result<()> {
+    tx.open_table(META)?.insert(key.as_str(), value)?;
+    Ok(())
 }
 
 pub struct Meta<'a> {

@@ -203,6 +203,47 @@ pub(crate) async fn fleet_events(
     }
 }
 
+/// Pulls `server`'s new audit entries into the mirror (verified against
+/// the pinned agent key and the chain this Mac holds); a truncated or
+/// rewritten chain raises a critical `AuditTampered` alert.
+pub(crate) async fn mirror_audit(core: &Weak<FleetCore>, handle: &ManagerHandle, server: &ServerId) {
+    let Some(c) = core.upgrade() else { return };
+    let Some(pin) = lock(&c.cache)
+        .pins(server)
+        .ok()
+        .flatten()
+        .and_then(|p| p.agent_signing)
+    else {
+        return;
+    };
+    let r = fleet_core::audit_mirror::mirror(handle, &c.cache, server, &pin, fleet_core::now_ms())
+        .await;
+    c.audit_mirrored(server, r);
+}
+
+impl FleetCore {
+    /// Reports a mirror run: a tampered chain is a critical alert; other
+    /// failures (offline, locked) wait for the next run.
+    pub(crate) fn audit_mirrored(
+        &self,
+        server: &ServerId,
+        r: Result<fleet_core::audit_mirror::MirrorReport, fleet_core::audit_mirror::MirrorError>,
+    ) {
+        if let Err(fleet_core::audit_mirror::MirrorError::Tamper(t)) = r {
+            self.alert(FleetAlertRow {
+                kind: FleetAlertKind::AuditTampered,
+                server_id: Some(server.to_string()),
+                device_id: None,
+                title: "Audit log changed on the server".into(),
+                detail: t.to_string(),
+                pending_hash: None,
+                activates_at_ms: None,
+                signed: true,
+            });
+        }
+    }
+}
+
 async fn on_ready(
     core: Weak<FleetCore>,
     handle: ManagerHandle,
@@ -227,6 +268,10 @@ async fn on_ready(
             let _ = catchup::store_cursor(&lock(&c.cache), &server, &cur);
         }
         lock(&c.fleet.tracker).caught_up(&server, &up);
+    }
+    // Audit mirror (design §5.8): `audit.query` needs a device session.
+    if kind == Some(SessionKind::Device) {
+        mirror_audit(&core, &handle, &server).await;
     }
     // Servers behind on the roster catch up (rule 2) — needs a device
     // session; while locked they stay queued.

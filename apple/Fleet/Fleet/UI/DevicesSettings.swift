@@ -306,7 +306,7 @@ struct FleetAlertsSection: View {
 
     static func tone(_ k: FleetAlertKind) -> Tone {
         switch k {
-        case .removedFromFleet, .recoveryPending, .rosterPushFailed, .syncRejected, .rosterFork: .critical
+        case .removedFromFleet, .recoveryPending, .rosterPushFailed, .syncRejected, .rosterFork, .auditTampered: .critical
         case .macAdded, .macRevoked, .rosterChanged, .pinChange: .warn
         case .syncConflict, .waitingForRoster, .recoveryVetoed: .info
         }
@@ -326,6 +326,7 @@ struct FleetAlertsSection: View {
         case .syncConflict: "Conflict"
         case .syncRejected: "Sync"
         case .rosterFork: "Roster fork"
+        case .auditTampered: "Audit log"
         }
     }
 }

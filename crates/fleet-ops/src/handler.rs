@@ -204,6 +204,17 @@ impl Registry {
             fleet_proto::op::tag::SYSTEM_INFO,
             Rc::new(crate::system::SystemInfoHandler),
         );
+        r.register(
+            fleet_proto::op::tag::CONNECTIONS_LIST,
+            Rc::new(crate::netconn::ConnectionsHandler),
+        );
+        // Null sink here; exec re-registers with its event bus.
+        r.register(
+            fleet_proto::op::tag::SYSTEM_REBOOT,
+            Rc::new(crate::reboot::RebootHandler::new(Rc::new(
+                crate::security::NullSink,
+            ))),
+        );
         crate::packages::register(&mut r);
         crate::logs::register(&mut r);
         crate::firewall::register(&mut r);
@@ -304,6 +315,11 @@ mod tests {
             tag::LOGINS_QUERY,
             tag::PORTS_LIST,
             tag::CERTS_LIST,
+            tag::CONNECTIONS_LIST,
+            tag::SYSTEM_REBOOT,
+            tag::LOGFILES_LIST,
+            tag::WEBLOG_QUERY,
+            tag::SEARCH_USERS,
         ] {
             assert!(tags.contains(&t), "missing tag {t}");
         }

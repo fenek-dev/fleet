@@ -98,6 +98,17 @@ pub struct AuditEntry {
     pub result: ResultSummary,
 }
 
+impl AuditEntry {
+    /// `BLAKE3(prev_hash ‖ postcard(entry))`: what the next entry's
+    /// `prev_hash` and checkpoints name (design §5.8). Agent and Mac share it.
+    pub fn entry_hash(&self) -> Hash32 {
+        let mut h = blake3::Hasher::new();
+        h.update(&self.prev_hash);
+        h.update(&encode(self));
+        *h.finalize().as_bytes()
+    }
+}
+
 /// Hourly signed pointer into the audit chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {

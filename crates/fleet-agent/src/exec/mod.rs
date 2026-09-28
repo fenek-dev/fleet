@@ -15,8 +15,12 @@
 //! Operations are dispatched through a `fleet_ops::Registry`: generic ones
 //! come from `fleet-ops`, state-bound ones (roster, policy, veto,
 //! `agent.health`, `roster.pending`, `events.query`, `change.confirm`,
-//! `changes.list`) from [`ops`]. `StreamOpen` runs the same pipeline and
-//! then [`stream`] pumps the handler's `OpStream`.
+//! `changes.list`) from [`ops`], `audit.query` from [`audit_ops`]; the
+//! whole production registry is assembled by `build` (its tags:
+//! [`registry_tags`]). `StreamOpen` runs the same pipeline and then
+//! [`stream`] pumps the handler's `OpStream`. Every admitted command is
+//! registered with [`attribution`] (config history) until it ends; the
+//! stored policy is re-verified at load ([`policy_check`]).
 //!
 //! Pipeline per command ([`Exec::admit`], design §5.6): verify → policy
 //! (AI rate included) → `Request`/`StreamOpen` matches `Op::is_stream` →
@@ -29,11 +33,14 @@
 //! (§4.10, [`apply`]).
 
 mod apply;
+mod attribution;
+mod audit_ops;
 mod confighist;
 mod conn;
 mod events;
 mod lifecycle;
 mod ops;
+mod policy_check;
 mod sources;
 mod sshd;
 mod state;
@@ -230,6 +237,8 @@ struct Admitted {
     revertible: Option<(ChangeKind, Rc<dyn Revertible>, KindSlot)>,
     /// `change.confirm`: the change it confirms.
     confirms: Option<PendingChange>,
+    /// Config-history attribution of this op's writes, until it ends.
+    _attributed: attribution::OpGuard,
 }
 
 /// One gate connection: the key kind the gate authenticated and exec's own
@@ -279,6 +288,8 @@ struct Exec {
     apply_timeout: Duration,
     profile_apply_timeout: Duration,
     confirm_sshd_login: Option<Duration>,
+    /// Running ops and their announced writes (config history).
+    attribution: Rc<attribution::ExecAttribution>,
 }
 
 /// Marks the change kinds an op claims as being applied; released on drop.
@@ -396,6 +407,7 @@ impl Exec {
             .borrow_mut()
             .commit_intent(&meta.command, cmd, now)?;
         meta.audit_seq = Some(intent_seq);
+        let attributed = self.attribution.begin(&meta.command.body.op, intent_seq);
         let revertible = revertible.map(|(kind, r)| {
             let claimed = fleet_ops::revertible::claimed_kinds(op);
             self.kinds.borrow_mut().extend(claimed.iter().copied());
@@ -412,6 +424,7 @@ impl Exec {
             intent_seq,
             revertible,
             confirms,
+            _attributed: attributed,
         })
     }
 
@@ -686,6 +699,93 @@ fn maybe_compact(exec: &Rc<Exec>, c: &Rc<CompactState>, force_after: Duration) {
     });
 }
 
+/// The production registry and the parts that feed its handlers.
+struct Built {
+    registry: Registry,
+    bus: Rc<events::EventBus>,
+    tel: Rc<fleet_ops::telemetry::Telemetry>,
+    sources: Rc<sources::Sources>,
+    config: Option<Rc<fleet_ops::confighist::ConfigTracker>>,
+    wired: wiring::Wired,
+    attribution: Rc<attribution::ExecAttribution>,
+}
+
+/// Every handler exec dispatches to (design §4.2): generic `fleet-ops`
+/// ones, hardening, state-bound ops, telemetry, sources, config history,
+/// the wired families, agent lifecycle, then `extra` (tests) replacing any
+/// of them.
+#[allow(clippy::too_many_arguments)]
+fn build(
+    st: &Rc<RefCell<State>>,
+    ctx: &SysCtx,
+    paths: &Paths,
+    sources_cfg: SourcesConfig,
+    ssh_logins: Rc<RefCell<Logins>>,
+    user_keys: crate::userkeys::UserKeysMode,
+    extra: Vec<(u16, Rc<dyn OpHandler>)>,
+) -> Built {
+    let mut registry = Registry::with_generic();
+    fleet_hardening::register(&mut registry);
+    let state_ops: Rc<dyn OpHandler> = Rc::new(ops::StateOps(st.clone()));
+    for tag in ops::TAGS {
+        registry.register(tag, state_ops.clone());
+    }
+    let change_ops: Rc<dyn OpHandler> = Rc::new(ops::ChangeOps(st.clone()));
+    for tag in ops::CHANGE_TAGS {
+        registry.register(tag, change_ops.clone());
+    }
+    let audit_ops: Rc<dyn OpHandler> = Rc::new(audit_ops::AuditOps(st.clone()));
+    for tag in audit_ops::TAGS {
+        registry.register(tag, audit_ops.clone());
+    }
+    let bus = events::EventBus::new(st.clone(), ctx.clock.clone());
+    let tel = telemetry::start(st, ctx, &mut registry, &bus);
+    let sources = sources::Sources::new(st, ctx, bus.clone(), sources_cfg, ssh_logins);
+    sources.register(&mut registry);
+    let attribution = Rc::new(attribution::ExecAttribution::default());
+    let config = confighist::start(st, &mut registry, &bus, attribution.clone());
+    let wired = wiring::start(st, paths, &mut registry, &bus, &tel);
+    lifecycle::register(st, &mut registry, user_keys);
+    for (tag, h) in extra {
+        registry.register(tag, h);
+    }
+    Built {
+        registry,
+        bus,
+        tel,
+        sources,
+        config,
+        wired,
+        attribution,
+    }
+}
+
+/// Tags of the production registry exec would build for `cfg` (the
+/// catalog-coverage test, design §4.2). Loads the installed state like
+/// `run` does, but starts nothing; exec must not be running.
+#[doc(hidden)]
+pub fn registry_tags(mut cfg: ExecConfig) -> Result<Vec<u16>, ExecError> {
+    let ssh_logins = Rc::new(RefCell::new(Logins::default()));
+    let terminator = cfg.terminator.take().unwrap_or_else(|| Box::new(NoopTerminator));
+    let state = State::load(StateParts {
+        paths: cfg.paths.clone(),
+        reverter: cfg.reverter,
+        timers: cfg.timers,
+        terminator,
+    })?;
+    let st = Rc::new(RefCell::new(state));
+    let b = build(
+        &st,
+        &cfg.ctx,
+        &cfg.paths,
+        cfg.sources,
+        ssh_logins,
+        cfg.user_keys,
+        std::mem::take(&mut cfg.handlers),
+    );
+    Ok(b.registry.tags().collect())
+}
+
 /// Runs exec until `shutdown` completes. The store is closed on return.
 pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Result<(), ExecError> {
     let paths = cfg.paths.clone();
@@ -726,26 +826,15 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     crate::notify::notify("READY=1");
 
     let st = Rc::new(RefCell::new(state));
-    let mut registry = Registry::with_generic();
-    fleet_hardening::register(&mut registry);
-    let state_ops: Rc<dyn OpHandler> = Rc::new(ops::StateOps(st.clone()));
-    for tag in ops::TAGS {
-        registry.register(tag, state_ops.clone());
-    }
-    let change_ops: Rc<dyn OpHandler> = Rc::new(ops::ChangeOps(st.clone()));
-    for tag in ops::CHANGE_TAGS {
-        registry.register(tag, change_ops.clone());
-    }
-    let bus = events::EventBus::new(st.clone(), ctx.clock.clone());
-    let tel = telemetry::start(&st, &ctx, &mut registry, &bus);
-    let sources = sources::Sources::new(&st, &ctx, bus.clone(), sources_cfg, ssh_logins);
-    sources.register(&mut registry);
-    let config = confighist::start(&st, &mut registry, &bus);
-    let wired = wiring::start(&st, &paths, &mut registry, &bus, &tel);
-    lifecycle::register(&st, &mut registry, user_keys);
-    for (tag, h) in extra {
-        registry.register(tag, h);
-    }
+    let Built {
+        registry,
+        bus,
+        tel,
+        sources,
+        config,
+        wired,
+        attribution,
+    } = build(&st, &ctx, &paths, sources_cfg, ssh_logins, user_keys, extra);
     let exec = Rc::new(Exec {
         st: st.clone(),
         registry,
@@ -765,6 +854,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         apply_timeout,
         profile_apply_timeout,
         confirm_sshd_login,
+        attribution,
     });
     let budget = Rc::new(Budget::default());
     let compaction = Rc::new(CompactState::default());

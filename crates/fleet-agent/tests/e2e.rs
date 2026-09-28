@@ -57,6 +57,11 @@ mod sources;
 #[path = "e2e/lifecycle.rs"]
 mod lifecycle;
 
+/// Registry coverage, `audit.query` + mirror, policy re-verification
+/// (`tests/e2e/audit.rs`).
+#[path = "e2e/audit.rs"]
+mod audit;
+
 fn run(f: impl Future<Output = ()>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

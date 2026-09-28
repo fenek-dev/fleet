@@ -231,6 +231,7 @@ pub(super) fn samples() -> Vec<Op> {
             | Op::AgentUninstall { .. }
             | Op::AlertRulesGet
             | Op::AlertRulesUpdate(_)
+            | Op::AuditQuery { .. }
             | Op::ShellExec(_)
             | Op::Unknown { .. } => {}
         }
@@ -298,6 +299,9 @@ pub(super) fn samples() -> Vec<Op> {
         Op::WeblogQuery {
             range: range(),
             limit: 100,
+            status: Some(StatusRange { min: 400, max: 499 }),
+            path_prefix: Some(HttpPath::new("/api/").unwrap()),
+            client: Some("203.0.113.9".parse().unwrap()),
         },
         Op::LoginsQuery {
             range: range(),
@@ -577,6 +581,10 @@ pub(super) fn samples() -> Vec<Op> {
             remove_firewall: false,
         },
         Op::AlertRulesGet,
+        Op::AuditQuery {
+            after_seq: 41,
+            limit: 500,
+        },
         Op::AlertRulesUpdate(AlertRuleSet {
             version: 4,
             rules: vec![AlertRule {
@@ -685,7 +693,7 @@ fn names_match_groups() {
         (Group::Game, &["game."][..]),
         (
             Group::Agent,
-            &["agent.", "roster.", "policy.", "alert_rules."][..],
+            &["agent.", "roster.", "policy.", "alert_rules.", "audit.query"][..],
         ),
         (Group::Shell, &["shell."][..]),
     ]);
@@ -764,6 +772,7 @@ fn tier_table() {
         "roster.pending",
         "roster.get",
         "alert_rules.get",
+        "audit.query",
     ];
     const ELEVATED: &[&str] = &[
         "authorized_keys.set",
@@ -996,6 +1005,39 @@ fn check_args_rejects() {
         assert!(peers(&[bad]).check_args().is_err(), "{bad}");
     }
     assert!(Op::SystemReboot { delay_s: 3601 }.check_args().is_err());
+    let weblog = |limit, status| Op::WeblogQuery {
+        range: TimeRange::default(),
+        limit,
+        status,
+        path_prefix: None,
+        client: None,
+    };
+    assert!(weblog(1000, None).check_args().is_ok());
+    assert!(weblog(0, None).check_args().is_err());
+    assert!(weblog(1001, None).check_args().is_err());
+    for bad in [(500, 400), (99, 200), (200, 600)] {
+        let s = StatusRange {
+            min: bad.0,
+            max: bad.1,
+        };
+        assert!(weblog(10, Some(s)).check_args().is_err(), "{bad:?}");
+    }
+    assert!(
+        Op::AuditQuery {
+            after_seq: 0,
+            limit: 0
+        }
+        .check_args()
+        .is_err()
+    );
+    assert_eq!(
+        Op::AuditQuery {
+            after_seq: 0,
+            limit: 1
+        }
+        .tier(),
+        Tier::Read
+    );
     assert!(
         Op::ProcessesList {
             sort: ProcessSort::Pid,

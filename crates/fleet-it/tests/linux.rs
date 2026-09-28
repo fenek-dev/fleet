@@ -1457,6 +1457,169 @@ fn update_confirmed_then_manual_and_timer_rollback() {
     });
 }
 
+// ------------------------------------------- remaining handlers, audit (W6b)
+
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn w6b_connections_list_shows_own_ssh_session() {
+    let fx = fixture();
+    let Payload::Connections(c) = read(fx, Op::ConnectionsList) else {
+        panic!("wrong payload")
+    };
+    let ssh: Vec<_> = c
+        .connections
+        .iter()
+        .filter(|c| c.local.port() == 22 && c.state == "ESTABLISHED")
+        .collect();
+    eprintln!(
+        "connections.list: {} rows, {} established on :22, e.g. {:?}",
+        c.connections.len(),
+        ssh.len(),
+        ssh.first()
+    );
+    assert!(!ssh.is_empty(), "our own SSH connection is missing");
+    assert!(
+        ssh.iter()
+            .any(|c| c.process.as_deref().is_some_and(|p| p.starts_with("sshd"))),
+        "sshd not mapped to the socket"
+    );
+}
+
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn w6b_logfiles_list_and_weblog_query_fixture_log() {
+    let fx = fixture();
+    let c = &fx.container;
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let line = |t: u64, ip: &str, uri: &str, status: u16| {
+        format!(
+            r#"{{"level":"info","ts":{t}.25,"logger":"http.log.access","request":{{"remote_ip":"10.0.0.1","client_ip":"{ip}","method":"GET","uri":"{uri}","headers":{{"User-Agent":["it"]}}}},"status":{status},"size":10}}"#
+        )
+    };
+    let body = [
+        line(now_s - 30, "198.51.100.4", "/index.html", 200),
+        line(now_s - 20, "198.51.100.4", "/.env", 404),
+        "garbage".to_owned(),
+        line(now_s - 10, "203.0.113.9", "/api/v1/x", 500),
+    ]
+    .join("\n")
+        + "\n";
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("access.log");
+    std::fs::write(&local, body).unwrap();
+    c.exec(&["mkdir", "-p", "/var/log/caddy"]).unwrap();
+    c.cp_into(&local, "/var/log/caddy/access.log").unwrap();
+    c.exec(&["chown", "root:root", "/var/log/caddy/access.log"]).unwrap();
+
+    let Payload::LogFiles(l) = read(fx, Op::LogfilesList) else {
+        panic!("wrong payload")
+    };
+    let paths: Vec<&str> = l.files.iter().map(|f| f.path.as_str()).collect();
+    eprintln!("logfiles.list: {} files, e.g. {:?}", paths.len(), &paths[..paths.len().min(5)]);
+    assert!(paths.contains(&"/var/log/caddy/access.log"));
+    assert!(!paths.iter().any(|p| p.starts_with("/var/log/journal")));
+
+    let q = |status, client| Op::WeblogQuery {
+        range: TimeRange::default(),
+        limit: 100,
+        status,
+        path_prefix: None,
+        client,
+    };
+    let Payload::WebLogSummary(all) = read(fx, q(None, None)) else {
+        panic!("wrong payload")
+    };
+    eprintln!(
+        "weblog.query: {} requests, by status {:?}, scanner hits {}",
+        all.requests, all.by_status, all.scanner_hits
+    );
+    assert_eq!(all.requests, 3);
+    assert_eq!(all.entries[0].path, "/api/v1/x", "newest first");
+    assert_eq!(all.scanner_hits, 1);
+    let Payload::WebLogSummary(errs) = read(
+        fx,
+        q(
+            Some(fleet_proto::op::StatusRange { min: 400, max: 599 }),
+            Some("198.51.100.4".parse().unwrap()),
+        ),
+    ) else {
+        panic!("wrong payload")
+    };
+    assert_eq!(errs.requests, 1);
+    assert_eq!(errs.entries[0].path, "/.env");
+    c.exec(&["rm", "-f", "/var/log/caddy/access.log"]).unwrap();
+}
+
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn w6b_audit_query_verified_by_mirror() {
+    use fleet_core::audit_mirror::{MirrorHead, verify_page};
+    let fx = fixture();
+    run(LIMIT, async {
+        let (conn, mut s) = open(fx).await;
+        let mut known = MirrorHead::default();
+        let mut pages = 0;
+        let mut entries = 0;
+        loop {
+            let op = Op::AuditQuery {
+                after_seq: known.seq,
+                limit: 200,
+            };
+            let Ok(Payload::AuditPage(p)) = call(&mut s, fx, op).await else {
+                panic!("audit.query failed")
+            };
+            let v = verify_page(&fx.server, &fx.agent_signing, known, &p)
+                .expect("chain or checkpoint doesn't verify");
+            pages += 1;
+            entries += v.entries.len();
+            let more = v.more && !v.entries.is_empty();
+            known = v.head;
+            if !more {
+                break;
+            }
+        }
+        eprintln!("audit.query: {entries} entries in {pages} pages, head seq {}", known.seq);
+        assert!(entries > 0 && known.seq as usize >= entries);
+        // Continuing from the verified head: only new entries, still linked.
+        let op = Op::AuditQuery {
+            after_seq: known.seq,
+            limit: 200,
+        };
+        let Ok(Payload::AuditPage(p)) = call(&mut s, fx, op).await else {
+            panic!("audit.query failed")
+        };
+        verify_page(&fx.server, &fx.agent_signing, known, &p).unwrap();
+        conn.disconnect().await;
+    });
+}
+
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn w6b_system_reboot_schedules_timer_then_cancel() {
+    let fx = fixture();
+    let c = &fx.container;
+    run(LIMIT, async {
+        let (conn, mut s) = open(fx).await;
+        let r = call(&mut s, fx, Op::SystemReboot { delay_s: 3600 }).await;
+        conn.disconnect().await;
+        assert_eq!(r, Ok(Payload::Empty));
+    });
+    let (_, timers) = c.exec_status(
+        &["systemctl", "list-timers", "--all", "--no-pager", "fleet-reboot.timer"],
+        30,
+    );
+    eprintln!("system.reboot timer: {}", timers.lines().nth(1).unwrap_or(""));
+    // Never let it fire: stop it before asserting anything else.
+    let (stopped, _) = c.exec_status(&["systemctl", "stop", "fleet-reboot.timer"], 30);
+    assert!(stopped, "fleet-reboot.timer not loaded");
+    assert!(timers.contains("fleet-reboot.timer"), "{timers}");
+    let (active, _) = c.exec_status(&["systemctl", "is-active", "fleet-reboot.timer"], 30);
+    assert!(!active);
+}
+
 /// Last by name: footprint after every other test in this run.
 #[test]
 #[ignore = "needs Docker; run tests/vm/run.sh"]
