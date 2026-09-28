@@ -7,6 +7,7 @@ tests/vm/run.sh              # Debian 12
 tests/vm/run.sh ubuntu24     # Ubuntu 24.04
 tests/vm/run.sh debian12 metrics   # only tests matching "metrics"
 FLEET_IT_KEEP=1 tests/vm/run.sh    # keep the container for debugging
+FLEET_TARGET_VOLUME=mine tests/vm/run.sh   # own build volume (parallel worktrees)
 ```
 
 `run.sh` does three things:

@@ -46,7 +46,7 @@ fn hex_addr(s: &str) -> Option<IpAddr> {
     }
 }
 
-fn endpoint(s: &str) -> Option<(IpAddr, u16)> {
+pub(crate) fn endpoint(s: &str) -> Option<(IpAddr, u16)> {
     let (a, p) = s.split_once(':')?;
     Some((hex_addr(a)?, u16::from_str_radix(p, 16).ok()?))
 }

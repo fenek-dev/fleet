@@ -5,10 +5,14 @@
 pub mod journal;
 pub mod lines;
 pub mod logfile;
+pub mod logfiles;
+pub mod weblog;
 
 pub use journal::JournalHandler;
 pub use lines::{FakeLineSpawner, LineSource, LineSpawner, SystemLineSpawner};
 pub use logfile::LogfileTailHandler;
+pub use logfiles::LogfilesListHandler;
+pub use weblog::WeblogHandler;
 
 use crate::handler::Registry;
 use fleet_proto::op::tag;
@@ -20,4 +24,6 @@ pub fn register(r: &mut Registry) {
     r.register(tag::JOURNAL_QUERY, journal.clone());
     r.register(tag::JOURNAL_FOLLOW, journal);
     r.register(tag::LOGFILE_TAIL, Rc::new(LogfileTailHandler::default()));
+    r.register(tag::LOGFILES_LIST, Rc::new(LogfilesListHandler));
+    r.register(tag::WEBLOG_QUERY, Rc::new(WeblogHandler::default()));
 }

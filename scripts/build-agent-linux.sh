@@ -8,6 +8,10 @@
 #
 # Output: target/linux/<arch>/fleet-agent
 #
+# FLEET_TARGET_VOLUME=<name> uses its own target volume: parallel
+# worktrees sharing one would see each other's (mtime-fresh) artifacts
+# for the same /src paths and skip rebuilding changed crates.
+#
 # aarch64 builds natively on Apple Silicon (linux/arm64 container).
 # x86_64 runs the container as linux/amd64 (Rosetta/QEMU emulation in
 # Docker Desktop): it works, but expect it to be several times slower.
@@ -45,7 +49,7 @@ docker run --rm \
     -v "$out:/out" \
     -v "fleet-rustup-$suffix:/usr/local/rustup" \
     -v "fleet-cargo-registry-$suffix:/usr/local/cargo/registry" \
-    -v "fleet-target-linux-$suffix:/target" \
+    -v "fleet-target-linux-${FLEET_TARGET_VOLUME:-$suffix}:/target" \
     -w /src \
     -e CARGO_TARGET_DIR=/target \
     -e CARGO_PROFILE_RELEASE_STRIP=symbols \

@@ -35,6 +35,8 @@
 //!   ops; [`provision`]: the provisioning wizard's orchestration (§9.1).
 #![forbid(unsafe_code)]
 
+/// Audit mirror: `audit.query` pages verified and stored (§5.8).
+pub mod audit_mirror;
 pub mod autorevert;
 pub mod bulk;
 pub mod cache;

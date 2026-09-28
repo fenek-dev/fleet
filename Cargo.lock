@@ -1170,6 +1170,7 @@ dependencies = [
  "fleet-ops",
  "fleet-proto",
  "hex",
+ "miniz_oxide",
  "postcard",
  "proptest",
  "redb",

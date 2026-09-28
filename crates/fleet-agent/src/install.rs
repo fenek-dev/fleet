@@ -199,6 +199,8 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
     let policy = encode(&StoredPolicy {
         toml: input.policy_toml.clone(),
         approval: None,
+        expected_version: None,
+        roster: None,
     });
     let server = input.server_id.as_str().as_bytes();
     let mut changes = vec![

@@ -54,6 +54,7 @@ fn render(p: &Payload, out: &mut String, indent: usize) {
         Payload::LogLines(v) => fields!(v),
         Payload::LogFiles(v) => fields!(v),
         Payload::WebLogSummary(v) => fields!(v),
+        Payload::AuditPage(v) => fields!(v),
         Payload::Logins(v) => fields!(v),
         Payload::Bans(v) => fields!(v),
         Payload::BanConfig(v) => fields!(v),

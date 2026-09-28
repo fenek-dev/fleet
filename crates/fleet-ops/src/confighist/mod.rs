@@ -31,7 +31,7 @@ pub mod write;
 #[cfg(test)]
 mod tests;
 
-pub use attrib::{AttributionContext, Unattributed, attribute, parse_op_scope};
+pub use attrib::{AttributionContext, Unattributed, attribute, attribute_path, parse_op_scope};
 pub use ops::{ConfigOps, TAGS};
 pub use rules::PathRules;
 pub use store::{
@@ -498,7 +498,7 @@ impl ConfigTracker {
                 b = batch => match b {
                     watch::Batch::Paths(paths) => {
                         for p in paths {
-                            let src = attribute(&ctx, None, self.attrib.as_ref());
+                            let src = attribute_path(&ctx, &p, self.attrib.as_ref());
                             if let Err(e) = self.observe(&ctx, &p, src, true) {
                                 log("config observe", &e.to_string());
                             }

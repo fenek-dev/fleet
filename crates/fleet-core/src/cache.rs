@@ -22,8 +22,9 @@
 //!
 //! Schema changes are append-only migrations recorded in
 //! `schema_migrations`; a database from a newer app version is refused.
-//! The audit-mirror and metrics tables of v1 are not used yet (the offline
-//! audit mirror comes later).
+//! The audit mirror (`audit_entries`, `audit_checkpoints`, MAC'd from v4)
+//! is filled by [`crate::audit_mirror`]; the metrics table of v1 is not
+//! used yet.
 
 use crate::ssh::{HostKey, SshError, SshTarget};
 use fleet_crypto::Zeroizing;
@@ -131,6 +132,11 @@ const MIGRATIONS: &[&str] = &[
         body        BLOB NOT NULL,
         mac         BLOB NOT NULL
     );",
+    // v4: the audit mirror is filled (`crate::audit_mirror`). Its rows are
+    // evidence against a server that rewrites history: MAC'd like the
+    // trust rows. Nothing was ever written to these tables before v4.
+    "ALTER TABLE audit_entries ADD COLUMN mac BLOB;
+    ALTER TABLE audit_checkpoints ADD COLUMN mac BLOB;",
 ];
 
 mod library;

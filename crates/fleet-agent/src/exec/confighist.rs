@@ -4,15 +4,17 @@
 //! logged, broadcast; queued while the state is busy, oldest dropped
 //! first).
 //!
-//! Attribution uses `Unattributed` until exec tracks the operation in
-//! flight (`fleet_ops::confighist::AttributionContext`): pid-less watch
-//! events are then `Unknown`, never guessed. Handlers that write tracked
-//! files record their own writes with `ConfigTracker::note_write`.
+//! Attribution is exec's [`ExecAttribution`]: pid-less watch events on a
+//! path announced by a running (or just finished) exec operation are
+//! `Fleet { op, seq }`; everything else is `Unknown`, never guessed.
+//! Handlers that write tracked files may also record their own writes with
+//! `ConfigTracker::note_write`.
 
+use super::attribution::ExecAttribution;
 use super::events::EventBus;
 use super::log;
 use super::state::State;
-use fleet_ops::confighist::{ConfigOps, ConfigTracker, Unattributed};
+use fleet_ops::confighist::{ConfigOps, ConfigTracker};
 use fleet_ops::{Registry, SysCtx};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,9 +25,10 @@ pub(super) fn start(
     st: &Rc<RefCell<State>>,
     registry: &mut Registry,
     bus: &Rc<EventBus>,
+    attribution: Rc<ExecAttribution>,
 ) -> Option<Rc<ConfigTracker>> {
     let store = Rc::new(st.borrow().store.config());
-    match ConfigTracker::new(store, bus.clone(), Rc::new(Unattributed)) {
+    match ConfigTracker::new(store, bus.clone(), attribution) {
         Ok(t) => {
             ConfigOps::register(t.clone(), registry);
             Some(t)

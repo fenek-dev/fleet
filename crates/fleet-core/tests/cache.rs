@@ -35,7 +35,7 @@ fn record(i: usize) -> ServerRecord {
 #[test]
 fn servers_groups_tags_and_jump_chain_roundtrip() {
     let mut c = Cache::open_in_memory().unwrap();
-    assert_eq!(c.schema_version().unwrap(), 3);
+    assert_eq!(c.schema_version().unwrap(), 4);
     c.upsert_group(&GroupRecord {
         id: "g1".into(),
         name: "Web".into(),
@@ -227,6 +227,10 @@ fn v1_database_is_upgraded_and_sealed() {
              CREATE TABLE settings (key TEXT PRIMARY KEY, value BLOB NOT NULL);
              CREATE TABLE roster_chain (epoch INTEGER NOT NULL, version INTEGER NOT NULL, hash BLOB NOT NULL,
                signed BLOB NOT NULL, PRIMARY KEY (epoch, version));
+             CREATE TABLE audit_entries (server_id TEXT NOT NULL, seq INTEGER NOT NULL, entry BLOB NOT NULL,
+               entry_hash BLOB NOT NULL, PRIMARY KEY (server_id, seq)) WITHOUT ROWID;
+             CREATE TABLE audit_checkpoints (server_id TEXT PRIMARY KEY, seq INTEGER NOT NULL,
+               checkpoint BLOB NOT NULL, verified_at_ms INTEGER NOT NULL);
              INSERT INTO schema_migrations VALUES (1, 0);
              INSERT INTO servers VALUES ('srv_000001', 'a', 'h', 22, 'u', NULL, NULL);
              INSERT INTO settings VALUES ('fleet_id', x'01');
@@ -237,7 +241,7 @@ fn v1_database_is_upgraded_and_sealed() {
     }
     let c = Cache::open(&path, key(3)).unwrap();
     assert!(c.upgraded());
-    assert_eq!(c.schema_version().unwrap(), 3);
+    assert_eq!(c.schema_version().unwrap(), 4);
     assert_eq!(c.server(&sid(1)).unwrap().unwrap().target.host, "h");
     assert_eq!(c.setting("fleet_id").unwrap(), Some(vec![1]));
     assert!(c.pins(&sid(1)).unwrap().is_some());
@@ -258,7 +262,7 @@ fn file_database_migrates_once_and_refuses_newer_schema() {
         c.upsert_server(&record(1)).unwrap();
     }
     let c = Cache::open(&path, key(1)).unwrap();
-    assert_eq!(c.schema_version().unwrap(), 3);
+    assert_eq!(c.schema_version().unwrap(), 4);
     assert_eq!(c.servers().unwrap().len(), 1);
     drop(c);
     {
@@ -277,7 +281,7 @@ fn file_database_migrates_once_and_refuses_newer_schema() {
         Cache::open(&path, key(1)),
         Err(CacheError::TooNew {
             found: 99,
-            supported: 3
+            supported: 4
         })
     ));
 }

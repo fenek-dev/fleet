@@ -92,6 +92,9 @@ pub enum FleetAlertKind {
     SyncRejected,
     /// Two different signed rosters at the same epoch and version.
     RosterFork,
+    /// A server's audit chain was truncated or rewritten after this Mac
+    /// verified it (design §5.8). Critical.
+    AuditTampered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]

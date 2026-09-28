@@ -137,6 +137,8 @@ pub fn parse_access_line(line: &[u8]) -> Option<AccessHit> {
     let ip = str_at(&v, &["request", "client_ip"])
         .or_else(|| str_at(&v, &["request", "remote_ip"]))
         .or_else(|| str_at(&v, &["remote_addr"]))
+        // The web role's nginx `fleet_json` format names it `remote`.
+        .or_else(|| str_at(&v, &["remote"]))
         .or_else(|| str_at(&v, &["client_ip"]))?
         .parse()
         .ok()?;

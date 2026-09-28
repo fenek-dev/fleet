@@ -173,6 +173,11 @@ impl FleetCore {
                 }
                 Err(e) => failure = Some(e.to_string()),
             }
+            // Audit mirror first, so AI and other actions run since the
+            // last refresh show up below (design §5.8).
+            if let Err(e) = self.refresh_audit_mirror(id, &key).await {
+                failure.get_or_insert(e.to_string());
+            }
         }
         let mut items: Vec<TimelineItem> = lock(&tl.servers)
             .get(id)
@@ -185,6 +190,41 @@ impl FleetCore {
             }));
         }
         (items, failure)
+    }
+
+    /// Fetches `id`'s new audit entries on the core runtime, then verifies
+    /// and stores them (a tampered chain raises the critical alert).
+    async fn refresh_audit_mirror(&self, id: &ServerId, key: &Ed25519Public) -> Result<(), FleetError> {
+        use fleet_core::audit_mirror;
+        use fleet_core::runner::OpRunner;
+        let after = audit_mirror::known_seq(&lock(&self.cache), id)?;
+        let (handle, _) = self.running()?;
+        let sid = id.clone();
+        let pages = self
+            .on_core(async move {
+                let (h, sid) = (&handle, &sid);
+                match audit_mirror::fetch(after, |op| h.run(sid, op, Actor::Human, None)).await {
+                    Ok(p) => Ok(Some(p)),
+                    // Monitor session (app locked) or offline: next time.
+                    Err(fleet_core::runner::RunError::Locked | fleet_core::runner::RunError::Offline) => {
+                        Ok(None)
+                    }
+                    Err(e) => Err(FleetError::Session {
+                        message: e.to_string(),
+                    }),
+                }
+            })
+            .await?;
+        let Some(pages) = pages else {
+            return Ok(());
+        };
+        let r = audit_mirror::apply(&lock(&self.cache), id, key, &pages, fleet_core::now_ms());
+        let failed = r.as_ref().err().map(|e| e.to_string());
+        self.audit_mirrored(id, r);
+        match failed {
+            Some(message) => Err(FleetError::Session { message }),
+            None => Ok(()),
+        }
     }
 
     fn rejected(&self, tl: &TimelineService, ids: &[ServerId]) -> u64 {

@@ -47,11 +47,33 @@ pub struct LogFiles {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebLogSummary {
+    /// Matching requests counted (bounded by the agent's scan cap).
     pub requests: u64,
     pub by_status: Vec<(u16, u64)>,
     pub top_clients: Vec<(IpAddr, u64)>,
     pub top_paths: Vec<(String, u64)>,
     pub scanner_hits: u64,
+    /// Matching requests, newest first, at most the query's `limit`.
+    pub entries: Vec<WebLogEntry>,
+    /// A bound (bytes scanned, lines, deadline) cut the scan short.
+    pub truncated: bool,
+}
+
+/// One parsed access-log line. Every field is attacker-influenced (rule 6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebLogEntry {
+    pub time_ms: u64,
+    pub client: IpAddr,
+    /// `GET`, `POST`, … (≤ 16 characters).
+    pub method: String,
+    /// Path without the query string (≤ 1024 characters).
+    pub path: String,
+    pub status: u16,
+    pub bytes: u64,
+    /// ≤ 256 characters.
+    pub user_agent: Option<String>,
+    /// Access log it came from.
+    pub log: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

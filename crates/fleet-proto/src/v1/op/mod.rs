@@ -29,13 +29,13 @@ pub use packages::{PkgSpec, UpgradeScope};
 pub use profile::{ProfileLevel, ProfilePhase, ProfileRole, ProfileSource, ProfileSpec};
 pub use security::BanConfig;
 pub use shell::ShellExec;
-pub use system::{ProcessSort, Resolution, SampleInterval};
+pub use system::{ProcessSort, Resolution, SampleInterval, StatusRange};
 pub use users::LoginShell;
 
 use super::alert::{AlertRuleSet, HealthCheckSet};
 use super::args::{
     AbsPath, ComposeFile, ComposeProject, ContainerRef, DebPackageName, FirewallRuleSet, GameName,
-    GameTemplateId, GroupName, ImageRef, JournalQuery, Label, Nice, Pid, RconCommand, SearchQuery,
+    GameTemplateId, GroupName, HttpPath, ImageRef, JournalQuery, Label, Nice, Pid, RconCommand, SearchQuery,
     SearchTerm, Signal, SshPublicKey, SudoPasswordHash, TimeRange, UnitName, UserName, VolumeName,
     WgPeer,
 };
@@ -93,8 +93,16 @@ tagged_enum! {
         /// then new ones while `follow`. `path` must be on the agent's log
         /// allow-list (checked with `AllowedPath`).
         LogfileTail { path: AbsPath, lines: u16, follow: bool } = LOGFILE_TAIL(111, "logfile.tail"),
-        /// Parsed web access logs (web role).
-        WeblogQuery { range: TimeRange, limit: u32 } = WEBLOG_QUERY(120, "weblog.query"),
+        /// Parsed JSON access logs of Caddy/nginx (web role), newest
+        /// first, as `Payload::WebLogSummary`. Optional filters: status
+        /// range, path prefix, client address. `limit` 1..=1000 entries.
+        WeblogQuery {
+            range: TimeRange,
+            limit: u32,
+            status: Option<StatusRange>,
+            path_prefix: Option<HttpPath>,
+            client: Option<IpAddr>,
+        } = WEBLOG_QUERY(120, "weblog.query"),
 
         // ---- security 200–299 ----
         LoginsQuery { range: TimeRange, failed_only: bool, limit: u32 } = LOGINS_QUERY(200, "logins.query"),
@@ -276,6 +284,11 @@ tagged_enum! {
         AgentUpdateRollback = AGENT_UPDATE_ROLLBACK(1532, "agent.update.rollback"),
         AlertRulesGet = ALERT_RULES_GET(1540, "alert_rules.get"),
         AlertRulesUpdate(rules: AlertRuleSet) = ALERT_RULES_UPDATE(1541, "alert_rules.update"),
+        /// Audit entries strictly after `after_seq` (oldest first, from the
+        /// archive anchor when older ones were archived) plus a fresh
+        /// signed checkpoint of the chain head, as `Payload::AuditPage`
+        /// (design §5.8: the Mac's audit mirror). `limit` 1..=1000.
+        AuditQuery { after_seq: u64, limit: u32 } = AUDIT_QUERY(1550, "audit.query"),
 
         // ---- shell 1600–1699 ----
         ShellExec(req: ShellExec) = SHELL_EXEC(1600, "shell.exec"),

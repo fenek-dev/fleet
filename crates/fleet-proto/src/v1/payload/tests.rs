@@ -248,6 +248,55 @@ pub(crate) fn samples() -> Vec<Payload> {
             truncated: false,
             timed_out: false,
         }),
+        Payload::WebLogSummary(WebLogSummary {
+            requests: 3,
+            by_status: vec![(404, 2)],
+            top_clients: vec![("203.0.113.4".parse().unwrap(), 3)],
+            top_paths: vec![("/.env".into(), 2)],
+            scanner_hits: 2,
+            entries: vec![WebLogEntry {
+                time_ms: 1,
+                client: "203.0.113.4".parse().unwrap(),
+                method: "GET".into(),
+                path: "/.env".into(),
+                status: 404,
+                bytes: 12,
+                user_agent: Some("curl".into()),
+                log: "/var/log/caddy/access.log".into(),
+            }],
+            truncated: false,
+        }),
+        Payload::AuditPage(Box::new(AuditPage {
+            entries: vec![crate::v1::AuditEntry {
+                seq: 5,
+                time: 6,
+                prev_hash: [1; 32],
+                actor: crate::v1::Actor::System,
+                device_id: crate::v1::DeviceId([2; 16]),
+                command_hash: [3; 32],
+                signature: crate::v1::Signature([4; 64]),
+                op: crate::v1::OpSummary {
+                    tag: 50,
+                    args: vec![0],
+                },
+                phase: crate::v1::Phase::Result,
+                result: crate::v1::ResultSummary::Done(crate::v1::Outcome::Ok),
+            }],
+            anchor: Some(AuditAnchor {
+                seq: 4,
+                entry_hash: [1; 32],
+            }),
+            checkpoint: crate::v1::SignedCheckpoint {
+                checkpoint: crate::v1::Checkpoint {
+                    server_id: crate::v1::ServerId::new("srv_test01").unwrap(),
+                    seq: 5,
+                    entry_hash: [5; 32],
+                    time_ms: 7,
+                },
+                signature: crate::v1::Signature([6; 64]),
+            },
+            more: false,
+        })),
     ]
 }
 

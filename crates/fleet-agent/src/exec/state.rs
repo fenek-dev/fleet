@@ -3,6 +3,7 @@
 //! log, pending auto-revert files, and the per-command checks that need
 //! this state (verification, policy, AI rate, commit).
 
+use super::policy_check;
 use super::{
     ExecError, PENDING_PERSIST_EVERY_MS, PRUNE_EVERY, SessionTerminator, log, remaining_ms,
 };
@@ -12,9 +13,12 @@ use crate::paths::Paths;
 use crate::pending::{self, ChangeId, PendingChange, PendingDir};
 use crate::revert::{self, Revert};
 use crate::store::{
-    CheckpointSigner, Compaction, EVENT_RETENTION_MS, Intent, MAX_EVENTS, MetaKey, Store,
-    StoreError,
+    AUDIT_RETENTION_MS, CheckpointSigner, Compaction, EVENT_RETENTION_MS, Intent,
+    MAX_ARCHIVE_ENTRIES, MAX_EVENTS, MetaKey, Store, StoreError,
 };
+
+/// Under `exec_dir`: archived audit entries (design §5.8).
+pub const AUDIT_ARCHIVE_DIR: &str = "audit-archive";
 use crate::{fsutil, now_ms};
 use fleet_crypto::receipt::sign_event;
 use fleet_crypto::roster::{self, PendingRoster, RecoveryClock, next_grace_remaining, roster_hash};
@@ -46,6 +50,12 @@ const MINUTE_MS: u64 = 60_000;
 pub struct StoredPolicy {
     pub toml: String,
     pub approval: Option<RootApproval>,
+    /// The command's `expected_version` (part of the approved op digest).
+    pub expected_version: Option<u64>,
+    /// The roster in force when the policy was accepted, so the approval
+    /// can be re-verified at start (design §5.4); `None` for the install
+    /// policy and for policies stored before re-verification existed.
+    pub roster: Option<SignedRoster>,
 }
 
 /// `MetaKey::PendingRecovery`. The delay is kept as time *remaining*,
@@ -193,6 +203,9 @@ pub(super) struct State {
     /// Admission times of AI commands in the last minute, per (device,
     /// AI client) (`actors.ai_commands_per_minute`).
     ai_calls: HashMap<(DeviceId, String), VecDeque<u64>>,
+    /// The stored policy failed re-verification at load (design §5.4):
+    /// `policy` is deny-all; startup raises the critical alert.
+    pub(super) policy_rejected: Option<policy_check::PolicyCheckError>,
 }
 
 fn meta_decode<T: serde::de::DeserializeOwned>(
@@ -215,11 +228,6 @@ fn meta_string(store: &Store, key: MetaKey) -> Result<Option<String>, ExecError>
         .transpose()
 }
 
-/// Parses a stored policy and checks it belongs to this fleet and server.
-fn load_policy(sp: &StoredPolicy, roster: &SignedRoster, server: &ServerId) -> Option<Policy> {
-    let p = Policy::from_toml(&sp.toml).ok()?;
-    (p.fleet_id == roster.roster.fleet_id && p.server_id == *server).then_some(p)
-}
 
 /// Reads the signing seed into a wiped buffer (no symlinks, 32 bytes).
 pub fn load_signing_key(paths: &Paths) -> Result<Ed25519Signer, ExecError> {
@@ -240,11 +248,24 @@ impl State {
         let server_id =
             meta_string(&store, MetaKey::ServerId)?.ok_or(ExecError::NotInstalled("server id"))?;
         let server_id = ServerId::new(server_id).map_err(|_| ExecError::Corrupt("server id"))?;
-        let sp: StoredPolicy = meta_decode(&store, MetaKey::Policy, "policy")?
+        let sp = store
+            .meta()
+            .get(MetaKey::Policy)?
             .ok_or(ExecError::NotInstalled("policy"))?;
-        let policy = load_policy(&sp, &roster, &server_id).ok_or(ExecError::Corrupt("policy"))?;
-        let epoch_hashes =
+        let epoch_hashes: Vec<Hash32> =
             meta_decode(&store, MetaKey::EpochHashes, "epoch hashes")?.unwrap_or_default();
+        // A policy that doesn't verify isn't enforced; exec still starts
+        // (deny-all, critical alert at startup) instead of crash-looping.
+        let (policy, policy_rejected) = match policy_check::decode_stored(&sp)
+            .ok_or(policy_check::PolicyCheckError::Invalid)
+            .and_then(|sp| policy_check::verify_stored(&sp, &roster, &epoch_hashes, &server_id))
+        {
+            Ok(p) => (p, None),
+            Err(e) => {
+                log("stored policy rejected", e);
+                (policy_check::deny_all(&roster, &server_id), Some(e))
+            }
+        };
         // Downtime doesn't count: the countdown resumes where it was saved.
         let grace_ms: Option<u64> =
             meta_decode(&store, MetaKey::GraceRemaining, "grace remaining")?;
@@ -298,6 +319,7 @@ impl State {
             applying: HashSet::new(),
             reverting: HashSet::new(),
             ai_calls: HashMap::new(),
+            policy_rejected,
         })
     }
 
@@ -415,6 +437,14 @@ impl State {
     /// transient timers).
     pub(super) fn startup(&mut self, now: u64) -> Result<Vec<(ChangeId, u32)>, ExecError> {
         self.store.audit().mark_interrupted_on_start(now)?;
+        if self.policy_rejected.is_some() {
+            self.emit(Event::AlertFired {
+                rule_id: policy_check::REJECTED_RULE.into(),
+                severity: fleet_proto::alert::Severity::Critical,
+                subject: "policy".into(),
+                value: 0,
+            });
+        }
         self.pending_dir.create()?;
         self.pending_dir.repair_updates()?;
         let rearm = self.recover_pending(now);
@@ -453,11 +483,31 @@ impl State {
         {
             log("event log prune", e);
         }
+        self.archive_audit(now);
         let old = now.saturating_sub(MINUTE_MS);
         self.ai_calls.retain(|_, q| {
             q.retain(|t| *t > old);
             !q.is_empty()
         });
+    }
+
+    /// Moves audit entries older than the retention into an archive file
+    /// (design §5.8, `store::audit_archive`); one batch per prune.
+    pub(super) fn archive_audit(&self, now: u64) {
+        let dir = self.paths.exec_dir.join(AUDIT_ARCHIVE_DIR);
+        match self.store.audit().archive_before(
+            &dir,
+            &self.server_id,
+            now.saturating_sub(AUDIT_RETENTION_MS),
+            MAX_ARCHIVE_ENTRIES,
+        ) {
+            Ok(Some(r)) => log(
+                "audit archived",
+                format!("seq {}..={} into {}", r.from_seq, r.to_seq, r.file),
+            ),
+            Ok(None) => {}
+            Err(e) => log("audit archive", e),
+        }
     }
 
     /// Logs what a compaction did (`true`), or `false` when the database
@@ -919,7 +969,11 @@ impl State {
                 .flatten()
                 .is_some_and(|c| c.origin.device_id == v.device_id)
         };
-        if !self.policy.allows_group(op.group()) && !own_change() {
+        // Under the deny-all fallback (stored policy rejected, design
+        // §5.4) the read-only monitor subset stays available, so a Mac can
+        // still catch up on events (the `policy.rejected` alert included).
+        let fallback_read = self.policy_rejected.is_some() && op.monitor_allowed();
+        if !self.policy.allows_group(op.group()) && !own_change() && !fallback_read {
             return Err(ErrorCode::PolicyDenied);
         }
         let tier = self.policy.effective_tier(op);

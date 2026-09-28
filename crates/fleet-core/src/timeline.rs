@@ -147,6 +147,12 @@ pub fn from_event(
             format!("version {version}"),
             None,
         ),
+        Event::RebootScheduled { at_ms, audit_seq } => (
+            C::Fleet,
+            "Reboot scheduled".into(),
+            format!("at {at_ms} (audit entry {audit_seq})"),
+            Some(Severity::Warning),
+        ),
         Event::ChangeReverted { audit_seq, .. } => (
             C::Change,
             "Change auto-reverted".into(),

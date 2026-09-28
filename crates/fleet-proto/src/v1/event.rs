@@ -95,6 +95,9 @@ tagged_enum! {
         Container { id: String, name: String, action: ContainerAction, exit_code: Option<i32> }
             = CONTAINER(22, "container"),
         HealthCheckChanged { check_id: String, ok: bool } = HEALTH_CHECK_CHANGED(23, "health_check.changed"),
+        /// `system.reboot` armed a reboot timer firing at `at_ms` (agent
+        /// clock), by the command with audit intent `audit_seq`.
+        RebootScheduled { at_ms: u64, audit_seq: u64 } = REBOOT_SCHEDULED(24, "reboot.scheduled"),
     }
 }
 
@@ -127,6 +130,7 @@ mod tests {
                 | Event::CertExpiring { .. }
                 | Event::Container { .. }
                 | Event::HealthCheckChanged { .. }
+                | Event::RebootScheduled { .. }
                 | Event::Unknown { .. } => {}
             }
         }
@@ -224,6 +228,10 @@ mod tests {
             Event::HealthCheckChanged {
                 check_id: "api".into(),
                 ok: false,
+            },
+            Event::RebootScheduled {
+                at_ms: 11,
+                audit_seq: 12,
             },
         ]
     }

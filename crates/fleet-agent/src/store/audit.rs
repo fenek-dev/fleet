@@ -17,8 +17,8 @@ use fleet_proto::{
 };
 use redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
-const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
-const OPEN: TableDefinition<u64, ()> = TableDefinition::new("audit_open");
+pub(super) const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
+pub(super) const OPEN: TableDefinition<u64, ()> = TableDefinition::new("audit_open");
 /// Key is always `()`; value is `seq (u64 BE) ‖ entry_hash`.
 const HEAD: TableDefinition<(), &[u8; 40]> = TableDefinition::new("audit_head");
 
@@ -67,10 +67,7 @@ pub enum ChainError {
 }
 
 pub fn entry_hash(entry: &AuditEntry) -> Hash32 {
-    let mut h = blake3::Hasher::new();
-    h.update(&entry.prev_hash);
-    h.update(&encode(entry));
-    *h.finalize().as_bytes()
+    entry.entry_hash()
 }
 
 pub struct AuditLog<'a> {
@@ -80,6 +77,10 @@ pub struct AuditLog<'a> {
 impl<'a> AuditLog<'a> {
     pub(super) fn new(db: super::DbRead<'a>) -> Self {
         Self { db }
+    }
+
+    pub(super) fn db(&self) -> &redb::Database {
+        &self.db
     }
 
     /// Appends an intent entry. Returns its seq.
@@ -226,16 +227,24 @@ impl<'a> AuditLog<'a> {
 
     /// Verifies the chain from `from_seq` to the head. If `from_seq`'s
     /// predecessor is present (or `from_seq` is the genesis entry), the first
-    /// link is checked too; otherwise the first entry's `prev_hash` is the
-    /// anchor (entries before it were archived).
+    /// link is checked too. At or below the archive anchor (design §5.8)
+    /// verification starts from the anchor: the first stored entry must
+    /// link to the anchor's hash. Otherwise (a gap without an anchor) the
+    /// first entry's `prev_hash` is taken as given.
     pub fn verify_chain(&self, from_seq: u64) -> std::result::Result<ChainHead, ChainError> {
         let tx = self.db.begin_read().map_err(StoreError::from)?;
         let t = tx.open_table(ENTRIES).map_err(StoreError::from)?;
         let head = read_head(&tx.open_table(HEAD).map_err(StoreError::from)?)?;
-        let from_seq = from_seq.max(1);
+        let anchor = super::audit_archive::anchor_in(&tx)?;
+        let from_seq = match &anchor {
+            Some(a) if from_seq <= a.seq + 1 => a.seq + 1,
+            _ => from_seq.max(1),
+        };
 
         let mut expected_prev: Option<Hash32> = if from_seq == 1 {
             Some([0; 32])
+        } else if let Some(a) = anchor.as_ref().filter(|a| a.seq + 1 == from_seq) {
+            Some(a.entry_hash)
         } else {
             match t.get(from_seq - 1).map_err(StoreError::from)? {
                 Some(v) => Some(entry_hash(&decode_entry(v.value())?)),

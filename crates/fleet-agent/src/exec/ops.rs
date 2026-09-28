@@ -42,7 +42,7 @@ pub(super) enum Plan {
     Events(Option<[u8; 16]>, u64, u32),
     Roster(Box<SignedRoster>, RosterDecision),
     Veto(Hash32),
-    Policy(Box<Policy>, StoredPolicy),
+    Policy(Box<Policy>, Box<StoredPolicy>),
 }
 
 pub(super) struct StateOps(pub(super) Rc<RefCell<State>>);
@@ -195,11 +195,15 @@ impl State {
                 if p.version <= current {
                     return Err(ErrorCode::VersionConflict { current });
                 }
+                // With the roster that verified the approval, so exec can
+                // verify it again at every start (design §5.4).
                 let stored = StoredPolicy {
                     toml: policy_toml.clone(),
                     approval: meta.approval.clone(),
+                    expected_version: meta.command.body.expected_version,
+                    roster: Some(self.roster.clone()),
                 };
-                Ok(Plan::Policy(Box::new(p), stored))
+                Ok(Plan::Policy(Box::new(p), Box::new(stored)))
             }
             _ => Err(ErrorCode::Unsupported),
         }
@@ -253,6 +257,7 @@ impl State {
                     .map_err(internal)?;
                 let version = p.version;
                 self.policy = *p;
+                self.policy_rejected = None;
                 self.push_view();
                 self.emit(Event::PolicyChanged { version });
                 Ok(Payload::Empty)
