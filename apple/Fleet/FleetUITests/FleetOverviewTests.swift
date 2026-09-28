@@ -15,7 +15,8 @@ final class FleetOverviewTests: FleetUITestCase {
         if exists("addServer.tags", timeout: 1) { replace("addServer.tags", with: tags) }
         tap("addServer.addConnect")
         tap("addServer.trust", timeout: 60)
-        tap("addServer.chooseArtifact")
+        snap("add-\(name)-after-trust")
+        tap("addServer.chooseArtifact", timeout: 120)
         tap("addServer.install")
         tap("addServer.done", timeout: 180)
     }
