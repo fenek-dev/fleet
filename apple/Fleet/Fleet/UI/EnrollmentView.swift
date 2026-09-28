@@ -171,6 +171,7 @@ struct EnrollmentView: View {
                         .autocorrectionDisabled()
                         .font(.mono(13))
                         .accessibilityIdentifier("onboarding.verify.\(i)")
+                        .accessibilityLabel("Word \(pos + 1)")
                 }
             }
             .formStyle(.grouped)

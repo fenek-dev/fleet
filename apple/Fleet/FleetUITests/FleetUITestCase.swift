@@ -22,7 +22,7 @@ class FleetUITestCase: XCTestCase {
         continueAfterFailure = false
         let id = UUID().uuidString.prefix(8)
         dataDir = URL(fileURLWithPath: "/tmp/fleet-ui-\(id)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+        // Not created here: the runner is sandboxed; the app creates it.
 
         app = XCUIApplication()
         app.launchEnvironment["FLEET_DATA_DIR"] = dataDir.path
