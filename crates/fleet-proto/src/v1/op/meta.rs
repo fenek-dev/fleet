@@ -222,16 +222,28 @@ impl Op {
     /// (design §5.4). Read-only ops (`bans.list`, `bans.config.get`,
     /// `authorized_keys.get`, `audit.run`) stay allowed since they never
     /// write anything.
+    ///
+    /// Mesh ops (`mesh.join`, `mesh.leave`, `mesh.peers.set`) are an
+    /// explicit exception: they set up operator-initiated overlay
+    /// connectivity between servers, not host security, so they stay
+    /// allowed under Agent-only (design §4.6, §5.4).
     pub fn takes_over_security(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Op::FirewallApply(_)
-                | Op::AuthorizedKeysSet { .. }
-                | Op::ProfileApply { .. }
-                | Op::BansAdd { .. }
-                | Op::BansRemove { .. }
-                | Op::BansConfigSet(_)
-        )
+            | Op::AuthorizedKeysSet { .. }
+            | Op::ProfileApply { .. }
+            | Op::BansAdd { .. }
+            | Op::BansRemove { .. }
+            | Op::BansConfigSet(_) => true,
+            // A rollback that would rewrite sshd config (incl. drop-ins),
+            // sudoers(.d), nftables or `/etc/fleet` is a security takeover
+            // too, even though `config.rollback` itself isn't otherwise
+            // security-specific.
+            Op::ConfigRollback { path, .. } => {
+                path.is_protected_config() || path.as_str() == "/etc/nftables.conf"
+            }
+            _ => false,
+        }
     }
 
     /// Accepted in a recovery session (design §5.5).
@@ -514,5 +526,35 @@ mod agent_only_tests {
             addr: "1.2.3.4".parse().unwrap()
         }
         .takes_over_security());
+    }
+
+    #[test]
+    fn config_rollback_takes_over_security_only_for_security_relevant_paths() {
+        let rollback = |p: &str| Op::ConfigRollback {
+            path: AbsPath::new(p).unwrap(),
+            version: 1,
+        };
+        // Security-relevant: sshd config (incl. drop-ins), sudoers(.d),
+        // nftables, Fleet's own directory.
+        for p in [
+            "/etc/ssh/sshd_config",
+            "/etc/ssh/sshd_config.d/00-fleet.conf",
+            "/etc/sudoers",
+            "/etc/sudoers.d/ops",
+            "/etc/nftables.conf",
+            "/etc/fleet/authorized_keys/admin",
+        ] {
+            assert!(rollback(p).takes_over_security(), "{p}");
+        }
+        // Not security-relevant: an ordinary tracked config file.
+        assert!(!rollback("/etc/nginx/nginx.conf").takes_over_security());
+        assert!(!rollback("/srv/app/config.yaml").takes_over_security());
+    }
+
+    #[test]
+    fn mesh_ops_are_not_takeover_security() {
+        // Explicit exception (design §4.6, §5.4): mesh sets up
+        // operator-initiated overlay connectivity, not host security.
+        assert!(!Op::MeshLeave.takes_over_security());
     }
 }

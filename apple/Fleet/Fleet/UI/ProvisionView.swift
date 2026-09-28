@@ -21,7 +21,7 @@ struct ProvisionView: View {
     @State private var exportId = ""
     /// Agent-only servers (design §5.4) refuse `profile.apply`: hardening
     /// is disabled here until the operator switches to Managed.
-    @State private var securityMode: SecurityModeArg = .managed
+    @State private var securityMode: SecurityModeStatus = .unknown
 
     private struct AddSheet: Identifiable {
         let id = UUID()
@@ -172,6 +172,9 @@ struct ProvisionView: View {
                 if securityMode == .agentOnly {
                     Text("This server is Agent only: Fleet won't apply hardening here. Switch it to Managed from the server's Overview tab first.")
                         .font(.secondary).foregroundStyle(Tone.warn.text)
+                } else if securityMode == .unknown {
+                    Text("This server's security mode is unknown (refresh the connection). Hardening stays disabled until it's confirmed Managed.")
+                        .font(.secondary).foregroundStyle(Tone.warn.text)
                 }
                 HStack {
                     if form.isCustom {
@@ -185,7 +188,7 @@ struct ProvisionView: View {
                     Button("Review plan") { begin() }
                         .buttonStyle(.borderedProminent).tint(.accent)
                         .disabled(running || form.name.isEmpty || form.adminUser.isEmpty
-                                  || securityMode == .agentOnly)
+                                  || securityMode != .managed)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -214,7 +217,7 @@ struct ProvisionView: View {
                         Spacer()
                         Button("Apply") { approve() }
                             .buttonStyle(.borderedProminent).tint(.accent)
-                            .disabled(running || securityMode == .agentOnly)
+                            .disabled(running || securityMode != .managed)
                     }
                 }
             }
@@ -341,13 +344,17 @@ struct ProvisionView: View {
         error = nil
         run = ProvisionRun()
         editingProfile = false
-        securityMode = .managed
+        securityMode = .unknown
         guard let api = core.api, let id = serverId else {
             state = nil
             return
         }
-        if let mode = try? api.securityMode(serverId: id) {
-            securityMode = mode
+        // A live round trip (`agent.health`), so it needs a Task; guarded
+        // against a stale answer landing after the operator picked another
+        // server.
+        Task {
+            let mode = (try? await api.securityMode(serverId: id)) ?? .unknown
+            if id == serverId { securityMode = mode }
         }
         do {
             state = try api.provisionState(serverId: id)

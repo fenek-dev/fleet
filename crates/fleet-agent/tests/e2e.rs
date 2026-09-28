@@ -673,6 +673,11 @@ fn agent_only_refuses_security_takeover_ops_without_burning_nonce() {
             Op::BansRemove {
                 addr: "203.0.113.9".parse().unwrap(),
             },
+            Op::BansAdd {
+                addr: "203.0.113.10".parse().unwrap(),
+                duration_s: 3600,
+                comment: fleet_proto::args::Label::new("").unwrap(),
+            },
             Op::BansConfigSet(fleet_ops::security::bans::default_config()),
             Op::ProfileApply {
                 spec: fleet_proto::op::ProfileSpec {

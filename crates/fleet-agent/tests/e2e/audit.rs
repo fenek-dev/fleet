@@ -137,6 +137,12 @@ fn stored_policy_reverified_at_start() {
             .set(MetaKey::Policy, &fleet_proto::encode(&sp))
             .unwrap();
     }
+    // The deny-all fallback (design §5.4) must behave as Agent-only too:
+    // no writes to authorized_keys while a policy can't be trusted. Remove
+    // the file first — a periodic sync (wrongly still Managed) would
+    // recreate it; only Agent-only leaves it gone.
+    let ak_path = fx.paths.authorized_keys_dir.join("admin");
+    let _ = std::fs::remove_file(&ak_path);
     fx.start_exec();
     let fx = &fx;
     run(async {
@@ -160,6 +166,14 @@ fn stored_policy_reverified_at_start() {
             &e.event,
             Event::AlertFired { rule_id, .. } if rule_id == "policy.rejected"
         )));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    });
+    assert!(
+        !ak_path.exists(),
+        "deny-all fallback must not sync authorized_keys"
+    );
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
         // A new approved policy is accepted again.
         let op = fx.policy_op(3);
         let approval = fx.approve(&fx.macs[0], &op);

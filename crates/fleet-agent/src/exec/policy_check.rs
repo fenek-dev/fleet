@@ -124,7 +124,9 @@ pub(super) fn deny_all(current: &SignedRoster, server: &ServerId) -> Policy {
         safety: Safety {
             auto_revert_seconds: 60,
         },
-        security: SecurityMode::Managed,
+        // A policy we can't trust must not have Fleet writing to nft sets
+        // or the admin's authorized_keys either (design §5.4).
+        security: SecurityMode::AgentOnly,
     }
 }
 

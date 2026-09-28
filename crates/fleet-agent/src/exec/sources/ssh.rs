@@ -189,6 +189,11 @@ impl Sources {
     }
 
     pub(in crate::exec) async fn learn(&self, ip: IpAddr) {
+        // Agent-only (design §5.4): never write a learned exemption into
+        // the kernel's nft sets.
+        if !self.bans_may_apply() {
+            return;
+        }
         if let Err(e) = self.bans.fleet_login(&self.ctx, ip, self.now()).await {
             log("learn Mac address", e);
         }

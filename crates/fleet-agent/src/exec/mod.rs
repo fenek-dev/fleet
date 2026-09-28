@@ -337,6 +337,29 @@ impl Exec {
             .map_err(refuse)?;
         self.st.borrow().check_policy(&v, now).map_err(refuse)?;
         let op = &v.body.op;
+        // A `policy.update` switching Managed → Agent-only while a
+        // security-relevant change is pending confirmation or mid-apply
+        // (design §5.4): refuse `Busy` here, before the nonce is consumed,
+        // rather than let the switch race an in-flight firewall/profile/
+        // authorized_keys/SSH change (whose auto-revert or confirm may
+        // itself be a security-relevant write).
+        if let Op::PolicyUpdate { policy_toml } = op
+            && self.st.borrow().policy.security == fleet_proto::policy::SecurityMode::Managed
+            && let Ok(target) = fleet_proto::Policy::from_toml(policy_toml)
+            && target.security == fleet_proto::policy::SecurityMode::AgentOnly
+        {
+            const GUARDED: [ChangeKind; 4] = [
+                ChangeKind::Firewall,
+                ChangeKind::Profile,
+                ChangeKind::AuthorizedKeys,
+                ChangeKind::Ssh,
+            ];
+            for kind in GUARDED {
+                if self.kind_busy(kind).map_err(refuse)? {
+                    return Err(refuse(ErrorCode::Busy));
+                }
+            }
+        }
         // Streams only as `StreamOpen`, everything else only as `Request`.
         if op.is_stream() != (inv == Invocation::Stream) {
             return Err(refuse(ErrorCode::Unsupported));

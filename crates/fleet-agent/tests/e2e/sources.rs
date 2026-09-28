@@ -491,6 +491,51 @@ fn agent_only_mode_detects_but_does_not_ban() {
     });
 }
 
+/// Switching Agent-only → Managed doesn't just clear the policy check: the
+/// op then actually runs (real handler, real nft argv on the fake runner),
+/// not merely a different rejection.
+#[test]
+fn agent_only_switch_to_managed_lets_bans_remove_execute() {
+    let (mut fx, root) = fixture_with_pol(GROUPS, "agent-only");
+    let feeds = start(&mut fx, root.path().to_owned(), None);
+    run(async {
+        let m = &fx.macs[0];
+        let mut s = fx.connect(m).await;
+        let op = || Op::BansRemove { addr: ip(ATTACKER) };
+        assert_eq!(ask(&mut s, &fx, op()).await, Err(ErrorCode::PolicyDenied));
+
+        let policy_op = Op::PolicyUpdate {
+            policy_toml: policy_toml(
+                fx.fleet,
+                2,
+                Pol {
+                    groups: GROUPS,
+                    security: "managed",
+                    ..Pol::default()
+                },
+            ),
+        };
+        let approval = fx.approve(m, &policy_op);
+        let r = s
+            .request(policy_op, &fx.server, Actor::Human, Some(approval))
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+
+        // Now it reaches the real handler: the fake nft sees the delete
+        // (the address wasn't banned, but nft "succeeded", so the handler
+        // answers `bans.list`'s empty snapshot rather than `NotFound`).
+        let r = ask(&mut s, &fx, op()).await;
+        assert!(matches!(r, Ok(Payload::Bans(_))), "{r:?}");
+        let calls = feeds.nft.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|a| a.first().map(String::as_str) == Some("delete")
+                && a.contains(&"banned4".to_owned())),
+            "{calls:?}"
+        );
+    });
+}
+
 #[test]
 fn bans_and_baseline_survive_restart() {
     let (mut fx, root) = fixture();

@@ -6,7 +6,9 @@
 
 use crate::api::{FleetCore, id16, lock};
 use crate::rows::{InstallProgress, InstallStep};
-use crate::types::{AgentHealthRow, ConnState, FleetError, HostKeyPrompt, SecurityModeArg};
+use crate::types::{
+    AgentHealthRow, ConnState, FleetError, HostKeyPrompt, SecurityModeArg, SecurityModeStatus,
+};
 use crate::validate;
 use fleet_core::cache::PinnedKeys;
 use fleet_core::install::{self, InstallRequest, InstallStage};
@@ -175,25 +177,40 @@ impl FleetCore {
         .await
     }
 
-    /// The security mode last pushed to `server_id` (design §5.4).
-    /// `Managed` if this Mac never pushed a policy (the behavior before
-    /// this field existed, and the case just after a fresh install whose
-    /// cache write raced a crash).
-    pub fn security_mode(&self, server_id: String) -> Result<SecurityModeArg, FleetError> {
+    /// The security mode last pushed to `server_id` (design §5.4):
+    /// `Unknown` when this Mac's cached copy of the pushed policy is
+    /// missing or its version doesn't match the agent's live
+    /// `agent.health.policy_version` — another Mac may have pushed a
+    /// newer policy this cache never saw, so guessing Managed or
+    /// Agent-only here would be misleading.
+    pub async fn security_mode(
+        self: Arc<Self>,
+        server_id: String,
+    ) -> Result<SecurityModeStatus, FleetError> {
         let id = validate::server_id(&server_id)?;
+        let health = match self.send_op(&server_id, Op::AgentHealth, None).await? {
+            Payload::AgentHealth(h) => h,
+            _ => return Err(FleetError::UnexpectedReply),
+        };
         let cache = lock(&self.cache);
-        Ok(fleet_core::policy::pushed(&cache, &id)
-            .map(|p| p.security.into())
-            .unwrap_or(SecurityModeArg::Managed))
+        let pushed = fleet_core::policy::pushed(&cache, &id);
+        Ok(match fresh_pushed(pushed.as_ref(), health.policy_version) {
+            Some(p) => SecurityModeArg::from(p.security).into(),
+            None => SecurityModeStatus::Unknown,
+        })
     }
 
     /// Switches `server_id` between Managed and Agent-only: a normal
     /// `policy.update` (Elevated, Touch-ID-approved) that keeps every
-    /// other setting from the last pushed policy (or the install default,
-    /// if this Mac never pushed one). Design §5.4: switching to Managed
-    /// re-enables bans and `authorized_keys` sync immediately, no agent
-    /// restart; switching to Agent-only stops them but does **not** undo
-    /// firewall or sshd state a prior Managed period already applied.
+    /// other setting from the last pushed policy, changing only
+    /// `security`. Refuses `PolicyOutOfDate` when this Mac's cached copy
+    /// is missing or its version doesn't match the agent's live
+    /// `agent.health.policy_version`, rather than silently overwrite
+    /// settings pushed by another Mac this cache never saw (design §5.4)
+    /// — the operator refreshes (reconnects) and tries again. Switching to
+    /// Managed re-enables bans and `authorized_keys` sync immediately, no
+    /// agent restart; switching to Agent-only stops them but does **not**
+    /// undo firewall or sshd state a prior Managed period already applied.
     pub async fn set_security_mode(
         self: Arc<Self>,
         server_id: String,
@@ -207,13 +224,10 @@ impl FleetCore {
         let current = health.policy_version;
         let mut policy = {
             let cache = lock(&self.cache);
-            match fleet_core::policy::pushed(&cache, &id) {
-                Some(p) => p,
-                None => {
-                    let fleet_id = FleetId(id16(&cache, crate::api::SETTING_FLEET_ID)?);
-                    fleet_core::policy::default_policy(fleet_id, id.clone(), mode.into())
-                }
-            }
+            let pushed = fleet_core::policy::pushed(&cache, &id);
+            fresh_pushed(pushed.as_ref(), current)
+                .cloned()
+                .ok_or(FleetError::PolicyOutOfDate)?
         };
         policy.security = mode.into();
         policy.version = current.saturating_add(1);
@@ -230,5 +244,48 @@ impl FleetCore {
         let cache = lock(&self.cache);
         fleet_core::policy::remember_pushed(&cache, &id, &toml)?;
         Ok(())
+    }
+}
+
+/// `pushed` if its version equals `live_version` (the agent's own
+/// `agent.health.policy_version`), else `None` — the cache is missing or
+/// stale relative to what the agent actually enforces (design §5.4).
+/// Pulled out of `security_mode`/`set_security_mode` so the "is this cache
+/// usable" decision is tested without a live connection.
+fn fresh_pushed(pushed: Option<&fleet_proto::Policy>, live_version: u64) -> Option<&fleet_proto::Policy> {
+    pushed.filter(|p| p.version == live_version)
+}
+
+#[cfg(test)]
+mod fresh_pushed_tests {
+    use super::fresh_pushed;
+    use fleet_proto::policy::SecurityMode;
+    use fleet_proto::{FleetId, ServerId};
+
+    fn policy(version: u64) -> fleet_proto::Policy {
+        let mut p = fleet_core::policy::default_policy(
+            FleetId([1; 16]),
+            ServerId::new("srv_abc123def456").unwrap(),
+            SecurityMode::Managed,
+        );
+        p.version = version;
+        p
+    }
+
+    #[test]
+    fn none_when_cache_missing() {
+        assert!(fresh_pushed(None, 3).is_none());
+    }
+
+    #[test]
+    fn none_when_cache_version_differs_from_live() {
+        let p = policy(2);
+        assert!(fresh_pushed(Some(&p), 3).is_none());
+    }
+
+    #[test]
+    fn some_when_versions_match() {
+        let p = policy(3);
+        assert_eq!(fresh_pushed(Some(&p), 3).map(|p| p.version), Some(3));
     }
 }

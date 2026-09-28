@@ -274,15 +274,17 @@ impl Sources {
         })
     }
 
-    /// Whether the ban engine may decide/apply bans right now (design
-    /// §5.4): off under `SecurityMode::AgentOnly`. A gone or momentarily
-    /// unreadable `State` defaults to Managed (bans stay on).
+    /// Whether the ban engine may decide/apply bans (or write a learned
+    /// exemption) right now (design §5.4): off under
+    /// `SecurityMode::AgentOnly`. A gone or momentarily unreadable `State`
+    /// is treated the same as `AgentOnly` — fail closed, never write to
+    /// nft sets on a guess.
     pub(super) fn bans_may_apply(&self) -> bool {
         let Some(st) = self.st.upgrade() else {
-            return true;
+            return false;
         };
         let Ok(st) = st.try_borrow() else {
-            return true;
+            return false;
         };
         st.policy.security != fleet_proto::policy::SecurityMode::AgentOnly
     }
@@ -309,6 +311,11 @@ impl Sources {
         }
         let s = self.clone();
         tokio::task::spawn_local(async move {
+            // Agent-only (design §5.4): never write persisted bans or
+            // exemptions into the kernel's nft sets.
+            if !s.bans_may_apply() {
+                return;
+            }
             let n = s.bans.restore_kernel(&s.ctx, s.ctx.clock.now_ms()).await;
             if n > 0 {
                 log("bans", format!("restored {n} kernel set elements"));

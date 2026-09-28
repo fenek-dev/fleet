@@ -39,6 +39,28 @@ impl From<SecurityMode> for SecurityModeArg {
     }
 }
 
+/// `FleetCore::security_mode`'s answer: the two real modes, or `Unknown`
+/// when this Mac's cached copy of the pushed policy is missing or stale
+/// relative to the agent's live `agent.health.policy_version` (another Mac
+/// pushed a newer policy this cache never saw). The app shows "Unknown",
+/// hides the mode-switch button and keeps hardening apply disabled rather
+/// than guess (design §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SecurityModeStatus {
+    Managed,
+    AgentOnly,
+    Unknown,
+}
+
+impl From<SecurityModeArg> for SecurityModeStatus {
+    fn from(v: SecurityModeArg) -> Self {
+        match v {
+            SecurityModeArg::Managed => SecurityModeStatus::Managed,
+            SecurityModeArg::AgentOnly => SecurityModeStatus::AgentOnly,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum KeyRole {
     /// Touch ID on every use.
@@ -267,6 +289,14 @@ pub enum FleetError {
     /// Provisioning step failed (§9.1); the wizard state holds the step.
     #[error("provisioning: {reason}")]
     Provision { reason: String },
+    /// `set_security_mode`/`security_mode`: this Mac's cached copy of the
+    /// pushed policy is missing or its version doesn't match the agent's
+    /// live `agent.health.policy_version` (another Mac pushed a newer
+    /// policy this cache never saw). Refresh before switching modes,
+    /// rather than risk silently reverting settings this Mac doesn't know
+    /// about (design §5.4).
+    #[error("policy out of date, refresh")]
+    PolicyOutOfDate,
 }
 
 impl From<fleet_core::sftp::SftpError> for FleetError {
