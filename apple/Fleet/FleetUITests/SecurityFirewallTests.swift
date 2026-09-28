@@ -37,6 +37,8 @@ final class SecurityFirewallTests: FleetUITestCase {
             if seg.exists { seg.click() }
         }
         tap("addServer.install")
+        Thread.sleep(forTimeInterval: 45)
+        snap("install-progress")
         tap("addServer.done", timeout: 240)
         sidebar("server.sec-1")
     }
