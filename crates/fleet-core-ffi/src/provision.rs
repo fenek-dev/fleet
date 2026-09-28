@@ -56,10 +56,18 @@ pub enum ProfileRoleRow {
     Game,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum WebServerRow {
+    Caddy,
+    Nginx,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ProvisionChoiceRow {
     pub level: ProfileLevelRow,
     pub roles: Vec<ProfileRoleRow>,
+    /// Used with the web role only.
+    pub web_server: WebServerRow,
     /// The admin the agent was installed with.
     pub admin_user: String,
     /// SSH source ranges (CIDR); empty: anywhere, rate-limited.
@@ -251,10 +259,14 @@ pub(crate) fn role_row(r: Role) -> ProfileRoleRow {
     }
 }
 
-fn to_choice(c: ProvisionChoiceRow) -> Result<ProvisionChoice, FleetError> {
+pub(crate) fn to_choice(c: ProvisionChoiceRow) -> Result<ProvisionChoice, FleetError> {
     let ch = ProvisionChoice {
         level: level(c.level),
         roles: c.roles.into_iter().map(role).collect(),
+        web_server: match c.web_server {
+            WebServerRow::Caddy => pv::WebServer::Caddy,
+            WebServerRow::Nginx => pv::WebServer::Nginx,
+        },
         admin_user: validate::user(&c.admin_user)?,
         allow_from: c
             .allow_from
@@ -270,10 +282,14 @@ fn to_choice(c: ProvisionChoiceRow) -> Result<ProvisionChoice, FleetError> {
     Ok(ch)
 }
 
-fn choice_row(c: &ProvisionChoice) -> ProvisionChoiceRow {
+pub(crate) fn choice_row(c: &ProvisionChoice) -> ProvisionChoiceRow {
     ProvisionChoiceRow {
         level: level_row(c.level),
         roles: c.roles.iter().copied().map(role_row).collect(),
+        web_server: match c.web_server {
+            pv::WebServer::Caddy => WebServerRow::Caddy,
+            pv::WebServer::Nginx => WebServerRow::Nginx,
+        },
         admin_user: c.admin_user.clone(),
         allow_from: c.allow_from.clone(),
         reboot_window: c.reboot_window.clone(),

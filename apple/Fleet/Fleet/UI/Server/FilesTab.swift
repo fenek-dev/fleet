@@ -14,9 +14,18 @@ final class TransferModel {
         var total: UInt64 = 0
         var finished = false
         var error: String?
+        /// Smoothed bytes per second while running.
+        var rate: Double = 0
+        var lastTick = Date()
     }
 
     private(set) var items: [Item] = []
+
+    /// Combined rate of running transfers, "12.4 MB/s"; nil when idle.
+    var aggregateRate: String? {
+        let r = items.filter { !$0.finished }.reduce(0.0) { $0 + $1.rate }
+        return r > 0 ? "\(Format.bytes(UInt64(r)))/s" : nil
+    }
 
     func begin(_ name: String) -> UUID {
         let item = Item(name: name)
@@ -27,6 +36,13 @@ final class TransferModel {
 
     func update(_ id: UUID, done: UInt64, total: UInt64) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        let now = Date()
+        let dt = now.timeIntervalSince(items[i].lastTick)
+        if dt > 0.05, done >= items[i].done {
+            let inst = Double(done - items[i].done) / dt
+            items[i].rate = items[i].rate == 0 ? inst : items[i].rate * 0.6 + inst * 0.4
+            items[i].lastTick = now
+        }
         items[i].done = done
         items[i].total = total
     }
@@ -34,6 +50,7 @@ final class TransferModel {
     func finish(_ id: UUID, error: String?) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         items[i].finished = true
+        items[i].rate = 0
         items[i].error = error
     }
 
@@ -78,6 +95,17 @@ struct FilesTab: View {
     @State private var newFolder = false
     @State private var confirmDelete: RemoteFileRow?
     @State private var dropTargeted = false
+    /// Item counts of directories in the current listing.
+    @State private var dirCounts: [String: Int] = [:]
+    /// Config-history version count of the selected file (nil: unknown).
+    @State private var versionCount: Int?
+    @State private var historyRows: [ConfigVersionRow]?
+
+    private var selectedFile: RemoteFileRow? {
+        guard selection.count == 1, let p = selection.first,
+              let e = entries.first(where: { $0.path == p }), e.kind == .file else { return nil }
+        return e
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -86,10 +114,15 @@ struct FilesTab: View {
                 Text(error).font(.base).foregroundStyle(Tone.warn.text)
             }
             table
+            if let f = selectedFile { detailBar(f) }
             if !transfers.items.isEmpty { transferList }
         }
         .padding(24)
         .task(id: server.id) { await start() }
+        .task(id: selectedFile?.path) { await loadVersionCount() }
+        .sheet(isPresented: Binding(get: { historyRows != nil }, set: { if !$0 { historyRows = nil } })) {
+            fileHistorySheet
+        }
         .sheet(item: $editing) { e in
             FileEditor(session: e) { text in try await save(e, text: text) }
         }
@@ -118,17 +151,117 @@ struct FilesTab: View {
 
     private var toolbar: some View {
         HStack(spacing: 8) {
+            Text("Files").font(.system(size: 15, weight: .semibold))
+            Text("SFTP").font(.caption11).foregroundStyle(Color.textSecondary)
+                .padding(.horizontal, 6).frame(height: 18)
+                .background(Color.control, in: Capsule())
+                .accessibilityIdentifier("files.sftpBadge")
             Button { go(parent(of: dir)) } label: { Image(systemName: "chevron.up") }
                 .disabled(dir == "/")
                 .help("Parent directory")
+                .accessibilityIdentifier("files.parent")
             breadcrumbs
             Spacer()
             if loading { ProgressView().controlSize(.small) }
             Button { Task { await list() } } label: { Image(systemName: "arrow.clockwise") }
                 .help("Refresh")
+                .accessibilityIdentifier("files.refresh")
             Button { newName = ""; newFolder = true } label: { Image(systemName: "folder.badge.plus") }
                 .help("New folder")
+                .accessibilityIdentifier("files.newFolder")
             Button("Upload…", systemImage: "arrow.up.doc") { pickUpload() }
+                .accessibilityIdentifier("files.upload")
+        }
+    }
+
+    private func detailBar(_ f: RemoteFileRow) -> some View {
+        HStack(spacing: 8) {
+            Text(f.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+            Text("·").foregroundStyle(Color.textMuted)
+            Text(Format.bytes(f.size)).foregroundStyle(Color.textSecondary)
+            Text("·").foregroundStyle(Color.textMuted)
+            Text(versionCount.map {
+                $0 == 0 ? "not in config history" : "\($0) version\($0 == 1 ? "" : "s") in config history"
+            } ?? "config history…")
+                .foregroundStyle(Color.textSecondary)
+                .accessibilityIdentifier("files.versionCount")
+            Spacer()
+            Button("History") { openHistory(f) }
+                .disabled((versionCount ?? 0) == 0)
+                .accessibilityIdentifier("files.history")
+            Button("Edit") { edit(f) }
+                .accessibilityIdentifier("files.edit")
+        }
+        .font(.secondary)
+        .padding(.horizontal, 12).frame(height: 40)
+        .background(Color.card, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.border))
+        .accessibilityIdentifier("files.detailBar")
+    }
+
+    private var fileHistorySheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Config history").font(.system(size: 15, weight: .semibold))
+                if let p = historyRows?.first?.path {
+                    Text(displaySafe(p, max: 4096)).font(.mono(12)).foregroundStyle(Color.textSecondary)
+                        .lineLimit(1).truncationMode(.head)
+                }
+                Spacer()
+            }
+            Table(historyRows ?? []) {
+                TableColumn("Ver") { v in Text("\(v.version)") }.width(44)
+                TableColumn("When") { v in Text(fmtDate(v.timeMs)) }.width(150)
+                TableColumn("Size") { v in Text(Format.bytes(v.size)) }.width(80)
+                TableColumn("By") { v in Text(v.source).lineLimit(1) }
+                TableColumn("") { v in
+                    if v.deleted { StatusPill(label: "deleted", tone: .warn) }
+                    else if v.secret { StatusPill(label: "secret", tone: .neutral) }
+                }
+                .width(80)
+            }
+            .accessibilityIdentifier("files.historyTable")
+            Text("Diffs and roll back: server → Config history.")
+                .font(.caption11).foregroundStyle(Color.textMuted)
+            HStack {
+                Spacer()
+                Button("Close") { historyRows = nil }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("files.historyClose")
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 620, minHeight: 320)
+    }
+
+    private func loadVersionCount() async {
+        versionCount = nil
+        guard let f = selectedFile, let api = core.api else { return }
+        let h = try? await api.configHistory(serverId: server.id, path: f.path, sinceMs: nil, limit: 500)
+        guard f.path == selectedFile?.path else { return }
+        versionCount = h?.versions.count ?? 0
+    }
+
+    private func openHistory(_ f: RemoteFileRow) {
+        guard let api = core.api else { return }
+        Task {
+            do {
+                let h = try await api.configHistory(serverId: server.id, path: f.path, sinceMs: nil, limit: 500)
+                historyRows = h.versions
+            } catch {
+                self.error = error.fleetMessage
+            }
+        }
+    }
+
+    /// Item counts for the directories of the listing (a few SFTP
+    /// listings, capped; runs after the table is shown).
+    private func countDirs(_ rows: [RemoteFileRow], in listedDir: String) async {
+        guard let api = core.api else { return }
+        for d in rows.filter({ $0.kind == .directory }).prefix(24) {
+            guard let sub = try? await api.fileList(serverId: server.id, dir: d.path) else { continue }
+            guard dir == listedDir else { return }
+            dirCounts[d.path] = sub.count
         }
     }
 
@@ -155,7 +288,9 @@ struct FilesTab: View {
                 .onDrag { dragProvider(e) }
             }
             TableColumn("Size") { e in
-                Text(e.kind == .directory ? "–" : Format.bytes(e.size)).monospacedDigit()
+                Text(e.kind == .directory
+                     ? (dirCounts[e.path].map { "\($0) item\($0 == 1 ? "" : "s")" } ?? "–")
+                     : Format.bytes(e.size)).monospacedDigit()
             }
             .width(80)
             TableColumn("Mode") { e in Text(String(format: "%04o", e.mode)).font(.mono(11)) }.width(56)
@@ -200,7 +335,13 @@ struct FilesTab: View {
 
     private var transferList: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Transfers").font(.system(size: 13, weight: .semibold))
+            HStack {
+                Text("Transfers").font(.system(size: 13, weight: .semibold))
+                if let r = transfers.aggregateRate {
+                    Text(r).font(.secondary).foregroundStyle(Color.textSecondary).monospacedDigit()
+                        .accessibilityIdentifier("files.transferRate")
+                }
+            }
             ForEach(transfers.items) { t in
                 HStack {
                     Text(t.name).lineLimit(1)
@@ -257,8 +398,12 @@ struct FilesTab: View {
         loading = true
         defer { loading = false }
         do {
-            entries = try await api.fileList(serverId: server.id, dir: dir)
+            let listed = try await api.fileList(serverId: server.id, dir: dir)
+            entries = listed
+            dirCounts = [:]
             error = nil
+            let d = dir
+            Task { await countDirs(listed, in: d) }
         } catch {
             self.error = error.fleetMessage
         }

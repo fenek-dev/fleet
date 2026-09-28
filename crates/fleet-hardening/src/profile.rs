@@ -240,7 +240,16 @@ struct CustomFile {
     #[serde(default)]
     skip: Option<SkipSection>,
     #[serde(default)]
+    web: Option<WebSection>,
+    #[serde(default)]
     exceptions: BTreeMap<String, String>,
+}
+
+/// Web role choice: the role manifest's `server` setting.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSection {
+    server: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -738,6 +747,15 @@ pub fn parse_custom(text: &str) -> Result<Resolved, ProfileError> {
                     .map_err(|_| ProfileError(format!("cidr {c:?}")))?,
             );
         }
+    }
+    if let Some(web) = f.web {
+        if !matches!(web.server.as_str(), "caddy" | "nginx") {
+            return err("web.server: only \"caddy\" or \"nginx\"");
+        }
+        let Some(m) = p.role_manifests.iter_mut().find(|m| m.role == ProfileRole::Web) else {
+            return err("web.server needs the web role");
+        };
+        m.settings.insert("server".into(), web.server);
     }
     if let Some(w) = f.updates.and_then(|u| u.reboot_window) {
         p.reboot_window = Some(RebootWindow::parse(&w)?);

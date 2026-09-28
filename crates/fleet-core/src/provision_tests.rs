@@ -272,6 +272,7 @@ fn choice() -> ProvisionChoice {
     ProvisionChoice {
         level: Level::Baseline,
         roles: vec![Role::Docker],
+        web_server: WebServer::Caddy,
         admin_user: ADMIN.into(),
         allow_from: vec![],
         reboot_window: None,
@@ -485,6 +486,29 @@ async fn a_plan_that_grew_since_review_is_not_applied() {
     let hash = st.plan_hash.unwrap();
     st.approve_plan(&hash).unwrap();
     assert_eq!(run(&fake, &mut st).await, Ok(Step::Done));
+}
+
+#[test]
+fn nginx_choice_is_custom_toml_only_with_the_web_role() {
+    let mut c = choice();
+    c.web_server = WebServer::Nginx;
+    // No web role: the choice is moot.
+    assert!(!c.is_custom());
+    assert!(!c.custom_toml(&server()).unwrap().contains("[web]"));
+    c.roles = vec![Role::Web];
+    assert!(c.is_custom());
+    let parsed: toml::Table = c.custom_toml(&server()).unwrap().parse().unwrap();
+    assert_eq!(parsed["web"]["server"].as_str(), Some("nginx"));
+    c.web_server = WebServer::Caddy;
+    assert!(!c.is_custom());
+}
+
+#[test]
+fn old_saved_choices_default_to_caddy() {
+    let mut v = serde_json::to_value(choice()).unwrap();
+    v.as_object_mut().unwrap().remove("web_server");
+    let c: ProvisionChoice = serde_json::from_value(v).unwrap();
+    assert_eq!(c.web_server, WebServer::Caddy);
 }
 
 #[tokio::test(flavor = "current_thread")]

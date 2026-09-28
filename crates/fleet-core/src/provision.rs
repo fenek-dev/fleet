@@ -118,11 +118,22 @@ impl Role {
     }
 }
 
+/// Web role's server (design §9.6); Caddy is the role's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WebServer {
+    #[default]
+    Caddy,
+    Nginx,
+}
+
 /// The wizard's form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisionChoice {
     pub level: Level,
     pub roles: Vec<Role>,
+    /// Only meaningful with the web role; nginx needs operator TOML.
+    #[serde(default)]
+    pub web_server: WebServer,
     /// The admin the agent was installed with (`--admin-user`).
     pub admin_user: String,
     /// SSH source ranges (CIDR); empty means anywhere (rate-limited).
@@ -176,7 +187,12 @@ impl ProvisionChoice {
 
     /// Source ranges or a reboot window need operator TOML (Elevated).
     pub fn is_custom(&self) -> bool {
-        !self.allow_from.is_empty() || self.reboot_window.is_some()
+        !self.allow_from.is_empty() || self.reboot_window.is_some() || self.nginx()
+    }
+
+    /// nginx picked with the web role (without it the choice is moot).
+    fn nginx(&self) -> bool {
+        self.web_server == WebServer::Nginx && self.roles.contains(&Role::Web)
     }
 
     /// The operator TOML (design §9.2), serialized (never string-built).
@@ -209,6 +225,11 @@ impl ProvisionChoice {
             let mut ssh = Table::new();
             ssh.insert("allow_from".into(), arr(self.allow_from.clone()));
             doc.insert("ssh".into(), Value::Table(ssh));
+        }
+        if self.nginx() {
+            let mut web = Table::new();
+            web.insert("server".into(), Value::String("nginx".into()));
+            doc.insert("web".into(), Value::Table(web));
         }
         if let Some(w) = &self.reboot_window {
             let mut up = Table::new();

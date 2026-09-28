@@ -111,6 +111,20 @@ fn custom_profile_parses() {
 }
 
 #[test]
+fn custom_profile_picks_web_server() {
+    let p = parse_custom("[profile]\nextends = \"baseline\"\nroles = [\"web\"]\n[web]\nserver = \"nginx\"\n")
+        .unwrap();
+    let m = p.role(ProfileRole::Web).unwrap();
+    assert_eq!(m.settings.get("server").map(String::as_str), Some("nginx"));
+    // Default stays Caddy.
+    let p = parse_custom("[profile]\nextends = \"baseline\"\nroles = [\"web\"]\n").unwrap();
+    assert_eq!(
+        p.role(ProfileRole::Web).unwrap().settings.get("server").map(String::as_str),
+        Some("caddy")
+    );
+}
+
+#[test]
 fn custom_profile_rejects() {
     let cases = [
         ("[profile]\nextends = \"custom\"\n", "extends"),
@@ -162,6 +176,14 @@ fn custom_profile_rejects() {
         (
             "[profile]\nextends = \"baseline\"\nname = \"a b\"\n",
             "name",
+        ),
+        (
+            "[profile]\nextends = \"baseline\"\nroles = [\"web\"]\n[web]\nserver = \"apache\"\n",
+            "web.server",
+        ),
+        (
+            "[profile]\nextends = \"baseline\"\n[web]\nserver = \"nginx\"\n",
+            "web role",
         ),
     ];
     for (toml, want) in cases {
