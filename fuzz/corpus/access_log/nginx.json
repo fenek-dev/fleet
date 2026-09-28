@@ -1,0 +1,1 @@
+{"time":"2024-01-01T00:00:00+00:00","remote_addr":"198.51.100.4","request":"GET /.env HTTP/1.1","status":"404","body_bytes_sent":"0","http_user_agent":"x","host":"example.com"}

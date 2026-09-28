@@ -56,7 +56,8 @@ crates/
 apple/Fleet/         # SwiftUI app
 packaging/           # systemd units, tmpfiles, needrestart
 profiles/            # baseline.toml, strict.toml, roles/*.toml, games/*.toml
-scripts/  tests/vm/  # fuzz/ planned, not present
+scripts/  tests/vm/
+fuzz/                # cargo-fuzz targets (own crate, nightly; fuzz/README.md)
 ```
 
 ## Conventions
@@ -64,7 +65,7 @@ scripts/  tests/vm/  # fuzz/ planned, not present
 - **Rust:** stable toolchain pinned in `rust-toolchain.toml`; builds use `--locked`. The agent is built as a static musl binary. `tokio` runs on a single thread in the agent.
 - **Serialization:** `postcard` on the wire, TOML for profiles and policies.
 - **Errors:** fixed protocol error codes. Human-readable messages are generated on the Mac only.
-- **Tests:** property tests for validation and parsing; `cargo-fuzz` for the decoder and parsers (planned); Docker harness now, Lima VMs later, for integration tests.
+- **Tests:** property tests for validation and parsing; `cargo-fuzz` for the decoder, crypto verification and parsers (`fuzz/`, nightly, not a workspace member; new parsers get a target); Docker harness now, Lima VMs later, for integration tests.
 - **Performance budgets:** agent idle memory under 5 MB (gate) and 20 MB (exec); CPU under 0.2% at idle; binary under 10 MB.
 
 ## Current state

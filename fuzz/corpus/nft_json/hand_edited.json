@@ -1,0 +1,13 @@
+{"nftables": [
+{"metainfo": {"version": "1.0.6", "release_name": "Lester Gooch #5", "json_schema_version": 1}},
+{"table": {"family": "inet", "name": "fleet", "handle": 7}},
+{"set": {"family": "inet", "name": "banned4", "table": "fleet", "type": "ipv4_addr", "handle": 1, "flags": ["interval", "timeout"], "elem": [{"elem": {"val": "192.0.2.10", "timeout": 3600, "expires": 3412}}]}},
+{"set": {"family": "inet", "name": "banned6", "table": "fleet", "type": "ipv6_addr", "handle": 2, "flags": ["interval", "timeout"]}},
+{"set": {"family": "inet", "name": "exempt4", "table": "fleet", "type": "ipv4_addr", "handle": 3, "flags": ["interval", "timeout"]}},
+{"set": {"family": "inet", "name": "exempt6", "table": "fleet", "type": "ipv6_addr", "handle": 4, "flags": ["interval", "timeout"]}},
+{"chain": {"family": "inet", "table": "fleet", "name": "input", "handle": 10, "type": "filter", "hook": "input", "prio": 0, "policy": "drop"}},
+{"chain": {"family": "inet", "table": "fleet", "name": "forward", "handle": 11, "type": "filter", "hook": "forward", "prio": 0, "policy": "accept"}},
+{"rule": {"family": "inet", "table": "fleet", "chain": "input", "handle": 12, "comment": "base", "expr": [{"match": {"op": "==", "left": {"meta": {"key": "iif"}}, "right": "lo"}}, {"accept": null}]}},
+{"rule": {"family": "inet", "table": "fleet", "chain": "input", "handle": 21, "comment": "r0 ssh", "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 22}}, {"accept": null}]}},
+{"rule": {"family": "inet", "table": "fleet", "chain": "input", "handle": 40, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 3306}}, {"counter": {"packets": 12, "bytes": 720}}, {"accept": null}]}}
+]}

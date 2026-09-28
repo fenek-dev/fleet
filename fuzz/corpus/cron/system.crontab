@@ -1,0 +1,2 @@
+0 4 * * * root /usr/sbin/logrotate /etc/logrotate.conf
+@daily www-data php /srv/app/cron.php

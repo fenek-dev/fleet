@@ -1,0 +1,2 @@
+openssl	amd64	3.0.13-1~deb12u1	install	installed	openssl	3.0.13-1~deb12u1
+libc6	arm64	2.36-9+deb12u7	hold	installed	glibc	2.36-9+deb12u7

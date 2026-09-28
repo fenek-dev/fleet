@@ -1,0 +1,184 @@
+# cargo-fuzz targets (see README.md). Not a member of the root workspace:
+# it needs a nightly toolchain (pinned in rust-toolchain.toml here).
+[package]
+name = "fleet-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hex = "0.4"
+serde = "1"
+fleet-proto = { path = "../crates/fleet-proto" }
+fleet-crypto = { path = "../crates/fleet-crypto" }
+fleet-ops = { path = "../crates/fleet-ops" }
+fleet-hardening = { path = "../crates/fleet-hardening" }
+fleet-compose = { path = "../crates/fleet-compose" }
+fleet-debver = { path = "../crates/fleet-debver" }
+fleet-core = { path = "../crates/fleet-core" }
+fleetctl-proto = { path = "../crates/fleetctl-proto" }
+
+# Own workspace, so the root workspace never picks this crate up.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "wire_message"
+path = "fuzz_targets/wire_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signed_command"
+path = "fuzz_targets/signed_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_reassembler"
+path = "fuzz_targets/chunk_reassembler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "noise_frames"
+path = "fuzz_targets/noise_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merkle_approval"
+path = "fuzz_targets/merkle_approval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roster_eval"
+path = "fuzz_targets/roster_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_toml"
+path = "fuzz_targets/policy_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile_toml"
+path = "fuzz_targets/profile_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compose_yaml"
+path = "fuzz_targets/compose_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sshd_log"
+path = "fuzz_targets/sshd_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "access_log"
+path = "fuzz_targets/access_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_json"
+path = "fuzz_targets/journal_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nft_json"
+path = "fuzz_targets/nft_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dpkg_status"
+path = "fuzz_targets/dpkg_status.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apt_sim"
+path = "fuzz_targets/apt_sim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "utmp"
+path = "fuzz_targets/utmp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sudoers"
+path = "fuzz_targets/sudoers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cron"
+path = "fuzz_targets/cron.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "debver"
+path = "fuzz_targets/debver.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_record"
+path = "fuzz_targets/sync_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fleetctl_frame"
+path = "fuzz_targets/fleetctl_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vuln_feed"
+path = "fuzz_targets/vuln_feed.rs"
+test = false
+doc = false
+bench = false

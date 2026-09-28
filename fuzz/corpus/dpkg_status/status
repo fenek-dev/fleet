@@ -1,0 +1,6 @@
+Package: openssl
+Status: install ok installed
+Version: 3.0.13
+
+Package: nftables
+Status: deinstall ok config-files

@@ -1,0 +1,25 @@
+version = 12
+fleet_id = "f_2b810000000000000000000000000000"
+server_id = "srv_7f3a9c"
+
+[capabilities]
+allow = ["system", "logs", "security", "services", "firewall", "packages",
+         "docker", "cron", "users", "files", "config", "search", "profile",
+         "mesh", "game"]
+shell_exec = false
+shell_exec_users = ["ops"]
+
+[elevated]
+extra = ["roster.pending"]
+
+[actors]
+ai = "full"
+ai_bulk_confirm_above = 5
+ai_commands_per_minute = 60
+
+[limits]
+commands_per_minute = 240
+max_stream_sessions = 32
+
+[safety]
+auto_revert_seconds = 60

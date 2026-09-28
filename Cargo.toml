@@ -15,6 +15,8 @@ members = [
     "crates/fleet-cloudinit",
     "crates/fleet-compose",
 ]
+# cargo-fuzz crate: own workspace, nightly toolchain.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

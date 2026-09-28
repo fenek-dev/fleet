@@ -1,0 +1,13 @@
+2025-03-01 10:00:03 startup archives unpack
+2025-03-01 10:00:03 install nginx-common:all <none> 1.22.1-9
+2025-03-01 10:00:03 status half-installed nginx-common:all 1.22.1-9
+2025-03-01 10:00:04 install nginx:amd64 <none> 1.22.1-9
+2025-03-01 10:00:05 configure nginx:amd64 1.22.1-9 <none>
+2025-03-02 04:15:33 upgrade libssl3:amd64 3.0.11-1~deb12u2 3.0.13-1~deb12u1
+2025-03-02 04:15:35 upgrade openssl:amd64 3.0.11-1~deb12u2 3.0.13-1~deb12u1
+2025-03-03 12:00:01 remove telnet:amd64 0.17+2.4-2 <none>
+2025-03-03 12:00:01 purge telnet:amd64 0.17+2.4-2 <none>
+2025-03-05 08:00:00 install htop:amd64 <none> 3.2.2-2
+2025-03-05 08:00:01 upgrade tzdata:all 2025b-0+deb12u1 2024a-0+deb12u1
+this line is junk
+2025-13-05 08:00:01 install bad:amd64 <none> 1.0

@@ -1,0 +1,1 @@
+{"level":"info","ts":1700000000.1,"logger":"http.log.access","msg":"handled request","request":{"remote_ip":"203.0.113.9","client_ip":"203.0.113.9","proto":"HTTP/1.1","method":"GET","host":"example.com","uri":"/wp-login.php","headers":{"User-Agent":["curl/8"]}},"status":404,"size":0}

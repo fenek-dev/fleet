@@ -1,0 +1,12 @@
+services:
+  web:
+    image: nginx:1.27@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - /srv/app/data:/data:ro
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+volumes:
+  cache: {}

@@ -1,0 +1,10 @@
+Defaults env_reset
+Defaults:ops !requiretty
+User_Alias ADMINS = ops, alice
+Cmnd_Alias SVC = /usr/bin/systemctl restart nginx, /usr/bin/systemctl reload *
+root ALL=(ALL:ALL) ALL
+%sudo ALL=(ALL:ALL) ALL
+ADMINS ALL=(root) NOPASSWD: SVC
+deploy ALL=(www-data) NOPASSWD: /usr/bin/rsync "", sha256:abc /bin/true
+#includedir /etc/sudoers.d
+@include /etc/sudoers.local

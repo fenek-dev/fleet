@@ -1505,14 +1505,14 @@ fleet/
 └── tests/vm/              # Docker harness (run.sh); Lima VM matrix planned
 ```
 
-`fuzz/` (cargo-fuzz targets) doesn't exist yet.
+`fuzz/` holds the cargo-fuzz targets: its own crate on a pinned nightly, excluded from the workspace (see `fuzz/README.md`).
 
 ---
 
 ## 13. Testing and verification
 
 - **Unit and property tests:** argument validation, dpkg version comparison, parsers (journald, auth events, access logs, nftables JSON), roster acceptance rules.
-- **Fuzzing (`cargo-fuzz`, planned; no targets yet):** frame decoding, postcard messages, `SignedCommand` and `RootApproval` verification, Merkle proofs, log parsers, the Compose validator.
+- **Fuzzing (`cargo-fuzz`, `fuzz/`):** postcard messages (decode/re-encode round trip), chunk reassembly, Noise transport decryption, `SignedCommand` and `RootApproval` verification, Merkle proofs, roster evaluation, policy and custom-profile TOML, the Compose validator, server-output parsers (sshd, access logs, journal JSON, nftables JSON, dpkg/apt, utmp, sudoers, cron), Debian version ordering (antisymmetry), and on the Mac side sync records, fleetctl frames and vulnerability feeds. Seeds come from fixtures and golden vectors; run on demand, not in CI yet (`fuzz/README.md`).
 - **Cryptography:** Noise test vectors; tests that tampered, replayed, stale, wrongly bound or revoked-device commands are rejected; tests that a compromised gate can't get commands executed or forge receipts. Also:
   - malleated (high-S) and DER-encoded signatures are rejected;
   - replays are rejected across an exec restart; an identical replayed command gets its original response and receipt back (also after a restart), never a signed `Replay`;
@@ -1548,7 +1548,7 @@ The v1 launch is the end of Phase 6. P0 features are spread across the phases, s
 - **Lima VM matrix** (Debian 12/13, Ubuntu 22.04/24.04): reboots during auto-revert windows, real sshd lockout, kernel-level nftables cases (section 4.8), Docker iptables vs nftables backends.
 - **Performance:** agent binary ~12 MB vs the 10 MB budget; budgets not yet gated in CI (there is no CI).
 - **Release review items:** the `minecraft-paper` image digest (template can't install without it) and the Caddy apt key fingerprint (section 9.9), both to verify out of band.
-- **Gaps:** host-key rotation after cloud-init (no op); `agent.update.*` and `uninstall` (sections 10.2, 10.3); ops without handlers (section 4.2); audit archiving, mirroring and Mac-side checkpoint checks (section 5.8); policy approval not re-verified at exec start (section 5.4); config-history attribution of pid-less events (section 4.9); `.deb` packaging (the installer accepts one, nothing builds it); fuzz targets (`fuzz/` absent); `cargo-vet`.
+- **Gaps:** host-key rotation after cloud-init (no op); `agent.update.*` and `uninstall` (sections 10.2, 10.3); ops without handlers (section 4.2); audit archiving, mirroring and Mac-side checkpoint checks (section 5.8); policy approval not re-verified at exec start (section 5.4); config-history attribution of pid-less events (section 4.9); `.deb` packaging (the installer accepts one, nothing builds it); fuzzing in CI (targets exist, run by hand); `cargo-vet`.
 
 **Later (P2 and beyond):** rolling reboots, FIDO2 keys and SSH certificates, drift dashboards, a mobile companion app, more distributions, a port-forwarding manager.
 

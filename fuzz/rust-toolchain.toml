@@ -1,0 +1,4 @@
+# cargo-fuzz needs nightly (-Zsanitizer); the workspace itself stays on stable.
+[toolchain]
+channel = "nightly-2026-09-20"
+profile = "minimal"

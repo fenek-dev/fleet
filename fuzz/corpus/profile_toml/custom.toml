@@ -1,0 +1,19 @@
+[profile]
+name = "web-docker-prod"
+extends = "strict"
+roles = ["docker", "web"]
+
+[admin]
+user = "ops"
+
+[ssh]
+allow_from = ["203.0.113.0/24", "2001:db8::/32"]
+
+[updates]
+reboot_window = "Sun 04:00-05:00 UTC"
+
+[skip]
+modules = ["kernel.modules.usb-storage", "swap", "sysctl.kernel.dmesg_restrict"]
+
+[exceptions]
+"services.cups.service" = "print server"

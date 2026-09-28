@@ -1,0 +1,30 @@
+# Fleet Strict profile (design §9.5): Baseline plus these additions,
+# similar to CIS Level 2. Values here override Baseline's.
+
+[profile]
+name = "strict"
+extends = "baseline"
+modules = ["mounts.tmp", "cron.allow", "sudo.pwquality"]
+
+[ssh]
+# SSH only from `ssh.allow_from` (firewall), fewer channels per connection.
+max_sessions = 4
+
+[sudo]
+log_io = true
+
+[auditd]
+# `-e 2`: rules can't change until the next reboot (PendingReboot).
+immutable = true
+
+[admin_shell]
+# The admin's shell startup files are also `chattr +i` (root can still
+# clear it; the admin can't replace or rename them even with a writable
+# home directory).
+immutable = true
+
+[kernel]
+blacklist = ["usb-storage"]
+
+[sysctl]
+"kernel.yama.ptrace_scope" = "2"

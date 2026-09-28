@@ -1,0 +1,6 @@
+MAILTO=ops@example.com
+SHELL=/bin/bash
+# m h dom mon dow command
+*/5 * * * * /usr/local/bin/backup --fast
+@reboot /usr/bin/true
+0 3 * jan,feb mon-fri echo "100%" > /dev/null
