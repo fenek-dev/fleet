@@ -45,9 +45,10 @@
 //!
 //! Every step saves the state ([`ProvisionBackend::save`]) and is safe to
 //! run again, so a failed or interrupted run resumes at the step that
-//! failed. A custom profile (source ranges, reboot window) is operator
-//! TOML, so each `profile.apply` phase is Elevated: one root approval
-//! (Touch ID) per phase, since the plan hash changes between phases.
+//! failed. Every Elevated `profile.apply` gets its own root approval
+//! (Touch ID), since the plan hash changes between phases: the Accounts
+//! phase always (it sets the sudo password), and with a custom profile
+//! (operator TOML: source ranges, reboot window) every phase.
 
 use crate::bulk::{BoxFut, Failure};
 use crate::manager::RequestOpts;

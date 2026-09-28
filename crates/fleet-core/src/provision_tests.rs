@@ -1,7 +1,9 @@
 //! Provisioning orchestration against a fake agent and app backend.
 
 use super::*;
-use crate::bulk::tests::healthy;
+use crate::bulk::tests::{SoftApprover, healthy};
+use crate::bulk::Approver;
+use fleet_proto::op::Tier;
 use fleet_proto::alert::Severity;
 use fleet_proto::payload::{
     AuditFinding, AuditReport, ChangeKind, ModuleOutcome, PendingChange, PendingChanges,
@@ -34,6 +36,8 @@ struct Fake {
     confirmed_as: Mutex<Option<String>>,
     saved: Mutex<Vec<ProvisionState>>,
     approvals: Mutex<Vec<String>>,
+    /// The Mac's root key (`None`: approvals fail).
+    root: Mutex<Option<Arc<SoftApprover>>>,
     passwords: Mutex<Vec<bool>>,
     /// Unconfirmed changes (`changes.list`).
     pending: Mutex<Vec<PendingChange>>,
@@ -75,6 +79,7 @@ impl Fake {
             confirmed_as: Mutex::new(None),
             saved: Mutex::new(Vec::new()),
             approvals: Mutex::new(Vec::new()),
+            root: Mutex::new(Some(SoftApprover::new(false))),
             passwords: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
             findings: Mutex::new(Vec::new()),
@@ -185,14 +190,27 @@ impl Fake {
 }
 
 impl ProvisionBackend for Arc<Fake> {
-    fn request(&self, _: &ServerId, op: Op, _: RequestOpts) -> BoxFut<Result<Payload, Failure>> {
-        let r = self.answer(op);
+    fn request(&self, _: &ServerId, op: Op, opts: RequestOpts) -> BoxFut<Result<Payload, Failure>> {
+        // Like exec: an Elevated op without a root approval is refused.
+        let r = if op.tier() == Tier::Elevated && opts.approval.is_none() {
+            Err(Failure::Agent(ErrorCode::ApprovalRequired))
+        } else {
+            self.answer(op)
+        };
         Box::pin(async move { r })
     }
 
-    fn approve(&self, what: String, _: ApprovalItem) -> BoxFut<Result<RootApproval, String>> {
-        self.approvals.lock().unwrap().push(what);
-        Box::pin(async { Err("no root key in tests".to_string()) })
+    fn approve(&self, what: String, item: ApprovalItem) -> BoxFut<Result<RootApproval, String>> {
+        self.approvals.lock().unwrap().push(what.clone());
+        let root = self.root.lock().unwrap().clone();
+        let r = match root {
+            Some(a) => a
+                .approve(&what, &[item])
+                .map_err(|e| format!("{e:?}"))
+                .and_then(|mut l| l.pop().ok_or_else(|| "no approval".to_string())),
+            None => Err("no root key".to_string()),
+        };
+        Box::pin(async move { r })
     }
 
     fn roster_chain(&self) -> Result<Vec<SignedRoster>, String> {
@@ -318,8 +336,12 @@ async fn phases_run_in_lockout_safe_order() {
     );
     // The confirm came over a connection as the admin (root login is off).
     assert_eq!(fake.confirmed_as.lock().unwrap().as_deref(), Some(ADMIN));
-    // Only the Accounts phase carries the sudo password hash.
+    // Only the Accounts phase carries the sudo password hash, which makes
+    // it (alone, for a built-in profile) Elevated: one root approval.
     assert_eq!(*fake.passwords.lock().unwrap(), vec![true, false, false]);
+    let asked = fake.approvals.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0].contains("Accounts"));
     assert_eq!((st.score_before, st.score_after), (Some(40), Some(100)));
     assert_eq!(st.modules.len(), 6);
     assert!(st.last_error.is_none());
@@ -484,13 +506,22 @@ async fn custom_profiles_need_a_root_approval_per_phase() {
     assert_eq!(run(&fake, &mut st).await, Ok(Step::Review));
     let hash = st.plan_hash.unwrap();
     st.approve_plan(&hash).unwrap();
-    // The fake has no root key: the first phase stops for approval.
+    // Without the root key the first phase stops for approval.
+    let root = fake.root.lock().unwrap().take();
     let e = run(&fake, &mut st).await.unwrap_err();
     assert!(matches!(e, ProvisionError::Approval(_)));
     assert_eq!(st.step, Step::Accounts);
     let asked = fake.approvals.lock().unwrap().clone();
     assert_eq!(asked.len(), 1);
     assert!(asked[0].contains("Accounts"));
+    // With it, every phase asks for its own approval.
+    *fake.root.lock().unwrap() = root;
+    assert_eq!(run(&fake, &mut st).await, Ok(Step::Done));
+    let asked = fake.approvals.lock().unwrap().clone();
+    assert_eq!(asked.len(), 4, "{asked:?}");
+    for (a, p) in asked[1..].iter().zip(["Accounts", "Access", "System"]) {
+        assert!(a.contains(p), "{a}");
+    }
 }
 
 #[test]

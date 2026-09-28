@@ -487,8 +487,11 @@ async fn denied_approval_runs_nothing() {
 #[tokio::test(flavor = "current_thread")]
 async fn dry_run_plans_without_changing_anything() {
     let exec = FakeExec::with(&[]);
+    // Phase All names its modules (never mixing access and others).
+    let mut spec = crate::opspec::profile_spec(fleetctl_proto::msg::ProfileLevelArg::Baseline, &[]);
+    spec.only = vec!["sysctl".parse().unwrap()];
     let apply = Op::ProfileApply {
-        spec: crate::opspec::profile_spec(fleetctl_proto::msg::ProfileLevelArg::Baseline, &[]),
+        spec,
         plan_hash: [0; 32],
         phase: fleet_proto::op::ProfilePhase::All,
         password_hash: None,
