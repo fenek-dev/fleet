@@ -405,6 +405,7 @@ pub async fn run_runbook<E: FnMut(RunbookEvent) + Send>(
             canary: step.canary,
             health: if step.canary { health.clone() } else { None },
             stop_on_failure: step.stop_on_failure,
+            batch_barrier: false,
             per_server_timeout: None,
             dry_run: false,
         };

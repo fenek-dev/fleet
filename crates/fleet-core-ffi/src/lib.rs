@@ -50,6 +50,7 @@ mod terminal;
 mod text;
 mod timeline;
 mod types;
+mod ui_fleet;
 mod validate;
 mod vuln;
 

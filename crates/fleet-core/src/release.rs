@@ -502,6 +502,7 @@ pub async fn rollout<E: FnMut(BulkEvent) + Send>(
             canary: false,
             health: None,
             stop_on_failure: true,
+            batch_barrier: false,
             per_server_timeout: None,
             dry_run: false,
         };
