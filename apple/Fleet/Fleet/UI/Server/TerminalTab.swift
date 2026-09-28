@@ -253,7 +253,7 @@ struct TerminalTab: View {
     @Environment(CoreBridge.self) private var core
     @Environment(TerminalStore.self) private var store
     let server: ServerRow
-    @AppStorage("terminal.tmux") private var tmux = true
+    @AppStorage("terminal.tmux", store: AppPaths.defaults) private var tmux = true
 
     private var tabs: [TerminalController] { store.tabs[server.id] ?? [] }
     private var current: TerminalController? {

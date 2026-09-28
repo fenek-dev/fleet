@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Observation
 
@@ -83,6 +84,9 @@ final class CoreBridge {
             keys?.creationAllowed = false
             status = .running
             sync?.start()
+            #if FLEET_TEST_HOOKS
+            exportTestKeys()
+            #endif
         } catch FleetError.NotEnrolled {
             status = .notEnrolled
         } catch FleetError.AlreadyStarted {
@@ -106,6 +110,26 @@ final class CoreBridge {
             break
         }
     }
+
+    #if FLEET_TEST_HOOKS
+    /// Test hook: writes `<dataDir>/ssh_pubkey` and `monitor_ssh_pubkey`
+    /// (OpenSSH lines) so testers can authorize this Mac without the UI.
+    private func exportTestKeys() {
+        if let k = try? core?.sshPublicKey() { TestHooks.export("ssh_pubkey", k) }
+        if let raw = try? keys?.publicKey(role: .monitorSsh),
+           let pk = try? P256.Signing.PublicKey(compressedRepresentation: raw)
+        {
+            func str(_ d: Data) -> Data {
+                var n = UInt32(d.count).bigEndian
+                return Data(bytes: &n, count: 4) + d
+            }
+            let blob = str(Data("ecdsa-sha2-nistp256".utf8)) + str(Data("nistp256".utf8))
+                + str(pk.x963Representation)
+            TestHooks.export("monitor_ssh_pubkey",
+                             "ecdsa-sha2-nistp256 \(blob.base64EncodedString()) fleet-monitor")
+        }
+    }
+    #endif
 
     func fail(_ message: String) {
         status = .failed(message)
@@ -238,14 +262,7 @@ final class CoreBridge {
     }
 
     private static func cachePath() throws -> String {
-        let dir = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true
-        ).appendingPathComponent("Fleet", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
-        return dir.appendingPathComponent("cache.sqlite").path
+        try AppPaths.cachePath()
     }
 }
 

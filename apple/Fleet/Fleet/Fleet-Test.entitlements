@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Ad-hoc test builds only (scripts/build-app-test.sh): no
+	     keychain-access-groups, which needs a provisioning profile. Test
+	     hooks keep keys in files, so no Keychain is needed. Never used
+	     for a signed or Release build. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
+</plist>

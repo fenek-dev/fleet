@@ -17,6 +17,13 @@ enum ServerTab: String, CaseIterable, Identifiable {
     case games = "Games"
     case timeline = "Timeline"
     var id: String { rawValue }
+    /// Stable accessibility name: `serverTab.<identifier>`.
+    var identifier: String {
+        switch self {
+        case .config: "config"
+        default: "\(self)"
+        }
+    }
 }
 
 struct ServerDetailView: View {
@@ -51,6 +58,7 @@ struct ServerDetailView: View {
                 Text("Install the Fleet agent to see live data and manage this server.")
             } actions: {
                 Button("Install agent…") { installing = true }
+                    .accessibilityIdentifier("server.installAgentPrimary")
                     .buttonStyle(.borderedProminent).tint(.accent)
             }
         } else {
@@ -78,16 +86,21 @@ struct ServerDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(s.name).font(.serverTitle).foregroundStyle(Color.text)
+                    .accessibilityIdentifier("server.name")
                 StatusPill(label: s.state.label, tone: s.state.tone)
+                    .accessibilityIdentifier("server.state")
                 Spacer()
                 if !s.agentPinned {
                     Button("Install agent…", systemImage: "shippingbox") { installing = true }
+                        .accessibilityIdentifier("server.installAgent")
                 }
                 if s.agentPinned {
                     SudoPasswordButton(serverId: s.id, serverName: s.name)
                 }
                 Button("Reconnect", systemImage: "arrow.clockwise") { core.reconnect(s.id) }
+                    .accessibilityIdentifier("server.reconnect")
                 Button("Terminal", systemImage: "terminal") { tab = .terminal }
+                    .accessibilityIdentifier("server.terminal")
                     .disabled(s.state != .ready)
             }
             HStack(spacing: 6) {
@@ -102,6 +115,7 @@ struct ServerDetailView: View {
                 HStack(spacing: 4) {
                     ForEach(ServerTab.allCases) { t in
                         Button(t.rawValue) { tab = t }
+                            .accessibilityIdentifier("serverTab.\(t.identifier)")
                             .buttonStyle(.plain)
                             .font(.base)
                             .foregroundStyle(tab == t ? Color.text : Color.textSecondary)

@@ -71,6 +71,12 @@ final class SecureEnclaveKeys: DeviceSigner {
 
     init(gate: KeyGate, environment: [String: String] = ProcessInfo.processInfo.environment) throws {
         self.gate = gate
+        #if FLEET_TEST_HOOKS
+        if TestHooks.signer {
+            backend = .software
+            return
+        }
+        #endif
         if SecureEnclave.isAvailable {
             backend = .secureEnclave
         } else {
@@ -128,6 +134,11 @@ final class SecureEnclaveKeys: DeviceSigner {
         defer { ctx.invalidate() }
         ctx.localizedCancelTitle = "Don't approve"
         ctx.localizedReason = reason.isEmpty ? "approve a Fleet change" : reason
+        #if FLEET_TEST_HOOKS
+        if backend == .software, TestHooks.approve("root-sign: " + ctx.localizedReason) {
+            return try signWith(.root, context: ctx, msg: msg)
+        }
+        #endif
         if backend == .secureEnclave {
             var err: NSError?
             if !ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &err) {

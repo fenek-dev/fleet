@@ -21,6 +21,7 @@ struct ContentView: View {
             set: { if !$0 { core.securityAlertSeen = true } }
         )) {
             Button("OK", role: .cancel) {}
+                .accessibilityIdentifier("security.alertOK")
         } message: {
             Text(core.securityAlert ?? "")
         }
@@ -96,6 +97,7 @@ struct AlertsView: View {
             }
             if alerts.isEmpty {
                 ContentUnavailableView("No open alerts", systemImage: "checkmark.seal")
+                    .accessibilityIdentifier("alerts.empty")
             } else {
                 List(alerts, id: \.self) { e in
                     HStack(spacing: 12) {
@@ -103,12 +105,14 @@ struct AlertsView: View {
                         StatusPill(label: label(e.alert?.severity), tone: tone)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(e.alert?.ruleId ?? e.name).foregroundStyle(Color.text)
+                                .accessibilityIdentifier("alerts.rule")
                             Text("\(serverName(e.serverId)) · \(e.alert?.subject ?? "")")
                                 .font(.secondary).foregroundStyle(Color.textMuted)
                         }
                     }
                 }
                 .scrollContentBackground(.hidden)
+                .accessibilityIdentifier("alerts.list")
             }
         }
         .background(Color.window)

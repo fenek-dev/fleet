@@ -9,6 +9,7 @@ struct AISettings: View {
             Section {
                 Toggle("Pause all AI agents", isOn: Binding(
                     get: { ai.paused }, set: { ai.setPaused($0) }))
+                    .accessibilityIdentifier("ai.pause")
                 Text("While paused, every MCP call is rejected at once.")
                     .font(.caption11).foregroundStyle(Color.textMuted)
             }
@@ -21,6 +22,7 @@ struct AISettings: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(c.clientName).foregroundStyle(Color.text)
+                                .accessibilityIdentifier("ai.client.name")
                             Text("via \(c.parentSigningId)\(c.parentTeam.isEmpty ? " (unsigned)" : " · \(c.parentTeam)")")
                                 .font(.caption11).foregroundStyle(Color.textMuted)
                         }
@@ -29,6 +31,7 @@ struct AISettings: View {
                             .formatted(date: .abbreviated, time: .omitted))
                             .font(.caption11).foregroundStyle(Color.textMuted)
                         Button("Revoke", role: .destructive) { ai.revoke(c) }
+                            .accessibilityIdentifier("ai.client.revoke")
                             .controlSize(.small)
                     }
                 }
@@ -38,6 +41,7 @@ struct AISettings: View {
                     .font(.secondary).textSelection(.enabled)
                 if let p = ai.socketPath {
                     LabeledContent("Socket", value: p).font(.caption11)
+                        .accessibilityIdentifier("ai.socketPath")
                 }
                 if let e = ai.socketError {
                     Text(e).foregroundStyle(Tone.critical.text)
@@ -117,10 +121,13 @@ struct AIPromptSheet: View {
             }
             HStack {
                 Button("Pause AI") { ai.setPaused(true) }
+                    .accessibilityIdentifier("aiPrompt.pause")
                 Spacer()
                 Button("Deny", role: .cancel) { answer(false) }
+                    .accessibilityIdentifier("aiPrompt.deny")
                     .keyboardShortcut(.cancelAction)
                 Button("Approve") { answer(true) }
+                    .accessibilityIdentifier("aiPrompt.approve")
                     .buttonStyle(.borderedProminent)
             }
             .disabled(busy)

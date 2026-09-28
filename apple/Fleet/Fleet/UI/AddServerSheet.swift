@@ -33,6 +33,7 @@ struct AddServerSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.sectionTitle)
+                .accessibilityIdentifier("addServer.title")
             switch step {
             case .details: details
             case .probing: busy("Connecting with this Mac's SSH key…")
@@ -44,6 +45,7 @@ struct AddServerSheet: View {
             if let error {
                 Text(error).font(.base).foregroundStyle(Tone.critical.text)
                     .textSelection(.enabled)
+                    .accessibilityIdentifier("addServer.error")
             }
         }
         .padding(24)
@@ -66,23 +68,33 @@ struct AddServerSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Form {
                 TextField("Name", text: $name, prompt: Text("web-04"))
+                    .accessibilityIdentifier("addServer.name")
                 TextField("Host", text: $host, prompt: Text("203.0.113.14"))
+                    .accessibilityIdentifier("addServer.host")
                 TextField("Port", text: $port)
+                    .accessibilityIdentifier("addServer.port")
                 TextField("User", text: $user)
+                    .accessibilityIdentifier("addServer.user")
                 TextField("Jump hosts", text: $jump, prompt: Text("user@bastion:22 (optional)"))
+                    .accessibilityIdentifier("addServer.jump")
                 Picker("Group", selection: $groupId) {
                     Text("None").tag(String?.none)
                     ForEach(core.groups, id: \.id) { Text($0.name).tag(Optional($0.id)) }
                 }
+                .accessibilityIdentifier("addServer.group")
                 TextField("Tags", text: $tags, prompt: Text("web, eu-central"))
+                    .accessibilityIdentifier("addServer.tags")
             }
             .formStyle(.grouped)
             sshKeyBox
             HStack {
                 Button("Cancel") { dismiss() }
+                    .accessibilityIdentifier("addServer.cancel")
                 Spacer()
                 Button("Add only") { add(connect: false) }
+                    .accessibilityIdentifier("addServer.addOnly")
                 Button("Add and connect") { add(connect: true) }
+                    .accessibilityIdentifier("addServer.addConnect")
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .keyboardShortcut(.defaultAction)
             }
@@ -99,6 +111,7 @@ struct AddServerSheet: View {
                     .font(.mono(11)).foregroundStyle(Color.text)
                     .lineLimit(3).truncationMode(.middle)
                     .textSelection(.enabled)
+                    .accessibilityIdentifier("addServer.sshKey")
                 Spacer()
                 Button("Copy", systemImage: "doc.on.doc") {
                     guard let k = core.sshPublicKey() else { return }
@@ -123,6 +136,7 @@ struct AddServerSheet: View {
                     Text(prompt.algorithm).font(.secondary).foregroundStyle(Color.textMuted)
                     Text(prompt.fingerprint).font(.mono(13)).foregroundStyle(Color.text)
                         .textSelection(.enabled)
+                        .accessibilityIdentifier("addServer.fingerprint")
                 }
                 .card(padding: 12)
                 ForEach(prompt.jumps, id: \.self) { j in
@@ -140,8 +154,10 @@ struct AddServerSheet: View {
             }
             HStack {
                 Button("Reject") { reject() }
+                    .accessibilityIdentifier("addServer.reject")
                 Spacer()
                 Button("Trust and continue") { trust() }
+                    .accessibilityIdentifier("addServer.trust")
                     .buttonStyle(.borderedProminent).tint(.accent)
             }
         }
@@ -157,23 +173,29 @@ struct AddServerSheet: View {
                 Text(artifact?.lastPathComponent ?? "No file chosen")
                     .font(.mono(12))
                     .foregroundStyle(artifact == nil ? Color.textMuted : Color.text)
+                    .accessibilityIdentifier("addServer.artifactName")
                 Spacer()
                 Button("Choose…") { chooseArtifact() }
+                    .accessibilityIdentifier("addServer.chooseArtifact")
             }
             .card(padding: 12)
             Form {
                 TextField("Admin user", text: $adminUser, prompt: Text(user))
+                    .accessibilityIdentifier("addServer.adminUser")
                 Picker("Security", selection: $securityMode) {
                     Text("Managed by Fleet").tag(SecurityModeArg.managed)
                     Text("Agent only (don't change security)").tag(SecurityModeArg.agentOnly)
                 }
+                .accessibilityIdentifier("addServer.security")
             }
             .formStyle(.grouped)
             securityModeHint
             HStack {
                 Button("Later") { dismiss() }
+                    .accessibilityIdentifier("addServer.later")
                 Spacer()
                 Button("Install") { install() }
+                    .accessibilityIdentifier("addServer.install")
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .disabled(artifact == nil)
             }
@@ -218,6 +240,7 @@ struct AddServerSheet: View {
                     }
                     .frame(width: 18)
                     Text(label).foregroundStyle(progress[s] != nil ? Color.text : Color.textMuted)
+                        .accessibilityIdentifier("addServer.step.\(label)")
                     if s == .uploading, let p = progress[s], p.totalBytes > 0 {
                         Spacer()
                         Text("\(Format.bytes(p.doneBytes)) / \(Format.bytes(p.totalBytes))")
@@ -228,8 +251,10 @@ struct AddServerSheet: View {
             if error != nil {
                 HStack {
                     Button("Close") { dismiss() }
+                        .accessibilityIdentifier("addServer.close")
                     Spacer()
                     Button("Try again") { error = nil; step = .install }
+                        .accessibilityIdentifier("addServer.retry")
                 }
             }
         }
@@ -247,6 +272,7 @@ struct AddServerSheet: View {
             HStack {
                 Spacer()
                 Button("Done") { dismiss() }
+                    .accessibilityIdentifier("addServer.done")
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .keyboardShortcut(.defaultAction)
             }
@@ -328,6 +354,10 @@ struct AddServerSheet: View {
     }
 
     private func chooseArtifact() {
+        if let preset = TestHooks.agentArtifact {
+            artifact = preset
+            return
+        }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false

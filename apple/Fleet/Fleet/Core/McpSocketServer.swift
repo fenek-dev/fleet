@@ -47,13 +47,7 @@ final class McpSocketServer: @unchecked Sendable {
     /// The socket path, in a directory that is ours alone: created 0700,
     /// forced back to 0700, not a symlink, owned by this user.
     static func defaultPath() throws -> String {
-        let dir = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true
-        ).appendingPathComponent("Fleet", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: dir, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
+        let dir = try AppPaths.dataDir()
         var st = stat()
         guard lstat(dir.path, &st) == 0 else {
             throw SocketError.posix("lstat", errno)
@@ -69,7 +63,7 @@ final class McpSocketServer: @unchecked Sendable {
                 throw SocketError.posix("chmod", errno)
             }
         }
-        return dir.appendingPathComponent("mcp.sock").path
+        return try AppPaths.mcpSocketPath()
     }
 
     func start() throws {

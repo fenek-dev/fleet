@@ -4,12 +4,24 @@ import SwiftUI
 struct SettingsView: View {
     var body: some View {
         TabView {
-            Tab("General", systemImage: "gearshape") { GeneralSettings() }
-            Tab("Devices", systemImage: "laptopcomputer") { DevicesSettings() }
-            Tab("Recovery", systemImage: "key") { RecoverySettings() }
-            Tab("AI", systemImage: "sparkles") { AISettings() }
-            Tab("Sync", systemImage: "icloud") { SyncSettings() }
-            Tab("Agent releases", systemImage: "shippingbox") { AgentReleasesSettings() }
+            Tab("General", systemImage: "gearshape") {
+                GeneralSettings().accessibilityIdentifier("settings.general")
+            }
+            Tab("Devices", systemImage: "laptopcomputer") {
+                DevicesSettings().accessibilityIdentifier("settings.devices")
+            }
+            Tab("Recovery", systemImage: "key") {
+                RecoverySettings().accessibilityIdentifier("settings.recovery")
+            }
+            Tab("AI", systemImage: "sparkles") {
+                AISettings().accessibilityIdentifier("settings.ai")
+            }
+            Tab("Sync", systemImage: "icloud") {
+                SyncSettings().accessibilityIdentifier("settings.sync")
+            }
+            Tab("Agent releases", systemImage: "shippingbox") {
+                AgentReleasesSettings().accessibilityIdentifier("settings.agentReleases")
+            }
         }
         .frame(width: 640, height: 520)
         .preferredColorScheme(.dark)
@@ -31,6 +43,7 @@ private struct GeneralSettings: View {
             )) {
                 ForEach(Self.options, id: \.1) { Text($0.0).tag($0.1) }
             }
+            .accessibilityIdentifier("settings.general.idleLock")
             LabeledContent("Core version", value: coreVersion())
         }
         .formStyle(.grouped)

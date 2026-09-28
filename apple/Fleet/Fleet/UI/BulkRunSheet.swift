@@ -170,9 +170,11 @@ struct OpEditor: View {
         Picker("Operation", selection: $draft.kind) {
             ForEach(OpDraft.Kind.allCases) { Text($0.rawValue).tag($0) }
         }
+        .accessibilityIdentifier("bulk.operation")
         switch draft.kind {
         case .unit:
             TextField("Unit", text: $draft.unit, prompt: Text("nginx.service"))
+                .accessibilityIdentifier("bulk.unit")
             Picker("Action", selection: $draft.unitAction) {
                 Text("Restart").tag(ServiceActionRow.restart)
                 Text("Reload").tag(ServiceActionRow.reload)
@@ -181,14 +183,17 @@ struct OpEditor: View {
                 Text("Enable").tag(ServiceActionRow.enable)
                 Text("Disable").tag(ServiceActionRow.disable)
             }
+            .accessibilityIdentifier("bulk.unitAction")
         case .pkgUpgrade:
             Picker("Scope", selection: $draft.securityOnly) {
                 Text("Security only").tag(true)
                 Text("All upgradable").tag(false)
             }
             .pickerStyle(.segmented)
+            .accessibilityIdentifier("bulk.scope")
         case .container:
             TextField("Container", text: $draft.container)
+                .accessibilityIdentifier("bulk.container")
             Picker("Action", selection: $draft.containerAction) {
                 Text("Restart").tag(ContainerActionRow.restart)
                 Text("Start").tag(ContainerActionRow.start)
@@ -196,19 +201,27 @@ struct OpEditor: View {
             }
         case .composePull, .composeRestart:
             TextField("Project", text: $draft.project)
+                .accessibilityIdentifier("bulk.project")
         case .configRollback:
             TextField("Path", text: $draft.path, prompt: Text("/etc/nginx/nginx.conf"))
+                .accessibilityIdentifier("bulk.path")
             TextField("Version", value: $draft.version, format: .number)
+                .accessibilityIdentifier("bulk.version")
         case .profileCheck:
             Toggle("Strict profile", isOn: $draft.strict)
+                .accessibilityIdentifier("bulk.strict")
         case .reboot:
             TextField("Delay (s)", value: $draft.delay, format: .number)
+                .accessibilityIdentifier("bulk.delay")
         case .shell:
             TextField("Run as user", text: $draft.user)
+                .accessibilityIdentifier("bulk.shellUser")
             TextEditor(text: $draft.command)
                 .font(.system(size: 12, design: .monospaced))
                 .frame(minHeight: 60)
+                .accessibilityIdentifier("bulk.shellCommand")
             TextField("Timeout (s)", value: $draft.timeout, format: .number)
+                .accessibilityIdentifier("bulk.shellTimeout")
             Text("Runs `/bin/sh -c` on each server, where the server policy allows shell.exec (off by default).")
                 .font(.caption11).foregroundStyle(Color.textMuted)
         case .agentHealth, .pkgRefresh:
@@ -226,11 +239,15 @@ struct TargetPicker: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Button("All") { selected = core.servers.map(\.id) }
+                    .accessibilityIdentifier("bulk.targets.all")
                 Button("Online") { selected = core.servers.filter { $0.state == .ready }.map(\.id) }
+                    .accessibilityIdentifier("bulk.targets.online")
                 ForEach(core.groups, id: \.id) { g in
                     Button(g.name) { selected = core.servers.filter { $0.groupId == g.id }.map(\.id) }
+                        .accessibilityIdentifier("bulk.targets.group.\(g.name)")
                 }
                 Button("None") { selected = [] }
+                    .accessibilityIdentifier("bulk.targets.none")
             }
             .controlSize(.small)
             ForEach(core.servers, id: \.id) { s in
@@ -249,6 +266,7 @@ struct TargetPicker: View {
                         }
                     }
                 }
+                .accessibilityIdentifier("bulk.target.\(s.name)")
             }
         }
     }
@@ -376,8 +394,10 @@ struct BulkRunSheet: View {
                 Spacer()
                 if progress.isRunning {
                     Button("Cancel", role: .destructive) { progress.cancel() }
+                        .accessibilityIdentifier("bulk.cancel")
                 }
                 Button("Close") { dismiss() }
+                    .accessibilityIdentifier("bulk.close")
                     .keyboardShortcut(.cancelAction)
             }
             .padding(16)
@@ -395,6 +415,7 @@ struct BulkRunSheet: View {
         .onAppear { refreshPreview() }
         .confirmationDialog(confirmTitle, isPresented: $confirmShown) {
             Button("Run", role: .destructive) { run(dryRun: false) }
+                .accessibilityIdentifier("bulk.confirmRun")
         } message: {
             Text(preview?.command ?? "")
         }
@@ -423,17 +444,24 @@ struct BulkRunSheet: View {
             }
             Section("Rollout") {
                 Toggle("Canary: first server, then health check", isOn: $canary)
+                    .accessibilityIdentifier("bulk.canary")
                 Toggle("Health check after canary", isOn: $healthCheck).disabled(!canary)
+                    .accessibilityIdentifier("bulk.healthCheck")
                 Stepper("At most \(concurrency) at a time", value: $concurrency, in: 1...64)
+                    .accessibilityIdentifier("bulk.concurrency")
                 Toggle("Stop on first failure", isOn: $stopOnFailure)
+                    .accessibilityIdentifier("bulk.stopOnFailure")
                 TextField("Per-server timeout (s, 0 = default)", value: $timeout, format: .number)
+                    .accessibilityIdentifier("bulk.timeout")
             }
             Section {
                 HStack {
                     Button("Dry run") { run(dryRun: true) }
                         .help(preview?.hasPlan == true ? "Fetches the plan from each server" : "Shows the command for each server")
+                        .accessibilityIdentifier("bulk.dryRun")
                     Spacer()
                     Button("Run on \(targets.count) servers") { confirmShown = true }
+                        .accessibilityIdentifier("bulk.run")
                         .buttonStyle(.borderedProminent)
                         .disabled(targets.isEmpty || preview == nil || progress.isRunning)
                 }

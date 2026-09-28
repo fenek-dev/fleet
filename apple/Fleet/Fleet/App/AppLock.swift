@@ -87,6 +87,16 @@ final class AppLock {
     }
 
     func unlock() async {
+        #if FLEET_TEST_HOOKS
+        if TestHooks.approve("app-unlock: unlock Fleet") {
+            lastError = nil
+            lastActivity = .now
+            gate.unlock(with: LAContext())
+            isLocked = false
+            onChange?(false)
+            return
+        }
+        #endif
         let ctx = LAContext()
         ctx.localizedCancelTitle = "Stay locked"
         var err: NSError?

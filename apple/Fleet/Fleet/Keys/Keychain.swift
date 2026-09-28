@@ -12,6 +12,9 @@ enum Keychain {
     }
 
     static func load(_ account: String) throws -> Data? {
+        #if FLEET_TEST_HOOKS
+        if let dir = TestHooks.dataDir { return TestHooks.FileKeychain.load(dir, service, account) }
+        #endif
         var query = base(account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -27,6 +30,13 @@ enum Keychain {
     /// Adds `data`; never overwrites an existing item (keys are generated
     /// once, a silent replace would orphan the roster entry).
     static func add(_ account: String, _ data: Data) throws {
+        #if FLEET_TEST_HOOKS
+        if let dir = TestHooks.dataDir {
+            guard try TestHooks.FileKeychain.store(dir, service, account, data, replace: false)
+            else { throw Failure.status(errSecDuplicateItem) }
+            return
+        }
+        #endif
         var query = base(account)
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
@@ -38,6 +48,12 @@ enum Keychain {
     /// (`SecItemUpdate`), so there's never a moment without an item. Only
     /// for replaceable secrets (the sync key), never for key blobs.
     static func set(_ account: String, _ data: Data) throws {
+        #if FLEET_TEST_HOOKS
+        if let dir = TestHooks.dataDir {
+            _ = try TestHooks.FileKeychain.store(dir, service, account, data, replace: true)
+            return
+        }
+        #endif
         var query = base(account)
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
@@ -51,6 +67,12 @@ enum Keychain {
 
     /// Removes an item (only for derived state, never for key blobs).
     static func delete(_ account: String) throws {
+        #if FLEET_TEST_HOOKS
+        if let dir = TestHooks.dataDir {
+            TestHooks.FileKeychain.delete(dir, service, account)
+            return
+        }
+        #endif
         let status = SecItemDelete(base(account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw Failure.status(status)

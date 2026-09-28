@@ -25,11 +25,13 @@ struct DevicesSettings: View {
                             Spacer()
                             if !d.thisMac {
                                 Button("Revoke…", role: .destructive) { revoking = d }
+                                    .accessibilityIdentifier("devices.revoke")
                                     .disabled(busy)
                             }
                         }
                     }
                     Button("Add Mac…") { addShown = true }
+                        .accessibilityIdentifier("devices.addMac")
                     LabeledContent("Fleet fingerprint") {
                         Text(status.fleetFingerprint).font(.mono(12)).textSelection(.enabled)
                     }
@@ -46,6 +48,7 @@ struct DevicesSettings: View {
                                            value: p.seenVersion.map { "has v\($0)" } ?? "not confirmed")
                         }
                         Button("Push now") { push() }.disabled(busy)
+                            .accessibilityIdentifier("devices.pushNow")
                     }
                 }
             }
@@ -70,6 +73,7 @@ struct DevicesSettings: View {
             Button("Revoke with Touch ID", role: .destructive) {
                 if let d = revoking { revoke(d) }
             }
+            .accessibilityIdentifier("devices.revokeConfirm")
         } message: {
             Text("A new roster goes to every server, its sessions are closed and the sync key is replaced. Offline servers keep trusting it until they reconnect.")
         }
@@ -142,7 +146,11 @@ struct AddMacSheet: View {
             if let result {
                 Text("Added. Roster v\(result.version) reached \(result.current) servers; \(result.queued) will get it when they reconnect.")
                 ForEach(result.failed, id: \.self) { Text($0).foregroundStyle(Tone.critical.text) }
-                HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+                HStack {
+                    Spacer()
+                    Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("addMac.done")
+                }
             } else if let prompt, sas == nil {
                 ProgressView("Waiting for “\(prompt.name)” to show its code…")
                 HStack { Spacer(); Button("Cancel") { dismiss() } }
@@ -155,8 +163,10 @@ struct AddMacSheet: View {
                     .font(.secondary).foregroundStyle(Color.textSecondary)
                 HStack {
                     Button("Codes differ", role: .cancel) { dismiss() }
+                        .accessibilityIdentifier("addMac.codesDiffer")
                     Spacer()
                     Button("Codes match — Approve") { approve(prompt) }
+                        .accessibilityIdentifier("addMac.approve")
                         .buttonStyle(.borderedProminent).tint(.accent)
                         .disabled(busy)
                 }
@@ -167,6 +177,7 @@ struct AddMacSheet: View {
                     ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
                 .pickerStyle(.segmented)
+                .accessibilityIdentifier("addMac.mode")
                 switch mode {
                 case .scan:
                     QRScannerView { code in begin(code) }
@@ -177,9 +188,11 @@ struct AddMacSheet: View {
                         .font(.mono(12))
                         .frame(height: 120)
                         .border(Color.borderControl)
+                        .accessibilityIdentifier("addMac.pasteCode")
                     HStack {
                         Spacer()
                         Button("Continue") { begin(pasted) }
+                            .accessibilityIdentifier("addMac.continue")
                             .disabled(pasted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy)
                     }
                 }
