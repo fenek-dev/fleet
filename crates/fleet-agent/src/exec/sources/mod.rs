@@ -221,7 +221,23 @@ impl Sources {
     ) -> Rc<Self> {
         let db = st.borrow().store.security();
         let now = ctx.clock.now_ms();
-        let bans = BanService::new(default_config(), bus.clone());
+        // The authoritative Agent-only gate (design §5.4): checked by
+        // `BanService` itself right before each kernel write, with no
+        // `.await` in between, so it can't race a concurrent
+        // `policy.update`. `Sources::bans_may_apply` (below) reads the
+        // same state and stays as the fast path that skips the work
+        // entirely in the common case.
+        let st_weak = Rc::downgrade(st);
+        let bans_gate: Rc<dyn Fn() -> bool> = Rc::new(move || {
+            let Some(st) = st_weak.upgrade() else {
+                return false;
+            };
+            let Ok(st) = st.try_borrow() else {
+                return false;
+            };
+            st.policy.security != fleet_proto::policy::SecurityMode::AgentOnly
+        });
+        let bans = BanService::with_gate(default_config(), bus.clone(), bans_gate);
         match db.get(SecurityKey::Bans) {
             Ok(Some(b)) => match decode::<BanState>(&b) {
                 Ok(s) => bans.import(s, now),

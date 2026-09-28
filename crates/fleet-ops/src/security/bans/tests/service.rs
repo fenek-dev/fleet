@@ -1,5 +1,7 @@
 use super::super::*;
-use super::{a, ip, service};
+use super::{a, ip, service, service_with_gate};
+use std::cell::Cell;
+use std::rc::Rc;
 use crate::CommandOutput;
 use crate::handler::{OpHandler, OpOutput, Registry};
 use crate::security::authlog::parse_sshd;
@@ -186,4 +188,78 @@ fn restore_kernel_only_fills_empty_sets() {
     );
     assert_eq!(block(svc.restore_kernel(&c, now)), 2);
     assert_eq!(runner.pending(), 0);
+}
+
+/// Design §5.4: the gate is checked right before each kernel write, not
+/// once for the whole call — the ban decision runs (the engine records the
+/// offence), but a gate that goes false stops the actual nft write, and
+/// the ban is forgotten again (as if nft itself had failed).
+#[test]
+fn gate_false_blocks_the_ban_write_after_the_decision() {
+    let mut cfg = default_config();
+    cfg.threshold = 1;
+    let (svc, runner, sink, c, _dir) =
+        service_with_gate(cfg, Rc::new(|| false) as Rc<dyn Fn() -> bool>);
+    let ev = parse_sshd("Failed password for root from 198.51.100.7 port 1 ssh2").unwrap();
+    let r = block(svc.observe_auth(&c, &ev, T0));
+    assert!(r.is_err(), "{r:?}");
+    assert!(runner.calls().is_empty(), "no nft call should be attempted");
+    assert!(svc.snapshot(T0).bans.is_empty(), "the ban must be forgotten");
+    assert!(sink.take().is_empty());
+}
+
+/// Same, for the learned-Mac-exemption write.
+#[test]
+fn gate_false_blocks_the_fleet_login_write() {
+    let (svc, runner, _sink, c, _dir) =
+        service_with_gate(default_config(), Rc::new(|| false) as Rc<dyn Fn() -> bool>);
+    let r = block(svc.fleet_login(&c, ip("203.0.113.50"), T0));
+    assert!(r.is_err(), "{r:?}");
+    assert!(runner.calls().is_empty(), "no nft call should be attempted");
+}
+
+/// Design §5.4: `restore_kernel` rechecks the gate before *each* write, not
+/// once for the whole restore — a gate that flips false after the first
+/// write stops the second one, even mid-loop.
+#[test]
+fn gate_checked_before_each_restore_kernel_write() {
+    let allowed = Rc::new(Cell::new(1u32));
+    let g = allowed.clone();
+    let gate: Rc<dyn Fn() -> bool> = Rc::new(move || {
+        let n = g.get();
+        let ok = n > 0;
+        g.set(n.saturating_sub(1));
+        ok
+    });
+    let (svc, runner, _sink, c, _dir) = service_with_gate(default_config(), gate);
+    let now = T0;
+    let mut st = svc.export(now);
+    for addr in ["198.51.100.7", "198.51.100.8"] {
+        st.bans.push(BanEntry {
+            addr: ip(addr),
+            prefix: 32,
+            until_ms: now + 1_800_000,
+            reason: BanReason::SshBruteForce,
+            strikes: 1,
+        });
+    }
+    svc.import(st, now);
+    let list = |set: &'static str| ["-j", "list", "set", "inet", "fleet", set];
+    let empty = r#"{"nftables":[{"set":{"name":"x"}}]}"#;
+    runner.expect(NFT, &list("banned4"), Ok(CommandOutput::ok(empty)));
+    runner.expect(
+        NFT,
+        &a(&nft_add_args("banned4", "198.51.100.7", Some(1_800), false)),
+        Ok(CommandOutput::ok("")),
+    );
+    // No expectation for the second address's add: the gate must block it
+    // before `run_nft` is ever called.
+    runner.expect(NFT, &list("exempt4"), Ok(CommandOutput::ok(empty)));
+    runner.expect(NFT, &list("banned6"), Ok(CommandOutput::ok(empty)));
+    runner.expect(NFT, &list("exempt6"), Ok(CommandOutput::ok(empty)));
+    let added = block(svc.restore_kernel(&c, now));
+    assert_eq!(added, 1, "only the first write went through");
+    assert_eq!(runner.pending(), 0);
+    // Exactly the 5 expected calls: no unexpected second `add` landed.
+    assert_eq!(runner.calls().len(), 5, "{:?}", runner.calls());
 }

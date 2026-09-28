@@ -40,3 +40,29 @@ pub(super) fn service(
     let c = ctx_at(dir.path(), runner.clone(), T0);
     (BanService::new(cfg, sink.clone()), runner, sink, c, dir)
 }
+
+/// Like [`service`], but with an explicit write gate (design §5.4): lets a
+/// test simulate the gate flipping between a decision and the write it
+/// guards.
+pub(super) fn service_with_gate(
+    cfg: BanConfig,
+    gate: Rc<dyn Fn() -> bool>,
+) -> (
+    Rc<BanService>,
+    Rc<FakeRunner>,
+    Rc<VecSink>,
+    SysCtx,
+    tempfile::TempDir,
+) {
+    let runner = Rc::new(FakeRunner::new());
+    let sink = Rc::new(VecSink::default());
+    let dir = tempfile::tempdir().unwrap();
+    let c = ctx_at(dir.path(), runner.clone(), T0);
+    (
+        BanService::with_gate(cfg, sink.clone(), gate),
+        runner,
+        sink,
+        c,
+        dir,
+    )
+}

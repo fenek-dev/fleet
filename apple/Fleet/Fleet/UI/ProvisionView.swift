@@ -80,13 +80,21 @@ struct ProvisionView: View {
         }
         .background(Color.window)
         .navigationTitle("Provisioning")
-        .sheet(item: $addSheet, onDismiss: { core.reload() }) { s in
+        .sheet(item: $addSheet, onDismiss: {
+            core.reload()
+            refreshSecurityMode()
+        }) { s in
             AddServerSheet(existing: s.existing)
         }
         .sheet(isPresented: $cloudInitShown) {
             CloudInitExportSheet(adminUser: form.adminUser)
         }
         .onChange(of: serverId) { _, _ in load() }
+        .onChange(of: server?.state) { _, new in
+            // The connection just came back: `securityMode` needs a live
+            // session to resolve, so re-check rather than sit on `Unknown`.
+            if new == .ready { refreshSecurityMode() }
+        }
         .onAppear(perform: pickInProgress)
     }
 
@@ -340,21 +348,28 @@ struct ProvisionView: View {
         }
     }
 
+    /// A live round trip (`agent.health`), so it needs a Task; guarded
+    /// against a stale answer landing after the operator picked another
+    /// server. Called on server change, after the install sheet closes
+    /// (install can just have set the mode) and when the connection comes
+    /// back up (`securityMode` needs a live session to resolve at all).
+    private func refreshSecurityMode() {
+        guard let api = core.api, let id = serverId else { return }
+        Task {
+            let mode = (try? await api.securityMode(serverId: id)) ?? .unknown
+            if id == serverId { securityMode = mode }
+        }
+    }
+
     private func load() {
         error = nil
         run = ProvisionRun()
         editingProfile = false
         securityMode = .unknown
+        refreshSecurityMode()
         guard let api = core.api, let id = serverId else {
             state = nil
             return
-        }
-        // A live round trip (`agent.health`), so it needs a Task; guarded
-        // against a stale answer landing after the operator picked another
-        // server.
-        Task {
-            let mode = (try? await api.securityMode(serverId: id)) ?? .unknown
-            if id == serverId { securityMode = mode }
         }
         do {
             state = try api.provisionState(serverId: id)
