@@ -364,6 +364,106 @@ fn auto_revert_then_confirm_over_a_new_session() {
     });
 }
 
+/// Switching Managed → Agent-only (design §5.4) while a firewall change is
+/// still pending confirmation is refused `Busy`, before the nonce is
+/// consumed: it must not race an in-flight security-relevant change.
+#[test]
+fn policy_update_to_agent_only_refused_busy_while_security_change_pending() {
+    let e = env(r#""system", "firewall""#, false);
+    let fx = &e.fx;
+    run(async {
+        let m = &fx.macs[0];
+        let mut s = fx.connect(m).await;
+        let cmd = s
+            .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(7)))
+            .unwrap();
+        let r = s.send(&cmd).await.unwrap();
+        assert!(matches!(r.result, Ok(Payload::ChangePending { .. })), "{r:?}");
+        assert_eq!(pending_files(fx), 1);
+
+        let policy_op = Op::PolicyUpdate {
+            policy_toml: policy_toml(
+                fx.fleet,
+                2,
+                Pol {
+                    groups: r#""system", "firewall""#,
+                    security: "agent-only",
+                    ..Pol::default()
+                },
+            ),
+        };
+        let approval = fx.approve(m, &policy_op);
+        let cmd2 = s
+            .build_command(
+                policy_op,
+                &fx.server,
+                Actor::Human,
+                Some(approval),
+                &CommandOpts::default(),
+            )
+            .unwrap();
+        assert_eq!(err(s.send(&cmd2).await.unwrap()), ErrorCode::Busy);
+        // Not burned: the identical resend is still `Busy`, never `Replay`.
+        assert_eq!(err(s.send(&cmd2).await.unwrap()), ErrorCode::Busy);
+    });
+}
+
+/// The System profile phase claims no `ChangeKind` (it isn't auto-revert),
+/// so `kind_busy` alone can't see it running — `Exec::security_ops` is
+/// what makes a Managed → Agent-only switch refuse `Busy` while it's still
+/// in flight (design §5.4).
+#[test]
+fn policy_update_to_agent_only_refused_busy_while_a_non_revertible_security_op_runs() {
+    use fleet_proto::op::ProfilePhase;
+    let e = env_with(
+        r#""system", "profile""#,
+        false,
+        Duration::from_millis(1500),
+        Duration::from_secs(30),
+    );
+    let fx = &e.fx;
+    run(async {
+        let m = &fx.macs[0];
+        let (mut s, mut s2) = (fx.connect(m).await, fx.connect(m).await);
+        let apply = s.request(
+            profile_apply(ProfilePhase::System),
+            &fx.server,
+            Actor::Human,
+            None,
+        );
+        let switch = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let policy_op = Op::PolicyUpdate {
+                policy_toml: policy_toml(
+                    fx.fleet,
+                    2,
+                    Pol {
+                        groups: r#""system", "profile""#,
+                        security: "agent-only",
+                        ..Pol::default()
+                    },
+                ),
+            };
+            let approval = fx.approve(m, &policy_op);
+            let busy = s2
+                .request(policy_op.clone(), &fx.server, Actor::Human, Some(approval.clone()))
+                .await
+                .unwrap();
+            assert_eq!(err(busy), ErrorCode::Busy);
+            (policy_op, approval)
+        };
+        let (apply_r, (policy_op, approval)) = tokio::join!(apply, switch);
+        assert_eq!(apply_r.unwrap().result, Ok(Payload::Empty));
+
+        // Finished now: the identical switch goes through.
+        let r = s2
+            .request(policy_op, &fx.server, Actor::Human, Some(approval))
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+    });
+}
+
 /// `change.confirm` is in the `firewall` group; the device that made a
 /// mesh change may confirm it even where the policy doesn't allow
 /// `firewall`, another device may not.

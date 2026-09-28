@@ -226,6 +226,12 @@ impl Sources {
             let Some(hit) = parse_access_line(&l) else {
                 continue;
             };
+            // Agent-only (design §5.4): web-log scanning never bans.
+            // Rechecked per line, not once for the whole batch — the
+            // policy can switch mid-poll on a long queue.
+            if !self.bans_may_apply() {
+                continue;
+            }
             let r = self
                 .bans
                 .observe_access_from(&self.ctx, std::path::Path::new(&path), &hit, self.now())

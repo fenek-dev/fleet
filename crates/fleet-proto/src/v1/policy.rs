@@ -35,6 +35,21 @@ pub struct Policy {
     pub actors: Actors,
     pub limits: Limits,
     pub safety: Safety,
+    /// Managed vs. Agent-only (design §5.4). Absent in older/hand-written
+    /// TOML means `Managed`, the behavior before this field existed.
+    #[serde(default)]
+    pub security: SecurityMode,
+}
+
+/// Whether the agent takes over host security (bans, `authorized_keys`,
+/// firewall/profile ops) or leaves an already-configured server alone
+/// (design §5.4, §10.1). Switching is a normal `policy.update`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecurityMode {
+    #[default]
+    Managed,
+    AgentOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +232,38 @@ auto_revert_seconds = 60
         assert!(p.allows_group(Group::Game));
         assert_eq!(p.actors.ai, AiAccess::Full);
         assert_eq!(p.effective_tier(&Op::SystemInfo), Tier::Read);
+        // Absent from the example TOML: defaults to Managed.
+        assert_eq!(p.security, SecurityMode::Managed);
+    }
+
+    #[test]
+    fn security_mode_toml_round_trip() {
+        let managed = Policy::from_toml(EXAMPLE).unwrap();
+        assert_eq!(managed.security, SecurityMode::Managed);
+
+        let toml = toml::to_string(&managed).unwrap();
+        assert!(toml.contains("security = \"managed\""));
+        assert_eq!(Policy::from_toml(&toml).unwrap(), managed);
+
+        let mut agent_only = managed.clone();
+        agent_only.security = SecurityMode::AgentOnly;
+        let toml = toml::to_string(&agent_only).unwrap();
+        assert!(toml.contains("security = \"agent-only\""));
+        let reparsed = Policy::from_toml(&toml).unwrap();
+        assert_eq!(reparsed, agent_only);
+        assert_eq!(reparsed.security, SecurityMode::AgentOnly);
+    }
+
+    #[test]
+    fn security_mode_postcard_round_trip() {
+        for mode in [SecurityMode::Managed, SecurityMode::AgentOnly] {
+            let mut p = Policy::from_toml(EXAMPLE).unwrap();
+            p.security = mode;
+            let bytes = crate::encode(&p);
+            let back: Policy = crate::decode(&bytes).unwrap();
+            assert_eq!(back, p);
+            assert_eq!(back.security, mode);
+        }
     }
 
     fn with(from: &str, to: &str) -> Result<Policy, PolicyError> {

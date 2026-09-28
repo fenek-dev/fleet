@@ -192,6 +192,9 @@ pub(super) struct Sources {
     pub(super) ssh_logins: Rc<RefCell<Logins>>,
     systemd: Rc<dyn SystemdApi>,
     lazy: Option<Rc<LazySystemd>>,
+    /// To re-read the live policy's security mode (design §5.4): Agent-only
+    /// turns off ban decisions here, without an agent restart.
+    st: Weak<RefCell<State>>,
 }
 
 /// Marks a Fleet package op; on drop, reads the dpkg log right away and
@@ -218,7 +221,23 @@ impl Sources {
     ) -> Rc<Self> {
         let db = st.borrow().store.security();
         let now = ctx.clock.now_ms();
-        let bans = BanService::new(default_config(), bus.clone());
+        // The authoritative Agent-only gate (design §5.4): checked by
+        // `BanService` itself right before each kernel write, with no
+        // `.await` in between, so it can't race a concurrent
+        // `policy.update`. `Sources::bans_may_apply` (below) reads the
+        // same state and stays as the fast path that skips the work
+        // entirely in the common case.
+        let st_weak = Rc::downgrade(st);
+        let bans_gate: Rc<dyn Fn() -> bool> = Rc::new(move || {
+            let Some(st) = st_weak.upgrade() else {
+                return false;
+            };
+            let Ok(st) = st.try_borrow() else {
+                return false;
+            };
+            st.policy.security != fleet_proto::policy::SecurityMode::AgentOnly
+        });
+        let bans = BanService::with_gate(default_config(), bus.clone(), bans_gate);
         match db.get(SecurityKey::Bans) {
             Ok(Some(b)) => match decode::<BanState>(&b) {
                 Ok(s) => bans.import(s, now),
@@ -267,7 +286,23 @@ impl Sources {
             db,
             systemd,
             lazy,
+            st: Rc::downgrade(st),
         })
+    }
+
+    /// Whether the ban engine may decide/apply bans (or write a learned
+    /// exemption) right now (design §5.4): off under
+    /// `SecurityMode::AgentOnly`. A gone or momentarily unreadable `State`
+    /// is treated the same as `AgentOnly` — fail closed, never write to
+    /// nft sets on a guess.
+    pub(super) fn bans_may_apply(&self) -> bool {
+        let Some(st) = self.st.upgrade() else {
+            return false;
+        };
+        let Ok(st) = st.try_borrow() else {
+            return false;
+        };
+        st.policy.security != fleet_proto::policy::SecurityMode::AgentOnly
     }
 
     /// `bans.*`, `integrity.status`, `logins.query` (roster resolver),
@@ -292,6 +327,11 @@ impl Sources {
         }
         let s = self.clone();
         tokio::task::spawn_local(async move {
+            // Agent-only (design §5.4): never write persisted bans or
+            // exemptions into the kernel's nft sets.
+            if !s.bans_may_apply() {
+                return;
+            }
             let n = s.bans.restore_kernel(&s.ctx, s.ctx.clock.now_ms()).await;
             if n > 0 {
                 log("bans", format!("restored {n} kernel set elements"));

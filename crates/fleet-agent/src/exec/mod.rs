@@ -239,6 +239,22 @@ struct Admitted {
     confirms: Option<PendingChange>,
     /// Config-history attribution of this op's writes, until it ends.
     _attributed: attribution::OpGuard,
+    /// Holds `Exec::security_ops`'s count for a `takes_over_security` op
+    /// (design §5.4); `None` for everything else.
+    _security: SecurityOpGuard,
+}
+
+/// Marks a `takes_over_security` op as admitted but not yet finished;
+/// decrements `Exec::security_ops` on drop (completion, error, or a
+/// stream ending — whichever ends this command).
+struct SecurityOpGuard(Option<Rc<Exec>>);
+
+impl Drop for SecurityOpGuard {
+    fn drop(&mut self) {
+        if let Some(exec) = self.0.take() {
+            exec.security_ops.set(exec.security_ops.get().saturating_sub(1));
+        }
+    }
 }
 
 /// One gate connection: the key kind the gate authenticated and exec's own
@@ -290,6 +306,12 @@ struct Exec {
     confirm_sshd_login: Option<Duration>,
     /// Running ops and their announced writes (config history).
     attribution: Rc<attribution::ExecAttribution>,
+    /// `Op::takes_over_security` ops admitted but not yet finished
+    /// (including a stream's whole lifetime, and an error outcome): design
+    /// §5.4's Managed → Agent-only switch refuses `Busy` while this is
+    /// nonzero, since some of these (the Accounts/System profile phases)
+    /// never claim a `ChangeKind` and so aren't covered by `kind_busy`.
+    security_ops: Cell<u32>,
 }
 
 /// Marks the change kinds an op claims as being applied; released on drop.
@@ -337,6 +359,35 @@ impl Exec {
             .map_err(refuse)?;
         self.st.borrow().check_policy(&v, now).map_err(refuse)?;
         let op = &v.body.op;
+        // A `policy.update` switching Managed → Agent-only while a
+        // security-relevant change is pending confirmation or mid-apply
+        // (design §5.4): refuse `Busy` here, before the nonce is consumed,
+        // rather than let the switch race an in-flight firewall/profile/
+        // authorized_keys/SSH change (whose auto-revert or confirm may
+        // itself be a security-relevant write).
+        if let Op::PolicyUpdate { policy_toml } = op
+            && self.st.borrow().policy.security == fleet_proto::policy::SecurityMode::Managed
+            && let Ok(target) = fleet_proto::Policy::from_toml(policy_toml)
+            && target.security == fleet_proto::policy::SecurityMode::AgentOnly
+        {
+            const GUARDED: [ChangeKind; 4] = [
+                ChangeKind::Firewall,
+                ChangeKind::Profile,
+                ChangeKind::AuthorizedKeys,
+                ChangeKind::Ssh,
+            ];
+            for kind in GUARDED {
+                if self.kind_busy(kind).map_err(refuse)? {
+                    return Err(refuse(ErrorCode::Busy));
+                }
+            }
+            // Some `takes_over_security` ops (bans, the Accounts/System
+            // profile phases) never claim a `ChangeKind` — `kind_busy`
+            // above doesn't see them — but are still admitted and running.
+            if self.security_ops.get() > 0 {
+                return Err(refuse(ErrorCode::Busy));
+            }
+        }
         // Streams only as `StreamOpen`, everything else only as `Request`.
         if op.is_stream() != (inv == Invocation::Stream) {
             return Err(refuse(ErrorCode::Unsupported));
@@ -408,6 +459,12 @@ impl Exec {
             .commit_intent(&meta.command, cmd, now)?;
         meta.audit_seq = Some(intent_seq);
         let attributed = self.attribution.begin(&meta.command.body.op, intent_seq);
+        let security = if op.takes_over_security() {
+            self.security_ops.set(self.security_ops.get() + 1);
+            SecurityOpGuard(Some(self.clone()))
+        } else {
+            SecurityOpGuard(None)
+        };
         let revertible = revertible.map(|(kind, r)| {
             let claimed = fleet_ops::revertible::claimed_kinds(op);
             self.kinds.borrow_mut().extend(claimed.iter().copied());
@@ -425,6 +482,7 @@ impl Exec {
             revertible,
             confirms,
             _attributed: attributed,
+            _security: security,
         })
     }
 
@@ -855,6 +913,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         profile_apply_timeout,
         confirm_sshd_login,
         attribution,
+        security_ops: Cell::new(0),
     });
     let budget = Rc::new(Budget::default());
     let compaction = Rc::new(CompactState::default());

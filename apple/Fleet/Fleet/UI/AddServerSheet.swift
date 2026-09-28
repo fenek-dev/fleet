@@ -25,6 +25,7 @@ struct AddServerSheet: View {
     @State private var prompt: HostKeyPrompt?
     @State private var artifact: URL?
     @State private var adminUser = ""
+    @State private var securityMode: SecurityModeArg = .managed
     @State private var run = InstallRun()
     @State private var health: AgentHealthRow?
     @State private var error: String?
@@ -162,8 +163,13 @@ struct AddServerSheet: View {
             .card(padding: 12)
             Form {
                 TextField("Admin user", text: $adminUser, prompt: Text(user))
+                Picker("Security", selection: $securityMode) {
+                    Text("Managed by Fleet").tag(SecurityModeArg.managed)
+                    Text("Agent only (don't change security)").tag(SecurityModeArg.agentOnly)
+                }
             }
             .formStyle(.grouped)
+            securityModeHint
             HStack {
                 Button("Later") { dismiss() }
                 Spacer()
@@ -172,6 +178,13 @@ struct AddServerSheet: View {
                     .disabled(artifact == nil)
             }
         }
+    }
+
+    private var securityModeHint: some View {
+        Text(securityMode == .managed
+             ? "Fleet manages bans and keeps this server's authorized_keys file in sync with the roster."
+             : "Fleet won't touch bans, authorized_keys or the firewall on this server. Switch to Managed later from the server's Overview tab.")
+            .font(.secondary).foregroundStyle(Color.textSecondary)
     }
 
     private static let steps: [(InstallStep, String)] = [
@@ -336,7 +349,7 @@ struct AddServerSheet: View {
             do {
                 health = try await api.installAgent(
                     serverId: id, adminUser: admin.isEmpty ? nil : admin,
-                    artifactPath: artifact.path, listener: relay)
+                    artifactPath: artifact.path, securityMode: securityMode, listener: relay)
                 core.reload()
                 step = .done
             } catch {

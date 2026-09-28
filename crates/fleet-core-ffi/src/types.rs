@@ -7,7 +7,59 @@
 use crate::text;
 use fleet_core::manager::{self, RequestError};
 use fleet_core::signer;
+use fleet_proto::policy::SecurityMode;
 use fleet_proto::{AgentHealth, Event, SystemInfo, alert::Severity};
+
+/// Whether Fleet owns host security on a server (design §5.4). `Managed`
+/// keeps today's behavior (bans, `authorized_keys`, hardening); `AgentOnly`
+/// is for an already-configured server the operator doesn't want Fleet to
+/// touch security on. Switching later is a normal, Touch-ID-approved
+/// `policy.update` in either direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SecurityModeArg {
+    Managed,
+    AgentOnly,
+}
+
+impl From<SecurityModeArg> for SecurityMode {
+    fn from(v: SecurityModeArg) -> Self {
+        match v {
+            SecurityModeArg::Managed => SecurityMode::Managed,
+            SecurityModeArg::AgentOnly => SecurityMode::AgentOnly,
+        }
+    }
+}
+
+impl From<SecurityMode> for SecurityModeArg {
+    fn from(v: SecurityMode) -> Self {
+        match v {
+            SecurityMode::Managed => SecurityModeArg::Managed,
+            SecurityMode::AgentOnly => SecurityModeArg::AgentOnly,
+        }
+    }
+}
+
+/// `FleetCore::security_mode`'s answer: the two real modes, or `Unknown`
+/// when this Mac's cached copy of the pushed policy is missing or stale
+/// relative to the agent's live `agent.health.policy_version` (another Mac
+/// pushed a newer policy this cache never saw). The app shows "Unknown",
+/// hides the mode-switch button and keeps hardening apply disabled rather
+/// than guess (design §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SecurityModeStatus {
+    Managed,
+    AgentOnly,
+    Unknown,
+}
+
+impl From<SecurityModeArg> for SecurityModeStatus {
+    fn from(v: SecurityModeArg) -> Self {
+        match v {
+            SecurityModeArg::Managed => SecurityModeStatus::Managed,
+            SecurityModeArg::AgentOnly => SecurityModeStatus::AgentOnly,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum KeyRole {
@@ -237,6 +289,14 @@ pub enum FleetError {
     /// Provisioning step failed (§9.1); the wizard state holds the step.
     #[error("provisioning: {reason}")]
     Provision { reason: String },
+    /// `set_security_mode`/`security_mode`: this Mac's cached copy of the
+    /// pushed policy is missing or its version doesn't match the agent's
+    /// live `agent.health.policy_version` (another Mac pushed a newer
+    /// policy this cache never saw). Refresh before switching modes,
+    /// rather than risk silently reverting settings this Mac doesn't know
+    /// about (design §5.4).
+    #[error("policy out of date, refresh")]
+    PolicyOutOfDate,
 }
 
 impl From<fleet_core::sftp::SftpError> for FleetError {

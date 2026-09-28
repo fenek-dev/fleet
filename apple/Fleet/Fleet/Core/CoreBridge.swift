@@ -334,6 +334,7 @@ extension Error {
         case .Sync(let reason): return "Sync: \(reason)."
         case .Recovery(let reason): return "Recovery: \(reason)."
         case .Provision(let reason): return "Provisioning: \(reason)."
+        case .PolicyOutOfDate: return "Policy out of date, refresh."
         default: return "Request failed."
         }
     }

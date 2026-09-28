@@ -19,6 +19,9 @@ struct ProvisionView: View {
     @State private var addSheet: AddSheet?
     @State private var cloudInitShown = false
     @State private var exportId = ""
+    /// Agent-only servers (design §5.4) refuse `profile.apply`: hardening
+    /// is disabled here until the operator switches to Managed.
+    @State private var securityMode: SecurityModeStatus = .unknown
 
     private struct AddSheet: Identifiable {
         let id = UUID()
@@ -77,13 +80,21 @@ struct ProvisionView: View {
         }
         .background(Color.window)
         .navigationTitle("Provisioning")
-        .sheet(item: $addSheet, onDismiss: { core.reload() }) { s in
+        .sheet(item: $addSheet, onDismiss: {
+            core.reload()
+            refreshSecurityMode()
+        }) { s in
             AddServerSheet(existing: s.existing)
         }
         .sheet(isPresented: $cloudInitShown) {
             CloudInitExportSheet(adminUser: form.adminUser)
         }
         .onChange(of: serverId) { _, _ in load() }
+        .onChange(of: server?.state) { _, new in
+            // The connection just came back: `securityMode` needs a live
+            // session to resolve, so re-check rather than sit on `Unknown`.
+            if new == .ready { refreshSecurityMode() }
+        }
         .onAppear(perform: pickInProgress)
     }
 
@@ -166,6 +177,13 @@ struct ProvisionView: View {
         HStack(alignment: .top, spacing: 20) {
             VStack(alignment: .leading, spacing: 16) {
                 ProfileFormView(form: $form, groups: core.groups)
+                if securityMode == .agentOnly {
+                    Text("This server is Agent only: Fleet won't apply hardening here. Switch it to Managed from the server's Overview tab first.")
+                        .font(.secondary).foregroundStyle(Tone.warn.text)
+                } else if securityMode == .unknown {
+                    Text("This server's security mode is unknown (refresh the connection). Hardening stays disabled until it's confirmed Managed.")
+                        .font(.secondary).foregroundStyle(Tone.warn.text)
+                }
                 HStack {
                     if form.isCustom {
                         Text("Source ranges or a reboot window make this a custom profile: each phase needs Touch ID.")
@@ -177,7 +195,8 @@ struct ProvisionView: View {
                     }
                     Button("Review plan") { begin() }
                         .buttonStyle(.borderedProminent).tint(.accent)
-                        .disabled(running || form.name.isEmpty || form.adminUser.isEmpty)
+                        .disabled(running || form.name.isEmpty || form.adminUser.isEmpty
+                                  || securityMode != .managed)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -206,7 +225,7 @@ struct ProvisionView: View {
                         Spacer()
                         Button("Apply") { approve() }
                             .buttonStyle(.borderedProminent).tint(.accent)
-                            .disabled(running)
+                            .disabled(running || securityMode != .managed)
                     }
                 }
             }
@@ -329,10 +348,25 @@ struct ProvisionView: View {
         }
     }
 
+    /// A live round trip (`agent.health`), so it needs a Task; guarded
+    /// against a stale answer landing after the operator picked another
+    /// server. Called on server change, after the install sheet closes
+    /// (install can just have set the mode) and when the connection comes
+    /// back up (`securityMode` needs a live session to resolve at all).
+    private func refreshSecurityMode() {
+        guard let api = core.api, let id = serverId else { return }
+        Task {
+            let mode = (try? await api.securityMode(serverId: id)) ?? .unknown
+            if id == serverId { securityMode = mode }
+        }
+    }
+
     private func load() {
         error = nil
         run = ProvisionRun()
         editingProfile = false
+        securityMode = .unknown
+        refreshSecurityMode()
         guard let api = core.api, let id = serverId else {
             state = nil
             return

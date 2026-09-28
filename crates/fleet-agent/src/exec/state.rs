@@ -701,6 +701,11 @@ impl State {
     }
 
     fn sync_authorized_keys(&self, now: u64) {
+        // Agent-only mode (design §5.4): never write or rewrite the admin's
+        // `authorized_keys` file — the operator owns it.
+        if self.policy.security == fleet_proto::policy::SecurityMode::AgentOnly {
+            return;
+        }
         if let Some(user) = &self.admin_user
             && let Err(e) = authorized_keys::sync(
                 &self.paths.authorized_keys_dir,
@@ -961,6 +966,17 @@ impl State {
 
     pub(super) fn check_policy(&self, v: &VerifiedCommand, now: u64) -> Result<(), ErrorCode> {
         let op = &v.body.op;
+        // Agent-only mode (design §5.4): the operator asked Fleet not to
+        // change security on this server. Refused here, before the nonce
+        // is consumed, so a retried/re-signed command isn't burned for
+        // nothing. Re-read from the live policy on every command: a
+        // `policy.update` that switches modes takes effect immediately,
+        // no agent restart needed.
+        if self.policy.security == fleet_proto::policy::SecurityMode::AgentOnly
+            && op.takes_over_security()
+        {
+            return Err(ErrorCode::PolicyDenied);
+        }
         // `change.confirm` is in the `firewall` group, but it confirms any
         // auto-revert change (mesh, profile, authorized keys, …). The device
         // that made the change may always confirm it (design §5.4): its

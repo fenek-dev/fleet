@@ -189,6 +189,11 @@ impl Sources {
     }
 
     pub(in crate::exec) async fn learn(&self, ip: IpAddr) {
+        // Agent-only (design §5.4): never write a learned exemption into
+        // the kernel's nft sets.
+        if !self.bans_may_apply() {
+            return;
+        }
         if let Err(e) = self.bans.fleet_login(&self.ctx, ip, self.now()).await {
             log("learn Mac address", e);
         }
@@ -324,7 +329,12 @@ impl Sources {
                     kind: AlertKind::BruteForce,
                     subject: ev.addr.to_string(),
                 });
-                if let Err(e) = self.bans.observe_auth(&self.ctx, ev, now).await {
+                // Agent-only (design §5.4): the failed-login event above
+                // still fires (detection-only), but the engine never
+                // decides or applies a ban.
+                if self.bans_may_apply()
+                    && let Err(e) = self.bans.observe_auth(&self.ctx, ev, now).await
+                {
                     log("ban", e);
                 }
             }

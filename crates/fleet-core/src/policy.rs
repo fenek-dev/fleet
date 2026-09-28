@@ -1,11 +1,18 @@
 //! Default per-server policy (design §5.4) written at agent install.
 
-use fleet_proto::policy::{Actors, AiAccess, Capabilities, Elevated, Limits, Policy, Safety};
+use fleet_proto::policy::{
+    Actors, AiAccess, Capabilities, Elevated, Limits, Policy, Safety, SecurityMode,
+};
 use fleet_proto::{FleetId, Group, ServerId};
 
 /// Version 1: every allowable group, `shell.exec` off, AI full access
 /// (the operator's current choice), the design's default limits.
-pub fn default_policy(fleet_id: FleetId, server_id: ServerId) -> Policy {
+///
+/// `security`: `Managed` (Fleet owns bans, `authorized_keys` and the
+/// firewall) or `AgentOnly` (an already-configured server the operator
+/// doesn't want Fleet to touch security on; design §5.4, §10.1). Switching
+/// later is a normal `policy.update`.
+pub fn default_policy(fleet_id: FleetId, server_id: ServerId, security: SecurityMode) -> Policy {
     Policy {
         version: 1,
         fleet_id,
@@ -31,6 +38,7 @@ pub fn default_policy(fleet_id: FleetId, server_id: ServerId) -> Policy {
         safety: Safety {
             auto_revert_seconds: 60,
         },
+        security,
     }
 }
 
@@ -68,11 +76,28 @@ mod tests {
 
     #[test]
     fn default_round_trips_through_the_agent_parser() {
-        let p = default_policy(FleetId([7; 16]), ServerId::new("srv_abc123def456").unwrap());
+        let p = default_policy(
+            FleetId([7; 16]),
+            ServerId::new("srv_abc123def456").unwrap(),
+            SecurityMode::Managed,
+        );
         let text = to_toml(&p).unwrap();
         assert_eq!(Policy::from_toml(&text).unwrap(), p);
         assert!(text.contains("shell_exec = false"));
         assert!(!p.capabilities.allow.contains(&Group::Shell));
+        assert_eq!(p.security, SecurityMode::Managed);
+    }
+
+    #[test]
+    fn default_agent_only_round_trips() {
+        let p = default_policy(
+            FleetId([7; 16]),
+            ServerId::new("srv_abc123def456").unwrap(),
+            SecurityMode::AgentOnly,
+        );
+        let text = to_toml(&p).unwrap();
+        assert_eq!(Policy::from_toml(&text).unwrap(), p);
+        assert_eq!(p.security, SecurityMode::AgentOnly);
     }
 
     #[test]
@@ -80,7 +105,7 @@ mod tests {
         let cache = crate::cache::Cache::open_in_memory().unwrap();
         let s = ServerId::new("srv_abc123def456").unwrap();
         assert!(pushed(&cache, &s).is_none());
-        let mut p = default_policy(FleetId([7; 16]), s.clone());
+        let mut p = default_policy(FleetId([7; 16]), s.clone(), SecurityMode::Managed);
         p.actors.ai_bulk_confirm_above = 2;
         remember_pushed(&cache, &s, &to_toml(&p).unwrap()).unwrap();
         assert_eq!(pushed(&cache, &s).unwrap().actors.ai_bulk_confirm_above, 2);

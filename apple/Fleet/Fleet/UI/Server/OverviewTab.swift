@@ -150,6 +150,8 @@ struct OverviewTab: View {
     @State private var error: String?
     @State private var confirmUninstall = false
     @State private var uninstalling = false
+    @State private var securityMode: SecurityModeStatus = .unknown
+    @State private var enablingManaged = false
 
     var body: some View {
         ScrollView {
@@ -281,6 +283,20 @@ struct OverviewTab: View {
             row("Memory", "gate \(Format.bytes(health.gateRssBytes)) · exec \(Format.bytes(health.execRssBytes))")
             row("Roster", "epoch \(health.rosterEpoch) · v\(health.rosterVersion)")
             row("Policy", "v\(health.policyVersion) · audit \(health.auditSeq)")
+            HStack {
+                Text("Security").foregroundStyle(Color.textSecondary)
+                Spacer()
+                StatusPill(label: securityModeLabel, tone: securityModeTone)
+            }
+            .font(.base)
+            if securityMode == .agentOnly {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Fleet doesn't manage bans, authorized_keys or the firewall on this server.")
+                        .font(.secondary).foregroundStyle(Color.textSecondary)
+                    Button("Enable Fleet security management…") { enableManaged() }
+                        .disabled(enablingManaged)
+                }
+            }
             if health.recoveryPending {
                 StatusPill(label: "Recovery pending", tone: .critical)
             }
@@ -309,12 +325,46 @@ struct OverviewTab: View {
         }
     }
 
+    private var securityModeLabel: String {
+        switch securityMode {
+        case .managed: "Managed by Fleet"
+        case .agentOnly: "Agent only"
+        case .unknown: "Unknown"
+        }
+    }
+
+    private var securityModeTone: Tone {
+        switch securityMode {
+        case .managed: .ok
+        case .agentOnly: .warn
+        case .unknown: .warn
+        }
+    }
+
     private func load() async {
         error = nil
         // agent.health works on monitor sessions; the rest needs unlock.
         do { health = try await core.agentHealth(server.id) } catch { self.error = error.fleetMessage }
         do { info = try await core.systemInfo(server.id) } catch { self.error = error.fleetMessage }
+        if let api = core.api {
+            securityMode = (try? await api.securityMode(serverId: server.id)) ?? .unknown
+        }
         await loadProcesses()
+    }
+
+    /// Pushes `security = "managed"` (Touch ID): a normal `policy.update`
+    /// that turns the ban engine and `authorized_keys` sync back on right
+    /// away, without touching firewall or sshd state (design §5.4).
+    private func enableManaged() {
+        guard let api = core.api else { return }
+        enablingManaged = true
+        Task {
+            defer { enablingManaged = false }
+            do {
+                try await api.setSecurityMode(serverId: server.id, mode: .managed)
+                securityMode = .managed
+            } catch { self.error = error.fleetMessage }
+        }
     }
 
     private func loadProcesses() async {

@@ -25,7 +25,7 @@
 use super::state::StoredPolicy;
 use fleet_crypto::approval::{op_digest, verify_approval};
 use fleet_crypto::roster::roster_hash;
-use fleet_proto::policy::{Actors, AiAccess, Capabilities, Elevated, Limits, Safety};
+use fleet_proto::policy::{Actors, AiAccess, Capabilities, Elevated, Limits, Safety, SecurityMode};
 use fleet_proto::{Hash32, Op, Policy, ServerId, SignedRoster};
 use serde::Deserialize;
 
@@ -124,6 +124,9 @@ pub(super) fn deny_all(current: &SignedRoster, server: &ServerId) -> Policy {
         safety: Safety {
             auto_revert_seconds: 60,
         },
+        // A policy we can't trust must not have Fleet writing to nft sets
+        // or the admin's authorized_keys either (design §5.4).
+        security: SecurityMode::AgentOnly,
     }
 }
 
