@@ -148,6 +148,8 @@ struct OverviewTab: View {
     @State private var health: AgentHealthRow?
     @State private var processes: [ProcessRow] = []
     @State private var error: String?
+    @State private var confirmUninstall = false
+    @State private var uninstalling = false
 
     var body: some View {
         ScrollView {
@@ -282,8 +284,28 @@ struct OverviewTab: View {
             if health.recoveryPending {
                 StatusPill(label: "Recovery pending", tone: .critical)
             }
+            Button("Uninstall agent…", role: .destructive) { confirmUninstall = true }
+                .disabled(uninstalling)
+                .confirmationDialog("Uninstall the agent from \(server.name)?",
+                                    isPresented: $confirmUninstall) {
+                    Button("Uninstall, keep audit database", role: .destructive) { uninstall() }
+                } message: {
+                    Text("SSH keys move back to ~/.ssh/authorized_keys and are confirmed over a new "
+                         + "connection first. The Fleet firewall table is kept.")
+                }
         } else {
             Text("No data").foregroundStyle(Color.textMuted)
+        }
+    }
+
+    private func uninstall() {
+        guard let api = core.api else { return }
+        uninstalling = true
+        Task {
+            defer { uninstalling = false }
+            do {
+                try await api.uninstallAgent(serverId: server.id, keepAudit: true, removeFirewall: false)
+            } catch { self.error = error.fleetMessage }
         }
     }
 

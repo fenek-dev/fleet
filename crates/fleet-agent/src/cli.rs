@@ -22,6 +22,12 @@ pub enum Mode {
     Bridge(BridgeMode),
     Install(InstallArgs),
     Revert(ChangeId),
+    /// `uninstall [--ssh-restored] [--keep-audit] [--remove-firewall]`.
+    Uninstall(crate::uninstall::UninstallOpts),
+    /// `user-keys <op> <home>`: the helper run as a user (`userkeys`).
+    UserKeys(crate::userkeys::KeysOp, PathBuf),
+    /// `version`: prints the version and target.
+    Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +40,9 @@ pub struct Cli {
 pub const USAGE: &str = "usage: fleet-agent [--root <dir>] gate | exec \
      | bridge [--recovery | --monitor] \
      | install --genesis <file> --policy <file> --server-id <id> [--admin-user <name>] \
-     | revert <change-id>";
+     | revert <change-id> \
+     | uninstall [--ssh-restored] [--keep-audit] [--remove-firewall] \
+     | user-keys get|set|merge|remove <home> | version";
 
 /// Parses argv without the program name, including a leading `--root`.
 pub fn parse_cli<S: AsRef<str>>(args: &[S]) -> Option<Cli> {
@@ -60,6 +68,14 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Option<Mode> {
         ["bridge", rest @ ..] => Some(Mode::Bridge(bridge_mode(rest))),
         ["install", flags @ ..] => parse_install(flags).map(Mode::Install),
         ["revert", id] => ChangeId::parse(id).map(Mode::Revert),
+        ["uninstall", flags @ ..] => {
+            crate::uninstall::UninstallOpts::parse(flags).map(Mode::Uninstall)
+        }
+        ["user-keys", op, home] => Some(Mode::UserKeys(
+            crate::userkeys::KeysOp::parse(op)?,
+            PathBuf::from(home),
+        )),
+        ["version"] => Some(Mode::Version),
         _ => None,
     }
 }

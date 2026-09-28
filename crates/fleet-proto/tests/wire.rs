@@ -950,6 +950,7 @@ fn catalog_vectors(body: &CommandBody, f: &mut Vec<String>) {
                     },
                     blake3: [0xb3; 32],
                     min_proto: 1,
+                    target: fleet_proto::AgentTarget::X86_64,
                 },
                 device_id: DeviceId([0xd1; 16]),
                 signature: Signature([0x51; 64]),

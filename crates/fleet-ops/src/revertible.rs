@@ -88,6 +88,10 @@ pub fn change_kind(op: &Op) -> Option<ChangeKind> {
         Op::AuthorizedKeysSet { .. } => ChangeKind::AuthorizedKeys,
         Op::MeshJoin(_) | Op::MeshLeave | Op::MeshPeersSet { .. } => ChangeKind::Mesh,
         Op::ProfileApply { .. } => ChangeKind::Profile,
+        // Modules live in fleet-agent (`update`, `uninstall`): they need
+        // the agent's own paths and binary.
+        Op::AgentUpdateCommit { .. } => ChangeKind::AgentUpdate,
+        Op::AgentUninstallPrepare => ChangeKind::Ssh,
         _ => return None,
     })
 }
@@ -221,6 +225,18 @@ mod tests {
             (fw, Some(ChangeKind::Firewall)),
             (Op::MeshLeave, Some(ChangeKind::Mesh)),
             (Op::MeshPeersSet { peers: vec![] }, Some(ChangeKind::Mesh)),
+            (Op::AgentUninstallPrepare, Some(ChangeKind::Ssh)),
+            (
+                Op::AgentUpdateCommit {
+                    version: fleet_proto::AgentVersion {
+                        major: 1,
+                        minor: 0,
+                        patch: 0,
+                    },
+                },
+                Some(ChangeKind::AgentUpdate),
+            ),
+            (Op::AgentUpdateRollback, None),
             (Op::SystemInfo, None),
             (Op::FirewallGet, None),
         ] {

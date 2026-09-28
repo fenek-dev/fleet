@@ -20,18 +20,24 @@ stage="$1"
 server_id="$2"
 admin="$3"
 
-# What the package does: users, groups, binary, units, tmpfiles.
-getent group fleet >/dev/null || groupadd --system fleet
-getent passwd fleet-gate >/dev/null ||
-    useradd --system --user-group --no-create-home --home-dir /nonexistent \
-        --shell /usr/sbin/nologin fleet-gate
+if [ -f "$stage/fleet-agent.deb" ]; then
+    # The package (scripts/build-deb.sh): users, groups, binary, units,
+    # tmpfiles, needrestart config.
+    dpkg -i "$stage/fleet-agent.deb" >/dev/null
+    echo "installed $(dpkg-query -W -f='${Package} ${Version} ${Status}' fleet-agent)" >&2
+else
+    # What the package does: users, groups, binary, units, tmpfiles.
+    getent group fleet >/dev/null || groupadd --system fleet
+    getent passwd fleet-gate >/dev/null ||
+        useradd --system --user-group --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin fleet-gate
+    install -d -m 0755 /usr/lib/fleet
+    install -m 0755 "$stage/fleet-agent" /usr/lib/fleet/fleet-agent
+    install -m 0644 "$stage/systemd/fleet-exec.service" /etc/systemd/system/fleet-exec.service
+    install -m 0644 "$stage/systemd/fleet-gate.service" /etc/systemd/system/fleet-gate.service
+    install -m 0644 "$stage/systemd/tmpfiles.d/fleet.conf" /usr/lib/tmpfiles.d/fleet.conf
+fi
 usermod --append --groups fleet "$admin"
-
-install -d -m 0755 /usr/lib/fleet
-install -m 0755 "$stage/fleet-agent" /usr/lib/fleet/fleet-agent
-install -m 0644 "$stage/systemd/fleet-exec.service" /etc/systemd/system/fleet-exec.service
-install -m 0644 "$stage/systemd/fleet-gate.service" /etc/systemd/system/fleet-gate.service
-install -m 0644 "$stage/systemd/tmpfiles.d/fleet.conf" /usr/lib/tmpfiles.d/fleet.conf
 
 # The test Macs' SSH keys (plain ~/.ssh; moving keys to /etc/fleet is a
 # separate step, design §10.1 step 5).

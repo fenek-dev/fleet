@@ -1,0 +1,37 @@
+#!/bin/sh
+# fleet-agent postrm: on purge only, remove Fleet's state, users and
+# groups (design §10.3). Lockout guard: while one of Fleet's sshd drop-ins
+# still points AuthorizedKeysFile at /etc/fleet/authorized_keys, those key
+# files stay (run `fleet-agent uninstall`, or agent.uninstall.prepare, to
+# move the keys back to ~/.ssh first).
+set -e
+
+case "$1" in
+purge)
+    keys_in_use=no
+    for f in /etc/ssh/sshd_config.d/00-fleet.conf /etc/ssh/sshd_config.d/10-fleet.conf; do
+        if [ -f "$f" ] && grep -qs '^[[:space:]]*AuthorizedKeysFile[[:space:]].*/etc/fleet/authorized_keys' "$f"; then
+            keys_in_use=yes
+        fi
+    done
+    rm -rf /var/lib/fleet /run/fleet /run/fleet-exec
+    if [ "$keys_in_use" = no ]; then
+        rm -rf /etc/fleet
+    else
+        echo "fleet-agent: sshd still reads /etc/fleet/authorized_keys; keeping it" >&2
+    fi
+    if getent passwd fleet-gate >/dev/null; then
+        userdel fleet-gate || true
+    fi
+    for g in fleet-gate fleet; do
+        if getent group "$g" >/dev/null; then
+            groupdel "$g" || true
+        fi
+    done
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    ;;
+esac
+
+exit 0

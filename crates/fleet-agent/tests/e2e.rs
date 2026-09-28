@@ -53,6 +53,10 @@ mod pipeline;
 #[path = "e2e/sources.rs"]
 mod sources;
 
+/// Agent updates and uninstall (`tests/e2e/lifecycle.rs`).
+#[path = "e2e/lifecycle.rs"]
+mod lifecycle;
+
 fn run(f: impl Future<Output = ()>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

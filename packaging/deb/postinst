@@ -1,0 +1,26 @@
+#!/bin/sh
+# fleet-agent postinst (design §10.1): users, groups, runtime directories.
+# The units are enabled and started by the install flow only after
+# `fleet-agent install` has stored the genesis roster and policy, never
+# here. Agent updates go through agent.update.*, not dpkg (needrestart and
+# this script never restart the agent).
+set -e
+
+case "$1" in
+configure)
+    if ! getent group fleet >/dev/null; then
+        groupadd --system fleet
+    fi
+    # Primary group fleet-gate (root:fleet-gate owns /run/fleet-exec).
+    if ! getent passwd fleet-gate >/dev/null; then
+        useradd --system --user-group --no-create-home \
+            --home-dir /nonexistent --shell /usr/sbin/nologin fleet-gate
+    fi
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/fleet.conf || true
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    ;;
+esac
+
+exit 0

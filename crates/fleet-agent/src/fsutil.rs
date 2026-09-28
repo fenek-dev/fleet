@@ -191,6 +191,30 @@ pub fn lookup_gid(group: &Path, name: &str) -> Option<u32> {
     lookup_id(group, name)
 }
 
+/// One `/etc/passwd` entry's ids and home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEntry {
+    pub uid: u32,
+    pub gid: u32,
+    pub home: String,
+}
+
+/// `user`'s uid, primary gid and home directory.
+pub fn lookup_user(passwd: &Path, user: &str) -> Option<UserEntry> {
+    let text = fs::read_to_string(passwd).ok()?;
+    text.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.len() < 7 || f[0] != user {
+            return None;
+        }
+        Some(UserEntry {
+            uid: f[2].parse().ok()?,
+            gid: f[3].parse().ok()?,
+            home: f[5].to_owned(),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

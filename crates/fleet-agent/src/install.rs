@@ -13,7 +13,7 @@
 use crate::exec::StoredPolicy;
 use crate::fsutil::{self, ensure_dir};
 use crate::paths::Paths;
-use crate::store::{MetaKey, Store, StoreError};
+use crate::store::{MetaKey, StoreError};
 use fleet_crypto::Zeroizing;
 use fleet_crypto::noise::StaticKeypair;
 use fleet_crypto::roster::{RosterError, verify_genesis};
@@ -150,6 +150,9 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
     ensure_dir(&paths.pending_dir, 0o700)?;
     ensure_dir(&paths.reverted_dir, 0o700)?;
     ensure_dir(&paths.staging_dir, 0o700)?;
+    // The admin uploads agent builds here over SFTP (design §10.2); exec
+    // copies them out with O_NOFOLLOW while hashing.
+    crate::update::ensure_incoming(paths, input.admin_user.as_deref(), owners.is_some())?;
     ensure_dir(&paths.authorized_keys_dir, 0o755)?;
     ensure_dir(&paths.gate_dir, 0o700)?;
     own(&paths.gate_dir, gate_uid, fleet_gid)?;
@@ -160,7 +163,7 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
     ensure_dir(&paths.exec_run_dir, 0o710)?;
     own(&paths.exec_run_dir, None, gate_gid)?;
 
-    let store = Store::open(&paths.state_db)?;
+    let store = crate::store::schema::open_versioned(&paths.state_db)?;
     if store.meta().get(MetaKey::Roster)?.is_some() {
         return Err(InstallError::AlreadyInstalled);
     }

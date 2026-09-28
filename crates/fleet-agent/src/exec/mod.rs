@@ -32,6 +32,7 @@ mod apply;
 mod confighist;
 mod conn;
 mod events;
+mod lifecycle;
 mod ops;
 mod sources;
 mod sshd;
@@ -167,18 +168,21 @@ pub struct ExecConfig {
     /// 3), waiting up to this long for the journal to catch up. `None`
     /// skips the check (tests without a journal).
     pub confirm_sshd_login: Option<Duration>,
+    /// How `agent.uninstall.prepare` reaches users' `~/.ssh`: as the user
+    /// through `setpriv` (production) or in-process (tests).
+    pub user_keys: crate::userkeys::UserKeysMode,
 }
 
 impl ExecConfig {
     pub fn new(paths: Paths, gate_uid: u32) -> Self {
         Self {
+            reverter: Box::new(RegistryRevert::for_paths(&paths)),
+            reverters: revert::agent_reverters(&paths, crate::userkeys::UserKeysMode::AsUser),
+            offload: Some(revert::offload_for(&paths)),
             paths,
             gate_uid,
             checkpoint_interval: Duration::from_secs(3600),
             maintenance_interval: Duration::from_secs(5),
-            reverter: Box::new(RegistryRevert::system()),
-            reverters: fleet_hardening::reverters(),
-            offload: Some(revert::system_offload()),
             timers: Rc::new(fleet_ops::SystemRunner),
             terminator: None,
             ctx: SysCtx::system(),
@@ -191,6 +195,7 @@ impl ExecConfig {
             apply_timeout: Duration::from_secs(30),
             profile_apply_timeout: Duration::from_secs(30 * 60),
             confirm_sshd_login: Some(Duration::from_secs(5)),
+            user_keys: crate::userkeys::UserKeysMode::AsUser,
         }
     }
 }
@@ -708,6 +713,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         cfg.profile_apply_timeout,
         cfg.confirm_sshd_login,
     );
+    let user_keys = cfg.user_keys;
     let mut state = State::load(StateParts {
         paths: cfg.paths,
         reverter: cfg.reverter,
@@ -736,6 +742,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
     sources.register(&mut registry);
     let config = confighist::start(&st, &mut registry, &bus);
     let wired = wiring::start(&st, &paths, &mut registry, &bus, &tel);
+    lifecycle::register(&st, &mut registry, user_keys);
     for (tag, h) in extra {
         registry.register(tag, h);
     }
@@ -769,8 +776,10 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
                 // reboot). Fails harmlessly if a timer survived (exec
                 // restart); maintenance reverts on the deadline regardless.
                 let timers = st.borrow().timers.clone();
-                for (id, secs) in rearm {
-                    if let Err(e) = revert::arm_timer_async(timers.as_ref(), id, secs).await {
+                for (id, secs, kind) in rearm {
+                    if let Err(e) =
+                        revert::arm_timer_for_async(timers.as_ref(), id, secs, kind).await
+                    {
                         log(&format!("re-arm revert timer {id}"), e);
                     }
                 }

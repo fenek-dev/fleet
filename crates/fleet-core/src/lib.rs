@@ -56,6 +56,7 @@ pub mod opspec;
 pub mod policy;
 pub mod provision;
 pub mod recovery_flow;
+pub mod release;
 pub mod roster_mgmt;
 pub mod runbook;
 pub mod runner;

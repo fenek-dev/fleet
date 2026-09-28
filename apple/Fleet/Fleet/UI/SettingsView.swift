@@ -9,6 +9,7 @@ struct SettingsView: View {
             Tab("Recovery", systemImage: "key") { RecoverySettings() }
             Tab("AI", systemImage: "sparkles") { AISettings() }
             Tab("Sync", systemImage: "icloud") { SyncSettings() }
+            Tab("Agent releases", systemImage: "shippingbox") { AgentReleasesSettings() }
         }
         .frame(width: 640, height: 520)
         .preferredColorScheme(.dark)
