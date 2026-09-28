@@ -109,11 +109,14 @@ struct FleetTableView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 320)
+            .accessibilityIdentifier("fleet.filter")
             Spacer()
             Button("Run command", systemImage: "terminal") {}
                 .disabled(true)
                 .help("Bulk actions arrive with the bulk engine")
+                .accessibilityIdentifier("fleet.runCommand")
             Button("Add server", systemImage: "plus") { showAdd = true }
+                .accessibilityIdentifier("fleet.addServer")
                 .buttonStyle(.borderedProminent)
                 .tint(.accent)
         }
@@ -140,6 +143,7 @@ struct FleetTableView: View {
             leadingColumns
             trailingColumns
         }
+        .accessibilityIdentifier("fleet.table")
         .contextMenu(forSelectionType: String.self) { ids in
             Button("Open") { if let id = ids.first { selection = .server(id) } }
             Button("Reconnect") { ids.forEach(core.reconnect) }
@@ -272,7 +276,9 @@ struct StatusBanners: View {
                     }
                     Spacer()
                     Button("Reject") { core.resolveHostKey(p, accept: false) }
+                        .accessibilityIdentifier("fleet.hostKey.reject")
                     Button("Trust") { core.resolveHostKey(p, accept: true) }
+                        .accessibilityIdentifier("fleet.hostKey.trust")
                         .buttonStyle(.borderedProminent)
                 }
                 .padding(12)
