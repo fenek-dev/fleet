@@ -115,6 +115,16 @@ impl LowerFirst for String {
     }
 }
 
+/// One line of words for the change from `current` to `proposed`
+/// ("Added 9100/tcp from 10.8.0.0/24").
+#[uniffi::export]
+pub fn firewall_describe_change(
+    current: FirewallRulesetArgs,
+    proposed: FirewallRulesetArgs,
+) -> Result<String, FleetError> {
+    Ok(describe(&firewall_diff(current, proposed)?))
+}
+
 #[uniffi::export]
 impl FleetCore {
     /// Rulesets this Mac has seen on the server, newest first.

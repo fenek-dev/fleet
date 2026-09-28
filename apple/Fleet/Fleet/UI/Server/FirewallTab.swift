@@ -54,6 +54,20 @@ struct FirewallTab: View {
     @State private var diff: [DiffLineRow]?
     @State private var pending: PendingAction?
     @State private var revert = AutoRevertModel()
+    @State private var security = SecurityModeModel()
+    @State private var history: [FwHistoryRow] = []
+    /// Docker's containers; nil when Docker isn't there (section hidden).
+    @State private var containers: [ContainerRow]?
+    /// Rules of the ruleset before the newest history entry (for "Added").
+    @State private var previousRules: [FirewallRuleArgs] = []
+    /// The next observed ruleset was applied from this Mac.
+    @State private var appliedHere = false
+    @State private var appliedTitle: String?
+    /// What the change being confirmed did ("Added 9100/tcp from …").
+    @State private var changeSummary: String?
+
+    private var locked: Bool { !security.allowsChanges }
+    private var lockReason: String { security.blockedReason ?? "" }
 
     private var baseArgs: FirewallRulesetArgs? {
         fw.map { FirewallRulesetArgs(managed: $0.managed, rules: firewallRulesToArgs(rules: $0.rules)) }
@@ -74,13 +88,16 @@ struct FirewallTab: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 TabHeader(title: "Firewall", loading: loading, error: error, refresh: { Task { await load() } })
-                AutoRevertBanner(model: revert, what: "Firewall rules changed", retry: retryConfirm)
+                SecurityModeNotice(model: security)
+                AutoRevertBanner(model: revert, what: changeSummary ?? "Firewall rules changed",
+                                 retry: retryConfirm)
                 if let fw {
                     rulesCard(fw)
+                    if containers != nil { containerCard }
+                    historyCard(fw)
                     bansCard
                     foreign(fw)
-                    Text("Cooperative mode: Fleet manages only its own table (inet fleet). Docker's rules and other tables are never flushed or edited.")
-                        .font(.caption11).foregroundStyle(Color.textMuted)
+                    cooperativeCard
                 } else if !loading {
                     Text("No data").foregroundStyle(Color.textMuted)
                 }
@@ -97,22 +114,32 @@ struct FirewallTab: View {
     // MARK: rules
 
     private func rulesCard(_ fw: FirewallRow) -> some View {
-        AdminSection(title: "Inbound rules · table inet fleet · v\(fw.version)") {
+        AdminSection(title: "Inbound rules") {
             HStack(spacing: 8) {
                 Picker("Mode", selection: $managed) {
                     Text("Managed").tag(true)
                     Text("Bans only").tag(false)
                 }
                 .pickerStyle(.segmented).labelsHidden().frame(width: 200)
+                .disabled(locked)
+                .accessibilityIdentifier("firewall.mode")
                 Button("Add rule", systemImage: "plus") { drafts.append(RuleDraft()) }
-                    .disabled(!managed)
+                    .disabled(!managed || locked)
+                    .accessibilityIdentifier("firewall.addRule")
                 Button("Revert edits") { resetDrafts() }.disabled(!dirty)
+                    .accessibilityIdentifier("firewall.revertEdits")
                 Button("Preview diff") { preview() }.disabled(!dirty)
+                    .accessibilityIdentifier("firewall.previewDiff")
                 Button("Apply…") { askApply(fw) }
                     .buttonStyle(.borderedProminent).tint(.accent)
-                    .disabled(!dirty || !problems.isEmpty || revert.phase == .confirming)
+                    .disabled(!dirty || !problems.isEmpty || revert.phase == .confirming || locked)
+                    .help(lockReason)
+                    .accessibilityIdentifier("firewall.apply")
             }
         } content: {
+            Text(managed ? "table inet fleet · policy drop · IPv4 + IPv6" : "table inet fleet · bans only")
+                .font(.caption11).foregroundStyle(Color.textMuted)
+                .accessibilityIdentifier("firewall.tableSubtitle")
             if managed {
                 header
                 List {
@@ -123,10 +150,11 @@ struct FirewallTab: View {
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
                 .frame(minHeight: CGFloat(max(drafts.count, 1)) * 36 + 12)
+                .disabled(locked)
                 HStack {
                     Text("—").frame(width: 24)
                     StatusPill(label: "Drop", tone: .critical)
-                    Text("All other inbound traffic · \(fw.banned) addresses currently banned")
+                    Text("All other inbound traffic · \(fw.banned) addresses currently banned by intrusion blocking")
                         .font(.secondary).foregroundStyle(Color.textSecondary)
                 }
             } else {
@@ -144,6 +172,7 @@ struct FirewallTab: View {
 
     private var header: some View {
         HStack(spacing: 8) {
+            Text("#").frame(width: 24, alignment: .leading)
             Text("Chain").frame(width: 90, alignment: .leading)
             Text("Action").frame(width: 90, alignment: .leading)
             Text("Proto").frame(width: 70, alignment: .leading)
@@ -155,8 +184,22 @@ struct FirewallTab: View {
         .font(.caption11).foregroundStyle(Color.textMuted).padding(.leading, 8)
     }
 
+    /// "New" for an unsaved rule, "Added" for one the last applied change
+    /// introduced (shortly after it was applied).
+    private func rowTag(_ d: RuleDraft) -> String? {
+        let a = d.args
+        guard let base = baseArgs?.rules else { return nil }
+        if !base.contains(a) { return "New" }
+        let recent = history.count > 1
+            && Date().timeIntervalSince1970 - Double(history[0].timeMs) / 1000 < 1800
+        return recent && !previousRules.contains(a) ? "Added" : nil
+    }
+
     private func ruleRow(_ d: Binding<RuleDraft>) -> some View {
-        HStack(spacing: 8) {
+        let tag = rowTag(d.wrappedValue)
+        let number = (drafts.firstIndex { $0.id == d.wrappedValue.id } ?? 0) + 1
+        return HStack(spacing: 8) {
+            Text("\(number)").foregroundStyle(Color.textMuted).frame(width: 24, alignment: .leading)
             Picker("", selection: d.chain) {
                 Text("input").tag(FwChainArg.input)
                 Text("forward").tag(FwChainArg.forward)
@@ -181,6 +224,7 @@ struct FirewallTab: View {
             }
             .frame(width: 110)
             TextField("Comment", text: d.comment)
+            if let tag { StatusPill(label: tag, tone: .info).accessibilityIdentifier("firewall.ruleTag") }
             Button { drafts.removeAll { $0.id == d.wrappedValue.id } } label: {
                 Image(systemName: "minus.circle")
             }
@@ -188,7 +232,7 @@ struct FirewallTab: View {
         }
         .font(.mono(11))
         .textFieldStyle(.roundedBorder)
-        .listRowBackground(Color.clear)
+        .listRowBackground(tag == nil ? Color.clear : Tone.info.bg)
     }
 
     // MARK: bans
@@ -201,8 +245,11 @@ struct FirewallTab: View {
                         Text("\(b.value.addr)/\(b.value.prefix)").font(.mono(11))
                         Text(b.value.reason).foregroundStyle(Color.textSecondary)
                         Spacer()
-                        Text("until \(fmtDate(b.value.untilMs))").foregroundStyle(Color.textMuted)
+                        Text(SecFormat.left(until: b.value.untilMs)).foregroundStyle(Color.textMuted)
+                            .help("Until \(fmtDate(b.value.untilMs))")
                         Button("Unban") { askUnban(b.value.addr) }.controlSize(.small)
+                            .disabled(locked)
+                            .help(lockReason)
                     }
                     .font(.secondary)
                 }
@@ -212,7 +259,8 @@ struct FirewallTab: View {
             }
             AdminSection(title: "Never ban") {
                 Button("Save") { askSaveExempt() }
-                    .disabled(banConfig == nil || exemptLines == banConfig?.exempt)
+                    .disabled(banConfig == nil || exemptLines == banConfig?.exempt || locked)
+                    .help(lockReason)
             } content: {
                 TextEditor(text: $exemptText)
                     .font(.mono(11)).frame(height: 90)
@@ -226,6 +274,126 @@ struct FirewallTab: View {
                 }
             }
         }
+    }
+
+    // MARK: container ports
+
+    enum Exposure: Equatable {
+        case internalOnly, localOnly, published
+
+        var label: String {
+            switch self {
+            case .internalOnly: "Internal"
+            case .localOnly: "Local only"
+            case .published: "Published"
+            }
+        }
+
+        var tone: Tone {
+            switch self {
+            case .internalOnly: .neutral
+            case .localOnly: .ok
+            case .published: .warn
+            }
+        }
+    }
+
+    /// `127.0.0.1:8080→80/tcp` -> ("127.0.0.1", "8080 → 80/tcp"); a mapping
+    /// with no host address (any) has host `nil`.
+    static func portMapping(_ s: String) -> (host: String?, text: String) {
+        let parts = s.components(separatedBy: "→")
+        guard parts.count == 2 else { return (nil, s) }
+        var left = parts[0]
+        var host: String?
+        if let i = left.lastIndex(of: ":") {
+            host = String(left[..<i])
+            left = String(left[left.index(after: i)...])
+        }
+        return (host, (host.map { "\($0):" } ?? "") + "\(left) → \(parts[1])")
+    }
+
+    static func exposure(_ ports: [String]) -> Exposure {
+        if ports.isEmpty { return .internalOnly }
+        let loopback: Set<String> = ["127.0.0.1", "::1"]
+        return ports.allSatisfy { loopback.contains(portMapping($0).host ?? "") } ? .localOnly : .published
+    }
+
+    private var containerCard: some View {
+        AdminSection(title: "Container ports") {
+            Text("forward chain in table inet fleet").font(.caption11).foregroundStyle(Color.textMuted)
+        } content: {
+            ForEach(Indexed.wrap(containers ?? [])) { c in
+                let e = Self.exposure(c.value.ports)
+                HStack(spacing: 12) {
+                    Text(c.value.name).font(.mono(11)).frame(width: 180, alignment: .leading)
+                    Text(c.value.ports.isEmpty
+                         ? "not published"
+                         : c.value.ports.map { Self.portMapping($0).text }.joined(separator: ", "))
+                        .foregroundStyle(Color.textSecondary).font(.mono(11))
+                    Spacer()
+                    StatusPill(label: e.label, tone: e.tone)
+                }
+                .font(.secondary)
+                .accessibilityIdentifier("firewall.container.\(c.value.name)")
+            }
+            if containers?.isEmpty ?? true {
+                Text("No running containers.").font(.secondary).foregroundStyle(Color.textMuted)
+            }
+            Text("Container traffic is filtered by Fleet's own forward chain (chain forward rules above), not by Docker's DOCKER-USER chain.")
+                .font(.caption11).foregroundStyle(Color.textMuted)
+        }
+    }
+
+    // MARK: ruleset history
+
+    private func historyCard(_ fw: FirewallRow) -> some View {
+        let unconfirmed: Bool = {
+            switch revert.phase {
+            case .confirming, .noConnection, .failed: true
+            default: false
+            }
+        }()
+        return AdminSection(title: "Ruleset history") {
+            Text("kept on this Mac").font(.caption11).foregroundStyle(Color.textMuted)
+        } content: {
+            ForEach(Array(history.enumerated()), id: \.element.n) { i, h in
+                HStack(spacing: 12) {
+                    Text("v\(h.n)").font(.mono(11)).foregroundStyle(Color.textMuted)
+                        .frame(width: 36, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(h.title).font(.base)
+                        Text("\(SecFormat.whenText(h.timeMs)) · \(h.source)")
+                            .font(.secondary).foregroundStyle(Color.textSecondary)
+                    }
+                    Spacer()
+                    if i == 0 {
+                        if unconfirmed { StatusPill(label: "Pending", tone: .info) }
+                        else { StatusPill(label: "Current", tone: .ok) }
+                    } else {
+                        Button("Roll back") { askRollback(h, fw) }
+                            .disabled(locked || revert.phase == .confirming)
+                            .help(lockReason)
+                            .accessibilityIdentifier("firewall.rollback.v\(h.n)")
+                    }
+                }
+                .accessibilityIdentifier("firewall.history.v\(h.n)")
+            }
+            if history.isEmpty {
+                Text("Rulesets Fleet sees on this server appear here.")
+                    .font(.secondary).foregroundStyle(Color.textMuted)
+            }
+        }
+    }
+
+    private var cooperativeCard: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Cooperative mode").font(.system(size: 13, weight: .semibold))
+            Text("Fleet only manages its own table (inet fleet). Docker's rules and other tables are never flushed or edited.")
+                .font(.secondary).foregroundStyle(Color.textSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .card()
+        .accessibilityIdentifier("firewall.cooperative")
     }
 
     private var exemptLines: [String] {
@@ -302,16 +470,40 @@ struct FirewallTab: View {
             button: "Apply") { apply(set, version: version) }
     }
 
-    private func apply(_ set: FirewallRulesetArgs, version: UInt64) {
+    private func apply(_ set: FirewallRulesetArgs, version: UInt64, title: String? = nil) {
         guard let api = core.api else { return }
+        let summary = title ?? baseArgs.flatMap { try? firewallDescribeChange(current: $0, proposed: set) }
         Task {
             do {
                 let change = try await api.firewallApply(serverId: server.id, ruleset: set, expectedVersion: version)
                 error = nil
+                appliedHere = true
+                appliedTitle = title
+                changeSummary = summary
                 revert.confirm(api: api, serverId: server.id, change: change) { Task { await load() } }
+                await load()
             } catch {
                 self.error = error.fleetMessage
             }
+        }
+    }
+
+    private func askRollback(_ h: FwHistoryRow, _ fw: FirewallRow) {
+        guard let api = core.api, let base = baseArgs else { return }
+        do {
+            let target = try api.fwHistoryRuleset(serverId: server.id, n: h.n)
+            let problems = firewallCheck(ruleset: target, sshPort: server.port)
+            if let first = problems.first {
+                error = "Can't roll back to v\(h.n): \(first)"
+                return
+            }
+            let summary = (try? firewallDescribeChange(current: base, proposed: target)) ?? "Ruleset changes"
+            pending = PendingAction(
+                title: "Roll back \(server.name) to v\(h.n)?",
+                message: "\(summary). The rollback is a normal change: it reverts automatically unless Fleet can reconnect and confirm it within the window.",
+                button: "Roll back") { apply(target, version: fw.version, title: "Rolled back to v\(h.n)") }
+        } catch {
+            self.error = error.fleetMessage
         }
     }
 
@@ -350,17 +542,39 @@ struct FirewallTab: View {
         }
     }
 
+    /// Remembers the ruleset the server reports (history is kept on this
+    /// Mac) and refreshes the list and the "Added" baseline.
+    private func observe(_ api: FleetCore, _ state: FirewallRow) {
+        let first = ((try? api.fwHistoryList(serverId: server.id)) ?? []).isEmpty
+        let args = FirewallRulesetArgs(managed: state.managed, rules: firewallRulesToArgs(rules: state.rules))
+        _ = try? api.fwHistoryObserve(
+            serverId: server.id, current: args, version: state.version,
+            source: appliedHere ? "This Mac" : (first ? "Seen on first load" : "Outside this Mac"),
+            title: appliedTitle)
+        appliedHere = false
+        appliedTitle = nil
+        history = (try? api.fwHistoryList(serverId: server.id)) ?? []
+        previousRules = history.count > 1
+            ? ((try? api.fwHistoryRuleset(serverId: server.id, n: history[1].n))?.rules ?? [])
+            : []
+    }
+
     private func load() async {
         guard let api = core.api else { return }
         loading = true
         defer { loading = false }
+        async let mode: Void = security.load(api: api, serverId: server.id)
         do {
-            fw = try await api.firewallGet(serverId: server.id)
+            let state = try await api.firewallGet(serverId: server.id)
+            fw = state
             resetDrafts()
             error = nil
+            observe(api, state)
         } catch {
             self.error = error.fleetMessage
         }
+        containers = try? await api.dockerContainers(serverId: server.id, all: false)
+        await mode
         bans = try? await api.bansList(serverId: server.id)
         if let c = try? await api.bansConfigGet(serverId: server.id) {
             banConfig = c
