@@ -1,64 +1,42 @@
 import XCTest
 
 /// Server header and Overview against a real pool server with the agent
-/// installed. Needs Docker, the pool (`tests/vm/pool.sh`) and an agent
-/// binary: `FLEET_UI_ENV_FLEET_TEST_AGENT_ARTIFACT=<path>` (defaults to
-/// `target/linux/aarch64/fleet-agent` of the checkout).
+/// installed. The runner is sandboxed (no Docker), so a host-side helper
+/// provides the server: it waits for `/tmp/fl-hdr/ssh_pubkey`, runs
+/// `tests/vm/pool.sh up 1 debian12 --key … --json` and writes the result
+/// to `/tmp/fl-hdr-pool.json`. The agent binary comes from
+/// `FLEET_UI_ENV_FLEET_TEST_AGENT_ARTIFACT`.
 final class ServerHeaderTests: FleetUITestCase {
-    private var poolName: String?
-    private var root: URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent()
-    }
+    static let dir = "/tmp/fl-hdr"
+    static let poolFile = "/tmp/fl-hdr-pool.json"
 
     override func setUpWithError() throws {
-        let env = ProcessInfo.processInfo.environment
-        if env["FLEET_UI_ENV_FLEET_TEST_AGENT_ARTIFACT"] == nil {
-            extraEnvironment["FLEET_TEST_AGENT_ARTIFACT"] =
-                root.appendingPathComponent("target/linux/aarch64/fleet-agent").path
-        }
+        extraEnvironment["FLEET_DATA_DIR"] = Self.dir
         try super.setUpWithError()
     }
 
-    override func tearDownWithError() throws {
-        if let poolName { _ = try? sh("tests/vm/pool.sh", "down", poolName) }
-        try super.tearDownWithError()
-    }
-
-    private func sh(_ args: String...) throws -> String {
-        let p = Process()
-        p.executableURL = root.appendingPathComponent(args[0])
-        p.arguments = Array(args.dropFirst())
-        p.currentDirectoryURL = root
-        var e = ProcessInfo.processInfo.environment
-        e["PATH"] = "/usr/local/bin:/opt/homebrew/bin:" + (e["PATH"] ?? "")
-        p.environment = e
-        let out = Pipe()
-        p.standardOutput = out
-        try p.run()
-        p.waitUntilExit()
-        return String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    private func poolServer() throws -> (name: String, port: Int) {
+        let deadline = Date().addingTimeInterval(180)
+        while Date() < deadline {
+            if let d = FileManager.default.contents(atPath: Self.poolFile),
+               let rows = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]],
+               let r = rows.first, let n = r["name"] as? String, let p = r["port"] as? Int {
+                return (n, p)
+            }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        throw XCTSkip("no pool server (\(Self.poolFile))")
     }
 
     func testHeaderAndOverview() throws {
         wait("onboarding.create", timeout: 30)
         createFleet(name: "Header fleet")
-        let key = try XCTUnwrap(waitForFile("ssh_pubkey"))
-        _ = key
-
-        let json = try sh("tests/vm/pool.sh", "up", "1", "debian12",
-                          "--key", dataDir.appendingPathComponent("ssh_pubkey").path, "--json")
-        let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]])
-        let row = try XCTUnwrap(rows.first)
-        let name = try XCTUnwrap(row["name"] as? String)
-        poolName = name
-        let port = try XCTUnwrap(row["port"] as? Int)
+        let pool = try poolServer()
 
         tap("fleet.addServer")
         replace("addServer.name", with: "web-04")
         replace("addServer.host", with: "127.0.0.1")
-        replace("addServer.port", with: "\(port)")
+        replace("addServer.port", with: "\(pool.port)")
         replace("addServer.user", with: "ops")
         tap("addServer.addConnect")
         tap("addServer.trust", timeout: 60)
@@ -76,8 +54,8 @@ final class ServerHeaderTests: FleetUITestCase {
         wait("overview.profile")
         wait("overview.metric.Disk I/O")
         wait("overview.metric.Network")
-        // Hardening score arrives.
-        let score = wait("overview.profile.score", timeout: 60)
+        wait("overview.profile.score", timeout: 60)
+        sleep(3)
         snap("overview-24h")
 
         tap("overview.range.7d")
@@ -96,7 +74,7 @@ final class ServerHeaderTests: FleetUITestCase {
 
         tap("overview.profile.score")
         wait("serverTab.security")
-        _ = score
+        snap("security-tab")
         serverTab("overview")
         tap("overview.timeline.viewAll")
         snap("timeline-tab")
