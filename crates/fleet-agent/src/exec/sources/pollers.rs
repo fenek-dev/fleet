@@ -222,6 +222,10 @@ impl Sources {
                     .map(move |l| (path.clone(), l))
             })
             .collect();
+        // Agent-only (design §5.4): web-log scanning never bans.
+        if !self.bans_may_apply() {
+            return;
+        }
         for (path, l) in lines {
             let Some(hit) = parse_access_line(&l) else {
                 continue;

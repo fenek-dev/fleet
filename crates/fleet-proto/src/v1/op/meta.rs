@@ -217,6 +217,23 @@ impl Op {
         )
     }
 
+    /// Ops that would make Fleet take over host security: refused with
+    /// `PolicyDenied` while the server's policy is `SecurityMode::AgentOnly`
+    /// (design §5.4). Read-only ops (`bans.list`, `bans.config.get`,
+    /// `authorized_keys.get`, `audit.run`) stay allowed since they never
+    /// write anything.
+    pub fn takes_over_security(&self) -> bool {
+        matches!(
+            self,
+            Op::FirewallApply(_)
+                | Op::AuthorizedKeysSet { .. }
+                | Op::ProfileApply { .. }
+                | Op::BansAdd { .. }
+                | Op::BansRemove { .. }
+                | Op::BansConfigSet(_)
+        )
+    }
+
     /// Accepted in a recovery session (design §5.5).
     pub fn recovery_allowed(&self) -> bool {
         matches!(
@@ -480,4 +497,22 @@ fn under_any(p: &AbsPath, roots: &[&str]) -> bool {
     roots
         .iter()
         .any(|r| AbsPath::new(*r).is_ok_and(|r| p.is_under(&r)))
+}
+
+#[cfg(test)]
+mod agent_only_tests {
+    use super::*;
+
+    #[test]
+    fn takes_over_security_flags_the_security_takeover_ops() {
+        // Read-only ops: never refused in Agent-only mode.
+        assert!(!Op::FirewallGet.takes_over_security());
+        assert!(!Op::BansList.takes_over_security());
+        assert!(!Op::BansConfigGet.takes_over_security());
+        // Mutating: these are what Agent-only refuses.
+        assert!(Op::BansRemove {
+            addr: "1.2.3.4".parse().unwrap()
+        }
+        .takes_over_security());
+    }
 }

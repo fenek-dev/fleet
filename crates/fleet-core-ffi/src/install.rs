@@ -6,7 +6,7 @@
 
 use crate::api::{FleetCore, id16, lock};
 use crate::rows::{InstallProgress, InstallStep};
-use crate::types::{AgentHealthRow, ConnState, FleetError, HostKeyPrompt};
+use crate::types::{AgentHealthRow, ConnState, FleetError, HostKeyPrompt, SecurityModeArg};
 use crate::validate;
 use fleet_core::cache::PinnedKeys;
 use fleet_core::install::{self, InstallRequest, InstallStage};
@@ -63,13 +63,18 @@ impl FleetCore {
     /// Installs the agent (a `.deb` package or a bare `fleet-agent`
     /// binary at `artifact_path`) with the genesis roster and a default
     /// policy, pins the printed agent keys and connects. `admin_user`
-    /// defaults to the SSH user. Needs a confirmed host key, an unlocked
-    /// app (SSH key) and passwordless sudo (or root).
+    /// defaults to the SSH user. `security_mode` picks the pushed policy's
+    /// starting mode (design §5.4): `Managed` lets Fleet take over host
+    /// security as before; `AgentOnly` leaves an already-configured server
+    /// alone (no bans, no `authorized_keys` rewriting) until the operator
+    /// switches it later. Needs a confirmed host key, an unlocked app (SSH
+    /// key) and passwordless sudo (or root).
     pub async fn install_agent(
         self: Arc<Self>,
         server_id: String,
         admin_user: Option<String>,
         artifact_path: String,
+        security_mode: SecurityModeArg,
         listener: Box<dyn InstallListener>,
     ) -> Result<AgentHealthRow, FleetError> {
         let id = validate::server_id(&server_id)?;
@@ -85,7 +90,8 @@ impl FleetCore {
             let genesis = fleet_core::enroll::genesis(&cache)?;
             let fleet_id = FleetId(id16(&cache, crate::api::SETTING_FLEET_ID)?);
             let device_id = DeviceId(id16(&cache, crate::api::SETTING_DEVICE_ID)?);
-            let policy = fleet_core::policy::default_policy(fleet_id, id.clone());
+            let policy =
+                fleet_core::policy::default_policy(fleet_id, id.clone(), security_mode.into());
             let toml = fleet_core::policy::to_toml(&policy)
                 .map_err(|message| FleetError::Internal { message })?;
             (host_key, genesis, toml, device_id)
@@ -167,5 +173,62 @@ impl FleetCore {
             }
         })
         .await
+    }
+
+    /// The security mode last pushed to `server_id` (design §5.4).
+    /// `Managed` if this Mac never pushed a policy (the behavior before
+    /// this field existed, and the case just after a fresh install whose
+    /// cache write raced a crash).
+    pub fn security_mode(&self, server_id: String) -> Result<SecurityModeArg, FleetError> {
+        let id = validate::server_id(&server_id)?;
+        let cache = lock(&self.cache);
+        Ok(fleet_core::policy::pushed(&cache, &id)
+            .map(|p| p.security.into())
+            .unwrap_or(SecurityModeArg::Managed))
+    }
+
+    /// Switches `server_id` between Managed and Agent-only: a normal
+    /// `policy.update` (Elevated, Touch-ID-approved) that keeps every
+    /// other setting from the last pushed policy (or the install default,
+    /// if this Mac never pushed one). Design §5.4: switching to Managed
+    /// re-enables bans and `authorized_keys` sync immediately, no agent
+    /// restart; switching to Agent-only stops them but does **not** undo
+    /// firewall or sshd state a prior Managed period already applied.
+    pub async fn set_security_mode(
+        self: Arc<Self>,
+        server_id: String,
+        mode: SecurityModeArg,
+    ) -> Result<(), FleetError> {
+        let id = validate::server_id(&server_id)?;
+        let health = match self.send_op(&server_id, Op::AgentHealth, None).await? {
+            Payload::AgentHealth(h) => h,
+            _ => return Err(FleetError::UnexpectedReply),
+        };
+        let current = health.policy_version;
+        let mut policy = {
+            let cache = lock(&self.cache);
+            match fleet_core::policy::pushed(&cache, &id) {
+                Some(p) => p,
+                None => {
+                    let fleet_id = FleetId(id16(&cache, crate::api::SETTING_FLEET_ID)?);
+                    fleet_core::policy::default_policy(fleet_id, id.clone(), mode.into())
+                }
+            }
+        };
+        policy.security = mode.into();
+        policy.version = current.saturating_add(1);
+        let toml = fleet_core::policy::to_toml(&policy)
+            .map_err(|message| FleetError::Internal { message })?;
+        self.send_op(
+            &server_id,
+            Op::PolicyUpdate {
+                policy_toml: toml.clone(),
+            },
+            Some(current),
+        )
+        .await?;
+        let cache = lock(&self.cache);
+        fleet_core::policy::remember_pushed(&cache, &id, &toml)?;
+        Ok(())
     }
 }

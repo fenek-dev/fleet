@@ -177,12 +177,17 @@ fn fixture() -> (Fixture, tempfile::TempDir) {
 }
 
 fn fixture_with(groups: &'static str) -> (Fixture, tempfile::TempDir) {
+    fixture_with_pol(groups, "managed")
+}
+
+fn fixture_with_pol(groups: &'static str, security: &'static str) -> (Fixture, tempfile::TempDir) {
     let fx = Fixture::with(
         1,
         0,
         Opts {
             pol: Pol {
                 groups,
+                security,
                 ..Pol::default()
             },
             ..Opts::default()
@@ -443,6 +448,46 @@ fn sshd_failures_ban_and_alert_services_and_integrity_report() {
             (*device_id, *source),
             (Some(fx.macs[0].id), Some(ip("203.0.113.9")))
         );
+    });
+}
+
+/// Agent-only (design §5.4): failed logins still emit their `login` event
+/// (detection only), but the ban engine never decides or applies a ban —
+/// no `nft add element … banned4 …` call, no `BanChanged` event.
+#[test]
+fn agent_only_mode_detects_but_does_not_ban() {
+    let (mut fx, root) = fixture_with_pol(GROUPS, "agent-only");
+    let feeds = start(&mut fx, root.path().to_owned(), None);
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        for i in 0..5 {
+            let m = format!("Failed password for root from {ATTACKER} port 4242 ssh2");
+            feeds.journal.send(jline(i, &m)).unwrap();
+        }
+        let mut failed = 0;
+        while failed < 5 {
+            let (_, e) = s.next_event().await.unwrap();
+            if matches!(e, Event::Login { success: false, .. }) {
+                failed += 1;
+            }
+            assert!(!matches!(e, Event::BanChanged { .. }), "{e:?}");
+        }
+        // Give the (would-be) ban a moment to land if the gate were wrongly
+        // still open, then check nft never saw a ban add.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let calls = feeds.nft.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|a| a.first().map(String::as_str) == Some("add")
+                && a.contains(&"banned4".to_owned())),
+            "{calls:?}"
+        );
+        let r = ask(&mut s, &fx, Op::BansList).await;
+        let Ok(Payload::Bans(b)) = r else {
+            panic!("{r:?}")
+        };
+        assert!(b.bans.is_empty());
     });
 }
 

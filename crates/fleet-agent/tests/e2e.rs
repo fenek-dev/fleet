@@ -169,6 +169,8 @@ struct Pol {
     /// TOML list body of `capabilities.allow`.
     groups: &'static str,
     ai_per_minute: u32,
+    /// `"managed"` or `"agent-only"` (design §5.4).
+    security: &'static str,
 }
 
 impl Default for Pol {
@@ -179,6 +181,7 @@ impl Default for Pol {
             max_streams: 32,
             groups: r#""system""#,
             ai_per_minute: 60,
+            security: "managed",
         }
     }
 }
@@ -190,11 +193,13 @@ fn policy_toml(fleet: FleetId, version: u64, pol: Pol) -> String {
         max_streams,
         groups,
         ai_per_minute,
+        security,
     } = pol;
     format!(
         r#"version = {version}
 fleet_id = "{fleet}"
 server_id = "{SERVER}"
+security = "{security}"
 [capabilities]
 allow = [{groups}]
 shell_exec = false
@@ -633,6 +638,216 @@ fn policy_denied_command_does_not_burn_approval() {
             .unwrap();
         assert_eq!(r.result, Ok(Payload::Empty));
     });
+}
+
+/// Agent-only (design §5.4): every op that would take over host security is
+/// refused with `PolicyDenied` in `check_policy`, before the nonce is
+/// consumed — resending the identical signed command gets the same refusal
+/// again, never `Replay`.
+#[test]
+fn agent_only_refuses_security_takeover_ops_without_burning_nonce() {
+    let fx = Fixture::with(
+        1,
+        0,
+        Opts {
+            pol: Pol {
+                groups: r#""firewall", "security", "users", "profile""#,
+                security: "agent-only",
+                ..Pol::default()
+            },
+            ..Opts::default()
+        },
+    );
+    run(async {
+        let m = &fx.macs[0];
+        let mut s = fx.connect(m).await;
+        let ops = [
+            Op::FirewallApply(fleet_proto::args::FirewallRuleSet {
+                mode: fleet_proto::args::FirewallMode::Managed,
+                rules: vec![],
+            }),
+            Op::AuthorizedKeysSet {
+                user: fleet_proto::args::UserName::new("ops").unwrap(),
+                keys: vec![],
+            },
+            Op::BansRemove {
+                addr: "203.0.113.9".parse().unwrap(),
+            },
+            Op::BansConfigSet(fleet_ops::security::bans::default_config()),
+            Op::ProfileApply {
+                spec: fleet_proto::op::ProfileSpec {
+                    source: fleet_proto::op::ProfileSource::Builtin {
+                        level: fleet_proto::op::ProfileLevel::Baseline,
+                        roles: vec![],
+                    },
+                    only: vec![],
+                },
+                plan_hash: [0; 32],
+                phase: fleet_proto::op::ProfilePhase::System,
+                password_hash: None,
+            },
+        ];
+        for op in ops {
+            // An approval, needed or not (`authorized_keys.set` is
+            // Elevated: without one, `verify` itself would answer
+            // `ApprovalRequired` before the policy check ever runs).
+            let approval = fx.approve(m, &op);
+            let cmd = s
+                .build_command(
+                    op.clone(),
+                    &fx.server,
+                    Actor::Human,
+                    Some(approval),
+                    &CommandOpts::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                err(s.send(&cmd).await.unwrap()),
+                ErrorCode::PolicyDenied,
+                "{}",
+                op.name()
+            );
+            // Resending the identical command: still refused, not `Replay`
+            // (the nonce was never committed).
+            assert_eq!(
+                err(s.send(&cmd).await.unwrap()),
+                ErrorCode::PolicyDenied,
+                "{} (resend)",
+                op.name()
+            );
+        }
+        // Read-only ops in the same groups stay allowed: never refused by
+        // the policy check (whatever else they answer — `firewall.get`
+        // has no real `nft` in this sandbox).
+        for op in [Op::FirewallGet, Op::BansList, Op::BansConfigGet] {
+            let r = s
+                .request(op.clone(), &fx.server, Actor::Human, None)
+                .await
+                .unwrap();
+            assert!(
+                !matches!(r.result, Err(ErrorCode::PolicyDenied)),
+                "{}: {:?}",
+                op.name(),
+                r.result
+            );
+        }
+    });
+}
+
+/// Switching `security` back to `managed` (a normal `policy.update`) takes
+/// effect immediately, no agent restart: a takeover op that was refused
+/// with `PolicyDenied` a moment ago now clears the policy check (it may
+/// still need `ApprovalRequired`, which is a normal Elevated-tier check,
+/// never `PolicyDenied`).
+#[test]
+fn agent_only_switch_to_managed_takes_effect_immediately() {
+    let fx = Fixture::with(
+        1,
+        0,
+        Opts {
+            pol: Pol {
+                groups: r#""users""#,
+                security: "agent-only",
+                ..Pol::default()
+            },
+            ..Opts::default()
+        },
+    );
+    run(async {
+        let m = &fx.macs[0];
+        let mut s = fx.connect(m).await;
+        let ak_op = || Op::AuthorizedKeysSet {
+            user: fleet_proto::args::UserName::new("ops").unwrap(),
+            keys: vec![],
+        };
+        // Elevated: an approval so `verify` doesn't answer
+        // `ApprovalRequired` before the policy check even runs.
+        let ak_approval = fx.approve(m, &ak_op());
+        let r = s
+            .request(ak_op(), &fx.server, Actor::Human, Some(ak_approval))
+            .await
+            .unwrap();
+        assert_eq!(err(r), ErrorCode::PolicyDenied);
+
+        let policy_op = Op::PolicyUpdate {
+            policy_toml: policy_toml(
+                fx.fleet,
+                2,
+                Pol {
+                    groups: r#""users""#,
+                    security: "managed",
+                    ..Pol::default()
+                },
+            ),
+        };
+        let approval = fx.approve(m, &policy_op);
+        let r = s
+            .request(policy_op, &fx.server, Actor::Human, Some(approval))
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+
+        // Same op again, no approval: now Elevated's normal
+        // `ApprovalRequired`, not `PolicyDenied` — the policy check passed.
+        let r = s
+            .request(ak_op(), &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(err(r), ErrorCode::ApprovalRequired);
+    });
+}
+
+/// `sync_authorized_keys` never runs under Agent-only (startup or
+/// maintenance tick), and resumes as soon as the policy switches to
+/// Managed — no agent restart.
+#[test]
+fn agent_only_never_syncs_authorized_keys_until_switched_to_managed() {
+    let fx = Fixture::with(
+        1,
+        0,
+        Opts {
+            pol: Pol {
+                security: "agent-only",
+                ..Pol::default()
+            },
+            ..Opts::default()
+        },
+    );
+    let ak_path = fx.paths.authorized_keys_dir.join("admin");
+    run(async {
+        // Startup sync plus a couple of 100ms maintenance ticks.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+    assert!(
+        !ak_path.exists(),
+        "agent-only must never write authorized_keys"
+    );
+
+    run(async {
+        let m = &fx.macs[0];
+        let mut s = fx.connect(m).await;
+        let policy_op = Op::PolicyUpdate {
+            policy_toml: policy_toml(
+                fx.fleet,
+                2,
+                Pol {
+                    security: "managed",
+                    ..Pol::default()
+                },
+            ),
+        };
+        let approval = fx.approve(m, &policy_op);
+        let r = s
+            .request(policy_op, &fx.server, Actor::Human, Some(approval))
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+    assert!(
+        ak_path.exists(),
+        "managed must sync authorized_keys again, no restart needed"
+    );
 }
 
 /// A gate that drops exec's reply and re-forwards the same command gets the

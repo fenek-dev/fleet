@@ -19,6 +19,9 @@ struct ProvisionView: View {
     @State private var addSheet: AddSheet?
     @State private var cloudInitShown = false
     @State private var exportId = ""
+    /// Agent-only servers (design §5.4) refuse `profile.apply`: hardening
+    /// is disabled here until the operator switches to Managed.
+    @State private var securityMode: SecurityModeArg = .managed
 
     private struct AddSheet: Identifiable {
         let id = UUID()
@@ -166,6 +169,10 @@ struct ProvisionView: View {
         HStack(alignment: .top, spacing: 20) {
             VStack(alignment: .leading, spacing: 16) {
                 ProfileFormView(form: $form, groups: core.groups)
+                if securityMode == .agentOnly {
+                    Text("This server is Agent only: Fleet won't apply hardening here. Switch it to Managed from the server's Overview tab first.")
+                        .font(.secondary).foregroundStyle(Tone.warn.text)
+                }
                 HStack {
                     if form.isCustom {
                         Text("Source ranges or a reboot window make this a custom profile: each phase needs Touch ID.")
@@ -177,7 +184,8 @@ struct ProvisionView: View {
                     }
                     Button("Review plan") { begin() }
                         .buttonStyle(.borderedProminent).tint(.accent)
-                        .disabled(running || form.name.isEmpty || form.adminUser.isEmpty)
+                        .disabled(running || form.name.isEmpty || form.adminUser.isEmpty
+                                  || securityMode == .agentOnly)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -206,7 +214,7 @@ struct ProvisionView: View {
                         Spacer()
                         Button("Apply") { approve() }
                             .buttonStyle(.borderedProminent).tint(.accent)
-                            .disabled(running)
+                            .disabled(running || securityMode == .agentOnly)
                     }
                 }
             }
@@ -333,9 +341,13 @@ struct ProvisionView: View {
         error = nil
         run = ProvisionRun()
         editingProfile = false
+        securityMode = .managed
         guard let api = core.api, let id = serverId else {
             state = nil
             return
+        }
+        if let mode = try? api.securityMode(serverId: id) {
+            securityMode = mode
         }
         do {
             state = try api.provisionState(serverId: id)

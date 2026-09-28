@@ -7,7 +7,37 @@
 use crate::text;
 use fleet_core::manager::{self, RequestError};
 use fleet_core::signer;
+use fleet_proto::policy::SecurityMode;
 use fleet_proto::{AgentHealth, Event, SystemInfo, alert::Severity};
+
+/// Whether Fleet owns host security on a server (design §5.4). `Managed`
+/// keeps today's behavior (bans, `authorized_keys`, hardening); `AgentOnly`
+/// is for an already-configured server the operator doesn't want Fleet to
+/// touch security on. Switching later is a normal, Touch-ID-approved
+/// `policy.update` in either direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SecurityModeArg {
+    Managed,
+    AgentOnly,
+}
+
+impl From<SecurityModeArg> for SecurityMode {
+    fn from(v: SecurityModeArg) -> Self {
+        match v {
+            SecurityModeArg::Managed => SecurityMode::Managed,
+            SecurityModeArg::AgentOnly => SecurityMode::AgentOnly,
+        }
+    }
+}
+
+impl From<SecurityMode> for SecurityModeArg {
+    fn from(v: SecurityMode) -> Self {
+        match v {
+            SecurityMode::Managed => SecurityModeArg::Managed,
+            SecurityMode::AgentOnly => SecurityModeArg::AgentOnly,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum KeyRole {

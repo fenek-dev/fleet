@@ -192,6 +192,9 @@ pub(super) struct Sources {
     pub(super) ssh_logins: Rc<RefCell<Logins>>,
     systemd: Rc<dyn SystemdApi>,
     lazy: Option<Rc<LazySystemd>>,
+    /// To re-read the live policy's security mode (design §5.4): Agent-only
+    /// turns off ban decisions here, without an agent restart.
+    st: Weak<RefCell<State>>,
 }
 
 /// Marks a Fleet package op; on drop, reads the dpkg log right away and
@@ -267,7 +270,21 @@ impl Sources {
             db,
             systemd,
             lazy,
+            st: Rc::downgrade(st),
         })
+    }
+
+    /// Whether the ban engine may decide/apply bans right now (design
+    /// §5.4): off under `SecurityMode::AgentOnly`. A gone or momentarily
+    /// unreadable `State` defaults to Managed (bans stay on).
+    pub(super) fn bans_may_apply(&self) -> bool {
+        let Some(st) = self.st.upgrade() else {
+            return true;
+        };
+        let Ok(st) = st.try_borrow() else {
+            return true;
+        };
+        st.policy.security != fleet_proto::policy::SecurityMode::AgentOnly
     }
 
     /// `bans.*`, `integrity.status`, `logins.query` (roster resolver),

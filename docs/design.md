@@ -670,6 +670,7 @@ Each server has its own policy, delivered by an Elevated `policy.update` command
 version = 12
 fleet_id = "f_2b81…"
 server_id = "srv_7f3a9c"
+security = "managed"          # managed | agent-only (absent from older TOML = managed)
 
 [capabilities]
 # Group names from the operation catalog (section 4.2).
@@ -695,6 +696,8 @@ max_stream_sessions = 32
 [safety]
 auto_revert_seconds = 60
 ```
+
+**Security mode (`security`, "Agent only" mode):** `managed` (default) is today's behavior: Fleet's ban engine decides and applies bans, and exec keeps the admin's `authorized_keys` file in sync with the roster. `agent-only` is for an already-configured server the operator doesn't want Fleet to change security on: the ban engine still records the failed-login `login` event (detection only) but never decides or applies a ban itself, and `authorized_keys` is never written or rewritten. Under `agent-only`, ops that would take over host security — `firewall.apply`, `authorized_keys.set`, `profile.apply`, and the mutating ban ops `bans.add`/`bans.remove`/`bans.config.set` — are refused with `PolicyDenied` in `check_policy`, before the nonce is consumed (section 5.6), so a retried command isn't burned for nothing; read-only ops (`bans.list`, `bans.config.get`, `authorized_keys.get`, `firewall.get`, `audit.run`) stay allowed. Switching mode is a normal `policy.update` (Elevated, root-key approval) — there's no dedicated op. The live policy is re-read on every command, so switching `agent-only` → `managed` turns bans and `authorized_keys` sync back on immediately, no agent restart. Switching `managed` → `agent-only` stops them going forward but does **not** undo firewall rules, `authorized_keys` entries or other state a prior `managed` period already applied — the operator cleans that up by hand if they want it gone. `fleet-agent install` (and the Mac app's install flow) can push a policy that starts in either mode; the default stays `managed` to keep existing behavior. Because `security` is `#[serde(default)]`, a policy TOML written before this field existed still parses and is treated as `managed`.
 
 **Rules for accepting a policy:** `version` is strictly greater than the current one (so an older policy with more permissions can't be replayed), `fleet_id` and `server_id` match, and the approving root key belongs to a Mac in the roster at the time of acceptance.
 
@@ -1432,6 +1435,8 @@ Every profile and role runs in CI against throwaway VMs (Lima or Multipass) for 
 3. The package creates the `fleet-gate` user, `fleet` group and units; `fleet-agent install --genesis <signed roster> --policy <toml> --server-id <id> [--admin-user <name>]` creates the directories with their modes (ownership only when run as root), generates the gate Noise static key and the exec Ed25519 signing key (kept if present), verifies the genesis roster, stores roster and policy, and prints both public keys as hex for the app to pin. `--root <dir>` before any mode re-roots every path for development.
 4. Push the roster and policy, then run the hardening audit to show the current score. Nothing is hardened without explicit approval.
 5. Moving SSH keys to `/etc/fleet/authorized_keys/` (section 5.9) is a separate step. The admin user's existing keys are imported into the extra section, `sshd` is switched over with auto-revert armed, and the step is confirmed from a fresh connection. The firewall starts in bans-only mode (section 4.8).
+
+**Security mode at install (`SecurityModeArg`, FFI `install_agent`):** the operator picks `Managed` (default, keeps steps 4–5 above) or `Agent only` — install pushes a default policy with `security = "agent-only"` (section 5.4) instead, and steps 4–5 don't apply: the agent's own ban engine and `authorized_keys` sync stay off, and `firewall.apply`/`profile.apply`/mutating ban ops are refused. The read-only hardening audit still runs so the operator can see the score. Switching a server's mode later, either direction, is `FleetCore::set_security_mode` — a `policy.update` built from the last pushed policy (or a fresh default) with only `security` and `version` changed, approved like any other Elevated op.
 
 **Implementation** (`fleet_core::install`, FFI `probe_host_key` → `accept_host_key` → `install_agent`):
 
