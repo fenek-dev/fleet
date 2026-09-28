@@ -22,6 +22,12 @@ struct ProvisionView: View {
     /// Agent-only servers (design §5.4) refuse `profile.apply`: hardening
     /// is disabled here until the operator switches to Managed.
     @State private var securityMode: SecurityModeStatus = .unknown
+    /// This Mac's address as the selected server sees it.
+    @State private var macError: String?
+    @State private var detectingMac = false
+    @State private var savedProfiles: [SavedProvisionProfileRow] = []
+    /// Empty: the suggested name is used.
+    @State private var profileName = ""
 
     private struct AddSheet: Identifiable {
         let id = UUID()
@@ -93,25 +99,29 @@ struct ProvisionView: View {
         .onChange(of: server?.state) { _, new in
             // The connection just came back: `securityMode` needs a live
             // session to resolve, so re-check rather than sit on `Unknown`.
-            if new == .ready { refreshSecurityMode() }
+            if new == .ready {
+                refreshSecurityMode()
+                detectMacSource()
+            }
         }
-        .onAppear(perform: pickInProgress)
+        .onAppear {
+            pickInProgress()
+            savedProfiles = core.api?.provisionSavedProfiles() ?? []
+        }
     }
 
     // MARK: header
 
     private var header: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Provision a server").font(.sectionTitle)
-                Text(subtitle).font(.secondary).foregroundStyle(Color.textMuted)
-            }
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text("Provision a server").font(.toolbarTitle)
+            Text(subtitle).font(.secondary).foregroundStyle(Color.textMuted).lineLimit(1)
             Spacer()
             Button("Export as cloud-init") { cloudInitShown = true }
                 .accessibilityIdentifier("provision.exportCloudInit")
         }
         .padding(.horizontal, 24)
-        .padding(.vertical, 16)
+        .frame(height: 60)
         .background(Color.header)
     }
 
@@ -182,7 +192,9 @@ struct ProvisionView: View {
     private var profile: some View {
         HStack(alignment: .top, spacing: 20) {
             VStack(alignment: .leading, spacing: 16) {
-                ProfileFormView(form: $form, groups: core.groups)
+                ProfileFormView(form: $form, groups: core.groups, macError: macError,
+                                detectingMac: detectingMac, saved: savedProfiles,
+                                profileName: $profileName)
                 if securityMode == .agentOnly {
                     Text("This server is Agent only: Fleet won't apply hardening here. Switch it to Managed from the server's Overview tab first.")
                         .font(.secondary).foregroundStyle(Tone.warn.text)
@@ -192,7 +204,7 @@ struct ProvisionView: View {
                 }
                 HStack {
                     if form.isCustom {
-                        Text("Source ranges or a reboot window make this a custom profile: each phase needs Touch ID.")
+                        Text("Source ranges, nginx or a reboot window make this a custom profile: each phase needs Touch ID.")
                             .font(.secondary).foregroundStyle(Color.textMuted)
                     }
                     Spacer()
@@ -204,7 +216,7 @@ struct ProvisionView: View {
                         .accessibilityIdentifier("provision.reviewPlan")
                         .buttonStyle(.borderedProminent).tint(.accent)
                         .disabled(running || form.name.isEmpty || form.adminUser.isEmpty
-                                  || securityMode != .managed)
+                                  || form.sshUnresolved || securityMode != .managed)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -400,6 +412,24 @@ struct ProvisionView: View {
             form.tags = s.tags.joined(separator: ", ")
             if form.adminUser.isEmpty { form.adminUser = s.user == "root" ? "ops" : s.user }
         }
+        detectMacSource()
+    }
+
+    /// The address the server sees this Mac's SSH connection from, for
+    /// "Only my Macs' IPs". Guarded against a stale answer after the
+    /// operator picked another server.
+    private func detectMacSource() {
+        guard let api = core.api, let id = serverId, server?.state == .ready else { return }
+        detectingMac = true
+        Task {
+            do {
+                let ip = try await api.provisionMacSource(serverId: id)
+                if id == serverId { form.macIPs = [ip]; macError = nil }
+            } catch {
+                if id == serverId { form.macIPs = []; macError = error.fleetMessage }
+            }
+            if id == serverId { detectingMac = false }
+        }
     }
 
     private func pinExport(_ s: ServerRow) {
@@ -418,6 +448,10 @@ struct ProvisionView: View {
         error = nil
         do {
             state = try api.provisionBegin(serverId: id, choice: form.row)
+            // The profile joins this Mac's library (best effort).
+            let name = profileName.isEmpty ? form.suggestedProfileName : profileName
+            try? api.provisionSaveProfile(name: name, choice: form.row)
+            savedProfiles = api.provisionSavedProfiles()
             editingProfile = false
             advance()
         } catch {
@@ -472,8 +506,14 @@ struct ProvisionForm: Equatable {
     var docker = false
     var web = false
     var game = false
+    var webServer: WebServerRow = .caddy
     var adminUser = ""
-    var sshFromAnywhere = true
+    /// SSH reachable from only this Mac's address (plus `allowFrom`), the
+    /// spec's default, instead of anywhere (rate-limited).
+    var sshMacsOnly = true
+    /// This Mac's address as the server sees it (detected, not typed).
+    var macIPs: [String] = []
+    /// Extra ranges: other Macs' addresses, CIDR, comma-separated.
     var allowFrom = ""
     var rebootWindow = RebootChoice.never
 
@@ -494,8 +534,9 @@ struct ProvisionForm: Equatable {
         docker = c.roles.contains(.docker)
         web = c.roles.contains(.web)
         game = c.roles.contains(.game)
+        webServer = c.webServer
         adminUser = c.adminUser
-        sshFromAnywhere = c.allowFrom.isEmpty
+        sshMacsOnly = !c.allowFrom.isEmpty
         allowFrom = c.allowFrom.joined(separator: ", ")
         rebootWindow = RebootChoice(rawValue: c.rebootWindow ?? "") ?? .never
     }
@@ -504,9 +545,43 @@ struct ProvisionForm: Equatable {
         s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
-    var ranges: [String] { sshFromAnywhere ? [] : Self.list(allowFrom) }
+    /// Source ranges sent to the server (empty: anywhere, rate-limited).
+    var ranges: [String] {
+        guard sshMacsOnly else { return [] }
+        var seen = Set<String>()
+        return (macIPs + Self.list(allowFrom)).filter { seen.insert($0).inserted }
+    }
 
-    var isCustom: Bool { !ranges.isEmpty || rebootWindow != .never }
+    var isCustom: Bool {
+        !ranges.isEmpty || rebootWindow != .never || (web && webServer == .nginx)
+    }
+
+    /// "Only my Macs' IPs" with no address to allow would lock everyone out.
+    var sshUnresolved: Bool { sshMacsOnly && ranges.isEmpty }
+
+    /// Suggested library name, e.g. `web-docker-strict`.
+    var suggestedProfileName: String {
+        var parts: [String] = []
+        if web { parts.append(webServer == .nginx ? "web-nginx" : "web") }
+        if docker { parts.append("docker") }
+        if game { parts.append("game") }
+        parts.append(level == .strict ? "strict" : "baseline")
+        return parts.joined(separator: "-")
+    }
+
+    /// Fills the profile fields from a saved profile; server-specific
+    /// fields (name, group, tags, this Mac's address) stay.
+    mutating func apply(saved c: ProvisionChoiceRow) {
+        level = c.level
+        docker = c.roles.contains(.docker)
+        web = c.roles.contains(.web)
+        game = c.roles.contains(.game)
+        webServer = c.webServer
+        if !c.adminUser.isEmpty { adminUser = c.adminUser }
+        sshMacsOnly = !c.allowFrom.isEmpty
+        allowFrom = c.allowFrom.filter { !macIPs.contains($0) }.joined(separator: ", ")
+        rebootWindow = RebootChoice(rawValue: c.rebootWindow ?? "") ?? .never
+    }
 
     var row: ProvisionChoiceRow {
         var roles: [ProfileRoleRow] = []
@@ -514,7 +589,8 @@ struct ProvisionForm: Equatable {
         if web { roles.append(.web) }
         if game { roles.append(.game) }
         return ProvisionChoiceRow(
-            level: level, roles: roles, adminUser: adminUser.trimmingCharacters(in: .whitespaces),
+            level: level, roles: roles, webServer: webServer,
+            adminUser: adminUser.trimmingCharacters(in: .whitespaces),
             allowFrom: ranges, rebootWindow: rebootWindow == .never ? nil : rebootWindow.rawValue,
             name: name.trimmingCharacters(in: .whitespaces), groupId: groupId, tags: Self.list(tags))
     }
@@ -523,6 +599,11 @@ struct ProvisionForm: Equatable {
 private struct ProfileFormView: View {
     @Binding var form: ProvisionForm
     let groups: [GroupRow]
+    /// Why this Mac's address couldn't be detected, if it couldn't.
+    var macError: String?
+    var detectingMac = false
+    var saved: [SavedProvisionProfileRow] = []
+    @Binding var profileName: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -540,6 +621,18 @@ private struct ProfileFormView: View {
                 }
             }
             section("Security profile") {
+                if !saved.isEmpty {
+                    Menu("Use a saved profile…") {
+                        ForEach(saved, id: \.name) { p in
+                            Button("\(p.name).toml") {
+                                form.apply(saved: p.choice)
+                                profileName = p.name
+                            }
+                        }
+                    }
+                    .frame(maxWidth: 260, alignment: .leading)
+                    .accessibilityIdentifier("provision.savedProfiles")
+                }
                 Picker("", selection: $form.level) {
                     VStack(alignment: .leading) {
                         Text("Baseline")
@@ -561,28 +654,71 @@ private struct ProfileFormView: View {
             section("Roles") {
                 role("Docker / Compose", "Ports bind to localhost unless you publish them.", $form.docker)
                 role("Web / reverse proxy", "TLS, security headers, scanner bans.", $form.web)
-                role("Game server", "Pick a template later: ports, backups, RCON.", $form.game)
+                if form.web {
+                    Picker("Web server", selection: $form.webServer) {
+                        Text("Caddy").tag(WebServerRow.caddy)
+                        Text("nginx").tag(WebServerRow.nginx)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 220)
+                    .padding(.leading, 20)
+                    .accessibilityIdentifier("provision.webServer")
+                    if form.webServer == .nginx {
+                        Text("nginx uses a custom profile: each phase needs Touch ID.")
+                            .font(.caption11).foregroundStyle(Color.textMuted)
+                            .padding(.leading, 20)
+                    }
+                }
+                role("Game server", "Templates (ports, backups, RCON) are picked from the server's Games tab.", $form.game)
             }
             section("Access") {
                 TextField("Admin user", text: $form.adminUser, prompt: Text("ops"))
                     .frame(maxWidth: 260)
                     .accessibilityIdentifier("provision.adminUser")
-                Picker("SSH reachable from", selection: $form.sshFromAnywhere) {
-                    Text("Anywhere, rate-limited").tag(true)
-                    Text("Only these ranges").tag(false)
+                Picker("SSH reachable from", selection: $form.sshMacsOnly) {
+                    Text("Only my Macs' IPs").tag(true)
+                    Text("Anywhere, rate-limited").tag(false)
                 }
                 .pickerStyle(.radioGroup)
                 .accessibilityIdentifier("provision.sshFrom")
-                if !form.sshFromAnywhere {
-                    TextField("CIDR ranges", text: $form.allowFrom, prompt: Text("203.0.113.0/24, 2001:db8::/32"))
-                        .font(.mono(12))
-                        .accessibilityIdentifier("provision.cidr")
+                if form.sshMacsOnly {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Text("This Mac:").font(.secondary).foregroundStyle(Color.textSecondary)
+                            if detectingMac {
+                                ProgressView().controlSize(.small)
+                            } else if let ip = form.macIPs.first {
+                                Text(ip).font(.mono(12))
+                                    .accessibilityIdentifier("provision.macIP")
+                            } else {
+                                Text(macError ?? "not detected").font(.secondary)
+                                    .foregroundStyle(Tone.warn.text)
+                                    .accessibilityIdentifier("provision.macIPError")
+                            }
+                        }
+                        TextField("Other Macs' IPs or CIDR ranges", text: $form.allowFrom,
+                                  prompt: Text("203.0.113.0/24, 2001:db8::/32"))
+                            .font(.mono(12))
+                            .accessibilityIdentifier("provision.cidr")
+                        Text("Reach the server from a Mac that isn't listed and SSH is refused until you add it.")
+                            .font(.caption11).foregroundStyle(Color.textMuted)
+                    }
+                    .padding(.leading, 20)
                 }
                 Picker("Reboot window", selection: $form.rebootWindow) {
                     ForEach(ProvisionForm.RebootChoice.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .frame(maxWidth: 360)
                 .accessibilityIdentifier("provision.rebootWindow")
+            }
+            HStack(spacing: 6) {
+                Image(systemName: "doc.text").foregroundStyle(Color.textMuted)
+                Text("Profile saved on this Mac as").font(.secondary).foregroundStyle(Color.textSecondary)
+                TextField(form.suggestedProfileName, text: $profileName)
+                    .textFieldStyle(.plain)
+                    .font(.mono(12)).frame(width: 190)
+                    .accessibilityIdentifier("provision.profileName")
+                Text(".toml").font(.mono(12)).foregroundStyle(Color.textMuted)
             }
         }
     }
@@ -669,18 +805,21 @@ private struct PlanPreview: View {
                     .font(.secondary).foregroundStyle(Color.textMuted)
             }
             if let before = state?.scoreBefore {
-                HStack {
+                HStack(spacing: 6) {
                     Text("Hardening score").font(.secondary)
                     Spacer()
                     Text("now").font(.caption11).foregroundStyle(Color.textMuted)
                     Text("\(before)").font(.system(size: 15, weight: .semibold))
-                    if let after = state?.scoreAfter {
-                        Image(systemName: "arrow.right").foregroundStyle(Color.textMuted)
+                    Image(systemName: "arrow.right").foregroundStyle(Color.textMuted)
+                    Text("expected").font(.caption11).foregroundStyle(Color.textMuted)
+                    if let after = state?.profileScore ?? state?.scoreAfter {
                         Text("\(after)").font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(Tone.ok.text)
+                    } else {
+                        Text("after apply").font(.secondary).foregroundStyle(Color.textSecondary)
                     }
                 }
-                ProgressView(value: Double(state?.scoreAfter ?? before), total: 100)
+                .accessibilityIdentifier("provision.scoreRow")
             }
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "checkmark.shield").foregroundStyle(Tone.ok.text)
