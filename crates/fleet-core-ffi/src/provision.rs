@@ -243,7 +243,7 @@ fn role(r: ProfileRoleRow) -> Role {
     }
 }
 
-fn role_row(r: Role) -> ProfileRoleRow {
+pub(crate) fn role_row(r: Role) -> ProfileRoleRow {
     match r {
         Role::Docker => ProfileRoleRow::Docker,
         Role::Web => ProfileRoleRow::Web,
@@ -446,7 +446,7 @@ fn save_state(cache: &Cache, st: &ProvisionState) -> Result<(), FleetError> {
 
 /// The choice a server was provisioned with (audit fixes re-use its
 /// level, roles, source ranges and reboot window).
-fn provisioned_profile(cache: &Cache, id: &ServerId) -> Option<ProvisionChoice> {
+pub(crate) fn provisioned_profile(cache: &Cache, id: &ServerId) -> Option<ProvisionChoice> {
     let raw = cache.setting(&profile_key(id)).ok().flatten()?;
     serde_json::from_slice(&raw).ok()
 }

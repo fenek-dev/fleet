@@ -64,7 +64,7 @@ struct ContentView: View {
         case .group(let id):
             FleetTableView(groupId: id, selection: $selection).id(id)
         case .server(let id):
-            ServerDetailView(serverId: id)
+            ServerDetailView(serverId: id) { selection = $0 }
         case .alerts:
             AlertsView()
         case .timeline:

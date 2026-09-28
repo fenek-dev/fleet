@@ -103,6 +103,45 @@ struct TimelineList: View {
     }
 }
 
+/// Compact list for the Overview's "Timeline · today" card: time, tone
+/// dot, title and one detail line.
+struct CompactTimelineRows: View {
+    let items: [TimelineItemRow]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(items) { i in
+                HStack(alignment: .top, spacing: 10) {
+                    Text(Date(timeIntervalSince1970: TimeInterval(i.timeMs) / 1000)
+                        .formatted(date: .omitted, time: .shortened))
+                        .font(.mono(11)).foregroundStyle(Color.textMuted)
+                        .frame(width: 58, alignment: .leading)
+                    Circle().fill(tone(i).dot).frame(width: 6, height: 6).padding(.top, 5)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(i.title).font(.base).foregroundStyle(Color.text).lineLimit(1)
+                        if !i.detail.isEmpty {
+                            Text(i.detail).font(.caption11).foregroundStyle(Color.textSecondary).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 6)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("overview.timeline.row")
+            }
+        }
+    }
+
+    private func tone(_ i: TimelineItemRow) -> Tone {
+        if i.ai { return .info }
+        switch i.severity {
+        case .critical: return .critical
+        case .warning: return .warn
+        case .info, .none: return .neutral
+        }
+    }
+}
+
 private struct TimelineChrome<Content: View>: View {
     let row: TimelineRow?
     @Binding var filter: TimelineFilter

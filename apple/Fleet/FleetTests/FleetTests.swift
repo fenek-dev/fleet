@@ -27,6 +27,12 @@ struct FleetTests {
         #expect(ChartMetric.netRx.value(v) == 150)
         #expect(ChartMetric.netTx.value(v) == 7)
         #expect(ChartMetric.memory.value(["mem.used": 1, "mem.total": 0]) == nil)
+        let io: [String: Double] = [
+            "disk.read:vda": 3, "disk.write:vda": 9, "net.rx:lo": 999, "net.rx:eth0": 4, "net.tx:eth0": 6,
+        ]
+        #expect(ChartMetric.diskIO.value(io) == 12)
+        #expect(ChartMetric.network.value(io) == 10)
+        #expect(ChartMetric.diskIO.value(["cpu.busy": 1]) == nil)
     }
 
     /// Device and SSH keys refuse to sign while locked, before touching the
