@@ -28,6 +28,17 @@ case "$(uname -m)" in
 esac
 
 "$root/scripts/build-agent-linux.sh" "$arch"
+# Build B for the update test: same source, higher version.
+next_out="$root/target/linux/$arch/next"
+FLEET_AGENT_OUT="$next_out" FLEET_AGENT_VERSION=0.2.0 \
+    "$root/scripts/build-agent-linux.sh" "$arch"
+export FLEET_IT_AGENT_NEXT="$next_out/fleet-agent"
+# FLEET_IT_DEB=1: install through the .deb (dpkg -i) instead of files.
+if [ -n "${FLEET_IT_DEB:-}" ]; then
+    FLEET_AGENT_OUT="$root/target/linux/$arch/deb" "$root/scripts/build-deb.sh" "$arch"
+    FLEET_IT_DEB="$(ls "$root/target/linux/$arch/deb/"fleet-agent_*.deb | head -n1)"
+    export FLEET_IT_DEB
+fi
 
 image="fleet-it:$distro"
 docker build -q -t "$image" \

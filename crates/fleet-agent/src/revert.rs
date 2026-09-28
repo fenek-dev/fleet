@@ -11,7 +11,7 @@
 //! so the whole confirm window starts then. The guard fires no earlier than
 //! the confirm deadline could, so it is harmless if stopping it fails.
 
-use crate::paths::{AGENT_BIN, SYSTEMCTL, SYSTEMD_RUN};
+use crate::paths::{AGENT_BIN, AGENT_PREV_BIN, SYSTEMCTL, SYSTEMD_RUN};
 use crate::pending::{ChangeId, ChangeKind, PendingDir, PendingError, RevertedMarker};
 use fleet_ops::{CommandRunner, CommandSpec, RunError, SysCtx};
 use std::time::Duration;
@@ -35,14 +35,23 @@ pub fn guard_unit_name(id: ChangeId) -> String {
     format!("fleet-revert-{id}-guard")
 }
 
-fn timer_spec(unit: String, id: ChangeId, secs: u32) -> CommandSpec {
+/// The binary a revert timer of `kind` runs: the previous build for an
+/// agent update (the new one may not even start), else the installed one.
+pub fn revert_bin(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::AgentUpdate => AGENT_PREV_BIN,
+        _ => AGENT_BIN,
+    }
+}
+
+fn timer_spec(unit: String, id: ChangeId, secs: u32, bin: &'static str) -> CommandSpec {
     CommandSpec::new(SYSTEMD_RUN)
         .args([
             format!("--on-active={secs}"),
             // Default accuracy is a minute: far too coarse for a 60 s window.
             "--timer-property=AccuracySec=1s".to_owned(),
             format!("--unit={unit}"),
-            AGENT_BIN.to_owned(),
+            bin.to_owned(),
             "revert".to_owned(),
             id.to_hex(),
         ])
@@ -52,12 +61,22 @@ fn timer_spec(unit: String, id: ChangeId, secs: u32) -> CommandSpec {
 /// `systemd-run --on-active=<secs> --timer-property=AccuracySec=1s
 /// --unit=fleet-revert-<id> <agent> revert <id>`.
 pub fn timer_command(id: ChangeId, secs: u32) -> CommandSpec {
-    timer_spec(unit_name(id), id, secs)
+    timer_spec(unit_name(id), id, secs, AGENT_BIN)
 }
 
 /// The guard timer: same command, its own unit.
 pub fn guard_command(id: ChangeId, secs: u32) -> CommandSpec {
-    timer_spec(guard_unit_name(id), id, secs)
+    timer_spec(guard_unit_name(id), id, secs, AGENT_BIN)
+}
+
+/// [`timer_command`] running [`revert_bin`] of `kind`.
+pub fn timer_command_for(id: ChangeId, secs: u32, kind: ChangeKind) -> CommandSpec {
+    timer_spec(unit_name(id), id, secs, revert_bin(kind))
+}
+
+/// [`guard_command`] running [`revert_bin`] of `kind`.
+pub fn guard_command_for(id: ChangeId, secs: u32, kind: ChangeKind) -> CommandSpec {
+    timer_spec(guard_unit_name(id), id, secs, revert_bin(kind))
 }
 
 /// `systemctl stop fleet-revert-<id>.timer fleet-revert-<id>-guard.timer`.
@@ -163,6 +182,26 @@ pub async fn arm_guard_async(
     run_fixed_async(runner, guard_command(id, secs)).await
 }
 
+/// [`arm_timer_async`] for a change of `kind` ([`revert_bin`]).
+pub async fn arm_timer_for_async(
+    runner: &dyn CommandRunner,
+    id: ChangeId,
+    secs: u32,
+    kind: ChangeKind,
+) -> Result<(), TimerError> {
+    run_fixed_async(runner, timer_command_for(id, secs, kind)).await
+}
+
+/// [`arm_guard_async`] for a change of `kind` ([`revert_bin`]).
+pub async fn arm_guard_for_async(
+    runner: &dyn CommandRunner,
+    id: ChangeId,
+    secs: u32,
+    kind: ChangeKind,
+) -> Result<(), TimerError> {
+    run_fixed_async(runner, guard_command_for(id, secs, kind)).await
+}
+
 /// Async [`disarm_timer`] (exec).
 pub async fn disarm_timer_async(
     runner: &dyn CommandRunner,
@@ -189,6 +228,37 @@ pub type OffloadReverter = std::sync::Arc<dyn Fn() -> RegistryRevert + Send + Sy
 /// The production [`OffloadReverter`]: [`RegistryRevert::system`].
 pub fn system_offload() -> OffloadReverter {
     std::sync::Arc::new(RegistryRevert::system)
+}
+
+/// [`system_offload`] with the agent's own modules for `paths`
+/// ([`RegistryRevert::for_paths`]).
+pub fn offload_for(paths: &crate::paths::Paths) -> OffloadReverter {
+    let paths = paths.clone();
+    std::sync::Arc::new(move || RegistryRevert::for_paths(&paths))
+}
+
+/// Every restore module: `fleet_hardening::reverters()` plus the agent's
+/// own, which need its paths: agent updates (`update::UpdateRevert`) and
+/// uninstall's SSH restore (`uninstall::SshRestoreRevert`).
+pub fn agent_reverters(
+    paths: &crate::paths::Paths,
+    mode: crate::userkeys::UserKeysMode,
+) -> fleet_ops::Reverters {
+    let mut r = fleet_hardening::reverters();
+    r.register(
+        ChangeKind::AgentUpdate,
+        std::rc::Rc::new(crate::update::UpdateRevert {
+            paths: paths.clone(),
+        }),
+    );
+    r.register(
+        ChangeKind::Ssh,
+        std::rc::Rc::new(crate::uninstall::SshRestoreRevert {
+            paths: paths.clone(),
+            mode,
+        }),
+    );
+    r
 }
 
 /// Restores a snapshot.
@@ -238,8 +308,13 @@ impl RegistryRevert {
     }
 
     pub fn system() -> Self {
+        Self::for_paths(&crate::paths::Paths::system())
+    }
+
+    /// Production modules ([`agent_reverters`]) for the agent at `paths`.
+    pub fn for_paths(paths: &crate::paths::Paths) -> Self {
         Self {
-            reverters: fleet_hardening::reverters(),
+            reverters: agent_reverters(paths, crate::userkeys::UserKeysMode::AsUser),
             ctx: SysCtx::system(),
             probe: true,
         }

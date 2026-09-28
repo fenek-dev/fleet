@@ -266,14 +266,36 @@ tagged_enum! {
         /// monitor sessions (design §5.5, §5.11).
         RosterGet = ROSTER_GET(1513, "roster.get"),
         PolicyUpdate { policy_toml: String } = POLICY_UPDATE(1520, "policy.update"),
-        /// Checks `/var/lib/fleet/staging/<hex(staged_path_hash)>` against
-        /// the root-signed manifest (design §10.2): the file's BLAKE3 must
-        /// equal both `staged_path_hash` and `manifest.blake3`.
+        /// Moves the upload `/var/lib/fleet/incoming/<hex(staged_path_hash)>`
+        /// (admin-writable SFTP drop) into root-only
+        /// `/var/lib/fleet/staging/` after checking it against the
+        /// root-signed manifest (design §10.2): the copied bytes' BLAKE3
+        /// must equal both `staged_path_hash` and `manifest.blake3`, the
+        /// signer a Mac of the current roster, the version above the
+        /// running one, the target this server's architecture.
         AgentUpdateStage { manifest: Box<SignedReleaseManifest>, staged_path_hash: Hash32 }
             = AGENT_UPDATE_STAGE(1530, "agent.update.stage"),
-        /// Switches to the staged `version` with a rollback timer.
+        /// Switches to the staged `version` under auto-revert
+        /// (`ChangeKind::AgentUpdate`): the new build must be confirmed
+        /// (`change.confirm` from a fresh connection, after `agent.health`)
+        /// within the health window, else the timer restores the previous
+        /// binary and restarts the units.
         AgentUpdateCommit { version: AgentVersion } = AGENT_UPDATE_COMMIT(1531, "agent.update.commit"),
+        /// Manual rollback to the binary kept by the last confirmed update.
         AgentUpdateRollback = AGENT_UPDATE_ROLLBACK(1532, "agent.update.rollback"),
+        /// Uninstall step 1 (design §10.3), under auto-revert
+        /// (`ChangeKind::Ssh`): copies every user's keys from
+        /// `/etc/fleet/authorized_keys/` back to `~/.ssh/authorized_keys`
+        /// and drops Fleet's `AuthorizedKeysFile`, so SSH keeps working
+        /// without the agent; confirmed from a fresh connection.
+        AgentUninstallPrepare = AGENT_UNINSTALL_PREPARE(1533, "agent.uninstall.prepare"),
+        /// Uninstall step 2, only after a confirmed prepare: schedules
+        /// `fleet-agent uninstall` in a transient unit (it stops exec).
+        /// `remove_firewall` deletes `table inet fleet` (it may be the
+        /// only firewall); `keep_audit` keeps the database for the audit
+        /// log.
+        AgentUninstall { keep_audit: bool, remove_firewall: bool }
+            = AGENT_UNINSTALL(1534, "agent.uninstall"),
         AlertRulesGet = ALERT_RULES_GET(1540, "alert_rules.get"),
         AlertRulesUpdate(rules: AlertRuleSet) = ALERT_RULES_UPDATE(1541, "alert_rules.update"),
 

@@ -1287,6 +1287,176 @@ fn services_unit_status_and_protected_stop() {
     };
 }
 
+// ---------------------------------------------------------------- updates
+
+/// `agent.health` over a new connection; `None` while the agent restarts.
+async fn fresh_version(fx: &'static Fixture) -> Option<fleet_proto::AgentVersion> {
+    let m = &fx.macs[0];
+    let conn = fx.ssh(m).await.ok()?;
+    let r = match fx.session(&conn, m).await {
+        Ok(Ok(mut s)) => tokio::time::timeout(
+            STEP,
+            s.request(Op::AgentHealth, &fx.server, Actor::Human, None),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok),
+        _ => None,
+    };
+    conn.disconnect().await;
+    match r?.result {
+        Ok(Payload::AgentHealth(h)) => Some(h.agent_version),
+        _ => None,
+    }
+}
+
+/// Polls until the agent reports `want` (or `limit` passes).
+async fn wait_version(
+    fx: &'static Fixture,
+    want: fleet_proto::AgentVersion,
+    limit: Duration,
+) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < limit {
+        if fresh_version(fx).await == Some(want) {
+            eprintln!("agent reports {want:?} after {:?}", t0.elapsed());
+            return true;
+        }
+        sleep(1).await;
+    }
+    false
+}
+
+fn agent_hash(fx: &Fixture) -> String {
+    fx.container
+        .exec(&["sha256sum", "/usr/lib/fleet/fleet-agent"])
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+/// Build A (installed) → signed build B (`FLEET_IT_AGENT_NEXT`, a higher
+/// `FLEET_AGENT_VERSION`): SFTP to the admin's drop directory, stage,
+/// commit, B comes up and is confirmed from a fresh connection; manual
+/// rollback to A; B committed again and never confirmed: the timer (run
+/// by the previous binary) restores A and restarts the units.
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn update_confirmed_then_manual_and_timer_rollback() {
+    use fleet_crypto::release::sign_release;
+    use fleet_proto::{AgentTarget, ReleaseManifest};
+    let Some(next) = std::env::var_os("FLEET_IT_AGENT_NEXT") else {
+        eprintln!("FLEET_IT_AGENT_NEXT unset (tests/vm/run.sh builds it): skipped");
+        return;
+    };
+    let fx = fixture();
+    let bin_b = std::fs::read(next).expect("build B");
+    let hash_b = fleet_crypto::blake3(&bin_b);
+    run(Duration::from_secs(360), async {
+        let m = &fx.macs[0];
+        let v_a = fresh_version(fx).await.expect("agent up");
+        let (c, mut s) = open(fx).await;
+        let sha_a = agent_hash(fx);
+        // The container's architecture (the test process may run under
+        // Rosetta, so not this process's).
+        let target = AgentTarget::parse(fx.container.exec(&["uname", "-m"]).unwrap().trim())
+            .expect("known architecture");
+        let signed = sign_release(
+            ReleaseManifest {
+                version: fleet_proto::AgentVersion {
+                    major: 0,
+                    minor: 2,
+                    patch: 0,
+                },
+                blake3: hash_b,
+                min_proto: 1,
+                target,
+            },
+            m.id,
+            &m.keys.root,
+        )
+        .unwrap();
+        let v_b = signed.manifest.version;
+        assert!(v_b > v_a, "build B {v_b:?} must be above A {v_a:?}");
+        // What the app does: SFTP as the admin into incoming/.
+        let sftp = fleet_core::sftp::Sftp::open(&c).await.expect("sftp");
+        sftp.upload_bytes(
+            &bin_b,
+            &format!("/var/lib/fleet/incoming/{}", hex::encode(hash_b)),
+            Some(0o600),
+            false,
+            &mut |_, _| {},
+        )
+        .await
+        .expect("upload");
+        let stage = Op::AgentUpdateStage {
+            manifest: Box::new(signed.clone()),
+            staged_path_hash: hash_b,
+        };
+        assert_eq!(call(&mut s, fx, stage).await, Ok(Payload::Empty));
+        let commit = Op::AgentUpdateCommit { version: v_b };
+        let change = match call(&mut s, fx, commit.clone()).await {
+            Ok(Payload::ChangePending { change, .. }) => change,
+            other => panic!("commit: {other:?}"),
+        };
+        eprintln!(
+            "update: committed, window {} ms",
+            change.deadline_ms - change.created_ms
+        );
+        c.disconnect().await;
+        assert!(
+            wait_version(fx, v_b, Duration::from_secs(25)).await,
+            "B never came up"
+        );
+        let r = confirm(fx, change.change_id).await;
+        assert!(r.is_ok(), "confirm: {r:?}");
+        sleep(40).await;
+        assert_eq!(fresh_version(fx).await, Some(v_b), "confirmed update kept");
+
+        // Manual rollback to A.
+        let (c, mut s) = open(fx).await;
+        assert_eq!(
+            call(&mut s, fx, Op::AgentUpdateRollback).await,
+            Ok(Payload::Empty)
+        );
+        c.disconnect().await;
+        assert!(
+            wait_version(fx, v_a, Duration::from_secs(30)).await,
+            "manual rollback"
+        );
+        assert_eq!(agent_hash(fx), sha_a);
+
+        // B again (still staged), never confirmed: the timer restores A.
+        let (c, mut s) = open(fx).await;
+        let change = match call(&mut s, fx, commit).await {
+            Ok(Payload::ChangePending { change, .. }) => change,
+            other => panic!("second commit: {other:?}"),
+        };
+        c.disconnect().await;
+        assert!(
+            wait_version(fx, v_b, Duration::from_secs(25)).await,
+            "B second start"
+        );
+        let t0 = Instant::now();
+        assert!(
+            wait_version(fx, v_a, Duration::from_secs(90)).await,
+            "timer did not roll back"
+        );
+        eprintln!(
+            "update: unconfirmed B rolled back {:?} after it came up (window {} ms)",
+            t0.elapsed(),
+            change.deadline_ms - change.created_ms
+        );
+        assert_eq!(agent_hash(fx), sha_a);
+        let (c, mut s) = open(fx).await;
+        let r = call(&mut s, fx, Op::ChangesList).await;
+        eprintln!("changes.list after rollback: {r:?}");
+        c.disconnect().await;
+    });
+}
+
 /// Last by name: footprint after every other test in this run.
 #[test]
 #[ignore = "needs Docker; run tests/vm/run.sh"]

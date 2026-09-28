@@ -159,6 +159,8 @@ impl Op {
             | Op::AgentUpdateStage { .. }
             | Op::AgentUpdateCommit { .. }
             | Op::AgentUpdateRollback
+            | Op::AgentUninstallPrepare
+            | Op::AgentUninstall { .. }
             | Op::AlertRulesUpdate(_)
             | Op::ShellExec(_)
             | Op::Unknown { .. } => Tier::Elevated,
@@ -233,7 +235,9 @@ impl Op {
             | Op::AuthorizedKeysSet { .. }
             | Op::MeshJoin(_)
             | Op::MeshLeave
-            | Op::MeshPeersSet { .. } => true,
+            | Op::MeshPeersSet { .. }
+            | Op::AgentUpdateCommit { .. }
+            | Op::AgentUninstallPrepare => true,
             Op::ProfileApply { spec, phase, .. } => phase.arms_auto_revert(spec),
             _ => false,
         }
@@ -445,6 +449,8 @@ impl Op {
             | Op::AgentUpdateStage { .. }
             | Op::AgentUpdateCommit { .. }
             | Op::AgentUpdateRollback
+            | Op::AgentUninstallPrepare
+            | Op::AgentUninstall { .. }
             | Op::AlertRulesGet
             | Op::Unknown { .. } => Ok(()),
         }

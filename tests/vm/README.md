@@ -7,7 +7,14 @@ tests/vm/run.sh              # Debian 12
 tests/vm/run.sh ubuntu24     # Ubuntu 24.04
 tests/vm/run.sh debian12 metrics   # only tests matching "metrics"
 FLEET_IT_KEEP=1 tests/vm/run.sh    # keep the container for debugging
+FLEET_IT_DEB=1 tests/vm/run.sh     # install through scripts/build-deb.sh's package
 ```
+
+It also builds a second agent (`FLEET_AGENT_VERSION=0.2.0`, into
+`target/linux/<arch>/next/`) for the update test
+(`update_confirmed_then_manual_and_timer_rollback`). The target volume is
+per checkout (`fleet-target-linux-<arch>-<cksum of the repo path>`), so
+concurrent worktrees don't share build artifacts.
 
 `run.sh` does three things:
 

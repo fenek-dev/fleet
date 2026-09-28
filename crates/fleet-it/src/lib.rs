@@ -14,6 +14,10 @@
 //! - `FLEET_IT_AGENT`: agent binary (default
 //!   `target/linux/<host arch>/fleet-agent`, see
 //!   `scripts/build-agent-linux.sh`).
+//! - `FLEET_IT_DEB`: a `.deb` from `scripts/build-deb.sh`; the install then
+//!   runs `dpkg -i` (users, units, binary) instead of copying files.
+//! - `FLEET_IT_AGENT_NEXT`: a second build with a higher version, for the
+//!   update test.
 #![forbid(unsafe_code)]
 
 use fleet_core::signer::{KeyRole, RoleSigner, SoftwareDeviceSigner};
@@ -394,6 +398,10 @@ impl Fixture {
             std::fs::copy(from, s.join(to)).map_err(|e| format!("{}: {e}", from.display()))
         };
         copy(&bin, "fleet-agent")?;
+        // `FLEET_IT_DEB`: install through the package (dpkg -i) instead.
+        if let Some(deb) = std::env::var_os("FLEET_IT_DEB") {
+            copy(Path::new(&deb), "fleet-agent.deb")?;
+        }
         let units = repo_root().join("packaging/systemd");
         std::fs::create_dir_all(s.join("systemd/tmpfiles.d")).map_err(err("mkdir"))?;
         copy(

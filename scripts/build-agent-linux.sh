@@ -6,7 +6,11 @@
 #
 #   scripts/build-agent-linux.sh [aarch64|x86_64]    (default: aarch64)
 #
-# Output: target/linux/<arch>/fleet-agent
+# Output: target/linux/<arch>/fleet-agent, or $FLEET_AGENT_OUT/fleet-agent.
+#
+# FLEET_AGENT_VERSION (optional, `major.minor.patch`) overrides the version
+# the agent reports and checks updates against (release builds; the update
+# harness builds the same source twice with different versions).
 #
 # aarch64 builds natively on Apple Silicon (linux/arm64 container).
 # x86_64 runs the container as linux/amd64 (Rosetta/QEMU emulation in
@@ -25,14 +29,28 @@ esac
 target="${arch}-unknown-linux-musl"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-out="$root/target/linux/$arch"
+out="${FLEET_AGENT_OUT:-$root/target/linux/$arch}"
 mkdir -p "$out"
+version_env=()
+if [ -n "${FLEET_AGENT_VERSION:-}" ]; then
+    case "$FLEET_AGENT_VERSION" in
+        *[!0-9.]* | "")
+            echo "FLEET_AGENT_VERSION must be major.minor.patch" >&2
+            exit 2
+            ;;
+    esac
+    version_env=(-e "FLEET_AGENT_VERSION=$FLEET_AGENT_VERSION")
+fi
 
 # Toolchain image (rust + musl-gcc for ring's C code); rust-toolchain.toml
 # pins the exact release, which rustup installs into the (persistent)
 # rustup volume on first use.
 image="fleet-agent-builder:$arch"
 suffix="${arch}"
+# One target volume per checkout: worktrees building concurrently into a
+# shared one see each other's artifacts (all mounted at /src, so cargo's
+# mtime fingerprints can't tell the sources apart).
+tree="$(printf '%s' "$root" | cksum | cut -d' ' -f1)"
 docker build -q --platform "$platform" -t "$image" \
     -f "$root/scripts/Dockerfile.agent-builder" "$root/scripts" >/dev/null
 
@@ -45,12 +63,13 @@ docker run --rm \
     -v "$out:/out" \
     -v "fleet-rustup-$suffix:/usr/local/rustup" \
     -v "fleet-cargo-registry-$suffix:/usr/local/cargo/registry" \
-    -v "fleet-target-linux-$suffix:/target" \
+    -v "fleet-target-linux-$suffix-$tree:/target" \
     -w /src \
     -e CARGO_TARGET_DIR=/target \
     -e CARGO_PROFILE_RELEASE_STRIP=symbols \
     -e TARGET="$target" \
     -e "$cc_var=musl-gcc" \
+    ${version_env[@]+"${version_env[@]}"} \
     "$image" \
     bash -euo pipefail -c '
         rustup target add "$TARGET" >/dev/null

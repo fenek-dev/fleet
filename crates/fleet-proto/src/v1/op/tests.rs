@@ -227,6 +227,8 @@ pub(super) fn samples() -> Vec<Op> {
             | Op::AgentUpdateStage { .. }
             | Op::AgentUpdateCommit { .. }
             | Op::AgentUpdateRollback
+            | Op::AgentUninstallPrepare
+            | Op::AgentUninstall { .. }
             | Op::AlertRulesGet
             | Op::AlertRulesUpdate(_)
             | Op::ShellExec(_)
@@ -560,6 +562,7 @@ pub(super) fn samples() -> Vec<Op> {
                     version,
                     blake3: [5; 32],
                     min_proto: 1,
+                    target: crate::v1::AgentTarget::X86_64,
                 },
                 device_id: DeviceId([2; 16]),
                 signature: Signature([6; 64]),
@@ -568,6 +571,11 @@ pub(super) fn samples() -> Vec<Op> {
         },
         Op::AgentUpdateCommit { version },
         Op::AgentUpdateRollback,
+        Op::AgentUninstallPrepare,
+        Op::AgentUninstall {
+            keep_audit: true,
+            remove_firewall: false,
+        },
         Op::AlertRulesGet,
         Op::AlertRulesUpdate(AlertRuleSet {
             version: 4,
@@ -765,6 +773,8 @@ fn tier_table() {
         "agent.update.stage",
         "agent.update.commit",
         "agent.update.rollback",
+        "agent.uninstall.prepare",
+        "agent.uninstall",
         "alert_rules.update",
         "shell.exec",
     ];
@@ -1180,7 +1190,9 @@ fn stream_and_session_sets() {
             "profile.apply",
             "mesh.join",
             "mesh.leave",
-            "mesh.peers.set"
+            "mesh.peers.set",
+            "agent.update.commit",
+            "agent.uninstall.prepare"
         ]
     );
 }

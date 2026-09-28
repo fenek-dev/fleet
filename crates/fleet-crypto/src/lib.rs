@@ -12,6 +12,7 @@ pub mod merkle;
 pub mod noise;
 pub mod receipt;
 pub mod recovery;
+pub mod release;
 pub mod roster;
 pub mod sig;
 pub mod stream;

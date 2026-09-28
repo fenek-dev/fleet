@@ -465,7 +465,7 @@ fn options(o: &BulkOptionsRow) -> Result<BulkOptions, FleetError> {
     })
 }
 
-fn targets(ids: &[String]) -> Result<Vec<ServerId>, FleetError> {
+pub(crate) fn targets(ids: &[String]) -> Result<Vec<ServerId>, FleetError> {
     ids.iter().map(|s| validate::server_id(s)).collect()
 }
 
@@ -625,7 +625,7 @@ impl FleetCore {
         }))
     }
 
-    fn spawn_run<F>(&self, fut: F) -> Result<Arc<BulkRunHandle>, FleetError>
+    pub(crate) fn spawn_run<F>(&self, fut: F) -> Result<Arc<BulkRunHandle>, FleetError>
     where
         F: FnOnce(CancelToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     {

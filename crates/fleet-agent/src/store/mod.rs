@@ -13,6 +13,7 @@ mod events;
 mod meta;
 mod metrics;
 mod replay;
+pub mod schema;
 mod security;
 
 pub use audit::{AuditLog, ChainError, ChainHead, CheckpointSigner, Intent};

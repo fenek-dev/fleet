@@ -126,12 +126,55 @@ pub struct AgentVersion {
     pub patch: u16,
 }
 
+/// CPU architecture of a static (musl) agent build (design §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentTarget {
+    X86_64,
+    Aarch64,
+}
+
+impl AgentTarget {
+    /// The architecture this code was compiled for; `None` on any other
+    /// (e.g. a Mac building for tests is `aarch64` too, which is fine: the
+    /// agent compares against its own build).
+    pub fn current() -> Option<Self> {
+        match std::env::consts::ARCH {
+            "x86_64" => Some(Self::X86_64),
+            "aarch64" => Some(Self::Aarch64),
+            _ => None,
+        }
+    }
+
+    /// Rust/Debian-neutral name (`x86_64`, `aarch64`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+
+    /// Parses [`AgentTarget::as_str`] and the Debian names (`amd64`, `arm64`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "x86_64" | "amd64" => Some(Self::X86_64),
+            "aarch64" | "arm64" => Some(Self::Aarch64),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseManifest {
+    /// Agents refuse any version not above the running one (design §5.7).
     pub version: AgentVersion,
     /// BLAKE3 of the agent binary.
     pub blake3: Hash32,
+    /// Oldest wire protocol the build still speaks; an agent refuses a
+    /// build whose `min_proto` is above its own `PROTO_VERSION` (the Macs
+    /// talking to it now couldn't talk to the new build).
     pub min_proto: u16,
+    /// Architecture the binary was built for; staging refuses a mismatch.
+    pub target: AgentTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

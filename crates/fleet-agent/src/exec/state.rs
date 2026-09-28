@@ -234,7 +234,7 @@ pub fn load_signing_key(paths: &Paths) -> Result<Ed25519Signer, ExecError> {
 
 impl State {
     pub(super) fn load(parts: StateParts) -> Result<Self, ExecError> {
-        let store = Store::open(&parts.paths.state_db)?;
+        let store = crate::store::schema::open_versioned(&parts.paths.state_db)?;
         let roster: SignedRoster = meta_decode(&store, MetaKey::Roster, "roster")?
             .ok_or(ExecError::NotInstalled("roster"))?;
         let server_id =
@@ -413,7 +413,10 @@ impl State {
     /// Per-entry problems are logged and quarantined, never fatal.
     /// Returns the confirm timers exec must re-arm (a reboot drops
     /// transient timers).
-    pub(super) fn startup(&mut self, now: u64) -> Result<Vec<(ChangeId, u32)>, ExecError> {
+    pub(super) fn startup(
+        &mut self,
+        now: u64,
+    ) -> Result<Vec<(ChangeId, u32, pending::ChangeKind)>, ExecError> {
         self.store.audit().mark_interrupted_on_start(now)?;
         self.pending_dir.create()?;
         self.pending_dir.repair_updates()?;
@@ -516,7 +519,7 @@ impl State {
     /// by a crash (`applying`), re-arm confirm timers for the rest (a reboot
     /// drops transient timers), quarantine unreadable files.
     /// Returns the confirm timers to re-arm `(id, seconds)`.
-    fn recover_pending(&mut self, now: u64) -> Vec<(ChangeId, u32)> {
+    fn recover_pending(&mut self, now: u64) -> Vec<(ChangeId, u32, pending::ChangeKind)> {
         let mut rearm = Vec::new();
         let entries = match self.pending_dir.scan() {
             Ok(e) => e,
@@ -550,7 +553,7 @@ impl State {
                 let secs = (change.deadline_ms - now).div_ceil(1000);
                 let secs = u32::try_from(secs).unwrap_or(u32::MAX).max(1);
                 // Armed by exec once its runtime runs (async runner).
-                rearm.push((e.id, secs));
+                rearm.push((e.id, secs, change.kind));
                 Ok(())
             };
             if let Err(err) = res {

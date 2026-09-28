@@ -29,6 +29,15 @@ fn main() -> ExitCode {
         Mode::Exec => run_exec(paths, dev),
         Mode::Install(args) => run_install(&paths, &args),
         Mode::Revert(id) => run_revert(&paths, id),
+        Mode::Uninstall(opts) => run_uninstall(&paths, opts, dev),
+        Mode::UserKeys(op, home) => {
+            fleet_agent::userkeys::helper_main(op, &home).map_err(|e| format!("user-keys: {e}"))
+        }
+        Mode::Version => {
+            let target = fleet_proto::AgentTarget::current().map_or("unknown", |t| t.as_str());
+            println!("{} {target}", fleet_agent::AGENT_VERSION_STR);
+            Ok(())
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -96,10 +105,28 @@ fn run_install(paths: &Paths, a: &InstallArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn run_uninstall(
+    paths: &Paths,
+    opts: fleet_agent::uninstall::UninstallOpts,
+    dev: bool,
+) -> Result<(), String> {
+    use fleet_agent::userkeys::{AsUser, Direct, UserKeys};
+    let runner = fleet_ops::SystemRunner;
+    // With --root (development) users' homes are handled in-process.
+    let as_user = AsUser(&runner);
+    let users: &dyn UserKeys = if dev { &Direct } else { &as_user };
+    let log = fleet_agent::uninstall::run_uninstall(paths, opts, &runner, users)
+        .map_err(|e| e.to_string())?;
+    for l in log {
+        println!("{l}");
+    }
+    Ok(())
+}
+
 fn run_revert(paths: &Paths, id: ChangeId) -> Result<(), String> {
     let dir = PendingDir::from_paths(paths);
     // Kinds without a restore module fail loudly rather than claim success.
-    let reverter = revert::RegistryRevert::system();
+    let reverter = revert::RegistryRevert::for_paths(paths);
     match revert::run_revert(&dir, id, &reverter, now_ms()).map_err(|e| e.to_string())? {
         RevertOutcome::Reverted | RevertOutcome::Kept | RevertOutcome::NotPending => Ok(()),
         RevertOutcome::Failed => Err("restore failed".into()),

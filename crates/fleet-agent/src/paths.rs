@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 
 /// The installed agent binary, as referenced by units and revert timers.
 pub const AGENT_BIN: &str = "/usr/lib/fleet/fleet-agent";
+/// The binary an update replaced. Revert timers of `ChangeKind::AgentUpdate`
+/// run this one (a broken new build can't block its own rollback).
+pub const AGENT_PREV_BIN: &str = "/usr/lib/fleet/fleet-agent.prev";
+/// `setpriv`: helpers that touch a user's home run as that user.
+pub const SETPRIV: &str = "/usr/bin/setpriv";
 /// `systemd-run`, used to arm auto-revert timers (design §4.10).
 pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 /// `systemctl`, used to disarm revert timers on confirmation.
@@ -46,8 +51,23 @@ pub struct Paths {
     pub gate_dir: PathBuf,
     /// Gate Noise static key (`0600 fleet-gate`).
     pub noise_key: PathBuf,
-    /// SFTP upload target for agent binaries (design §10.2).
+    /// Root-only (`0700 root`) staged agent builds, `<hex blake3>` plus
+    /// `<hex blake3>.manifest`, copied in from `incoming_dir` by
+    /// `agent.update.stage` (design §10.2).
     pub staging_dir: PathBuf,
+    /// SFTP drop for agent builds (`0700 <admin>`): the admin user uploads
+    /// here, exec copies out with `O_NOFOLLOW` while hashing.
+    pub incoming_dir: PathBuf,
+    /// The installed agent binary (units and timers name [`AGENT_BIN`]).
+    pub agent_bin: PathBuf,
+    /// The binary an update replaced (auto-revert and manual rollback).
+    pub agent_prev_bin: PathBuf,
+    /// `postcard(update::UpdateState)`: versions and hashes of the current
+    /// and previous binary.
+    pub update_state: PathBuf,
+    /// The root everything above is under (`/` in production); uninstall
+    /// removes host paths below it.
+    pub root: PathBuf,
     /// Root-owned `authorized_keys` directory (design §5.9).
     pub authorized_keys_dir: PathBuf,
     /// User database, for the `fleet-gate` uid.
@@ -80,6 +100,7 @@ impl Paths {
             exec_run_dir,
             quarantine_dir: exec_dir.join("quarantine"),
             state_db: exec_dir.join("state.redb"),
+            update_state: exec_dir.join("update.bin"),
             signing_key: exec_dir.join("signing.key"),
             pending_dir: exec_dir.join("pending"),
             reverted_dir: exec_dir.join("reverted"),
@@ -87,6 +108,10 @@ impl Paths {
             noise_key: gate_dir.join("noise.key"),
             gate_dir,
             staging_dir: r.join("var/lib/fleet/staging"),
+            incoming_dir: r.join("var/lib/fleet/incoming"),
+            agent_bin: r.join(&AGENT_BIN[1..]),
+            agent_prev_bin: r.join(&AGENT_PREV_BIN[1..]),
+            root: r.to_path_buf(),
             authorized_keys_dir: r.join("etc/fleet/authorized_keys"),
             passwd: r.join("etc/passwd"),
             group: r.join("etc/group"),

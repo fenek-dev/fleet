@@ -148,7 +148,13 @@ impl Exec {
         let mut raw = [0u8; 16];
         fleet_crypto::random_bytes(&mut raw).map_err(|_| ErrorCode::Internal)?;
         let id = ChangeId(raw);
-        let window = self.st.borrow().policy.safety.auto_revert_seconds.max(1);
+        // An agent update's window is the health window after its restart
+        // (design §10.2), not the policy's.
+        let window = if kind == ChangeKind::AgentUpdate {
+            crate::update::CONFIRM_WINDOW_S
+        } else {
+            self.st.borrow().policy.safety.auto_revert_seconds.max(1)
+        };
         let apply_secs = u32::try_from(self.apply_timeout.as_secs()).unwrap_or(u32::MAX);
         // Never before the confirm deadline (apply end + window), with
         // slack for the bookkeeping after the handler returns.
@@ -181,7 +187,7 @@ impl Exec {
             st.timers.clone()
         };
         // Never apply without an independent timer.
-        if let Err(e) = revert::arm_guard_async(timers.as_ref(), id, guard_secs).await {
+        if let Err(e) = revert::arm_guard_for_async(timers.as_ref(), id, guard_secs, kind).await {
             log("arm revert guard timer", e);
             if let Err(e) = self.st.borrow().pending_dir.remove(id) {
                 log("remove pending change", e);
@@ -245,7 +251,8 @@ impl Exec {
             }
         }
         let timers = self.st.borrow().timers.clone();
-        if let Err(e) = revert::arm_timer_async(timers.as_ref(), id, window).await {
+        if let Err(e) = revert::arm_timer_for_async(timers.as_ref(), id, window, change.kind).await
+        {
             log("arm revert timer", e);
             self.abort_change(id).await;
             return Err(ErrorCode::Internal);

@@ -35,7 +35,7 @@ pub use op::{Authorization, ChangeId, Group, Op, Tier};
 pub use payload::{F32, Payload, payload_tag};
 pub use policy::{Policy, PolicyError};
 pub use roster::{
-    AgentVersion, Device, Hash32, KeyRef, PrevRecovery, ReleaseManifest, Role, Roster,
+    AgentTarget, AgentVersion, Device, Hash32, KeyRef, PrevRecovery, ReleaseManifest, Role, Roster,
     SignedReleaseManifest, SignedRoster,
 };
 pub use stream::{SignedStreamSeal, StreamChunk, StreamSeal};

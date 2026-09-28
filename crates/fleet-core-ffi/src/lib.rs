@@ -41,6 +41,7 @@ mod mesh_game;
 mod ops;
 mod provision;
 mod recovery;
+mod release;
 mod rows;
 mod search;
 mod signer;
