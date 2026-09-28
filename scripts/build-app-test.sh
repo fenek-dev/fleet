@@ -37,6 +37,9 @@ if [[ "$action" == "test" ]]; then
     done
     echo $$ >"$lock/pid"
     trap 'rm -rf "$lock"' EXIT
+    # A hung test must not hold the shared lock for long: 10 min per test.
+    set -- -test-timeouts-enabled YES -default-test-execution-time-allowance 600 \
+        -maximum-test-execution-time-allowance 600 "$@"
 fi
 
 xcodebuild -project Fleet.xcodeproj -scheme Fleet -configuration Debug \
