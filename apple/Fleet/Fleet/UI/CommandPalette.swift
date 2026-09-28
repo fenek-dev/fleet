@@ -52,6 +52,7 @@ struct CommandPalette: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 15))
                     .focused($focused)
+                    .accessibilityIdentifier("palette.query")
                     .onSubmit { run(list) }
             }
             .padding(14)
@@ -71,6 +72,9 @@ struct CommandPalette: View {
                         .background(i == highlighted ? Color.selected : .clear,
                                     in: RoundedRectangle(cornerRadius: 8))
                         .contentShape(Rectangle())
+                        .accessibilityElement(children: .combine)
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityIdentifier("palette.item.\(a.id)")
                         .onTapGesture { highlighted = i; run(list) }
                     }
                 }

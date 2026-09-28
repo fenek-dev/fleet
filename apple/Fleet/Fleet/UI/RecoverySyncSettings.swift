@@ -37,6 +37,7 @@ struct RecoverySettings: View {
                 SecureField("24 words", text: $words)
                 SecureField("Passphrase (if any)", text: $passphrase)
                 Button("Check code") { runDrill() }
+                    .accessibilityIdentifier("recovery.checkCode")
                     .disabled(busy || words.split(separator: " ").count != 24)
                 ForEach(drill, id: \.serverId) { r in
                     LabeledContent(r.name.isEmpty ? r.serverId : r.name, value: r.result)
@@ -55,12 +56,14 @@ struct RecoverySettings: View {
                          : "Without a strong passphrase recovery waits 72 hours and can be vetoed.")
                         .font(.secondary).foregroundStyle(Color.textMuted)
                     Button("Replace with Touch ID") { rotate() }.disabled(busy)
+                        .accessibilityIdentifier("recovery.replaceCode")
                 } else {
                     Text("Write these words down. The old code keeps working for 72 hours.")
                         .foregroundStyle(Tone.warn.text)
                     Text(newWords.enumerated().map { "\($0 + 1). \($1)" }.joined(separator: "   "))
                         .font(.mono(12)).textSelection(.disabled).privacySensitive()
                     Button("I wrote them down") { newWords = [] }
+                        .accessibilityIdentifier("recovery.wroteDown")
                 }
             }
             if let error { Text(error).foregroundStyle(Tone.critical.text) }
@@ -136,6 +139,7 @@ struct SyncSettings: View {
                     LabeledContent("Last sync", value: sync.lastSync?.formatted() ?? "never")
                     if let e = sync.lastError { Text(e).foregroundStyle(Tone.warn.text) }
                     Button("Sync now") { Task { await sync.cycle(); load() } }
+                        .accessibilityIdentifier("sync.syncNow")
                         .disabled(sync.running)
                 }
                 Text("Records are encrypted on this Mac with the fleet's sync key; Apple stores only ciphertext.")
@@ -207,6 +211,7 @@ struct SudoPasswordButton: View {
 
     var body: some View {
         Button("Sudo password…") { reveal() }
+            .accessibilityIdentifier("server.sudoPassword")
             .popover(isPresented: Binding(get: { shown != nil || error != nil },
                                           set: { if !$0 { shown = nil; error = nil } })) {
                 VStack(alignment: .leading, spacing: 8) {

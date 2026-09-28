@@ -108,6 +108,7 @@ struct ProvisionView: View {
             }
             Spacer()
             Button("Export as cloud-init") { cloudInitShown = true }
+                .accessibilityIdentifier("provision.exportCloudInit")
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 16)
@@ -135,12 +136,15 @@ struct ProvisionView: View {
                     }
                 }
                 .frame(maxWidth: 420)
+                .accessibilityIdentifier("provision.server")
                 HStack {
                     Button("Add server…") { addSheet = AddSheet(existing: nil) }
+                        .accessibilityIdentifier("provision.addServer")
                     if let s = server, !s.agentPinned {
                         Button(s.hostKeyPinned ? "Install agent…" : "Confirm host key and install…") {
                             addSheet = AddSheet(existing: s)
                         }
+                        .accessibilityIdentifier("provision.installAgent")
                         .buttonStyle(.borderedProminent).tint(.accent)
                     }
                 }
@@ -154,6 +158,7 @@ struct ProvisionView: View {
                     HStack {
                         TextField("Export id (ci_…)", text: $exportId)
                             .font(.mono(12)).frame(maxWidth: 260)
+                            .accessibilityIdentifier("provision.exportId")
                         if !CloudInitExports.recent.isEmpty {
                             Menu("Recent") {
                                 ForEach(CloudInitExports.recent, id: \.id) { e in
@@ -163,6 +168,7 @@ struct ProvisionView: View {
                             .frame(width: 90)
                         }
                         Button("Pin host key") { pinExport(s) }
+                            .accessibilityIdentifier("provision.pinHostKey")
                             .disabled(exportId.isEmpty)
                     }
                 }
@@ -192,8 +198,10 @@ struct ProvisionView: View {
                     Spacer()
                     if state != nil {
                         Button("Back") { editingProfile = false }
+                            .accessibilityIdentifier("provision.back")
                     }
                     Button("Review plan") { begin() }
+                        .accessibilityIdentifier("provision.reviewPlan")
                         .buttonStyle(.borderedProminent).tint(.accent)
                         .disabled(running || form.name.isEmpty || form.adminUser.isEmpty
                                   || securityMode != .managed)
@@ -221,9 +229,12 @@ struct ProvisionView: View {
                     }
                     HStack {
                         Button("Edit profile") { editingProfile = true }
+                            .accessibilityIdentifier("provision.editProfile")
                         Button("Cancel provisioning", role: .destructive) { cancel() }
+                            .accessibilityIdentifier("provision.cancel")
                         Spacer()
                         Button("Apply") { approve() }
+                            .accessibilityIdentifier("provision.apply")
                             .buttonStyle(.borderedProminent).tint(.accent)
                             .disabled(running || securityMode != .managed)
                     }
@@ -248,13 +259,16 @@ struct ProvisionView: View {
                     Text(e).font(.base).foregroundStyle(Tone.critical.text).textSelection(.enabled)
                     HStack {
                         Button("Resume") { advance() }
+                            .accessibilityIdentifier("provision.resume")
                             .buttonStyle(.borderedProminent).tint(.accent)
                         Button("Cancel provisioning", role: .destructive) { cancel() }
+                            .accessibilityIdentifier("provision.cancelFailed")
                     }
                 }
                 .card()
             } else if !running {
                 Button("Resume") { advance() }.buttonStyle(.borderedProminent).tint(.accent)
+                    .accessibilityIdentifier("provision.resumeIdle")
             }
             if !(state?.modules.isEmpty ?? true) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -330,9 +344,11 @@ struct ProvisionView: View {
                     state = nil
                     form = ProvisionForm()
                 }
+                .accessibilityIdentifier("provision.another")
                 Spacer()
                 if let id = serverId {
                     Button("Open server") { selection = .server(id) }
+                        .accessibilityIdentifier("provision.openServer")
                         .buttonStyle(.borderedProminent).tint(.accent)
                 }
             }
@@ -513,11 +529,14 @@ private struct ProfileFormView: View {
             section("Server") {
                 HStack(spacing: 12) {
                     TextField("Name", text: $form.name)
+                        .accessibilityIdentifier("provision.name")
                     Picker("Group", selection: $form.groupId) {
                         Text("None").tag(String?.none)
                         ForEach(groups, id: \.id) { Text($0.name).tag(Optional($0.id)) }
                     }
+                    .accessibilityIdentifier("provision.group")
                     TextField("Tags", text: $form.tags, prompt: Text("web, docker, eu-central"))
+                        .accessibilityIdentifier("provision.tags")
                 }
             }
             section("Security profile") {
@@ -537,6 +556,7 @@ private struct ProfileFormView: View {
                 }
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
+                .accessibilityIdentifier("provision.level")
             }
             section("Roles") {
                 role("Docker / Compose", "Ports bind to localhost unless you publish them.", $form.docker)
@@ -546,19 +566,23 @@ private struct ProfileFormView: View {
             section("Access") {
                 TextField("Admin user", text: $form.adminUser, prompt: Text("ops"))
                     .frame(maxWidth: 260)
+                    .accessibilityIdentifier("provision.adminUser")
                 Picker("SSH reachable from", selection: $form.sshFromAnywhere) {
                     Text("Anywhere, rate-limited").tag(true)
                     Text("Only these ranges").tag(false)
                 }
                 .pickerStyle(.radioGroup)
+                .accessibilityIdentifier("provision.sshFrom")
                 if !form.sshFromAnywhere {
                     TextField("CIDR ranges", text: $form.allowFrom, prompt: Text("203.0.113.0/24, 2001:db8::/32"))
                         .font(.mono(12))
+                        .accessibilityIdentifier("provision.cidr")
                 }
                 Picker("Reboot window", selection: $form.rebootWindow) {
                     ForEach(ProvisionForm.RebootChoice.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .frame(maxWidth: 360)
+                .accessibilityIdentifier("provision.rebootWindow")
             }
         }
     }
@@ -571,6 +595,7 @@ private struct ProfileFormView: View {
             }
         }
         .toggleStyle(.checkbox)
+        .accessibilityIdentifier("provision.role.\(title)")
     }
 
     private func section(_ title: String, @ViewBuilder _ content: () -> some View) -> some View {

@@ -31,6 +31,7 @@ struct AgentReleasesSettings: View {
                         .foregroundStyle(artifact == nil ? Color.textMuted : Color.primary)
                     Spacer()
                     Button("Choose…") { choose() }.disabled(busy)
+                        .accessibilityIdentifier("releases.choose")
                 }
                 if let hash {
                     LabeledContent("BLAKE3 of the binary") {
@@ -38,11 +39,13 @@ struct AgentReleasesSettings: View {
                     }
                 }
                 TextField("Version (major.minor.patch)", text: $version)
+                    .accessibilityIdentifier("releases.version")
                 Picker("Architecture", selection: $target) {
                     Text("x86_64 (amd64)").tag("x86_64")
                     Text("aarch64 (arm64)").tag("aarch64")
                 }
                 TextField("Independent build's BLAKE3 (b3sum output)", text: $attested)
+                    .accessibilityIdentifier("releases.attested")
                     .font(.mono(11))
                 Text("Rebuild the same source on a second machine or CI (pinned toolchain, "
                      + "--locked) and paste its hash. The app signs only when both builds agree.")
@@ -52,6 +55,7 @@ struct AgentReleasesSettings: View {
                         .foregroundStyle(Tone.critical.text)
                 }
                 Button("Sign release…") { sign() }
+                    .accessibilityIdentifier("releases.sign")
                     .disabled(busy || !attestationMatches || version.isEmpty)
             }
             Section("Signed releases") {
@@ -67,6 +71,7 @@ struct AgentReleasesSettings: View {
                         }
                         Spacer()
                         Button("Roll out to all servers…") { rollout(r) }
+                            .accessibilityIdentifier("releases.rollout")
                             .disabled(busy || progress.isRunning || core.servers.isEmpty)
                     }
                 }

@@ -49,7 +49,9 @@ struct CloudInitExportSheet: View {
                 .font(.base).foregroundStyle(Color.textSecondary)
             Form {
                 TextField("Admin user", text: $adminUser)
+                    .accessibilityIdentifier("cloudInit.adminUser")
                 TextField("Hostname", text: $hostname, prompt: Text("web-05 (optional)"))
+                    .accessibilityIdentifier("cloudInit.hostname")
             }
             .formStyle(.grouped)
             .disabled(result != nil)
@@ -79,13 +81,16 @@ struct CloudInitExportSheet: View {
             }
             HStack {
                 Button(result == nil ? "Cancel" : "Done") { dismiss() }
+                    .accessibilityIdentifier("cloudInit.close")
                 Spacer()
                 if result == nil {
                     Button("Generate") { generate() }
+                        .accessibilityIdentifier("cloudInit.generate")
                         .buttonStyle(.borderedProminent).tint(.accent)
                         .disabled(adminUser.isEmpty)
                 } else {
                     Button("Save…") { save() }
+                        .accessibilityIdentifier("cloudInit.save")
                         .buttonStyle(.borderedProminent).tint(.accent)
                 }
             }
