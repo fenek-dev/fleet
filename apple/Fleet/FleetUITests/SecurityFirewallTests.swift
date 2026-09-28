@@ -20,6 +20,8 @@ final class SecurityFirewallTests: FleetUITestCase {
         _ = waitForFile("ssh_pubkey")
         // Give the watcher a moment to authorize the key on the server.
         Thread.sleep(forTimeInterval: 6)
+        let lock = wait("sidebar.lock")
+        if lock.label == "Unlock" { lock.click(); Thread.sleep(forTimeInterval: 2) }
         tap("fleet.addServer")
         replace("addServer.name", with: "sec-1")
         replace("addServer.host", with: "127.0.0.1")
