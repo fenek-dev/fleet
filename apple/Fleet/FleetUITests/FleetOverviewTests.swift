@@ -32,6 +32,10 @@ final class FleetOverviewTests: FleetUITestCase {
         guard let go = waitForFile("go", timeout: 900) else {
             throw XCTSkip("no servers provided (no <dataDir>/go)")
         }
+        if element("sidebar.lock").label == "Unlock" {
+            tap("sidebar.lock")
+            Thread.sleep(forTimeInterval: 3)
+        }
         let ports = go.split(separator: ",").map(String.init)
         for (i, p) in ports.enumerated() {
             addPoolServer(name: "srv-\(i + 1)", port: p, tags: i == 0 ? "web" : "web, docker")
