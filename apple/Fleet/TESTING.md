@@ -30,7 +30,7 @@ Keep the dir path short (under about 60 characters): it holds `mcp.sock`, and Un
 | `FLEET_DATA_DIR=<dir>` | Every app file (`cache.sqlite`, `vulns.sqlite`, `mcp.sock`, the core's download dirs) lives under it. UserDefaults/`@AppStorage` go to `<dir>/defaults.plist`. Keychain items (keys, Noise key, sync key, sudo passwords) are files in `<dir>/keys/` (0600). |
 | `FLEET_TEST_SIGNER=1` | Software P-256 keys. App lock, root-key signatures, sudo-password reveal and AI/MCP approval prompts skip Touch ID and append `TEST-APPROVE <kind>: <reason>` to `<dir>/approvals.log`. Assert on that file to prove Touch ID would have been asked. |
 | `FLEET_TEST_AUTO_PAIR=0` | With the signer on, MCP pairing prompts are answered automatically (approval logged). `0` keeps the pairing sheet (`aiPrompt.approve` / `aiPrompt.deny`). |
-| `FLEET_TEST_AGENT_ARTIFACT=<path>` | "Choose…" in the install step picks this file (no file panel). |
+| `FLEET_TEST_AGENT_ARTIFACT=<path>` | "Choose…" in the install step picks this file (no file panel). Use the `.deb` (`agent-artifact.sh --deb-only`): a bare binary is refused on a fresh pool server (no fleet-gate user/units). |
 
 Once the keys exist (after onboarding, and on every later launch) the app writes `<dir>/ssh_pubkey` and `<dir>/monitor_ssh_pubkey` (OpenSSH lines). Authorize `ssh_pubkey` on a server before "Add and connect". The monitor key is pinned by the agent install itself.
 

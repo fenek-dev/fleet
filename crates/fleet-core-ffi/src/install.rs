@@ -209,10 +209,15 @@ impl FleetCore {
             let (handle, _) = core.running()?;
             let state = handle.wait_ready(&id, READY_TIMEOUT).await;
             if state != Some(CoreState::Ready) {
-                return Err(FleetError::NotReady {
-                    state: state
-                        .map(ConnState::from)
-                        .unwrap_or(ConnState::Disconnected),
+                // The agent is installed and pinned; only the session
+                // failed. Say so, so the operator doesn't re-run the install.
+                return Err(FleetError::Install {
+                    message: format!(
+                        "The agent is installed and its keys are pinned, but this Mac could not \
+                         open a session to it (state: {}). Check the server's Overview for the \
+                         connection error and reconnect; there is no need to install again.",
+                        state.map_or_else(|| "disconnected".to_string(), |s| format!("{s:?}"))
+                    ),
                 });
             }
             listener.on_progress(InstallProgress::step(InstallStep::CheckingHealth));

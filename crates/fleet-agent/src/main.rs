@@ -27,7 +27,7 @@ fn main() -> ExitCode {
             run_async(gate::run(GateConfig::new(paths), terminate())).map_err(|e| e.to_string())
         }
         Mode::Exec => run_exec(paths, dev),
-        Mode::Install(args) => run_install(&paths, &args),
+        Mode::Install(args) => run_install(&paths, &args, dev),
         Mode::Revert(id) => run_revert(&paths, id),
         Mode::Uninstall(opts) => run_uninstall(&paths, opts, dev),
         Mode::UserKeys(op, home) => {
@@ -91,7 +91,7 @@ fn run_exec(paths: Paths, dev: bool) -> Result<(), String> {
     run_async(exec::run(ExecConfig::new(paths, gate_uid), terminate())).map_err(|e| e.to_string())
 }
 
-fn run_install(paths: &Paths, a: &InstallArgs) -> Result<(), String> {
+fn run_install(paths: &Paths, a: &InstallArgs, dev: bool) -> Result<(), String> {
     let genesis = std::fs::read(&a.genesis).map_err(|e| format!("genesis: {e}"))?;
     let input = InstallInput {
         genesis: install::parse_genesis(&genesis).map_err(|e| e.to_string())?,
@@ -100,6 +100,25 @@ fn run_install(paths: &Paths, a: &InstallArgs) -> Result<(), String> {
         admin_user: a.admin_user.clone(),
     };
     let out = install::install(paths, &input).map_err(|e| e.to_string())?;
+    // Monitor sessions authenticate with their own SSH key, which must be
+    // in the file sshd reads: still ~/.ssh/authorized_keys (design §5.9,
+    // §10.1). Done here too because Agent-only never syncs keys later.
+    if let Some(admin) = &a.admin_user
+        && fsutil::current_uid().is_ok_and(|u| u == 0)
+    {
+        use fleet_agent::userkeys::{AsUser, Direct, UserKeys};
+        let runner = fleet_ops::SystemRunner;
+        let as_user = AsUser(&runner);
+        let users: &dyn UserKeys = if dev { &Direct } else { &as_user };
+        if let Err(e) = fleet_agent::authorized_keys::sync_home_monitor(
+            paths,
+            admin,
+            Some(&input.genesis.roster),
+            users,
+        ) {
+            eprintln!("fleet-agent: monitor keys in ~/.ssh/authorized_keys: {e}");
+        }
+    }
     println!("noise_static={}", hex::encode(out.noise_static.0));
     println!("signing_key={}", hex::encode(out.signing_key.0));
     Ok(())

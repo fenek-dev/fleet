@@ -44,6 +44,8 @@ pub enum InstallError {
     NoGateUser,
     #[error("group {0} does not exist (packaging creates it)")]
     NoGroup(&'static str),
+    #[error("adding the admin user to group fleet failed: {0}")]
+    AdminGroup(String),
     #[error("already installed (a roster is stored)")]
     AlreadyInstalled,
     #[error("key file {0} is corrupt")]
@@ -110,6 +112,40 @@ impl Owners {
             fleet_gid: gid(FLEET_GROUP)?,
             gate_gid: gid(GATE_USER)?,
         })
+    }
+}
+
+const USERMOD: &str = "/usr/sbin/usermod";
+
+/// Argument list of the fixed-path `usermod` call (never a shell string).
+fn usermod_args(user: &str) -> [&str; 4] {
+    ["--append", "--groups", FLEET_GROUP, user]
+}
+
+/// Adds `user` to `fleet` (idempotent; `usermod --append`).
+fn add_to_fleet_group(user: &str) -> Result<(), InstallError> {
+    let out = std::process::Command::new(USERMOD)
+        .args(usermod_args(user))
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(InstallError::AdminGroup(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn usermod_appends_to_fleet() {
+        assert_eq!(
+            super::usermod_args("ops"),
+            ["--append", "--groups", "fleet", "ops"]
+        );
     }
 }
 
@@ -198,6 +234,13 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
         }
     };
 
+    // The admin's SSH sessions run `fleet-agent bridge`, which reaches
+    // `agent.sock` (fleet-gate:fleet 0660) only as a member of `fleet`
+    // (design §4.1). Sessions opened afterwards carry the new group.
+    if let (Some(u), Some(_)) = (&input.admin_user, &owners) {
+        add_to_fleet_group(u)?;
+    }
+
     let roster = encode(&input.genesis);
     let policy = encode(&StoredPolicy {
         toml: input.policy_toml.clone(),
@@ -213,6 +256,7 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
     ];
     if let Some(u) = &input.admin_user {
         changes.push((MetaKey::AdminUser, Some(u.as_bytes())));
+        crate::uninstall::record_admin(paths, u);
     }
     store.meta().update(&changes)?;
 

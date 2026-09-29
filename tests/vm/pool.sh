@@ -115,8 +115,17 @@ case "$cmd" in
             i=$((i + 1))
         done
         for name in "${started[@]}"; do
-            state="$(docker exec "$name" systemctl is-system-running --wait 2>/dev/null || true)"
-            state="$(echo "$state" | tail -n1)"
+            # Right after `docker run`, systemd may not answer yet (ubuntu24
+            # returns nothing): retry until it prints a state, then wait.
+            state=""
+            for _ in $(seq 1 60); do
+                state="$(docker exec "$name" systemctl is-system-running --wait 2>/dev/null || true)"
+                state="$(echo "$state" | tail -n1)"
+                case "$state" in
+                    running | degraded) break ;;
+                esac
+                sleep 1
+            done
             case "$state" in
                 running | degraded) ;;
                 *)

@@ -12,8 +12,13 @@
 //!    catches transport errors: nothing on the server is trusted to verify
 //!    the agent (signed-manifest checks come with `agent.update.*`).
 //! 3. `.deb`: `dpkg -i` it (creates users, units, `/usr/lib/fleet`), then
-//!    run the installed binary; bare binary: run it from `/tmp` (development:
-//!    the package's users and units must already exist).
+//!    run the installed binary; bare binary: refused up front unless the
+//!    package's `fleet-gate` user already exists ([`InstallError::NeedsPackage`]),
+//!    else `install(1)`ed root-owned to `/usr/lib/fleet/fleet-agent` and run
+//!    from there (`/tmp` is often noexec).
+//!    `fleet-agent install` (root) adds the admin user to group `fleet`; a
+//!    fresh login must show the group (`id -nG`) before the install is
+//!    reported done ([`InstallError::NotInFleetGroup`]).
 //!    `fleet-agent install --genesis … --policy … --server-id … --admin-user …`
 //!    prints `noise_static=<hex>` and `signing_key=<hex>`; those are pinned.
 //! 4. `systemctl enable --now` the two units, remove the temp files.
@@ -43,6 +48,9 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const RM: &str = "/usr/bin/rm";
 const CAT: &str = "/usr/bin/cat";
 const UNAME: &str = "/usr/bin/uname";
+const GETENT: &str = "/usr/bin/getent";
+const INSTALL: &str = "/usr/bin/install";
+const ID: &str = "/usr/bin/id";
 const MAX_OUTPUT: usize = 64 * 1024;
 const STEP_TIMEOUT: Duration = Duration::from_secs(300);
 /// Reading the local artifact (a few MB): only a permission prompt or a
@@ -73,12 +81,26 @@ pub enum InstallError {
     #[error("uploaded file hash differs (transport error)")]
     HashMismatch,
     /// A remote step failed; `stderr` is untrusted server text.
-    #[error("{step} failed (exit {status:?}): {stderr}")]
+    #[error("{step} failed ({}){}", exit_text(*status), stderr_suffix(stderr))]
     Remote {
         step: &'static str,
         status: Option<u32>,
         stderr: String,
     },
+    /// A bare binary was chosen but the server has no Fleet package yet
+    /// (`fleet-gate` user / `fleet` group), which only the `.deb` creates.
+    #[error(
+        "this server has no Fleet agent package (users and services are missing), so a bare \
+         fleet-agent binary can't be installed; choose the .deb package instead"
+    )]
+    NeedsPackage,
+    /// The install finished but a fresh login of the admin user is not in
+    /// group `fleet`, so `fleet-agent bridge` can't reach the agent.
+    #[error(
+        "the agent is installed, but user {0} is not in the server's `fleet` group, so it can't \
+         reach the agent socket; run `sudo usermod -aG fleet {0}` on the server and reconnect"
+    )]
+    NotInFleetGroup(String),
     /// A local step (not a remote command, whose timeout is
     /// [`SshError::Timeout`]) made no progress in time.
     #[error("{0} timed out")]
@@ -316,6 +338,21 @@ pub struct InstalledAgent {
     pub signing_key: Ed25519Public,
 }
 
+fn exit_text(status: Option<u32>) -> String {
+    match status {
+        Some(c) => format!("exit {c}"),
+        None => "killed by a signal".into(),
+    }
+}
+
+fn stderr_suffix(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    }
+}
+
 /// Longest stderr excerpt kept in an error.
 const MAX_STDERR: usize = 2000;
 
@@ -333,7 +370,7 @@ fn truncate_chars(mut s: String, max: usize) -> String {
 
 fn remote_failure(step: &'static str, out: &ExecOutput) -> InstallError {
     let stderr = truncate_chars(
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
         MAX_STDERR,
     );
     InstallError::Remote {
@@ -434,6 +471,20 @@ pub async fn install_agent(
             InstallError::Artifact("no artifact".into())
         })?;
         let kind = ArtifactKind::of(&path);
+        // A bare binary can't create the `fleet-gate` user, the `fleet`
+        // group or the units: refuse before uploading anything.
+        if kind == ArtifactKind::Binary {
+            let out = conn
+                .exec_capture(
+                    &command_line(&[GETENT, "passwd", "fleet-gate"])?,
+                    MAX_OUTPUT,
+                    Duration::from_secs(30),
+                )
+                .await?;
+            if out.status != Some(0) {
+                return Err(InstallError::NeedsPackage);
+            }
+        }
         // Every digest below is computed from these captured bytes: the
         // file is never reopened, so it can't change between the check
         // and the upload.
@@ -534,7 +585,28 @@ pub async fn install_agent(
                     run(&conn, "dpkg -i", &t).await?;
                     INSTALLED_AGENT.to_string()
                 }
-                ArtifactKind::Binary => bin.clone(),
+                ArtifactKind::Binary => {
+                    // /tmp is often noexec (CIS hardening, Fleet's own
+                    // Strict profile): copy into the root-owned agent
+                    // directory and run it from there.
+                    let mut t = sudo.to_vec();
+                    t.extend([INSTALL, "-d", "-m", "0755", "-o", "root", "-g", "root", "/usr/lib/fleet"]);
+                    run(&conn, "install directory", &t).await?;
+                    let mut t = sudo.to_vec();
+                    t.extend([
+                        INSTALL,
+                        "-m",
+                        "0755",
+                        "-o",
+                        "root",
+                        "-g",
+                        "root",
+                        value(&bin)?,
+                        INSTALLED_AGENT,
+                    ]);
+                    run(&conn, "install agent binary", &t).await?;
+                    INSTALLED_AGENT.to_string()
+                }
             };
             let mut t = sudo.to_vec();
             t.extend([
@@ -562,6 +634,22 @@ pub async fn install_agent(
                 "fleet-gate.service",
             ]);
             run(&conn, "systemctl enable", &t).await?;
+
+            // `fleet-agent install` put the admin user in group `fleet`;
+            // only a fresh login carries it, and that is what the app's
+            // bridge sessions use. Root reaches the socket regardless.
+            if req.target.user != "root" {
+                let (fresh, _) =
+                    SshConnection::connect(req.target, ssh_key, Some(req.host_key.clone()))
+                        .await?;
+                let groups = run(&fresh, "id", &[ID, "-nG"]).await;
+                fresh.disconnect().await;
+                let groups = groups?;
+                let text = String::from_utf8_lossy(&groups.stdout);
+                if !text.split_whitespace().any(|g| g == "fleet") {
+                    return Err(InstallError::NotInFleetGroup(admin.to_string()));
+                }
+            }
             Ok(InstalledAgent {
                 noise_static,
                 signing_key,
@@ -608,7 +696,7 @@ mod tests {
             "sudo -n dpkg -i /tmp/x.deb"
         );
         assert!(command_line(&["rm", "-f", "/tmp/a b"]).is_err());
-        for bin in [SUDO, SHA256SUM, DPKG, SYSTEMCTL, RM, CAT, UNAME] {
+        for bin in [SUDO, SHA256SUM, DPKG, SYSTEMCTL, RM, CAT, UNAME, GETENT, INSTALL, ID] {
             assert!(bin.starts_with("/usr/bin/") && is_token(bin));
         }
     }
@@ -691,6 +779,18 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         // Unblock the abandoned reader thread so the runtime can shut down.
         let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+
+    #[test]
+    fn remote_error_text() {
+        let e = InstallError::Remote {
+            step: "fleet-agent install",
+            status: Some(1),
+            stderr: "sudo: nope".into(),
+        };
+        assert_eq!(e.to_string(), "fleet-agent install failed (exit 1): sudo: nope");
+        let e = InstallError::Remote { step: "x", status: None, stderr: String::new() };
+        assert_eq!(e.to_string(), "x failed (killed by a signal)");
     }
 
     #[test]

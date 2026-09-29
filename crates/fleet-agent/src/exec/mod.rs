@@ -838,6 +838,7 @@ pub fn registry_tags(mut cfg: ExecConfig) -> Result<Vec<u16>, ExecError> {
         reverter: cfg.reverter,
         timers: cfg.timers,
         terminator,
+        user_keys: cfg.user_keys,
     })?;
     let st = Rc::new(RefCell::new(state));
     let b = build(
@@ -885,6 +886,7 @@ pub async fn run(mut cfg: ExecConfig, shutdown: impl Future<Output = ()>) -> Res
         reverter: cfg.reverter,
         timers: cfg.timers,
         terminator,
+        user_keys: cfg.user_keys,
     })?;
     let rearm = state.startup(now_ms())?;
 

@@ -100,15 +100,33 @@ pub fn portable_lines(text: &str) -> String {
     out
 }
 
-/// Users with a Fleet key file, their passwd entry and portable lines.
+/// Where install (and exec at start) record the admin user, outside the
+/// store so prepare's revert and the CLI can read it without opening it.
+fn admin_marker(paths: &Paths) -> std::path::PathBuf {
+    paths.exec_dir.join("admin-user")
+}
+
+/// Records the admin user for [`users_plan`].
+pub fn record_admin(paths: &Paths, admin: &str) {
+    let p = admin_marker(paths);
+    if fs::read_to_string(&p).is_ok_and(|t| t.trim() == admin) {
+        return;
+    }
+    if let Err(e) = fsutil::write_atomic(&p, admin.as_bytes(), 0o600) {
+        eprintln!("fleet-agent: record admin user: {e}");
+    }
+}
+
+/// Users with a Fleet key file (plus the recorded admin user, whose
+/// Agent-only install has none), their passwd entry and portable lines.
 pub fn users_plan(paths: &Paths) -> Result<Vec<(String, UserEntry, String)>, OpError> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(&paths.authorized_keys_dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Ok(e) => Some(e),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(OpError::internal(format!("authorized_keys dir: {e}"))),
     };
-    for e in entries.flatten() {
+    for e in entries.into_iter().flatten().flatten() {
         let Some(user) = e.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -120,9 +138,17 @@ pub fn users_plan(paths: &Paths) -> Result<Vec<(String, UserEntry, String)>, OpE
         };
         let text = fs::read_to_string(e.path())
             .map_err(|e| OpError::internal(format!("read keys of {user}: {e}")))?;
-        let lines = portable_lines(&text);
-        if !lines.is_empty() {
-            out.push((user, entry, lines));
+        // Users without portable keys stay in the plan: their own
+        // `~/.ssh/authorized_keys` may still hold Fleet monitor lines.
+        out.push((user, entry, portable_lines(&text)));
+    }
+    if let Ok(admin) = fs::read_to_string(admin_marker(paths)) {
+        let admin = admin.trim();
+        if !admin.is_empty()
+            && !out.iter().any(|(u, _, _)| u == admin)
+            && let Some(entry) = fsutil::lookup_user(&paths.passwd, admin)
+        {
+            out.push((admin.to_owned(), entry, String::new()));
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -190,7 +216,12 @@ pub fn apply_ssh(
     users: &dyn UserKeys,
 ) -> Result<(), OpError> {
     for (_, entry, lines) in users_plan(paths)? {
-        users.merge(&entry, &lines)?;
+        if !lines.is_empty() {
+            users.merge(&entry, &lines)?;
+        }
+        // The monitor lines install (and roster syncs) put there point at
+        // the agent being removed.
+        users.sync_monitor(&entry, "")?;
     }
     for c in FLEET_SSHD_CONFS {
         let p = host(paths, c);
@@ -510,6 +541,37 @@ mod tests {
         )
         .unwrap();
         (d, paths, home.display().to_string())
+    }
+
+    /// Agent-only installs have no `/etc/fleet/authorized_keys` files: the
+    /// recorded admin user's monitor lines must still be snapshotted,
+    /// removed and restored.
+    #[test]
+    fn agent_only_admin_monitor_lines_are_cleaned_and_restored() {
+        let (_d, paths, home) = setup();
+        fs::remove_dir_all(&paths.authorized_keys_dir).unwrap();
+        fs::create_dir_all(&paths.exec_dir).unwrap();
+        record_admin(&paths, "admin");
+        let mon = format!(
+            "{} ecdsa-sha2-nistp256 AAAA fleet-monitor-d_{}",
+            crate::authorized_keys::monitor_options(),
+            "ab".repeat(16)
+        );
+        let before = format!("ssh-ed25519 OP op\n{mon}\n");
+        fs::create_dir_all(format!("{home}/.ssh")).unwrap();
+        fs::write(format!("{home}/.ssh/authorized_keys"), &before).unwrap();
+        let snap = snapshot(&paths, &Direct).unwrap();
+        assert_eq!(snap.users.len(), 1);
+        apply_ssh(&paths, &Rec::default(), &Direct).unwrap();
+        assert_eq!(
+            fs::read_to_string(format!("{home}/.ssh/authorized_keys")).unwrap(),
+            "ssh-ed25519 OP op\n"
+        );
+        restore_ssh(&paths, &Rec::default(), &Direct, &snap).unwrap();
+        assert_eq!(
+            fs::read_to_string(format!("{home}/.ssh/authorized_keys")).unwrap(),
+            before
+        );
     }
 
     #[test]

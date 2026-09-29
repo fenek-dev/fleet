@@ -37,7 +37,9 @@ else
     install -m 0644 "$stage/systemd/fleet-gate.service" /etc/systemd/system/fleet-gate.service
     install -m 0644 "$stage/systemd/tmpfiles.d/fleet.conf" /usr/lib/tmpfiles.d/fleet.conf
 fi
-usermod --append --groups fleet "$admin"
+
+# The admin's membership in `fleet` is `fleet-agent install --admin-user`'s
+# job (design §10.1), deliberately not done here.
 
 # The test Macs' SSH keys (plain ~/.ssh; moving keys to /etc/fleet is a
 # separate step, design §10.1 step 5).
