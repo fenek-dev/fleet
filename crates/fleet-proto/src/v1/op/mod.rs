@@ -29,7 +29,10 @@ pub use packages::{PkgSpec, UpgradeScope};
 pub use profile::{ProfileLevel, ProfilePhase, ProfileRole, ProfileSource, ProfileSpec};
 pub use security::BanConfig;
 pub use shell::ShellExec;
-pub use system::{ProcessSort, Resolution, SampleInterval, StatusRange};
+pub use system::{
+    MINUTES_PER_DAY, ProcessSort, REBOOT_MAX_LEAD_S, RebootWhen, Resolution, SampleInterval,
+    StatusRange,
+};
 pub use users::LoginShell;
 
 use super::alert::{AlertRuleSet, HealthCheckSet};
@@ -83,6 +86,13 @@ tagged_enum! {
         HealthChecksUpdate(checks: HealthCheckSet) = HEALTH_CHECKS_UPDATE(41, "health_checks.update"),
         /// `delay_s` at most one hour.
         SystemReboot { delay_s: u32 } = SYSTEM_REBOOT(50, "system.reboot"),
+        /// Schedules the reboot for an absolute time or a local-time daily
+        /// window (design §9); replaces an earlier schedule. Tier Change.
+        SystemRebootSchedule { when: RebootWhen } = SYSTEM_REBOOT_SCHEDULE(51, "system.reboot.schedule"),
+        /// Stops a scheduled reboot (from `system.reboot` or `.schedule`).
+        SystemRebootCancel = SYSTEM_REBOOT_CANCEL(52, "system.reboot.cancel"),
+        /// `Payload::RebootStatus`.
+        SystemRebootStatus = SYSTEM_REBOOT_STATUS(53, "system.reboot.status"),
 
         // ---- logs 100–199 ----
         JournalQuery(query: JournalQuery) = JOURNAL_QUERY(100, "journal.query"),
@@ -130,6 +140,9 @@ tagged_enum! {
 
         // ---- firewall 400–499 ----
         FirewallGet = FIREWALL_GET(400, "firewall.get"),
+        /// Packet/byte hit counters of Fleet's operator rules
+        /// (`Payload::FirewallCounters`); read-only.
+        FirewallCounters = FIREWALL_COUNTERS(402, "firewall.counters"),
         /// Replaces Fleet's table; auto-revert armed. Needs
         /// `CommandBody::expected_version` (the version `firewall.get` returned).
         FirewallApply(ruleset: FirewallRuleSet) = FIREWALL_APPLY(401, "firewall.apply"),
@@ -137,6 +150,10 @@ tagged_enum! {
         /// mesh, profile); must come over a fresh connection (design §4.10).
         ChangeConfirm { change_id: ChangeId } = CHANGE_CONFIRM(410, "change.confirm"),
         ChangesList = CHANGES_LIST(411, "changes.list"),
+        /// Reverts a pending auto-revert change now instead of waiting for
+        /// its timer (design §4.10): the same restore, once, whichever of
+        /// this and the timer claims the change first.
+        ChangeRevert { change_id: ChangeId } = CHANGE_REVERT(412, "change.revert"),
 
         // ---- packages 500–599 ----
         PkgList { filter: Option<SearchTerm> } = PKG_LIST(500, "pkg.list"),

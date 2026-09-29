@@ -115,12 +115,76 @@ fn env(groups: &'static str, fail: bool) -> Env {
 }
 
 fn env_with(groups: &'static str, fail: bool, delay: Duration, apply_timeout: Duration) -> Env {
+    env_full(
+        groups,
+        fail,
+        delay,
+        apply_timeout,
+        Pol::default().security,
+        None,
+    )
+}
+
+/// Stands in for systemd where the reboot ops run: remembers the armed
+/// `fleet-reboot` timer's description and answers `systemctl show` and
+/// `date +%z` from it.
+#[derive(Default)]
+struct RebootSim {
+    armed: Option<String>,
+    calls: Vec<Vec<String>>,
+}
+
+type Sim = Arc<Mutex<RebootSim>>;
+
+struct SimRunner(Sim);
+
+impl CommandRunner for SimRunner {
+    fn run(&self, spec: CommandSpec) -> LocalBoxFuture<'_, Result<CommandOutput, RunError>> {
+        Box::pin(std::future::ready(self.run_blocking(spec)))
+    }
+    fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutput, RunError> {
+        let mut argv = vec![spec.program.to_owned()];
+        argv.extend(spec.args.iter().map(|a| a.to_string_lossy().into_owned()));
+        let mut sim = self.0.lock().unwrap();
+        sim.calls.push(argv.clone());
+        let out = match (spec.program, argv.get(1).map(String::as_str)) {
+            ("/usr/bin/systemd-run", _) => {
+                sim.armed = argv
+                    .iter()
+                    .find_map(|a| a.strip_prefix("--description=").map(str::to_owned));
+                String::new()
+            }
+            ("/usr/bin/systemctl", Some("stop")) => {
+                sim.armed = None;
+                String::new()
+            }
+            ("/usr/bin/systemctl", Some("show")) => match &sim.armed {
+                Some(d) => format!("ActiveState=active\nDescription={d}\n"),
+                None => "ActiveState=inactive\nDescription=fleet-reboot.timer\n".into(),
+            },
+            ("/usr/bin/date", _) => "+0100\n".into(),
+            ("/usr/sbin/nft", _) => r#"{"nftables": []}"#.into(),
+            _ => String::new(),
+        };
+        Ok(CommandOutput::ok(out))
+    }
+}
+
+fn env_full(
+    groups: &'static str,
+    fail: bool,
+    delay: Duration,
+    apply_timeout: Duration,
+    security: &'static str,
+    sim: Option<Sim>,
+) -> Env {
     let mut fx = Fixture::with(
         2,
         0,
         Opts {
             pol: Pol {
                 groups,
+                security,
                 ..Pol::default()
             },
             ..Opts::default()
@@ -155,6 +219,9 @@ fn env_with(groups: &'static str, fail: bool, delay: Duration, apply_timeout: Du
             fleet_ops::SysCtx::system(),
         ));
         cfg.timers = Rc::new(SharedRecorder(t));
+        if let Some(sim) = sim {
+            cfg.ctx.runner = Rc::new(SimRunner(sim));
+        }
     });
     Env { fx, log, timers }
 }
@@ -707,5 +774,304 @@ fn in_flight_change_is_protected() {
         assert_eq!(second.result, first.result);
         assert_eq!(second.receipt, first.receipt);
         assert_eq!(pending_files(fx), 1);
+    });
+}
+
+/// `change.revert`: the timer's restore, now, over the very session that
+/// made the change (a confirm may not). The pending file and both timers
+/// are gone, the origin's audit entry closes as `Reverted`, and reverting
+/// again is `NotFound`.
+#[test]
+fn change_revert_restores_now_disarms_timers_and_audits() {
+    let e = env(r#""system", "firewall""#, false);
+    let fx = &e.fx;
+    run(async {
+        let m = &fx.macs[0];
+        let mut s = fx.connect(m).await;
+        let cmd = s
+            .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(7)))
+            .unwrap();
+        let r = s.send(&cmd).await.unwrap();
+        let id = change_id(&r);
+        let hex_id = hex::encode(id);
+        e.log.take();
+
+        let revert = Op::ChangeRevert { change_id: id };
+        let r = s
+            .request(revert.clone(), &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        assert!(r.receipt.receipt.audit_seq.is_some());
+        assert_eq!(e.log.take(), ["restore firewall.apply"]);
+        assert_eq!(pending_files(fx), 0);
+        let stop = e.timers.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            stop,
+            [
+                "/usr/bin/systemctl",
+                "stop",
+                &format!("fleet-revert-{hex_id}.timer"),
+                &format!("fleet-revert-{hex_id}-guard.timer")
+            ]
+        );
+        let r = s
+            .request(
+                Op::AuditQuery {
+                    after_seq: 0,
+                    limit: 1000,
+                },
+                &fx.server,
+                Actor::Human,
+                None,
+            )
+            .await
+            .unwrap();
+        let Ok(Payload::AuditPage(page)) = r.result else {
+            panic!("{r:?}")
+        };
+        assert!(
+            page.entries
+                .iter()
+                .any(|en| en.op.tag == tag::FIREWALL_APPLY
+                    && en.result == fleet_proto::ResultSummary::Done(fleet_proto::Outcome::Reverted)),
+            "the firewall.apply intent is closed as reverted"
+        );
+
+        // Once: the change is gone (a racing timer that got there first
+        // leaves the same answer).
+        let r = s
+            .request(revert, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(err(r), ErrorCode::NotFound);
+        assert!(e.log.take().is_empty(), "nothing restored twice");
+        // The kind is free again.
+        let cmd = s
+            .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(8)))
+            .unwrap();
+        assert!(matches!(
+            s.send(&cmd).await.unwrap().result,
+            Ok(Payload::ChangePending { .. })
+        ));
+    });
+}
+
+/// `change.revert` is in the `firewall` group, which this policy doesn't
+/// allow: only the device that made the change may revert it (like
+/// `change.confirm`).
+#[test]
+fn change_revert_allowed_for_the_device_that_made_the_change() {
+    let e = env(r#""system", "mesh""#, false);
+    let fx = &e.fx;
+    run(async {
+        let (m0, m1) = (&fx.macs[0], &fx.macs[1]);
+        let mut s = fx.connect(m0).await;
+        let r = s
+            .request(Op::MeshLeave, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        let revert = Op::ChangeRevert {
+            change_id: change_id(&r),
+        };
+        let mut other = fx.connect(m1).await;
+        let r = other
+            .request(revert.clone(), &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(err(r), ErrorCode::PolicyDenied);
+        assert_eq!(pending_files(fx), 1);
+        let r = s
+            .request(revert, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        assert_eq!(pending_files(fx), 0);
+        assert_eq!(e.log.take(), ["snapshot mesh.leave", "restore mesh.leave"]);
+    });
+}
+
+/// Agent-only mode (design §5.4): `firewall.apply` is refused, but
+/// reverting a pending change, `firewall.counters` and the reboot ops are
+/// not security takeovers.
+#[test]
+fn agent_only_allows_revert_counters_and_reboot_ops() {
+    let sim: Sim = Arc::default();
+    let e = env_full(
+        r#""system", "mesh", "firewall""#,
+        false,
+        Duration::ZERO,
+        Duration::from_secs(30),
+        "agent-only",
+        Some(sim.clone()),
+    );
+    let fx = &e.fx;
+    run(async {
+        let m0 = &fx.macs[0];
+        let mut s = fx.connect(m0).await;
+        let r = s
+            .request(Op::MeshLeave, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        let revert = Op::ChangeRevert {
+            change_id: change_id(&r),
+        };
+        let r = s
+            .request(revert, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        assert_eq!(pending_files(fx), 0);
+
+        // Read-only counters answer (no table: nothing counted).
+        let r = s
+            .request(Op::FirewallCounters, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert!(matches!(r.result, Ok(Payload::FirewallCounters(_))), "{r:?}");
+
+        // Security takeover: refused before anything else.
+        let cmd = s
+            .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(7)))
+            .unwrap();
+        assert_eq!(err(s.send(&cmd).await.unwrap()), ErrorCode::PolicyDenied);
+
+        // Reboot ops work in Agent-only mode.
+        let sched = Op::SystemRebootSchedule {
+            when: fleet_proto::op::RebootWhen::In { delay_s: 3600 },
+        };
+        let r = s
+            .request(sched, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        let status = |r: Reply| match r.result {
+            Ok(Payload::RebootStatus(s)) => s.at_ms,
+            other => panic!("{other:?}"),
+        };
+        let r = s
+            .request(Op::SystemRebootStatus, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        let at = status(r).expect("armed");
+        assert!(at > now_ms() + 3_500_000 && at < now_ms() + 3_700_000, "{at}");
+        let r = s
+            .request(Op::SystemRebootCancel, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        let r = s
+            .request(Op::SystemRebootStatus, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(status(r), None);
+    });
+}
+
+/// Reboot windows in the server's local time (one `date +%z` call), a
+/// replaced schedule, and the agent's bounds on `At`.
+#[test]
+fn reboot_window_and_at_schedule_status_cancel() {
+    use fleet_proto::op::RebootWhen;
+    let sim: Sim = Arc::default();
+    let e = env_full(
+        r#""system""#,
+        false,
+        Duration::ZERO,
+        Duration::from_secs(30),
+        "managed",
+        Some(sim.clone()),
+    );
+    let fx = &e.fx;
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
+        let at_of = |r: Reply| match r.result {
+            Ok(Payload::RebootStatus(s)) => s.at_ms,
+            other => panic!("{other:?}"),
+        };
+        // A window covering all but the last minute of the local day is
+        // (almost surely) open now: the reboot is due within seconds.
+        let win = Op::SystemRebootSchedule {
+            when: RebootWhen::Window {
+                start_min: 0,
+                end_min: 1439,
+            },
+        };
+        let r = s
+            .request(win, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        {
+            let calls = sim.lock().unwrap().calls.clone();
+            assert!(calls.iter().any(|c| c == &["/usr/bin/date", "+%z"]), "{calls:?}");
+        }
+        let r = s
+            .request(Op::SystemRebootStatus, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        let first = at_of(r).expect("armed");
+        assert!(first <= now_ms() + 24 * 3_600_000);
+
+        // A later schedule replaces it.
+        let target = now_ms() + 2 * 3_600_000;
+        let at = Op::SystemRebootSchedule {
+            when: RebootWhen::At { at_ms: target },
+        };
+        let r = s
+            .request(at, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(r.result, Ok(Payload::Empty));
+        let r = s
+            .request(Op::SystemRebootStatus, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        let got = at_of(r).expect("armed");
+        assert!(got.abs_diff(target) < 60_000, "{got} vs {target}");
+
+        // In the past or past 30 days: refused, the schedule stays.
+        for at_ms in [now_ms() - 60_000, now_ms() + 31 * 86_400_000] {
+            let bad = Op::SystemRebootSchedule {
+                when: RebootWhen::At { at_ms },
+            };
+            let r = s
+                .request(bad, &fx.server, Actor::Human, None)
+                .await
+                .unwrap();
+            assert_eq!(err(r), ErrorCode::InvalidArgument);
+        }
+        // Malformed arguments never reach the handler.
+        let bad = Op::SystemRebootSchedule {
+            when: RebootWhen::Window {
+                start_min: 90,
+                end_min: 90,
+            },
+        };
+        let r = s
+            .request(bad, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(r.receipt.receipt.audit_seq, None);
+        assert_eq!(err(r), ErrorCode::InvalidArgument);
+        let r = s
+            .request(Op::SystemRebootStatus, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert!(at_of(r).is_some());
+
+        // Cancel, twice (idempotent).
+        for _ in 0..2 {
+            let r = s
+                .request(Op::SystemRebootCancel, &fx.server, Actor::Human, None)
+                .await
+                .unwrap();
+            assert_eq!(r.result, Ok(Payload::Empty));
+        }
+        let r = s
+            .request(Op::SystemRebootStatus, &fx.server, Actor::Human, None)
+            .await
+            .unwrap();
+        assert_eq!(at_of(r), None);
     });
 }

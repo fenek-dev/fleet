@@ -61,6 +61,28 @@ pub struct FirewallState {
     pub foreign_ruleset: String,
 }
 
+/// Hits on one operator rule of Fleet's table: packets and bytes its final
+/// verdict rule has matched since the table's chains were last (re)created
+/// (every `firewall.apply` recreates them, so counting restarts there;
+/// nftables keeps no timestamp and the agent has no 24 h history).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCounter {
+    /// Index into `FirewallState::rules`.
+    pub rule: u16,
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+/// `firewall.counters`: `version` is the model version the counters belong
+/// to (compare with `FirewallState::version` before matching by index).
+/// A rule missing from `rules` has no counter (the table was rendered by an
+/// older agent, or isn't in rendered form).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirewallCounters {
+    pub version: u64,
+    pub rules: Vec<RuleCounter>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChangeKind {
     Firewall,

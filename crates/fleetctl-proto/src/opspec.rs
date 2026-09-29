@@ -58,6 +58,11 @@ pub enum OpSpec {
         #[serde(default)]
         delay_s: u32,
     },
+    /// `system.reboot.schedule` for a daily window in the server's local
+    /// time: minutes since local midnight (`0..1440`, start != end, an end
+    /// before the start wraps past midnight). Reboots at the next window
+    /// start, or right away when the window is open now.
+    SystemRebootWindow { start_min: u16, end_min: u16 },
     /// `shell.exec` (Elevated, policy-gated).
     ShellExec {
         user: String,
@@ -98,6 +103,7 @@ impl OpSpec {
             OpSpec::ConfigRollback { .. } => "config.rollback",
             OpSpec::ProfileCheck { .. } => "profile.check",
             OpSpec::SystemReboot { .. } => "system.reboot",
+            OpSpec::SystemRebootWindow { .. } => "system.reboot.schedule",
             OpSpec::ShellExec { .. } => "shell.exec",
         }
     }

@@ -5,9 +5,11 @@
 //! where they differ.
 
 use crate::text;
+use fleet_proto::op::RebootWhen;
 use fleet_proto::payload::{
     ChangeKind, ChangeSource, ComposeStatus, ConfigVersion, ContainerInfo, ContainerState,
-    ContainerStats, CronTab, DockerLogLine, GameBackup, GameInfo, GroupInfo, ImageInfo, LogStream,
+    ContainerStats, CronTab, DockerLogLine, FirewallCounters, GameBackup, GameInfo, GroupInfo,
+    ImageInfo, LogStream,
     MeshPeerStatus, MeshStatus, NetworkInfo, PendingChange, TimerInfo, UserInfo, VolumeInfo,
 };
 
@@ -98,6 +100,66 @@ impl From<PendingChange> for PendingChangeRow {
             created_ms: c.created_ms,
             deadline_ms: c.deadline_ms,
             new_version: c.new_version,
+        }
+    }
+}
+
+/// Hits on one operator rule of Fleet's firewall table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct RuleCounterRow {
+    /// Index into `FirewallRow::rules`.
+    pub rule: u32,
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+/// `firewall.counters`: counting restarts whenever Fleet's table is
+/// (re)applied (nftables keeps no timestamp), so these are hits "since the
+/// last apply", not a 24 h window. `version` is the ruleset version the
+/// counters belong to; a rule without an entry has no counter.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FirewallCountersRow {
+    pub version: u64,
+    pub rules: Vec<RuleCounterRow>,
+}
+
+impl From<FirewallCounters> for FirewallCountersRow {
+    fn from(c: FirewallCounters) -> Self {
+        Self {
+            version: c.version,
+            rules: c
+                .rules
+                .into_iter()
+                .map(|r| RuleCounterRow {
+                    rule: r.rule.into(),
+                    packets: r.packets,
+                    bytes: r.bytes,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// When `system.reboot.schedule` reboots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RebootWhenRow {
+    In { delay_s: u32 },
+    At { at_ms: u64 },
+    /// Daily window in the server's local time (minutes since midnight).
+    Window { start_min: u32, end_min: u32 },
+}
+
+impl From<RebootWhenRow> for RebootWhen {
+    /// Out-of-range minutes saturate to a value `Op::check_args` refuses.
+    fn from(w: RebootWhenRow) -> Self {
+        let min = |m: u32| u16::try_from(m).unwrap_or(u16::MAX);
+        match w {
+            RebootWhenRow::In { delay_s } => RebootWhen::In { delay_s },
+            RebootWhenRow::At { at_ms } => RebootWhen::At { at_ms },
+            RebootWhenRow::Window { start_min, end_min } => RebootWhen::Window {
+                start_min: min(start_min),
+                end_min: min(end_min),
+            },
         }
     }
 }

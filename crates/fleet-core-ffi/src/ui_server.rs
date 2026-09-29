@@ -49,6 +49,7 @@ mod tests {
         let c = ProvisionChoice {
             level: Level::Strict,
             roles: vec![Role::Docker, Role::Web],
+            web_server: Default::default(),
             admin_user: "ops".into(),
             allow_from: vec![],
             reboot_window: None,

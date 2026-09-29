@@ -72,7 +72,8 @@ struct UsersTab: View {
                 Toggle("System accounts", isOn: $showSystem)
                 Button("New user…", systemImage: "person.badge.plus") { creating = true }
             }
-            AutoRevertBanner(model: revert, what: "SSH keys changed", retry: retryConfirm)
+            AutoRevertBanner(model: revert, what: "SSH keys changed", retry: retryConfirm,
+                             revertNow: revertNow)
             HSplitView {
                 VStack(spacing: 12) {
                     Table(users, selection: $selection) {
@@ -224,6 +225,11 @@ struct UsersTab: View {
     private func retryConfirm() {
         guard let api = core.api, let c = revert.change else { return }
         revert.confirm(api: api, serverId: server.id, change: c) { Task { await loadUser() } }
+    }
+
+    private func revertNow() {
+        guard let api = core.api else { return }
+        revert.revertNow(api: api, serverId: server.id) { Task { await loadUser() } }
     }
 
     private func run(_ op: @escaping (FleetCore) async throws -> Void) {

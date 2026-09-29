@@ -1178,8 +1178,119 @@ proptest! {
     #[test]
     fn parsers_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..512), s in ".{0,300}") {
         let _ = parse_table(&bytes);
+        let _ = parse::parse_counters(&bytes);
         let _ = summarize_ruleset(&bytes);
         let _ = parse_ufw(&s);
         let _ = parse_sshd_ports(&s);
     }
+}
+
+// ---- hit counters (`firewall.counters`) ----
+
+/// `MANAGED_JSON` as `nft -j` prints a table whose operator rules carry
+/// counters: `packets = 100 + index`, `bytes = 1000 + index` on the final
+/// verdict rule of each; the rate-limit meter rules get a counter too
+/// (they must not count).
+fn managed_json_with_counters() -> String {
+    let mut v: serde_json::Value = serde_json::from_str(MANAGED_JSON).unwrap();
+    for item in v["nftables"].as_array_mut().unwrap() {
+        let Some(rule) = item.get_mut("rule") else {
+            continue;
+        };
+        let comment = rule["comment"].as_str().unwrap_or("").to_owned();
+        let Some((idx, _)) = parse::parse_comment(&comment) else {
+            continue;
+        };
+        let exprs = rule["expr"].as_array_mut().unwrap();
+        let metered = exprs
+            .iter()
+            .any(|e| e.get("set").is_some() || e.get("meter").is_some());
+        let (packets, bytes) = if metered {
+            (9_999, 9_999)
+        } else {
+            (100 + idx as u64, 1000 + idx as u64)
+        };
+        let at = exprs.len() - 1;
+        exprs.insert(
+            at,
+            serde_json::json!({"counter": {"packets": packets, "bytes": bytes}}),
+        );
+    }
+    v.to_string()
+}
+
+#[test]
+fn counters_are_read_per_operator_rule_and_meters_skipped() {
+    let json = managed_json_with_counters();
+    let got = parse::parse_counters(json.as_bytes()).unwrap();
+    let rules = parse_table(MANAGED_JSON.as_bytes())
+        .unwrap()
+        .model
+        .unwrap()
+        .rules
+        .len();
+    assert_eq!(got.len(), rules);
+    for (i, (idx, packets, bytes)) in got.iter().enumerate() {
+        assert_eq!(*idx, i);
+        assert_eq!((*packets, *bytes), (100 + i as u64, 1000 + i as u64));
+    }
+    // A table rendered before counters existed: no counters, not an error.
+    assert_eq!(parse::parse_counters(MANAGED_JSON.as_bytes()).unwrap(), []);
+    // The table still parses as the same model with counters present.
+    let with = parse_table(json.as_bytes()).unwrap();
+    let without = parse_table(MANAGED_JSON.as_bytes()).unwrap();
+    assert_eq!(with.model, without.model);
+    assert_eq!(with.version, without.version);
+}
+
+#[test]
+fn counters_answer_follows_the_table_state() {
+    let json = managed_json_with_counters();
+    let c = counters_from(Ok(CommandOutput::ok(json.as_str()))).unwrap();
+    let p = parse_table(MANAGED_JSON.as_bytes()).unwrap();
+    assert_eq!(c.version, p.version);
+    assert_eq!(c.rules.len(), p.model.unwrap().rules.len());
+    assert_eq!(
+        c.rules[1],
+        RuleCounter {
+            rule: 1,
+            packets: 101,
+            bytes: 1001
+        }
+    );
+    // No table: version 0, nothing counted.
+    let none = counters_from(Ok(CommandOutput {
+        code: Some(1),
+        stderr: NO_TABLE.as_bytes().to_vec(),
+        ..CommandOutput::default()
+    }))
+    .unwrap();
+    assert_eq!((none.version, none.rules.len()), (model::ABSENT_VERSION, 0));
+    // A table Fleet can't model: its indices mean nothing, so none answered.
+    let odd = json.replace(r#""comment":"r5 block""#, r#""comment":"r7 block""#);
+    assert_ne!(odd, json);
+    let c = counters_from(Ok(CommandOutput::ok(odd.as_str()))).unwrap();
+    assert!(c.rules.is_empty());
+    // nft failing is an error, not an empty answer.
+    assert!(counters_from(Ok(CommandOutput::exit(1))).is_err());
+}
+
+#[test]
+fn counters_op_runs_one_nft_listing() {
+    let r = Rc::new(FakeRunner::new());
+    let json = managed_json_with_counters();
+    r.expect(
+        NFT,
+        &["-j", "list", "table", "inet", "fleet"],
+        Ok(CommandOutput::ok(json.as_str())),
+    );
+    let c = ctx(nowhere(), r.clone());
+    let op = Op::FirewallCounters;
+    let h = FirewallHandler;
+    h.validate(&c, &op, &meta(op.clone(), None)).unwrap();
+    match block(h.handle(&c, &op, &meta(op.clone(), None))).unwrap() {
+        OpOutput::Payload(Payload::FirewallCounters(c)) => assert!(!c.rules.is_empty()),
+        _ => panic!(),
+    }
+    assert_eq!(r.pending(), 0);
 }

@@ -235,6 +235,10 @@ struct OverviewTab: View {
     @State private var uninstalling = false
     @State private var securityMode: SecurityModeStatus = .unknown
     @State private var enablingManaged = false
+    /// The armed reboot (ms since the epoch; 0 = armed for an unknown time).
+    @State private var rebootAt: UInt64?
+    @State private var cancellingReboot = false
+    @State private var rebootError: String?
 
     private var info: SystemInfoRow? { ctx.info }
     private var health: AgentHealthRow? { ctx.health }
@@ -263,6 +267,7 @@ struct OverviewTab: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
                 VStack(alignment: .leading, spacing: 16) {
+                    if let at = rebootAt { rebootCard(at) }
                     timelineCard
                     containersCard
                     profileCard
@@ -289,7 +294,10 @@ struct OverviewTab: View {
             Task { await metrics.start(api: api, serverId: server.id, window: range) }
         }
         .onChange(of: core.eventTick) {
-            if core.lastEventServer == server.id { Task { await loadContainers() } }
+            if core.lastEventServer == server.id {
+                Task { await loadContainers() }
+                Task { await loadReboot() }
+            }
         }
         .onDisappear { metrics.stop() }
     }
@@ -382,6 +390,50 @@ struct OverviewTab: View {
         .accessibilityIdentifier("overview.containers")
     }
 
+    /// A reboot armed on the server (bulk window, another Mac, MCP), with
+    /// Cancel.
+    private func rebootCard(_ at: UInt64) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "power.circle").foregroundStyle(Tone.warn.text)
+                Text("Reboot scheduled").font(.system(size: 13, weight: .semibold)).foregroundStyle(Color.text)
+                Spacer()
+                Button("Cancel") { Task { await cancelReboot() } }
+                    .disabled(cancellingReboot)
+                    .accessibilityIdentifier("overview.reboot.cancel")
+            }
+            Text(at == 0 ? "At a time the agent did not record." : fmtDate(at))
+                .font(.secondary).foregroundStyle(Color.textSecondary)
+                .accessibilityIdentifier("overview.reboot.time")
+            if let e = rebootError {
+                Text(e).font(.secondary).foregroundStyle(Tone.critical.text)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .card()
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("overview.reboot")
+    }
+
+    private func loadReboot() async {
+        guard let api = core.api else { return }
+        // An agent without the op just has nothing scheduled.
+        rebootAt = try? await api.systemRebootStatus(serverId: server.id)
+    }
+
+    private func cancelReboot() async {
+        guard let api = core.api else { return }
+        cancellingReboot = true
+        defer { cancellingReboot = false }
+        do {
+            try await api.systemRebootCancel(serverId: server.id)
+            rebootError = nil
+        } catch {
+            rebootError = error.fleetMessage
+        }
+        await loadReboot()
+    }
+
     private func containerTone(_ c: ContainerRow) -> Tone {
         switch c.state {
         case "running": .ok
@@ -441,6 +493,7 @@ struct OverviewTab: View {
 
     private func loadCards() async {
         profile = try? core.api?.serverProfile(serverId: server.id)
+        await loadReboot()
         await loadContainers()
         guard let api = core.api else { return }
         do {

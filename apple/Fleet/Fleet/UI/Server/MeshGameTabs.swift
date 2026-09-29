@@ -124,7 +124,8 @@ struct MeshTab: View {
                         creating = true
                     }
                 }
-                AutoRevertBanner(model: revert, what: "Mesh membership changed", retry: retryConfirm)
+                AutoRevertBanner(model: revert, what: "Mesh membership changed", retry: retryConfirm,
+                                 revertNow: revertNow)
                 if let s = status {
                     AdminSection(title: "This server") {
                         if s.joined {
@@ -186,6 +187,11 @@ struct MeshTab: View {
     private func retryConfirm() {
         guard let api = core.api, let c = revert.change else { return }
         revert.confirm(api: api, serverId: server.id, change: c) { Task { await load() } }
+    }
+
+    private func revertNow() {
+        guard let api = core.api else { return }
+        revert.revertNow(api: api, serverId: server.id) { Task { await load() } }
     }
 
     private func load() async {

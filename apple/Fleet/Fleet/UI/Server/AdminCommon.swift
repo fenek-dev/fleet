@@ -102,12 +102,26 @@ final class AutoRevertModel {
         case reverted
         case noConnection
         case failed(String)
+        /// "Revert now" is on its way to the agent.
+        case reverting
     }
 
     private(set) var phase: Phase = .idle
     private(set) var change: PendingChangeRow?
     private(set) var now = Date()
     @ObservationIgnored private var ticker: Task<Void, Never>?
+    /// The operator asked to revert now: the outcome of a confirmation
+    /// still in flight no longer decides the phase.
+    @ObservationIgnored private var manualRevert = false
+
+    /// "Revert now" applies while the change waits for its deadline.
+    var canRevertNow: Bool {
+        guard change != nil, remaining > 0 else { return false }
+        switch phase {
+        case .confirming, .noConnection, .failed: return true
+        default: return false
+        }
+    }
 
     var remaining: Int {
         guard let c = change else { return 0 }
@@ -120,6 +134,7 @@ final class AutoRevertModel {
     func confirm(api: FleetCore, serverId: String, change: PendingChangeRow,
                  done: @escaping @MainActor () -> Void = {}) {
         self.change = change
+        manualRevert = false
         phase = .confirming
         startTicker()
         Task {
@@ -135,8 +150,31 @@ final class AutoRevertModel {
             } catch {
                 outcome = .failed(error.fleetMessage)
             }
+            // A manual revert decides the phase; the confirmation's result
+            // (usually "reverted" or a lost race) is moot.
+            if manualRevert { return }
             phase = outcome
             if outcome != .noConnection { ticker?.cancel() }
+            done()
+        }
+    }
+
+    /// `change.revert`: puts the previous state back now instead of at the
+    /// deadline. `done` runs afterwards (reload).
+    func revertNow(api: FleetCore, serverId: String, done: @escaping @MainActor () -> Void = {}) {
+        guard let change, canRevertNow else { return }
+        manualRevert = true
+        phase = .reverting
+        Task {
+            do {
+                try await api.revertChange(serverId: serverId, changeIdHex: change.changeIdHex)
+                phase = .reverted
+                ticker?.cancel()
+            } catch {
+                // Confirmed or reverted meanwhile, or the agent refused.
+                manualRevert = false
+                phase = .failed(error.fleetMessage)
+            }
             done()
         }
     }
@@ -167,6 +205,8 @@ struct AutoRevertBanner: View {
     let model: AutoRevertModel
     let what: String
     var retry: (() -> Void)?
+    /// Reverts the pending change now (`change.revert`).
+    var revertNow: (() -> Void)?
 
     var body: some View {
         if model.active {
@@ -177,11 +217,18 @@ struct AutoRevertBanner: View {
                     Text(detail).font(.secondary).foregroundStyle(Color.textSecondary)
                 }
                 Spacer()
-                if model.phase == .confirming { ProgressView().controlSize(.small) }
+                if model.phase == .confirming || model.phase == .reverting {
+                    ProgressView().controlSize(.small)
+                }
+                if let revertNow, model.canRevertNow {
+                    Button("Revert now") { revertNow() }
+                        .help("Put the previous state back now instead of waiting for the deadline")
+                        .accessibilityIdentifier("autorevert.revertNow")
+                }
                 if let retry, canRetry {
                     Button("Confirm change") { retry() }.buttonStyle(.borderedProminent).tint(.accent)
                 }
-                if model.phase != .confirming {
+                if model.phase != .confirming && model.phase != .reverting {
                     Button("Dismiss") { model.dismiss() }
                 }
             }
@@ -213,6 +260,7 @@ struct AutoRevertBanner: View {
         case .reverted: "Change reverted"
         case .noConnection: "Could not reconnect · reverts in \(countdown)"
         case .failed: "Confirmation failed · reverts in \(countdown)"
+        case .reverting: "Reverting…"
         }
     }
 
@@ -226,6 +274,7 @@ struct AutoRevertBanner: View {
         case .noConnection:
             "No fresh connection came up. If access is broken, the server restores the previous state at the deadline."
         case .failed(let m): m
+        case .reverting: "\(what). Asking the server to restore the previous state now."
         }
     }
 

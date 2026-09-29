@@ -533,6 +533,64 @@ impl FleetCore {
         }
     }
 
+    /// `change.revert`: restores the state from before a pending
+    /// auto-revert change right now (the timer's restore, once), instead
+    /// of waiting for its deadline. Tier Change, no Touch ID. A change
+    /// that was confirmed or reverted meanwhile is an error (`NotFound`).
+    pub async fn revert_change(
+        &self,
+        server_id: String,
+        change_id_hex: String,
+    ) -> Result<(), FleetError> {
+        let change_id = change_id(&change_id_hex)?;
+        self.send_op(&server_id, Op::ChangeRevert { change_id }, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// `firewall.counters`: hits per operator rule (index into
+    /// `firewall_get`'s rules) since Fleet's table was last applied.
+    pub async fn firewall_counters(
+        &self,
+        server_id: String,
+    ) -> Result<FirewallCountersRow, FleetError> {
+        match self.send_op(&server_id, Op::FirewallCounters, None).await? {
+            Payload::FirewallCounters(c) => Ok(c.into()),
+            p => unexpected(p),
+        }
+    }
+
+    /// `system.reboot.schedule`.
+    pub async fn system_reboot_schedule(
+        &self,
+        server_id: String,
+        when: RebootWhenRow,
+    ) -> Result<(), FleetError> {
+        self.send_op(
+            &server_id,
+            Op::SystemRebootSchedule { when: when.into() },
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `system.reboot.cancel` (nothing scheduled is fine).
+    pub async fn system_reboot_cancel(&self, server_id: String) -> Result<(), FleetError> {
+        self.send_op(&server_id, Op::SystemRebootCancel, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// `system.reboot.status`: when the armed reboot fires (ms since the
+    /// epoch, `0` = armed for an unknown time), `None` if none is.
+    pub async fn system_reboot_status(&self, server_id: String) -> Result<Option<u64>, FleetError> {
+        match self.send_op(&server_id, Op::SystemRebootStatus, None).await? {
+            Payload::RebootStatus(s) => Ok(s.at_ms),
+            p => unexpected(p),
+        }
+    }
+
     pub async fn ban_remove(&self, server_id: String, addr: String) -> Result<(), FleetError> {
         let addr = addr.trim().parse().map_err(|_| invalid("address"))?;
         self.send_op(&server_id, Op::BansRemove { addr }, None)
@@ -1021,5 +1079,70 @@ mod tests {
         assert!(!config_rollback_needs_approval(
             "/srv/app/compose.yaml".into()
         ));
+    }
+
+    #[test]
+    fn revert_and_reboot_ops_need_no_approval() {
+        use fleet_proto::op::RebootWhen;
+        for op in [
+            Op::ChangeRevert { change_id: [3; 16] },
+            Op::FirewallCounters,
+            Op::SystemRebootCancel,
+            Op::SystemRebootStatus,
+            Op::SystemRebootSchedule {
+                when: RebootWhen::At { at_ms: 1 },
+            },
+        ] {
+            assert!(!opspec::needs_approval(&op), "{}", op.name());
+        }
+        assert!(change_id("zz").is_err());
+        assert_eq!(change_id(&"03".repeat(16)).unwrap(), [3; 16]);
+    }
+
+    #[test]
+    fn reboot_when_rows_convert_and_bad_minutes_fail_check_args() {
+        use fleet_proto::op::RebootWhen;
+        let w = RebootWhen::from(RebootWhenRow::Window {
+            start_min: 30,
+            end_min: 90,
+        });
+        assert_eq!(
+            w,
+            RebootWhen::Window {
+                start_min: 30,
+                end_min: 90
+            }
+        );
+        let bad = RebootWhen::from(RebootWhenRow::Window {
+            start_min: 30,
+            end_min: 100_000,
+        });
+        assert!(!bad.is_valid());
+        assert_eq!(
+            RebootWhen::from(RebootWhenRow::In { delay_s: 5 }),
+            RebootWhen::In { delay_s: 5 }
+        );
+    }
+
+    #[test]
+    fn counters_rows_keep_rule_indexes() {
+        use fleet_proto::payload::{FirewallCounters, RuleCounter};
+        let row = FirewallCountersRow::from(FirewallCounters {
+            version: 9,
+            rules: vec![RuleCounter {
+                rule: 2,
+                packets: 10,
+                bytes: 1000,
+            }],
+        });
+        assert_eq!(row.version, 9);
+        assert_eq!(
+            row.rules,
+            [RuleCounterRow {
+                rule: 2,
+                packets: 10,
+                bytes: 1000
+            }]
+        );
     }
 }
