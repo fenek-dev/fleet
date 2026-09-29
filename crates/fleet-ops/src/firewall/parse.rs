@@ -341,6 +341,50 @@ fn build_rules(parts: Vec<Part>) -> R<Vec<FirewallRule>> {
     Ok(rules)
 }
 
+/// Hit counters of the operator rules in `nft -j list table inet fleet`:
+/// `(rule index, packets, bytes)` for every operator rule whose final
+/// verdict rule carries an nft `counter` (rate-limit meter rules are
+/// skipped), ordered by index. Anything unexpected in a rule is skipped:
+/// counters are informational and never feed back into a script.
+pub fn parse_counters(json: &[u8]) -> Result<Vec<(usize, u64, u64)>, ParseError> {
+    let v: Value = serde_json::from_slice(json).map_err(|_| ParseError::Json)?;
+    let mut by_idx: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
+    for (kind, obj) in items(&v) {
+        if kind != "rule"
+            || str_of(obj, "table") != Some("fleet")
+            || str_of(obj, "family") != Some("inet")
+            || !matches!(str_of(obj, "chain"), Some("input" | "forward"))
+        {
+            continue;
+        }
+        let Some((idx, _)) = str_of(obj, "comment").and_then(parse_comment) else {
+            continue;
+        };
+        let Ok(exprs) = rule_exprs(obj) else { continue };
+        let mut counter = None;
+        let mut metered = false;
+        for e in exprs {
+            let Some((k, v)) = e.as_object().and_then(|o| o.iter().next()) else {
+                continue;
+            };
+            match k.as_str() {
+                "set" | "meter" => metered = true,
+                "counter" => {
+                    let n = |f: &str| v.get(f).and_then(Value::as_u64).unwrap_or(0);
+                    counter = Some((n("packets"), n("bytes")));
+                }
+                _ => {}
+            }
+        }
+        if let (false, Some((p, b))) = (metered, counter) {
+            let e = by_idx.entry(idx).or_default();
+            e.0 = e.0.saturating_add(p);
+            e.1 = e.1.saturating_add(b);
+        }
+    }
+    Ok(by_idx.into_iter().map(|(i, (p, b))| (i, p, b)).collect())
+}
+
 /// Parses `nft -j list table inet fleet`.
 pub fn parse_table(json: &[u8]) -> Result<Parsed, ParseError> {
     let v: Value = serde_json::from_slice(json).map_err(|_| ParseError::Json)?;

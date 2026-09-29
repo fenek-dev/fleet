@@ -94,20 +94,20 @@ table inet fleet {
 		tcp dport 22 ip6 saddr @exempt6 accept comment "base"
 		tcp dport 22 ct state new meta nfproto ipv4 update @m4_0 { ip saddr limit rate over 10/minute burst 5 packets } drop comment "r0 ssh"
 		tcp dport 22 ct state new meta nfproto ipv6 update @m6_0 { ip6 saddr limit rate over 10/minute burst 5 packets } drop comment "r0 ssh"
-		tcp dport 22 accept comment "r0 ssh"
-		tcp dport { 80, 443 } accept comment "r1 web"
-		tcp dport 9000-9100 ip saddr 203.0.113.0/24 accept comment "r2 office"
+		tcp dport 22 counter accept comment "r0 ssh"
+		tcp dport { 80, 443 } counter accept comment "r1 web"
+		tcp dport 9000-9100 ip saddr 203.0.113.0/24 counter accept comment "r2 office"
 		udp dport 27015-27016 ct state new meta nfproto ipv4 update @m4_1 { ip saddr limit rate over 60/minute burst 20 packets } drop comment "r4 game: cs2"
 		udp dport 27015-27016 ct state new meta nfproto ipv6 update @m6_1 { ip6 saddr limit rate over 60/minute burst 20 packets } drop comment "r4 game: cs2"
-		udp dport 27015-27016 accept comment "r4 game: cs2"
-		tcp dport 8080 ip6 saddr 2001:db8::/32 reject comment "r5 block"
+		udp dport 27015-27016 counter accept comment "r4 game: cs2"
+		tcp dport 8080 ip6 saddr 2001:db8::/32 counter reject comment "r5 block"
 	}
 	chain forward {
 		type filter hook forward priority filter; policy accept;
 		ip saddr != @exempt4 ip saddr @banned4 drop comment "base"
 		ip6 saddr != @exempt6 ip6 saddr @banned6 drop comment "base"
 		ct state established,related accept comment "base"
-		ct status dnat meta l4proto tcp ct original proto-dst 8080 accept comment "r3 app"
+		ct status dnat meta l4proto tcp ct original proto-dst 8080 counter accept comment "r3 app"
 		ct status dnat drop comment "base"
 	}
 }

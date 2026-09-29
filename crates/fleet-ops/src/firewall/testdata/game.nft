@@ -97,12 +97,12 @@ table inet fleet {
 		tcp dport 22 ip6 saddr @exempt6 accept comment "base"
 		tcp dport 22 ct state new meta nfproto ipv4 update @m4_0 { ip saddr limit rate over 10/minute burst 5 packets } drop comment "r0 ssh"
 		tcp dport 22 ct state new meta nfproto ipv6 update @m6_0 { ip6 saddr limit rate over 10/minute burst 5 packets } drop comment "r0 ssh"
-		tcp dport 22 accept comment "r0 ssh"
+		tcp dport 22 counter accept comment "r0 ssh"
 		udp dport 27015-27016 ct state new meta nfproto ipv4 update @m4_1 { ip saddr limit rate over 60/minute burst 20 packets } drop comment "r1 cs2"
 		udp dport 27015-27016 ct state new meta nfproto ipv6 update @m6_1 { ip6 saddr limit rate over 60/minute burst 20 packets } drop comment "r1 cs2"
-		udp dport 27015-27016 accept comment "r1 cs2"
+		udp dport 27015-27016 counter accept comment "r1 cs2"
 		tcp dport 25565 ip saddr 198.51.100.0/24 ct state new meta nfproto ipv4 update @m4_2 { ip saddr limit rate over 30/minute } drop comment "r2 minecraft"
-		tcp dport 25565 ip saddr 198.51.100.0/24 accept comment "r2 minecraft"
+		tcp dport 25565 ip saddr 198.51.100.0/24 counter accept comment "r2 minecraft"
 	}
 	chain forward {
 		type filter hook forward priority filter; policy accept;
@@ -111,7 +111,7 @@ table inet fleet {
 		ct state established,related accept comment "base"
 		ct status dnat meta l4proto udp ct original proto-dst 7777 ct state new meta nfproto ipv4 update @m4_3 { ip saddr limit rate over 120/minute burst 40 packets } drop comment "r3 container game"
 		ct status dnat meta l4proto udp ct original proto-dst 7777 ct state new meta nfproto ipv6 update @m6_3 { ip6 saddr limit rate over 120/minute burst 40 packets } drop comment "r3 container game"
-		ct status dnat meta l4proto udp ct original proto-dst 7777 accept comment "r3 container game"
+		ct status dnat meta l4proto udp ct original proto-dst 7777 counter accept comment "r3 container game"
 		ct status dnat drop comment "base"
 	}
 }

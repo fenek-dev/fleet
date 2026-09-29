@@ -92,16 +92,16 @@ table inet fleet {
 		tcp dport { 22, 2222 } ip6 saddr @exempt6 accept comment "base"
 		tcp dport 22 ct state new meta nfproto ipv4 update @m4_0 { ip saddr limit rate over 10/minute burst 5 packets } drop comment "r0 ssh"
 		tcp dport 22 ct state new meta nfproto ipv6 update @m6_0 { ip6 saddr limit rate over 10/minute burst 5 packets } drop comment "r0 ssh"
-		tcp dport 22 accept comment "r0 ssh"
+		tcp dport 22 counter accept comment "r0 ssh"
 	}
 	chain forward {
 		type filter hook forward priority filter; policy accept;
 		ip saddr != @exempt4 ip saddr @banned4 drop comment "base"
 		ip6 saddr != @exempt6 ip6 saddr @banned6 drop comment "base"
 		ct state established,related accept comment "base"
-		ct status dnat meta l4proto tcp ct original proto-dst { 80, 443 } accept comment "r1 caddy"
-		ct status dnat meta l4proto tcp ct original proto-dst 5432 ip saddr 10.0.0.0/8 accept comment "r2 db from lan"
-		ct status dnat meta l4proto udp ct original proto-dst 5353 drop comment "r3 no mdns"
+		ct status dnat meta l4proto tcp ct original proto-dst { 80, 443 } counter accept comment "r1 caddy"
+		ct status dnat meta l4proto tcp ct original proto-dst 5432 ip saddr 10.0.0.0/8 counter accept comment "r2 db from lan"
+		ct status dnat meta l4proto udp ct original proto-dst 5353 counter drop comment "r3 no mdns"
 		ct status dnat drop comment "base"
 	}
 }

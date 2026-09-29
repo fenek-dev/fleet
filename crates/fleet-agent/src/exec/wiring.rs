@@ -58,10 +58,7 @@ pub(super) fn start(
     let alerts: Rc<dyn AlertInput> = tel.clone();
     fleet_ops::users::register(registry, sink.clone());
     // `reboot.scheduled` through the event bus.
-    registry.register(
-        fleet_proto::op::tag::SYSTEM_REBOOT,
-        Rc::new(fleet_ops::reboot::RebootHandler::new(sink.clone())),
-    );
+    fleet_ops::reboot::register(registry, sink.clone());
     let docker: Rc<dyn DockerApi> = Rc::new(BollardDocker::new());
     fleet_ops::docker::register(registry, docker.clone());
     fleet_ops::shell::register(registry, Rc::new(PolicyShell(st.clone())));

@@ -24,7 +24,9 @@ use crate::revertible::Revertible;
 use crate::runner::{CommandOutput, CommandSpec, RunError};
 use fleet_proto::args::{FirewallMode, FirewallRuleSet};
 use fleet_proto::op::tag;
-use fleet_proto::payload::{ChangeKind, FirewallState, PendingChange};
+use fleet_proto::payload::{
+    ChangeKind, FirewallCounters, FirewallState, PendingChange, RuleCounter,
+};
 use fleet_proto::{ErrorCode, Op, Payload};
 use parse::{Parsed, UfwStatus};
 use serde::{Deserialize, Serialize};
@@ -189,6 +191,33 @@ pub async fn read_state(ctx: &SysCtx) -> Result<FirewallState, OpError> {
     })
 }
 
+/// `firewall.counters` from one `nft -j list table inet fleet`: the hit
+/// counters of a table in rendered form, matched by operator-rule index to
+/// `FirewallState::rules`. A missing table, or one Fleet can't model,
+/// answers no counters (its rule indices mean nothing).
+pub fn counters_from(out: Result<CommandOutput, RunError>) -> Result<FirewallCounters, OpError> {
+    let out = out?;
+    let table = table_from(Ok(out.clone()))?;
+    let version = table.version();
+    let modeled = matches!(&table, Table::Present(Parsed { model: Some(_), .. }));
+    let rules = if modeled {
+        parse::parse_counters(&out.stdout)
+            .map_err(|e| OpError::internal(format!("nft: {e}")))?
+            .into_iter()
+            .filter_map(|(i, packets, bytes)| {
+                Some(RuleCounter {
+                    rule: u16::try_from(i).ok()?,
+                    packets,
+                    bytes,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(FirewallCounters { version, rules })
+}
+
 /// Lockout checks against where sshd listens now (`InvalidArgument`,
 /// also when sshd's config can't be read in full).
 fn check_set(ctx: &SysCtx, set: &FirewallRuleSet) -> Result<model::SshInfo, OpError> {
@@ -250,7 +279,7 @@ impl FirewallHandler {
 impl OpHandler for FirewallHandler {
     fn validate(&self, ctx: &SysCtx, op: &Op, _meta: &OpMeta) -> Result<(), OpError> {
         match op {
-            Op::FirewallGet => Ok(()),
+            Op::FirewallGet | Op::FirewallCounters => Ok(()),
             Op::FirewallApply(set) => check_set(ctx, &model::canonical(set)).map(|_| ()),
             _ => Err(ErrorCode::Unsupported.into()),
         }
@@ -265,6 +294,9 @@ impl OpHandler for FirewallHandler {
         Box::pin(async move {
             match op {
                 Op::FirewallGet => Ok(OpOutput::Payload(Payload::Firewall(read_state(ctx).await?))),
+                Op::FirewallCounters => Ok(OpOutput::Payload(Payload::FirewallCounters(
+                    counters_from(ctx.runner.run(list_table_spec()).await)?,
+                ))),
                 Op::FirewallApply(set) => self.apply(ctx, set, meta).await,
                 _ => Err(ErrorCode::Unsupported.into()),
             }
@@ -275,6 +307,7 @@ impl OpHandler for FirewallHandler {
 pub fn register(r: &mut Registry) {
     let h = Rc::new(FirewallHandler);
     r.register(tag::FIREWALL_GET, h.clone());
+    r.register(tag::FIREWALL_COUNTERS, h.clone());
     r.register(tag::FIREWALL_APPLY, h);
 }
 

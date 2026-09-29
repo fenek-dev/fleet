@@ -637,6 +637,35 @@ fn golden_vectors_v1() {
         &mut f,
     );
     check("op_unknown_1234", &Op::Unknown { tag: 1234 }, &mut f);
+    check(
+        "op_change_revert",
+        &Op::ChangeRevert {
+            change_id: [0xc4; 16],
+        },
+        &mut f,
+    );
+    check("op_firewall_counters", &Op::FirewallCounters, &mut f);
+    check(
+        "op_system_reboot_schedule_window",
+        &Op::SystemRebootSchedule {
+            when: op::RebootWhen::Window {
+                start_min: 180,
+                end_min: 300,
+            },
+        },
+        &mut f,
+    );
+    check(
+        "op_system_reboot_schedule_at",
+        &Op::SystemRebootSchedule {
+            when: op::RebootWhen::At {
+                at_ms: 1_750_000_000_123,
+            },
+        },
+        &mut f,
+    );
+    check("op_system_reboot_cancel", &Op::SystemRebootCancel, &mut f);
+    check("op_system_reboot_status", &Op::SystemRebootStatus, &mut f);
     check("signed_roster", &fixture_roster(), &mut f);
     check("signed_command", &fixture_command(), &mut f);
     check(
@@ -1008,6 +1037,32 @@ fn catalog_vectors(body: &CommandBody, f: &mut Vec<String>) {
         &Payload::MetricsSample(payload::MetricsSample {
             time_ms: 1_750_000_000_123,
             values: vec![(0, F32(12.5)), (7, F32(0.0)), (255, F32(f32::NAN))],
+        }),
+        f,
+    );
+    check(
+        "payload_firewall_counters",
+        &Payload::FirewallCounters(payload::FirewallCounters {
+            version: 0x1122_3344_5566_7788,
+            rules: vec![
+                payload::RuleCounter {
+                    rule: 0,
+                    packets: 1234,
+                    bytes: 567_890,
+                },
+                payload::RuleCounter {
+                    rule: 3,
+                    packets: 0,
+                    bytes: 0,
+                },
+            ],
+        }),
+        f,
+    );
+    check(
+        "payload_reboot_status",
+        &Payload::RebootStatus(payload::RebootStatus {
+            at_ms: Some(1_750_000_000_123),
         }),
         f,
     );
