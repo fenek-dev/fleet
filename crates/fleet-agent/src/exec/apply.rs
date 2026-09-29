@@ -136,32 +136,32 @@ impl Exec {
             log("revert change", e);
             ErrorCode::Internal
         })?;
+        // Everything up to the disarm await is synchronous, so maintenance
+        // can't consume the marker in between: a conflict's version comes
+        // from the restore's own outcome, and whether a timer beat us to
+        // it from the marker it left.
         let (timers, dir) = {
             let st = self.st.borrow();
             (st.timers.clone(), st.pending_dir.clone())
         };
+        let already = outcome == RevertOutcome::NotPending
+            && dir
+                .markers()
+                .ok()
+                .is_some_and(|m| m.iter().any(|(i, mk)| *i == id && mk.restored));
+        // Audit and announce now rather than at the next maintenance tick.
+        self.st.borrow_mut().process_markers(now_ms());
         if outcome != RevertOutcome::NotPending
             && let Err(e) = revert::disarm_timer_async(timers.as_ref(), id).await
         {
             // Harmless: the timer's revert finds nothing to claim.
             log("disarm revert timers", e);
         }
-        let marker = dir
-            .markers()
-            .ok()
-            .and_then(|m| m.into_iter().find(|(i, _)| *i == id))
-            .map(|(_, m)| m);
-        let conflict = marker.as_ref().and_then(|m| m.conflict);
-        let already = outcome == RevertOutcome::NotPending && marker.is_some_and(|m| m.restored);
-        // Audit and announce now rather than at the next maintenance tick.
-        self.st.borrow_mut().process_markers(now_ms());
         match outcome {
             RevertOutcome::Reverted => Ok(Payload::Empty),
             RevertOutcome::NotPending if already => Ok(Payload::Empty),
             RevertOutcome::NotPending => Err(ErrorCode::NotFound),
-            RevertOutcome::Kept => Err(ErrorCode::VersionConflict {
-                current: conflict.unwrap_or(0),
-            }),
+            RevertOutcome::Kept { current } => Err(ErrorCode::VersionConflict { current }),
             RevertOutcome::Failed => Err(ErrorCode::Internal),
         }
     }

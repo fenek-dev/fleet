@@ -128,7 +128,7 @@ fn run_revert(paths: &Paths, id: ChangeId) -> Result<(), String> {
     // Kinds without a restore module fail loudly rather than claim success.
     let reverter = revert::RegistryRevert::for_paths(paths);
     match revert::run_revert(&dir, id, &reverter, now_ms()).map_err(|e| e.to_string())? {
-        RevertOutcome::Reverted | RevertOutcome::Kept | RevertOutcome::NotPending => Ok(()),
+        RevertOutcome::Reverted | RevertOutcome::Kept { .. } |RevertOutcome::NotPending => Ok(()),
         RevertOutcome::Failed => Err("restore failed".into()),
     }
 }

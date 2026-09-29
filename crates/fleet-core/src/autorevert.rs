@@ -40,6 +40,9 @@ pub enum ConfirmError {
     Reconnect(String),
     #[error("agent refused: {0:?}")]
     Agent(ErrorCode),
+    /// Stopped by [`ConfirmRegistry::cancel`] ("Revert now").
+    #[error("confirmation cancelled")]
+    Cancelled,
     #[error(transparent)]
     Request(RequestError),
 }
@@ -223,6 +226,99 @@ pub fn confirm_window(
     Ok(b.min(cap))
 }
 
+/// The confirmations in flight, at most one per server, so that "Revert
+/// now" can stop the automatic one *before* it sends `change.revert`
+/// (otherwise a confirm still reconnecting could win the race and keep the
+/// change the operator just rejected). `run` registers a confirmation,
+/// [`ConfirmRegistry::cancel`] aborts it and returns only once it has been
+/// dropped, i.e. after nothing of it can reach the agent any more.
+#[derive(Clone, Default)]
+pub struct ConfirmRegistry {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<ServerId, Running>>>,
+}
+
+struct Running {
+    token: u64,
+    abort: futures_util::future::AbortHandle,
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Runs on drop of the registered confirmation: unregisters it (unless
+/// replaced) and tells a waiting `cancel` it is gone.
+struct Finished {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<ServerId, Running>>>,
+    id: ServerId,
+    token: u64,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&self.id).is_some_and(|r| r.token == self.token) {
+            map.remove(&self.id);
+        }
+        drop(map);
+        if let Some(tx) = self.done.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl ConfirmRegistry {
+    /// Runs `confirmation` as `id`'s registered confirmation; a running one
+    /// for the same server is cancelled first. `Err(Cancelled)` when
+    /// [`ConfirmRegistry::cancel`] stopped it.
+    pub async fn run<F>(&self, id: &ServerId, confirmation: F) -> Result<(), ConfirmError>
+    where
+        F: std::future::Future<Output = Result<(), ConfirmError>>,
+    {
+        self.cancel(id).await;
+        static TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (abort, reg) = futures_util::future::AbortHandle::new_pair();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                id.clone(),
+                Running {
+                    token,
+                    abort,
+                    done: rx,
+                },
+            );
+        // Declared before the future, so it drops after it.
+        let _finished = Finished {
+            inner: self.inner.clone(),
+            id: id.clone(),
+            token,
+            done: Some(tx),
+        };
+        match futures_util::future::Abortable::new(confirmation, reg).await {
+            Ok(r) => r,
+            Err(_) => Err(ConfirmError::Cancelled),
+        }
+    }
+
+    /// Stops `id`'s confirmation, if one runs, and waits until it has been
+    /// dropped. Whether one was running.
+    pub async fn cancel(&self, id: &ServerId) -> bool {
+        let running = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        let Some(r) = running else { return false };
+        r.abort.abort();
+        // Resolves (Ok, or Err when the sender is gone) once the
+        // confirmation's future has been dropped.
+        let _ = r.done.await;
+        true
+    }
+}
+
 /// Confirms a `ChangePending` answer over a fresh connection within the
 /// change's own deadline (capped by [`CONFIRM_TIMEOUT`], skew-adjusted).
 /// The one entry point for bulk, provisioning and MCP callers.
@@ -244,6 +340,86 @@ pub async fn confirm_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    /// Records its drop in `log`, then never finishes by itself.
+    struct Pending(Arc<Mutex<Vec<&'static str>>>);
+    impl std::future::Future for Pending {
+        type Output = Result<(), ConfirmError>;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            // Give a racing `cancel` every chance to run ahead of us.
+            self.0.lock().unwrap().push("confirm dropped");
+        }
+    }
+
+    fn sid() -> ServerId {
+        ServerId::new("srv_test01").unwrap()
+    }
+
+    /// The race behind "Revert now": the automatic confirmation is still
+    /// running (reconnecting). `cancel` returns only after it has been
+    /// dropped, so `change.revert` is always sent after nothing of the
+    /// confirmation can reach the agent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_drops_the_confirmation_before_the_revert_is_sent() {
+        let reg = ConfirmRegistry::default();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (r2, l2, id) = (reg.clone(), log.clone(), sid());
+        let confirm = tokio::spawn(async move { r2.run(&id, Pending(l2)).await });
+        // Let it register and start.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(reg.cancel(&sid()).await);
+        log.lock().unwrap().push("revert sent");
+        assert!(matches!(
+            confirm.await.unwrap(),
+            Err(ConfirmError::Cancelled)
+        ));
+        assert_eq!(*log.lock().unwrap(), ["confirm dropped", "revert sent"]);
+        // Nothing left to cancel.
+        assert!(!reg.cancel(&sid()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finished_confirmations_unregister_and_new_ones_replace_old() {
+        let reg = ConfirmRegistry::default();
+        // A confirmation that completes leaves nothing to cancel.
+        assert!(reg.run(&sid(), async { Ok(()) }).await.is_ok());
+        assert!(!reg.cancel(&sid()).await);
+        assert!(matches!(
+            reg.run(&sid(), async { Err(ConfirmError::Reverted) }).await,
+            Err(ConfirmError::Reverted)
+        ));
+        assert!(!reg.cancel(&sid()).await);
+        // A second run for the same server cancels the first.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (r2, l2, id) = (reg.clone(), log.clone(), sid());
+        let first = tokio::spawn(async move { r2.run(&id, Pending(l2)).await });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let second = reg.run(&sid(), async { Ok(()) }).await;
+        assert!(second.is_ok());
+        assert!(matches!(first.await.unwrap(), Err(ConfirmError::Cancelled)));
+        assert_eq!(*log.lock().unwrap(), ["confirm dropped"]);
+        // Other servers are untouched.
+        let other = ServerId::new("srv_test02").unwrap();
+        let (r3, l3, o2) = (reg.clone(), log.clone(), other.clone());
+        let third = tokio::spawn(async move { r3.run(&o2, Pending(l3)).await });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(!reg.cancel(&sid()).await);
+        assert!(reg.cancel(&other).await);
+        assert!(matches!(third.await.unwrap(), Err(ConfirmError::Cancelled)));
+    }
 
     #[test]
     fn budget_keeps_margin() {

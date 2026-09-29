@@ -122,6 +122,7 @@ fn env_with(groups: &'static str, fail: bool, delay: Duration, apply_timeout: Du
         apply_timeout,
         Pol::default().security,
         None,
+        None,
     )
 }
 
@@ -162,11 +163,30 @@ impl CommandRunner for SimRunner {
                 Some(d) => format!("ActiveState=active\nDescription={d}\n"),
                 None => "ActiveState=inactive\nDescription=fleet-reboot.timer\n".into(),
             },
-            ("/usr/bin/date", _) => "+0100\n".into(),
+            ("/usr/bin/date", _) => "00:30:00\n".into(),
             ("/usr/sbin/nft", _) => r#"{"nftables": []}"#.into(),
             _ => String::new(),
         };
         Ok(CommandOutput::ok(out))
+    }
+}
+
+/// The production reverter, except that the state's version reads as
+/// `moved` (the state "changed again since"): the restore is then skipped.
+struct MovedOn(fleet_agent::revert::RegistryRevert, Option<u64>);
+
+impl fleet_agent::revert::Revert for MovedOn {
+    fn revert(
+        &self,
+        kind: WireKind,
+        snapshot: &[u8],
+        new_version: Option<u64>,
+    ) -> Result<(), fleet_agent::revert::RevertError> {
+        self.0.revert(kind, snapshot, new_version)
+    }
+
+    fn current_version(&self, kind: WireKind, snapshot: &[u8]) -> Option<u64> {
+        self.1.or_else(|| self.0.current_version(kind, snapshot))
     }
 }
 
@@ -177,6 +197,7 @@ fn env_full(
     apply_timeout: Duration,
     security: &'static str,
     sim: Option<Sim>,
+    moved: Option<u64>,
 ) -> Env {
     let mut fx = Fixture::with(
         2,
@@ -214,9 +235,9 @@ fn env_full(
         let mut restore = fleet_ops::Reverters::new();
         restore.register(WireKind::Firewall, r.clone());
         restore.register(WireKind::Mesh, r);
-        cfg.reverter = Box::new(fleet_agent::revert::RegistryRevert::new(
-            restore,
-            fleet_ops::SysCtx::system(),
+        cfg.reverter = Box::new(MovedOn(
+            fleet_agent::revert::RegistryRevert::new(restore, fleet_ops::SysCtx::system()),
+            moved,
         ));
         cfg.timers = Rc::new(SharedRecorder(t));
         if let Some(sim) = sim {
@@ -857,6 +878,44 @@ fn change_revert_restores_now_disarms_timers_and_audits() {
     });
 }
 
+/// The state moved on after the change (its version is no longer the
+/// change's): the revert keeps it and answers the *real* current version,
+/// straight from the restore's outcome (never a fabricated one, even when
+/// maintenance passes the marker meanwhile).
+#[test]
+fn change_revert_of_a_moved_on_state_reports_the_current_version() {
+    let e = env_full(
+        r#""system", "firewall""#,
+        false,
+        Duration::ZERO,
+        Duration::from_secs(30),
+        "managed",
+        None,
+        Some(9),
+    );
+    let fx = &e.fx;
+    run(async {
+        let mut s = fx.connect(&fx.macs[0]).await;
+        let cmd = s
+            .build_command(fw(), &fx.server, Actor::Human, None, &with_ev(Some(7)))
+            .unwrap();
+        let id = change_id(&s.send(&cmd).await.unwrap());
+        e.log.take();
+        let r = s
+            .request(
+                Op::ChangeRevert { change_id: id },
+                &fx.server,
+                Actor::Human,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(err(r), ErrorCode::VersionConflict { current: 9 });
+        assert!(e.log.take().is_empty(), "nothing restored");
+        assert_eq!(pending_files(fx), 0);
+    });
+}
+
 /// `change.revert` is in the `firewall` group, which this policy doesn't
 /// allow: only the device that made the change may revert it (like
 /// `change.confirm`).
@@ -904,6 +963,7 @@ fn agent_only_allows_revert_counters_and_reboot_ops() {
         Duration::from_secs(30),
         "agent-only",
         Some(sim.clone()),
+        None,
     );
     let fx = &e.fx;
     run(async {
@@ -981,6 +1041,7 @@ fn reboot_window_and_at_schedule_status_cancel() {
         Duration::from_secs(30),
         "managed",
         Some(sim.clone()),
+        None,
     );
     let fx = &e.fx;
     run(async {
@@ -989,8 +1050,8 @@ fn reboot_window_and_at_schedule_status_cancel() {
             Ok(Payload::RebootStatus(s)) => s.at_ms,
             other => panic!("{other:?}"),
         };
-        // A window covering all but the last minute of the local day is
-        // (almost surely) open now: the reboot is due within seconds.
+        // The sim's local clock reads 00:30, inside 00:00-23:59: due within
+        // seconds.
         let win = Op::SystemRebootSchedule {
             when: RebootWhen::Window {
                 start_min: 0,
@@ -1004,7 +1065,7 @@ fn reboot_window_and_at_schedule_status_cancel() {
         assert_eq!(r.result, Ok(Payload::Empty));
         {
             let calls = sim.lock().unwrap().calls.clone();
-            assert!(calls.iter().any(|c| c == &["/usr/bin/date", "+%z"]), "{calls:?}");
+            assert!(calls.iter().any(|c| c == &["/usr/bin/date", "+%H:%M:%S"]), "{calls:?}");
         }
         let r = s
             .request(Op::SystemRebootStatus, &fx.server, Actor::Human, None)

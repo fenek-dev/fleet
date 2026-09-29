@@ -61,6 +61,9 @@ pub struct FleetCore {
     pub(crate) mcp: std::sync::OnceLock<Arc<fleet_core::mcp_host::McpHost>>,
     /// Multi-Mac state: roster management, sync, catch-up (`fleet_mgmt`).
     pub(crate) fleet: crate::fleet_mgmt::FleetState,
+    /// The app's automatic confirmations in flight, so "Revert now" can
+    /// stop one before it sends `change.revert`.
+    pub(crate) confirms: fleet_core::autorevert::ConfirmRegistry,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -288,6 +291,7 @@ impl FleetCore {
             sftp: Mutex::default(),
             mcp: std::sync::OnceLock::new(),
             fleet: crate::fleet_mgmt::FleetState::new(*key_bytes, &cache_path),
+            confirms: Default::default(),
         }))
     }
 

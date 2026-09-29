@@ -240,7 +240,7 @@ fn confirm_failure(e: ConfirmError) -> ConfirmFailure {
         ConfirmError::NoConnection => ConfirmFailure::NoConnection,
         ConfirmError::Reconnect(_) => ConfirmFailure::ReconnectFailed,
         ConfirmError::Agent(code) => ConfirmFailure::Agent(code),
-        ConfirmError::Request(_) => ConfirmFailure::RequestFailed,
+        ConfirmError::Request(_) | ConfirmError::Cancelled => ConfirmFailure::RequestFailed,
     }
 }
 

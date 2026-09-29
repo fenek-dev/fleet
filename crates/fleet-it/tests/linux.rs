@@ -1701,7 +1701,20 @@ fn w6c_reboot_window_status_cancel() {
             panic!("status")
         };
         let at = st.at_ms.expect("armed");
-        let lead_s = at / 1000 - fleet_core::now_ms() / 1000;
+        let (_, raw) = c.exec_status(
+            &[
+                "systemctl",
+                "show",
+                "fleet-reboot.timer",
+                "--property=ActiveState",
+                "--property=Description",
+                "--property=NextElapseUSecRealtime",
+                "--timestamp=utc",
+            ],
+            30,
+        );
+        assert!(at > 1_000_000_000_000, "status {at}; systemctl show:\n{raw}");
+        let lead_s = (at / 1000).saturating_sub(fleet_core::now_ms() / 1000);
         // About three hours ahead (a DST switch in between may shift it).
         assert!((3 * 3600 - 300..=3 * 3600 + 3900).contains(&lead_s), "{lead_s}");
         let (armed, _) = c.exec_status(&["systemctl", "is-active", "fleet-reboot.timer"], 30);

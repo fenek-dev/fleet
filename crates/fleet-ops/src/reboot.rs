@@ -13,11 +13,13 @@
 //! of its own and a status read after an exec restart still knows.
 //! Emits `reboot.scheduled`; the audit log has the command like any other.
 //!
-//! **Windows** are daily and in the server's local time: one `date +%z`
-//! call gives the UTC offset, and the lead time to the next window start
-//! follows from that (right away, at the floor, when the local time is
-//! inside a window). A DST switch between now and the window can shift the
-//! reboot by the switch's size (one hour at most). No shell string is
+//! **Windows** are daily and in the server's local time. One
+//! `date +%H:%M:%S` call tells whether the window is open now (then the
+//! one-shot above, at the floor, unless the window closes within the
+//! floor); otherwise `--on-calendar='*-*-* HH:MM:00'` at the window start,
+//! which systemd resolves with the server's time zone rules, so DST
+//! changes before the start are handled. `system.reboot.status` reads
+//! systemd's `NextElapseUSecRealtime` for such a timer. No shell string is
 //! built anywhere: fixed binary paths and argument lists.
 
 use crate::ctx::SysCtx;
@@ -71,35 +73,95 @@ pub fn status_command() -> CommandSpec {
             "fleet-reboot.timer",
             "--property=ActiveState",
             "--property=Description",
+            "--property=NextElapseUSecRealtime",
+            "--timestamp=utc",
         ])
         .timeout(COMMAND_TIMEOUT)
 }
 
-/// `date +%z`: the local UTC offset (`+0530`).
-pub fn offset_command() -> CommandSpec {
-    CommandSpec::new(DATE).arg("+%z").timeout(COMMAND_TIMEOUT)
+/// `date +%H:%M:%S`: the server's local time of day. Only "is the window
+/// open right now" needs it; the future start is left to systemd's
+/// calendar (which follows the server's time zone rules, DST included).
+pub fn local_time_command() -> CommandSpec {
+    CommandSpec::new(DATE)
+        .arg("+%H:%M:%S")
+        .timeout(COMMAND_TIMEOUT)
 }
 
-/// Seconds east of UTC from `date +%z` output (`+hhmm` / `-hhmm`).
-pub fn parse_offset(out: &str) -> Option<i64> {
-    let s = out.trim();
-    let (sign, rest) = match s.as_bytes().first()? {
-        b'+' => (1, &s[1..]),
-        b'-' => (-1, &s[1..]),
-        _ => return None,
+/// Seconds since local midnight from `date +%H:%M:%S` output.
+pub fn parse_local_seconds(out: &str) -> Option<u32> {
+    let mut parts = out.trim().split(':');
+    let mut field = |max: u32| {
+        let p = parts.next()?;
+        if p.len() != 2 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        p.parse::<u32>().ok().filter(|v| *v <= max)
     };
-    if rest.len() != 4 || !rest.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let hh: i64 = rest[..2].parse().ok()?;
-    let mm: i64 = rest[2..].parse().ok()?;
-    (hh <= 14 && mm < 60).then_some(sign * (hh * 3600 + mm * 60))
+    // 60: a leap second.
+    let (h, m, s) = (field(23)?, field(59)?, field(60)?);
+    parts.next().is_none().then_some(h * 3600 + m * 60 + s)
 }
 
-/// Lead time in seconds for `when`, from `now_ms` and the local UTC offset
-/// (only windows need it). `InvalidArgument` for an `At` in the past or
-/// beyond 30 days.
-pub fn lead_seconds(when: &RebootWhen, now_ms: u64, offset_s: i64) -> Result<u32, ErrorCode> {
+/// `--on-calendar` for the window start (server-local, DST-aware).
+pub fn calendar_command(start_min: u16) -> CommandSpec {
+    CommandSpec::new(SYSTEMD_RUN)
+        .args([
+            format!(
+                "--on-calendar=*-*-* {:02}:{:02}:00",
+                start_min / 60,
+                start_min % 60
+            ),
+            "--timer-property=AccuracySec=1s".to_owned(),
+            format!("--unit={UNIT}"),
+            "--collect".to_owned(),
+            "--description=Fleet scheduled reboot window".to_owned(),
+            SYSTEMCTL.to_owned(),
+            "reboot".to_owned(),
+        ])
+        .timeout(COMMAND_TIMEOUT)
+}
+
+/// What a window means right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowPlan {
+    /// Open now with room to spare: reboot after the floor.
+    Now,
+    /// Closed, or closing within the floor: at the next start, `wait_s`
+    /// from now by the local clock (an estimate; systemd decides).
+    Next { wait_s: u32 },
+}
+
+/// `local_s`: seconds since local midnight. A reboot armed `MIN_DELAY_S`
+/// from now must still land before the window's (exclusive) end, else the
+/// next day's window is used.
+pub fn plan_window(start_min: u16, end_min: u16, local_s: u32) -> WindowPlan {
+    let day = i64::from(MINUTES_PER_DAY) * 60;
+    let (s, e, now) = (
+        i64::from(start_min) * 60,
+        i64::from(end_min) * 60,
+        i64::from(local_s),
+    );
+    let inside = if s < e {
+        (s..e).contains(&now)
+    } else {
+        now >= s || now < e
+    };
+    let left = (e - now).rem_euclid(day);
+    if inside && left > i64::from(MIN_DELAY_S) {
+        return WindowPlan::Now;
+    }
+    let wait = (s - now).rem_euclid(day);
+    // Equal (inside, about to close, at the start second): a full day.
+    let wait = if wait == 0 { day } else { wait };
+    WindowPlan::Next {
+        wait_s: u32::try_from(wait).unwrap_or(u32::MAX),
+    }
+}
+
+/// Lead time in seconds for `In` and `At` (`InvalidArgument` for an `At`
+/// in the past or beyond 30 days). Windows go through [`plan_window`].
+pub fn lead_seconds(when: &RebootWhen, now_ms: u64) -> Result<u32, ErrorCode> {
     let floor = |s: u64| u32::try_from(s).unwrap_or(u32::MAX).max(MIN_DELAY_S);
     match *when {
         RebootWhen::In { delay_s } => Ok(floor(u64::from(delay_s))),
@@ -113,31 +175,68 @@ pub fn lead_seconds(when: &RebootWhen, now_ms: u64, offset_s: i64) -> Result<u32
             }
             Ok(floor(secs))
         }
-        RebootWhen::Window { start_min, end_min } => {
-            let now_s = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
-            let local = now_s.saturating_add(offset_s).rem_euclid(86_400);
-            let minute = i64::from(u16::try_from(local / 60).unwrap_or(0));
-            let (start, end) = (i64::from(start_min), i64::from(end_min));
-            let inside = if start < end {
-                (start..end).contains(&minute)
-            } else {
-                minute >= start || minute < end
-            };
-            if inside {
-                return Ok(MIN_DELAY_S);
-            }
-            let wait = (start * 60 - local).rem_euclid(i64::from(MINUTES_PER_DAY) * 60);
-            Ok(floor(u64::try_from(wait).unwrap_or(0)))
-        }
+        RebootWhen::Window { .. } => Err(ErrorCode::Internal),
     }
 }
 
-/// `at=<ms>` out of `systemctl show` output; `None` when no active timer.
-/// An active timer whose description has no parsable time (armed by
-/// something else) answers `Some(0)`: scheduled, time unknown.
+/// Unix seconds of systemd's `--timestamp=utc` form, `Tue 2026-09-29
+/// 04:43:00 UTC` (a weekday name, `YYYY-MM-DD`, `HH:MM:SS`, `UTC`; the
+/// weekday is not checked). `None` for anything else, dates before 1970
+/// and the `n/a` systemd prints for no next elapse.
+pub fn parse_utc_timestamp(s: &str) -> Option<u64> {
+    let mut it = s.split(' ').filter(|p| !p.is_empty());
+    let (wd, date, time, tz) = (it.next()?, it.next()?, it.next()?, it.next()?);
+    if it.next().is_some()
+        || tz != "UTC"
+        || wd.len() != 3
+        || !wd.bytes().all(|b| b.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let num = |p: &str, len: usize| {
+        (p.len() == len && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse::<i64>().ok())
+            .flatten()
+    };
+    let mut d = date.split('-');
+    let (y, m, day) = (num(d.next()?, 4)?, num(d.next()?, 2)?, num(d.next()?, 2)?);
+    let mut t = time.split(':');
+    let (hh, mm, ss) = (num(t.next()?, 2)?, num(t.next()?, 2)?, num(t.next()?, 2)?);
+    if d.next().is_some()
+        || t.next().is_some()
+        || !(1970..=9999).contains(&y)
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&day)
+        || hh > 23
+        || mm > 59
+        || ss > 60
+    {
+        return None;
+    }
+    // Days from civil (Howard Hinnant's algorithm).
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
+/// Reads `systemctl show` output: `None` when no active timer. The target
+/// is the description's `at=<ms>` (our own one-shot timers); a calendar
+/// timer has none, so `NextElapseUSecRealtime` (systemd's own next elapse,
+/// DST-correct, in `--timestamp=utc` form) stands in. An active timer with neither
+/// answers `Some(0)`: scheduled, time unknown.
 pub fn parse_status(text: &str) -> RebootStatus {
     let mut active = false;
     let mut at = None;
+    let mut next = None;
+    let digits = |d: &str| {
+        (!d.is_empty() && d.len() <= 20 && d.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| d.parse::<u64>().ok())
+            .flatten()
+    };
     for line in text.lines() {
         if let Some(v) = line.strip_prefix("ActiveState=") {
             active = v.trim() == "active";
@@ -145,12 +244,13 @@ pub fn parse_status(text: &str) -> RebootStatus {
             at = v
                 .trim()
                 .strip_prefix(DESCRIPTION_PREFIX)
-                .filter(|d| !d.is_empty() && d.len() <= 20 && d.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|d| d.parse::<u64>().ok());
+                .and_then(digits);
+        } else if let Some(v) = line.strip_prefix("NextElapseUSecRealtime=") {
+            next = parse_utc_timestamp(v.trim()).and_then(|s| s.checked_mul(1000));
         }
     }
     RebootStatus {
-        at_ms: active.then_some(at.unwrap_or(0)),
+        at_ms: active.then_some(at.or(next).unwrap_or(0)),
     }
 }
 
@@ -165,6 +265,20 @@ impl RebootHandler {
 
     /// Replaces any earlier timer with one firing in `secs`.
     async fn arm(&self, ctx: &SysCtx, secs: u32, meta: &OpMeta) -> Result<OpOutput, OpError> {
+        let at_ms = ctx.clock.now_ms() + u64::from(secs) * 1000;
+        self.arm_with(ctx, schedule_command(secs, at_ms), at_ms, meta)
+            .await
+    }
+
+    /// Stops any earlier timer, runs `arm` (a `systemd-run` spec) and
+    /// announces `at_ms` (an estimate for calendar timers).
+    async fn arm_with(
+        &self,
+        ctx: &SysCtx,
+        arm: CommandSpec,
+        at_ms: u64,
+        meta: &OpMeta,
+    ) -> Result<OpOutput, OpError> {
         let out = ctx.runner.run(cancel_command()).await?;
         if !out.success() && out.code != Some(NOT_LOADED) {
             return Err(OpError::internal(format!(
@@ -172,8 +286,7 @@ impl RebootHandler {
                 out.code
             )));
         }
-        let at_ms = ctx.clock.now_ms() + u64::from(secs) * 1000;
-        let out = ctx.runner.run(schedule_command(secs, at_ms)).await?;
+        let out = ctx.runner.run(arm).await?;
         if !out.success() {
             return Err(OpError::internal(format!(
                 "systemd-run reboot timer: exit {:?}",
@@ -187,13 +300,13 @@ impl RebootHandler {
         Ok(OpOutput::Payload(Payload::Empty))
     }
 
-    async fn utc_offset(&self, ctx: &SysCtx) -> Result<i64, OpError> {
-        let out = ctx.runner.run(offset_command()).await?;
+    async fn local_seconds(&self, ctx: &SysCtx) -> Result<u32, OpError> {
+        let out = ctx.runner.run(local_time_command()).await?;
         if !out.success() {
             return Err(OpError::internal(format!("date: exit {:?}", out.code)));
         }
-        parse_offset(&String::from_utf8_lossy(&out.stdout))
-            .ok_or_else(|| OpError::internal("date: unexpected UTC offset"))
+        parse_local_seconds(&String::from_utf8_lossy(&out.stdout))
+            .ok_or_else(|| OpError::internal("date: unexpected local time"))
     }
 }
 
@@ -220,11 +333,18 @@ impl OpHandler for RebootHandler {
                     self.arm(ctx, (*delay_s).max(MIN_DELAY_S), meta).await
                 }
                 Op::SystemRebootSchedule { when } => {
-                    let offset = match when {
-                        RebootWhen::Window { .. } => self.utc_offset(ctx).await?,
-                        _ => 0,
-                    };
-                    let secs = lead_seconds(when, ctx.clock.now_ms(), offset)?;
+                    if let RebootWhen::Window { start_min, end_min } = *when {
+                        let local = self.local_seconds(ctx).await?;
+                        return match plan_window(start_min, end_min, local) {
+                            WindowPlan::Now => self.arm(ctx, MIN_DELAY_S, meta).await,
+                            WindowPlan::Next { wait_s } => {
+                                let at = ctx.clock.now_ms() + u64::from(wait_s) * 1000;
+                                self.arm_with(ctx, calendar_command(start_min), at, meta)
+                                    .await
+                            }
+                        };
+                    }
+                    let secs = lead_seconds(when, ctx.clock.now_ms())?;
                     self.arm(ctx, secs, meta).await
                 }
                 Op::SystemRebootCancel => {
@@ -293,6 +413,8 @@ mod tests {
         "fleet-reboot.timer",
         "--property=ActiveState",
         "--property=Description",
+        "--property=NextElapseUSecRealtime",
+        "--timestamp=utc",
     ];
 
     fn run_args(secs: &str, at_ms: u64) -> Vec<String> {
@@ -363,12 +485,15 @@ mod tests {
     }
 
     #[test]
-    fn offsets_parse_strictly() {
-        assert_eq!(parse_offset("+0000\n"), Some(0));
-        assert_eq!(parse_offset("+0530"), Some(19_800));
-        assert_eq!(parse_offset("-0800"), Some(-28_800));
-        for bad in ["", "0530", "+530", "+05:30", "+1500", "+0560", "+05a0", "UTC"] {
-            assert_eq!(parse_offset(bad), None, "{bad:?}");
+    fn local_time_parses_strictly() {
+        assert_eq!(parse_local_seconds("00:00:00\n"), Some(0));
+        assert_eq!(parse_local_seconds("03:30:15"), Some(3 * 3600 + 30 * 60 + 15));
+        assert_eq!(parse_local_seconds("23:59:60"), Some(86_400));
+        for bad in [
+            "", "3:30:15", "03:30", "03:30:15:01", "24:00:00", "03:60:00", "03:30:61", "0a:00:00",
+            "+0100", "03:30:-1", "03: 0:00",
+        ] {
+            assert_eq!(parse_local_seconds(bad), None, "{bad:?}");
         }
     }
 
@@ -376,88 +501,139 @@ mod tests {
     const MIDNIGHT: u64 = 1_767_225_600_000;
 
     #[test]
-    fn window_lead_time_follows_local_time() {
-        let win = |s, e| RebootWhen::Window {
-            start_min: s,
-            end_min: e,
-        };
-        let at = |h: u64, m: u64| MIDNIGHT + (h * 3600 + m * 60) * 1000;
-        // UTC, 01:00, window 03:00-05:00: two hours to the start.
-        assert_eq!(lead_seconds(&win(180, 300), at(1, 0), 0), Ok(7200));
-        // Inside the window: right away.
-        assert_eq!(lead_seconds(&win(180, 300), at(4, 0), 0), Ok(MIN_DELAY_S));
-        // Window end is exclusive: 05:00 waits for tomorrow's 03:00.
-        assert_eq!(lead_seconds(&win(180, 300), at(5, 0), 0), Ok(22 * 3600));
-        // Window start inclusive.
-        assert_eq!(lead_seconds(&win(180, 300), at(3, 0), 0), Ok(MIN_DELAY_S));
-        // Local time east of UTC: 01:00 UTC is 03:30 at +02:30 = inside.
-        assert_eq!(
-            lead_seconds(&win(180, 300), at(1, 0), 9000),
-            Ok(MIN_DELAY_S)
-        );
-        // West of UTC: 01:00 UTC is 20:00 the day before at -05:00.
-        assert_eq!(
-            lead_seconds(&win(180, 300), at(1, 0), -5 * 3600),
-            Ok(7 * 3600)
-        );
+    fn window_plan_follows_the_local_clock() {
+        let at = |h: u32, m: u32, s: u32| h * 3600 + m * 60 + s;
+        let next = |wait_s| WindowPlan::Next { wait_s };
+        // 01:00, window 03:00-05:00: two hours to the start.
+        assert_eq!(plan_window(180, 300, at(1, 0, 0)), next(7200));
+        // Inside: right away; the start is inclusive.
+        assert_eq!(plan_window(180, 300, at(4, 0, 0)), WindowPlan::Now);
+        assert_eq!(plan_window(180, 300, at(3, 0, 0)), WindowPlan::Now);
+        // The end is exclusive: 05:00 waits for tomorrow's 03:00.
+        assert_eq!(plan_window(180, 300, at(5, 0, 0)), next(22 * 3600));
         // Wrapping window 23:00-01:00.
-        assert_eq!(lead_seconds(&win(1380, 60), at(23, 30), 0), Ok(MIN_DELAY_S));
-        assert_eq!(lead_seconds(&win(1380, 60), at(0, 30), 0), Ok(MIN_DELAY_S));
-        assert_eq!(lead_seconds(&win(1380, 60), at(12, 0), 0), Ok(11 * 3600));
+        assert_eq!(plan_window(1380, 60, at(23, 30, 0)), WindowPlan::Now);
+        assert_eq!(plan_window(1380, 60, at(0, 30, 0)), WindowPlan::Now);
+        assert_eq!(plan_window(1380, 60, at(12, 0, 0)), next(11 * 3600));
+    }
+
+    /// The floor must not push the reboot past the window's end: with
+    /// `MIN_DELAY_S` or less left, the next day's window is used.
+    #[test]
+    fn window_closing_within_the_floor_picks_tomorrow() {
+        let end = 300 * 60;
+        let day = 86_400;
+        // Six seconds left: room for the 5 s floor.
+        assert_eq!(plan_window(180, 300, end - 6), WindowPlan::Now);
+        // Exactly the floor left, and less: too late.
+        for left in [MIN_DELAY_S, 3, 1] {
+            assert_eq!(
+                plan_window(180, 300, end - left),
+                WindowPlan::Next {
+                    wait_s: 180 * 60 + day - (end - left)
+                },
+                "{left}"
+            );
+        }
+        // Same across midnight (window 23:00-01:00, 2 s before 01:00).
+        assert_eq!(
+            plan_window(1380, 60, 3600 - 2),
+            WindowPlan::Next {
+                wait_s: 1380 * 60 - (3600 - 2)
+            }
+        );
+    }
+
+    #[test]
+    fn calendar_timer_leaves_dst_to_systemd() {
+        let c = calendar_command(3 * 60 + 5);
+        let args: Vec<String> = c
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "--on-calendar=*-*-* 03:05:00");
+        assert!(args.contains(&"--unit=fleet-reboot".to_owned()));
+        assert!(!args.iter().any(|a| a.starts_with("--on-active")));
     }
 
     #[test]
     fn at_and_in_bounds() {
         let now = MIDNIGHT;
         let at = |ms| RebootWhen::At { at_ms: ms };
-        assert_eq!(lead_seconds(&at(now + 90_500), now, 0), Ok(91));
-        assert_eq!(lead_seconds(&at(now + 1000), now, 0), Ok(MIN_DELAY_S));
-        assert_eq!(lead_seconds(&at(now), now, 0), Ok(MIN_DELAY_S));
+        assert_eq!(lead_seconds(&at(now + 90_500), now), Ok(91));
+        assert_eq!(lead_seconds(&at(now + 1000), now), Ok(MIN_DELAY_S));
+        assert_eq!(lead_seconds(&at(now), now), Ok(MIN_DELAY_S));
         assert_eq!(
-            lead_seconds(&at(now - 1), now, 0),
+            lead_seconds(&at(now - 1), now),
             Err(ErrorCode::InvalidArgument)
         );
         let max = u64::from(REBOOT_MAX_LEAD_S) * 1000;
-        assert!(lead_seconds(&at(now + max), now, 0).is_ok());
+        assert!(lead_seconds(&at(now + max), now).is_ok());
         assert_eq!(
-            lead_seconds(&at(now + max + 1), now, 0),
+            lead_seconds(&at(now + max + 1), now),
             Err(ErrorCode::InvalidArgument)
         );
         assert_eq!(
-            lead_seconds(&RebootWhen::In { delay_s: 0 }, now, 0),
+            lead_seconds(&RebootWhen::In { delay_s: 0 }, now),
             Ok(MIN_DELAY_S)
         );
     }
 
     #[test]
-    fn schedule_window_asks_for_the_offset_then_arms() {
+    fn schedule_window_arms_now_or_a_calendar_timer() {
         let dir = tempfile::tempdir().unwrap();
-        let r = Rc::new(FakeRunner::new());
-        // T0's local time at +01:00 decides the lead; whatever it is, the
-        // timer is armed once with the description carrying the target.
-        r.expect(DATE, &["+%z"], Ok(CommandOutput::ok("+0100\n")));
-        let c = ctx_at(dir.path(), r.clone(), T0);
-        let win = RebootWhen::Window {
-            start_min: 0,
-            end_min: 1439,
-        };
-        // 00:00-23:59 covers all but the last minute; pick T0's inside state.
-        let lead = lead_seconds(&win, T0, 3600).unwrap();
-        r.expect(SYSTEMCTL, STOP, Ok(CommandOutput::exit(NOT_LOADED)))
-            .expect(
-                SYSTEMD_RUN,
-                &as_strs(&run_args(&format!("{lead}s"), T0 + u64::from(lead) * 1000)),
-                Ok(CommandOutput::ok("")),
-            );
         let sink = Rc::new(Sink::default());
         let h = RebootHandler::new(sink.clone());
-        let op = Op::SystemRebootSchedule { when: win };
+        let op = Op::SystemRebootSchedule {
+            when: RebootWhen::Window {
+                start_min: 180,
+                end_min: 300,
+            },
+        };
+        // Open now (04:00 local): the floor, as a one-shot with `at=`.
+        let r = Rc::new(FakeRunner::new());
+        r.expect(DATE, &["+%H:%M:%S"], Ok(CommandOutput::ok("04:00:00\n")))
+            .expect(SYSTEMCTL, STOP, Ok(CommandOutput::exit(NOT_LOADED)))
+            .expect(
+                SYSTEMD_RUN,
+                &as_strs(&run_args("5s", T0 + 5_000)),
+                Ok(CommandOutput::ok("")),
+            );
+        let c = ctx_at(dir.path(), r.clone(), T0);
         block(h.handle(&c, &op, &meta(op.clone(), Some(4)))).unwrap();
         assert_eq!(r.pending(), 0);
-        assert_eq!(sink.0.borrow().len(), 1);
-        // An unparsable offset arms nothing.
+        // Closed (01:00 local): systemd's calendar, announced with the
+        // local-clock estimate.
         let r = Rc::new(FakeRunner::new());
-        r.expect(DATE, &["+%z"], Ok(CommandOutput::ok("CEST")));
+        r.expect(DATE, &["+%H:%M:%S"], Ok(CommandOutput::ok("01:00:00\n")))
+            .expect(SYSTEMCTL, STOP, Ok(CommandOutput::exit(NOT_LOADED)))
+            .expect(
+                SYSTEMD_RUN,
+                &[
+                    "--on-calendar=*-*-* 03:00:00",
+                    "--timer-property=AccuracySec=1s",
+                    "--unit=fleet-reboot",
+                    "--collect",
+                    "--description=Fleet scheduled reboot window",
+                    SYSTEMCTL,
+                    "reboot",
+                ],
+                Ok(CommandOutput::ok("")),
+            );
+        let c = ctx_at(dir.path(), r.clone(), T0);
+        block(h.handle(&c, &op, &meta(op.clone(), Some(5)))).unwrap();
+        assert_eq!(r.pending(), 0);
+        assert_eq!(
+            sink.0.borrow().last(),
+            Some(&Event::RebootScheduled {
+                at_ms: T0 + 7_200_000,
+                audit_seq: 5
+            })
+        );
+        // An unparsable local time arms nothing.
+        let r = Rc::new(FakeRunner::new());
+        r.expect(DATE, &["+%H:%M:%S"], Ok(CommandOutput::ok("CEST")));
         let c = ctx_at(dir.path(), r.clone(), T0);
         let e = block(h.handle(&c, &op, &meta(op.clone(), Some(5)))).unwrap_err();
         assert_eq!(e.code(), ErrorCode::Internal);
@@ -471,6 +647,23 @@ mod tests {
         let e = block(h.handle(&c, &op, &meta(op.clone(), Some(6)))).unwrap_err();
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert!(r.calls().is_empty());
+    }
+
+    /// The committed fuzz seeds (malformed included) never panic.
+    #[test]
+    fn fuzz_seeds_parse_without_panic() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/reboot_parse");
+        let mut n = 0;
+        for e in std::fs::read_dir(dir).unwrap() {
+            let bytes = std::fs::read(e.unwrap().path()).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            let _ = parse_status(&text);
+            if let Some(s) = parse_local_seconds(&text) {
+                assert!(s <= 86_400);
+            }
+            n += 1;
+        }
+        assert!(n >= 5);
     }
 
     #[test]
@@ -511,6 +704,42 @@ mod tests {
             parse_status("ActiveState=active\nDescription=Fleet scheduled reboot\n"),
             RebootStatus { at_ms: Some(0) }
         );
+        // A calendar timer has no `at=`: systemd's own next elapse.
+        assert_eq!(
+            parse_status(
+                "ActiveState=active\nDescription=Fleet scheduled reboot window\nNextElapseUSecRealtime=Tue 2026-09-29 04:43:00 UTC\n"
+            ),
+            RebootStatus {
+                at_ms: Some(1_790_656_980_000)
+            }
+        );
+        assert_eq!(parse_utc_timestamp("Thu 2024-02-29 23:59:59 UTC"), Some(1_709_251_199));
+        assert_eq!(parse_utc_timestamp("Thu 1970-01-01 00:00:00 UTC"), Some(0));
+        // The description wins when both are there; junk next elapses
+        // are ignored.
+        assert_eq!(
+            parse_status("ActiveState=active\nDescription=Fleet scheduled reboot at=7\nNextElapseUSecRealtime=Tue 2026-09-29 04:43:00 UTC\n").at_ms,
+            Some(7)
+        );
+        for n in [
+            "",
+            "n/a",
+            "@1750000000",
+            "Tue 2026-09-29 04:43:00 CEST",
+            "Tue 2026-09-29 04:43:00",
+            "Tue 2026-09-29 04:43:00 UTC extra",
+            "Tue 2026-13-29 04:43:00 UTC",
+            "Tue 2026-09-32 04:43:00 UTC",
+            "Tue 2026-09-29 24:43:00 UTC",
+            "Tue 1969-12-31 23:59:59 UTC",
+            "Tue 99999999999-09-29 04:43:00 UTC",
+            "Tue 2026-9-29 4:43:00 UTC",
+            "Tue 2026-09-29-01 04:43:00 UTC",
+            "Tuesday 2026-09-29 04:43:00 UTC",
+        ] {
+            let t = format!("ActiveState=active\nNextElapseUSecRealtime={n}\n");
+            assert_eq!(parse_status(&t).at_ms, Some(0), "{n}");
+        }
         // Hostile description text is not parsed as a time.
         for d in [
             "at=12x",

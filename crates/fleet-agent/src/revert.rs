@@ -397,7 +397,10 @@ pub enum RevertOutcome {
     Failed,
     /// The state changed again after this change (its version is no longer
     /// the change's `new_version`): kept as it is, audited as a conflict.
-    Kept,
+    Kept {
+        /// The version the state has now (from the restore's own check).
+        current: u64,
+    },
     /// Already confirmed or reverted.
     NotPending,
 }
@@ -457,7 +460,7 @@ pub fn finish_claimed(
     dir.remove_claimed(id)?;
     Ok(match (restored, conflict) {
         (true, _) => RevertOutcome::Reverted,
-        (false, Some(_)) => RevertOutcome::Kept,
+        (false, Some(current)) => RevertOutcome::Kept { current },
         (false, None) => RevertOutcome::Failed,
     })
 }

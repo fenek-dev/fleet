@@ -359,7 +359,7 @@ fn revert_keeps_state_changed_since() {
     let moved = Versioned(9, RefCell::default());
     assert_eq!(
         revert::run_revert(&dir, b, &moved, 6).unwrap(),
-        RevertOutcome::Kept
+        RevertOutcome::Kept { current: 9 }
     );
     assert_eq!(*moved.1.borrow(), 0);
     let m = dir.markers().unwrap();
