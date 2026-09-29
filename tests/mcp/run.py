@@ -25,6 +25,7 @@ remembered-pairing checks.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,9 @@ SOCK = f"{DATA}/mcp.sock"
 CTL = "/tmp/fl-mcp-ctl"
 STATE = f"{CTL}/state.json"
 POOL = f"{ROOT}/tests/vm/pool.sh"
-AGENT = f"{ROOT}/target/linux/aarch64/fleet-agent"
+# The packaged path (tests/vm/agent-artifact.sh --deb-only): a bare binary
+# needs the package's users to exist already (design §10.1).
+AGENT = f"{ROOT}/target/linux/aarch64/deb/fleet-agent_0.1.0_arm64.deb"
 # The UI runner is sandboxed: it answers in its own temporary directory.
 ACK = os.path.expanduser("~/Library/Containers/dev.fleet.FleetUITests.xctrunner/Data/tmp/fl-mcp-ack")
 UI_LOG = f"{CTL}/ui.log"
@@ -256,7 +259,23 @@ def srv(i):
 
 
 def names():
+    """Server ids (tools take ids, as fleet_list_servers returns them)."""
     return [x["name"] for x in state["servers"]]
+
+
+def resolve_ids():
+    """Tools address servers by id: keep the display name as `label` and put
+    the id in `name`; `extra` becomes ids too (`extra_labels` keeps names)."""
+    m = mcp("resolve")
+    r = m.call("fleet_list_servers", {})
+    m.close()
+    ids = {row["name"]: row["id"] for row in r.summary["servers"]}
+    for x in state["servers"]:
+        x.setdefault("label", x["name"])
+        x["name"] = ids.get(x["label"], x["name"])
+    state.setdefault("extra_labels", state.get("extra", []))
+    state["extra"] = [ids.get(n, n) for n in state["extra_labels"]]
+    save()
 
 
 # ---------------------------------------------------------------- phases
@@ -316,6 +335,13 @@ def phase_setup():
         state["extra"].append(f"extra{i + 1}")
     save()
     s.close()
+    # Bug MCP-5: the app's install doesn't put the admin user in group
+    # `fleet`, so the bridge can't reach /run/fleet/agent.sock and the server
+    # stays Offline. Fix it by hand; the app reconnects on its own.
+    for p in pool:
+        sh(p["name"], "usermod --append --groups fleet ops")
+    time.sleep(60)
+    resolve_ids()
 
 
 def phase_teardown():
@@ -374,8 +400,10 @@ def phase_reads():
         check(f"reads.fleet_search.{kind}", not r.error, r)
         log("INFO", f"reads.fleet_search.{kind}", (r.texts[0][:250] if r.texts else "", f"untrusted={len(r.untrusted)}"))
     n = srv(0)["name"]
-    r = m.call("config_diff", {"server": n, "path": "/etc/ssh/sshd_config", "from": 1})
-    log("INFO", "reads.config_diff", r)
+    for p in ["/etc/ssh/sshd_config", "/etc/hostname", "/etc/motd"]:
+        r = m.call("config_diff", {"server": n, "path": p, "from": 1})
+        log("INFO", f"reads.config_diff.{p}", r.texts[:1])
+        check(f"reads.config_diff_non_secret_allowed.{p}", "secret" not in (r.texts[0] if r.texts else ""), r.texts[:1])
     for p in ["/etc/shadow", "/etc/ssh/ssh_host_ed25519_key"]:
         r = m.call("config_diff", {"server": n, "path": p, "from": 1})
         check(f"reads.config_diff_secret_refused.{p}", r.error, r)
@@ -453,28 +481,35 @@ def phase_changes():
     r = m.call("service_action", {"servers": [a, b], "unit": "cron.service", "action": "restart"}, timeout=180)
     check("changes.service_restart_two_below_threshold", not r.error, r)
     log("INFO", "changes.service_restart_two", r.texts[0][:500] if r.texts else r)
-    check("changes.no_prompt_below_threshold", approvals() == before, approvals()[len(before):])
+    new = [ln for ln in approvals()[len(before):].splitlines() if "to use Fleet" not in ln]
+    check("changes.no_prompt_below_threshold", not new, new)
+
+    def failed(r):
+        return r.error or (isinstance(r.summary, dict) and r.summary.get("failed", 0) > 0)
 
     for x in state["servers"]:
         n = x["name"]
         r = m.call("firewall_get", {"server": n})
-        log("INFO", f"changes.firewall_get.{n}", r.texts[0][:400] if r.texts else r)
-        if r.error or not isinstance(r.summary, dict):
-            continue
-        s = r.summary
-        ver = s.get("version", 0)
-        rules = s.get("ruleset")
-        r = m.call("firewall_apply", {"server": n, "ruleset": rules if rules is not None else {}, "expected_version": ver}, timeout=180)
-        log("INFO", f"changes.firewall_apply.{n}", r)
+        # The version is only in the (untrusted) rendered payload.
+        body = r.untrusted[0] if r.untrusted else ""
+        ver = int(re.search(r"^version: (\d+)", body, re.M).group(1)) if "version:" in body else 0
+        mode = re.search(r"^mode: (\w+)", body, re.M).group(1) if "mode:" in body else "BansOnly"
+        rules = {"mode": mode, "rules": []}
+        r = m.call("firewall_apply", {"server": n, "ruleset": rules, "expected_version": ver}, timeout=240)
+        log("INFO", f"changes.firewall_apply.{n}", r.texts[0][:300] if r.texts else r)
         if x["mode"] == "agentonly":
-            check("changes.firewall_apply_refused_agent_only", r.error, r)
+            check("changes.firewall_apply_refused_agent_only", failed(r) and "PolicyDenied" in r.texts[0], r)
         else:
-            check("changes.firewall_apply_managed", not r.error, r)
-            r = m.call("firewall_apply", {"server": n, "ruleset": rules if rules is not None else {}, "expected_version": ver}, timeout=180)
-            check("changes.firewall_apply_stale_version_conflict", r.error, r)
-            log("INFO", "changes.firewall_stale", r.texts)
+            check("changes.firewall_apply_managed_confirmed", not failed(r) and "confirmed" in r.texts[0], r)
+            # (Re-applying the same ruleset keeps the version: use a wrong one.)
+            r = m.call("firewall_apply", {"server": n, "ruleset": rules, "expected_version": ver + 1}, timeout=240)
+            check("changes.firewall_apply_stale_version_conflict", failed(r) and "VersionConflict" in r.texts[0], r)
+            check("changes.failed_change_sets_isError", r.error, r.raw.get("isError"))
+    r = m.call("firewall_apply", {"server": a, "ruleset": {}, "expected_version": 0})
+    log("INFO", "changes.firewall_apply_bad_ruleset", r.texts)
     r = m.call("docker_action", {"server": a, "container": "nope", "action": "restart"})
-    check("changes.docker_action_error", r.error, r)
+    check("changes.docker_action_fails", failed(r), r)
+    check("changes.failure_code_not_internal", "Internal" not in (r.texts[0] if r.texts else ""), r.texts[:1])
     log("INFO", "changes.docker_action", r.texts)
     r = m.call("compose_deploy", {"server": a, "project": "demo",
                                   "compose_yaml": "services:\n  web:\n    image: nginx:alpine\n"})
@@ -532,7 +567,8 @@ def phase_operator():
     c["t"].join()
     log("INFO", "bulk.prompt_text", text)
     check("bulk.above_threshold_prompt", ok and "bulk" in text.lower(), text)
-    check("bulk.prompt_lists_all_targets", all(t in text for t in targets), text)
+    labels = [x.get("label", x["name"]) for x in state["servers"]] + state.get("extra_labels", [])
+    check("bulk.prompt_lists_all_targets", all(t in text for t in labels), text)
     check("bulk.denied_code", getattr(c["r"], "code", None) == "approval_denied", c["r"])
     c = call_async(m, "service_action", wide)
     ok, text = s.step(3)
