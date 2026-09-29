@@ -195,14 +195,33 @@ pub fn read_agent_binary(path: &Path) -> Result<Vec<u8>, ReleaseImportError> {
         return Err(ReleaseImportError::TooLarge);
     }
     let bytes = std::fs::read(path)?;
-    let bin = match crate::install::ArtifactKind::of(path) {
-        crate::install::ArtifactKind::Deb => deb_binary(&bytes)?,
-        crate::install::ArtifactKind::Binary => bytes,
+    agent_binary_of(&bytes, crate::install::ArtifactKind::of(path))
+}
+
+/// The agent binary of artifact bytes already in memory (no file access).
+pub fn agent_binary_of(
+    bytes: &[u8],
+    kind: crate::install::ArtifactKind,
+) -> Result<Vec<u8>, ReleaseImportError> {
+    if bytes.len() > MAX_PACKAGE {
+        return Err(ReleaseImportError::TooLarge);
+    }
+    let bin = match kind {
+        crate::install::ArtifactKind::Deb => deb_binary(bytes)?,
+        crate::install::ArtifactKind::Binary => bytes.to_vec(),
     };
     if bin.len() > MAX_BINARY {
         return Err(ReleaseImportError::TooLarge);
     }
     Ok(bin)
+}
+
+/// BLAKE3 (hex) of the agent binary of artifact bytes in memory.
+pub fn bytes_hash(
+    bytes: &[u8],
+    kind: crate::install::ArtifactKind,
+) -> Result<String, ReleaseImportError> {
+    Ok(hex::encode(fleet_crypto::blake3(&agent_binary_of(bytes, kind)?)))
 }
 
 /// BLAKE3 (hex) of an artifact's agent binary, shown before signing.

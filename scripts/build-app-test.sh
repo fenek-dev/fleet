@@ -17,6 +17,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # skip by default; FLEET_SKIP_AGENT_BUNDLE=0 scripts/build-app-test.sh embeds
 # them (needed to exercise the bundled-agent install path).
 export FLEET_SKIP_AGENT_BUNDLE="${FLEET_SKIP_AGENT_BUNDLE:-1}"
+"$root/scripts/gen-bundled-artifacts.sh" --stub
 cd "$root/apple/Fleet"
 xcodegen generate >/dev/null
 
@@ -53,4 +54,5 @@ xcodebuild -project Fleet.xcodeproj -scheme Fleet -configuration Debug \
     -skipPackagePluginValidation \
     CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO \
     FLEET_ENTITLEMENTS=Fleet/Fleet-Test.entitlements \
+    'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) DEBUG FLEET_TEST_HOOKS FLEET_ADHOC_KEYSTORE' \
     "$@" "$action"

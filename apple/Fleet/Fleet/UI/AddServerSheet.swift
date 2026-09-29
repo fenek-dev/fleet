@@ -414,6 +414,7 @@ struct AddServerSheet: View {
                 health = try await api.installAgent(
                     serverId: id, adminUser: admin.isEmpty ? nil : admin,
                     artifactPath: file?.path, bundledDir: Self.bundledAgentDir?.path,
+                    bundledPins: BundledArtifacts.agentPins,
                     securityMode: securityMode, listener: relay)
                 core.reload()
                 step = .done

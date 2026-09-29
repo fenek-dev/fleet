@@ -95,6 +95,7 @@ impl FleetCore {
         admin_user: Option<String>,
         artifact_path: Option<String>,
         bundled_dir: Option<String>,
+        bundled_pins: std::collections::HashMap<String, String>,
         security_mode: SecurityModeArg,
         listener: Box<dyn InstallListener>,
     ) -> Result<AgentHealthRow, FleetError> {
@@ -159,8 +160,11 @@ impl FleetCore {
             } else {
                 install::ArtifactSource::File(&artifact)
             };
+            let pins: std::collections::BTreeMap<String, String> =
+                bundled_pins.into_iter().collect();
             let installed = install::install_agent(
                 InstallRequest {
+                    bundled_pins: &pins,
                     server_id: &id,
                     target: &rec.target,
                     host_key: host_key.clone(),

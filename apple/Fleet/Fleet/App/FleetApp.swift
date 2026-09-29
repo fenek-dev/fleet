@@ -75,6 +75,32 @@ struct FleetApp: App {
         guard core.status == .starting else { return }
         lock.onChange = { [core] locked in core.setLocked(locked) }
         lock.install()
+        switch Keychain.startupChoice() {
+        case .refuse(let r):
+            core.fail(Keychain.refusalMessage(r))
+        case .fallback:
+            // Ad-hoc build: the Noise and cache keys are sealed to the
+            // Secure Enclave with user presence (design §5.2 "Unsigned
+            // builds"). Open them once with the first unlock's Touch ID;
+            // the core opens after that.
+            core.awaitingFirstUnlock = true
+            lock.onUnlocked = { [core] ctx in
+                guard core.awaitingFirstUnlock else { return }
+                do {
+                    try LocalKeyStore.unlockSecrets(context: ctx)
+                } catch {
+                    core.fail("Could not open Fleet's keys with the Secure Enclave. Unlock again.")
+                    return
+                }
+                core.awaitingFirstUnlock = false
+                openCore()
+            }
+        default:
+            openCore()
+        }
+    }
+
+    private func openCore() {
         do {
             let keys = try SecureEnclaveKeys(gate: gate)
             core.open(keys: keys, keyStore: NoiseKeyStore())
