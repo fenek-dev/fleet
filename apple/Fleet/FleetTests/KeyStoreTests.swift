@@ -48,6 +48,19 @@ struct KeyStoreTests {
         }
     }
 
+    /// The peer check validates a running SecCode against `cdhash H"..."`;
+    /// a running process never satisfies a cdhash it doesn't have.
+    @Test func cdhashRequirementRejectsOtherHash() {
+        var me: SecCode?
+        #expect(SecCodeCopySelf([], &me) == errSecSuccess)
+        var req: SecRequirement?
+        let bogus = String(repeating: "ab", count: 20)
+        #expect(SecRequirementCreateWithString("cdhash H\"\(bogus)\"" as CFString, [], &req)
+            == errSecSuccess)
+        guard let me, let req else { return }
+        #expect(SecCodeCheckValidity(me, [], req) != errSecSuccess)
+    }
+
     @Test func cdhashDecision() {
         #expect(McpSocketServer.cdhashAccepted(actual: "ab12", pinned: "AB12"))
         #expect(!McpSocketServer.cdhashAccepted(actual: "ab13", pinned: "ab12"))
