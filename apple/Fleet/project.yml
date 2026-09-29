@@ -137,6 +137,11 @@ schemes:
         FleetTests: [test]
         FleetUITests: [test]
     test:
+      # The unit-test host is the app itself: keep it off the real
+      # ~/Library/Application Support/Fleet (Debug test hooks).
+      environmentVariables:
+        FLEET_DATA_DIR: /tmp/fleet-unit-tests
+        FLEET_TEST_SIGNER: "1"
       targets:
         - FleetTests
         - FleetUITests
