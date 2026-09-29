@@ -22,6 +22,8 @@ struct SidebarView: View {
     @Environment(AlertAcks.self) private var acks
     @Binding var selection: NavItem?
     var openPalette: () -> Void
+    @State private var groupSheet: GroupSheetRequest?
+    @State private var deleting: GroupRow?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -63,6 +65,23 @@ struct SidebarView: View {
             .padding(12)
         }
         .background(Color.sidebar)
+        .sheet(item: $groupSheet) { GroupNameSheet(group: $0.group) }
+        .confirmationDialog(
+            "Delete group \(deleting?.name ?? "")?", isPresented: Binding(
+                get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete group", role: .destructive) {
+                if let g = deleting {
+                    try? core.removeGroup(g.id)
+                    if selection == .group(g.id) { selection = .fleet }
+                }
+                deleting = nil
+            }
+            .accessibilityIdentifier("group.confirmDelete")
+        } message: {
+            Text("Its servers stay in the fleet, ungrouped.")
+        }
     }
 
     // MARK: sections
@@ -84,7 +103,19 @@ struct SidebarView: View {
 
     private var groupsSection: some View {
         VStack(alignment: .leading, spacing: 2) {
-            header("Groups")
+            HStack {
+                header("Groups")
+                Spacer()
+                Button { groupSheet = GroupSheetRequest(group: nil) } label: {
+                    Image(systemName: "plus").font(.system(size: 11, weight: .semibold))
+                        .frame(width: 22, height: 22).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.textMuted)
+                .help("New group")
+                .accessibilityLabel("New group")
+                .accessibilityIdentifier("sidebar.newGroup")
+            }
             ForEach(core.groups, id: \.id) { g in
                 let count = core.servers.filter { $0.groupId == g.id }.count
                 SidebarRow(selected: selection == .group(g.id), height: 30, action: { selection = .group(g.id) }) {
@@ -94,6 +125,10 @@ struct SidebarView: View {
                     Text("\(count)").font(.secondary).foregroundStyle(Color.textMuted)
                 }
                 .accessibilityIdentifier("sidebar.group.\(g.name)")
+                .contextMenu {
+                    Button("Rename…") { groupSheet = GroupSheetRequest(group: g) }
+                    Button("Delete…", role: .destructive) { deleting = g }
+                }
             }
         }
     }
@@ -159,6 +194,11 @@ struct SidebarView: View {
         }
         .accessibilityIdentifier("sidebar.\(id)")
     }
+}
+
+private struct GroupSheetRequest: Identifiable {
+    let id = UUID()
+    let group: GroupRow?
 }
 
 private struct SidebarRow<Content: View>: View {

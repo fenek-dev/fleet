@@ -166,6 +166,23 @@ final class CoreBridge {
         reload()
     }
 
+    func renameGroup(_ id: String, _ name: String) throws {
+        try core?.renameGroup(groupId: id, name: name)
+        reload()
+    }
+
+    /// Servers in the group become ungrouped.
+    func removeGroup(_ id: String) throws {
+        try core?.removeGroup(groupId: id)
+        reload()
+    }
+
+    /// Group (nil = none) and tags of an existing server.
+    func setPlacement(_ id: String, groupId: String?, tags: [String]) throws {
+        try core?.setServerPlacement(serverId: id, groupId: groupId, tags: tags)
+        reload()
+    }
+
     func removeServer(_ id: String) throws {
         try core?.removeServer(serverId: id)
         reload()

@@ -78,7 +78,13 @@ struct RunbooksView: View {
         .toolbar {
             Button("Run on servers…") { bulkShown = true }
         }
-        .task { reload() }
+        .task {
+            reload()
+            consumeIntent()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .fleetRunIntent)) { _ in
+            consumeIntent()
+        }
         .sheet(isPresented: $bulkShown) {
             BulkRunSheet(targets: core.servers.filter { $0.state == .ready }.map(\.id))
         }
@@ -114,6 +120,17 @@ struct RunbooksView: View {
         }
     }
 
+    /// The palette asked to run a saved snippet or runbook: open its run
+    /// sheet, which still shows the exact text and needs confirmation.
+    private func consumeIntent() {
+        guard let intent = RunIntent.pending else { return }
+        RunIntent.pending = nil
+        switch intent {
+        case .snippet(let id): runningSnippet = snippets.first { $0.id == id }
+        case .runbook(let id): runningRunbook = runbooks.first { $0.id == id }
+        }
+    }
+
     private func delete(snippet: SnippetRow) {
         try? core.api?.deleteSnippet(id: snippet.id)
         reload()
@@ -123,6 +140,19 @@ struct RunbooksView: View {
         try? core.api?.deleteRunbook(id: runbook.id)
         reload()
     }
+}
+
+/// Palette to Runbooks screen hand-off (the screen is created after the
+/// selection changes, so the request waits here).
+@MainActor
+enum RunIntent {
+    case snippet(String)
+    case runbook(String)
+    static var pending: RunIntent?
+}
+
+extension Notification.Name {
+    static let fleetRunIntent = Notification.Name("dev.fleet.runIntent")
 }
 
 extension SnippetRow: Identifiable {}
@@ -236,6 +266,8 @@ private struct RunRunbookSheet: View {
     let runbook: RunbookRow
     let finished: () -> Void
     @State private var values: [String: String] = [:]
+    @State private var preview: RunbookPreviewRow?
+    @State private var confirmed = false
     @State private var progress = BulkProgress()
     @State private var error: String?
 
@@ -253,6 +285,30 @@ private struct RunRunbookSheet: View {
                 .formStyle(.grouped)
                 .frame(maxHeight: 160)
             }
+            // Exact resolved operations and the named targets, before Run.
+            if let preview {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(preview.steps.enumerated()), id: \.offset) { i, s in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("\(i + 1). \(s.name) · \(s.opName)"
+                                     + (s.elevated ? " · needs Touch ID" : ""))
+                                    .font(.base).foregroundStyle(Color.text)
+                                Text(s.command).font(.mono(11)).foregroundStyle(Color.textSecondary)
+                                    .textSelection(.enabled)
+                            }
+                            .accessibilityIdentifier("runbook.preview.step")
+                        }
+                        Text("Targets: " + preview.targets.joined(separator: ", "))
+                            .font(.secondary).foregroundStyle(Color.textSecondary)
+                            .accessibilityIdentifier("runbook.preview.targets")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 200)
+                Toggle("I checked the operations and the targets", isOn: $confirmed)
+                    .accessibilityIdentifier("runbook.confirm")
+            }
             if let error { Text(error).foregroundStyle(Tone.critical.text) }
             if let ok = progress.runbookResult {
                 Text(ok ? "Runbook finished: every step succeeded." : "Runbook finished with failures.")
@@ -265,20 +321,39 @@ private struct RunRunbookSheet: View {
                 if progress.isRunning { Button("Cancel") { progress.cancel() } }
                 Button("Run \(runbook.steps.count) steps on \(runbook.targets.count) servers") { run() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(progress.isRunning)
+                    .disabled(progress.isRunning || preview == nil || !confirmed)
+                    .accessibilityIdentifier("runbook.run")
             }
         }
         .padding(16)
         .frame(minWidth: 760, minHeight: 520)
+        .task(id: values) { refreshPreview() }
+    }
+
+    private var resolvedParams: [String: String] {
+        var params: [String: String] = [:]
+        for p in runbook.params {
+            if let v = values[p.name] ?? p.defaultValue { params[p.name] = v }
+        }
+        return params
+    }
+
+    private func refreshPreview() {
+        confirmed = false
+        guard let api = core.api else { return }
+        do {
+            preview = try api.runbookPreview(id: runbook.id, params: resolvedParams)
+            error = nil
+        } catch {
+            preview = nil
+            self.error = error.fleetMessage
+        }
     }
 
     private func run() {
         guard let api = core.api else { return }
         progress.reset(targets: runbook.targets)
-        var params: [String: String] = [:]
-        for p in runbook.params {
-            if let v = values[p.name] ?? p.defaultValue { params[p.name] = v }
-        }
+        let params = resolvedParams
         do {
             progress.handle = try api.runRunbook(id: runbook.id, params: params, listener: progress.listener())
         } catch {

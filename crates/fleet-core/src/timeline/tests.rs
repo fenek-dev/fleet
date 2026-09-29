@@ -195,7 +195,8 @@ fn audit_items_mark_ai() {
     )
     .unwrap();
     assert!(item.is_ai());
-    assert_eq!(item.title, "pkg.refresh");
+    assert_eq!(item.title, "Packages refresh");
+    assert_eq!(item.name, "pkg.refresh");
     assert_eq!(item.detail, "ok · AI (claude)");
     assert_eq!(item.category, Category::Action);
     let human = from_audit(
@@ -212,6 +213,33 @@ fn audit_items_mark_ai() {
     assert!(!human.is_ai());
     assert_eq!(human.detail, "reverted · operator");
     assert_eq!(op_name(9999), "unknown");
+}
+
+#[test]
+fn read_ops_hidden_unless_ai_and_names_human() {
+    let server = sid("srv_aaaaaaaaaaaa");
+    let mut e = audit(
+        5,
+        20,
+        Actor::Human,
+        Phase::Result,
+        ResultSummary::Done(Outcome::Ok),
+    );
+    e.op = OpSummary::from(&Op::SystemInfo);
+    assert!(from_audit(&server, &e).is_none());
+    e.actor = Actor::System;
+    assert!(from_audit(&server, &e).is_none());
+    e.actor = Actor::Ai {
+        client: BoundedString::new("claude").unwrap(),
+        session: [0; 16],
+    };
+    assert_eq!(from_audit(&server, &e).unwrap().name, "system.info");
+    assert_eq!(human_op_title("unit.restart"), "Service restart");
+    assert_eq!(human_op_title("weird.op"), "weird.op");
+    // Every hidden name is a real catalog op.
+    for n in READ_OPS {
+        assert!(fleet_proto::op::tag::NAMES.contains(n), "{n}");
+    }
 }
 
 #[test]

@@ -165,7 +165,8 @@ struct ServerDetailView: View {
                     Text(ServerContext.facts(s, info: ctx.info, health: ctx.health)
                          + (s.proxyJump.map { " · via \($0)" } ?? ""))
                         .font(.mono(12)).foregroundStyle(Color.textSecondary)
-                        .lineLimit(1).truncationMode(.tail)
+                        .lineLimit(2).truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
                         .help("\(s.user)@\(s.host):\(s.port)")
                         .accessibilityIdentifier("server.facts")
                 }

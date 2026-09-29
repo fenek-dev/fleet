@@ -94,6 +94,11 @@ struct FleetTableView: View {
     @State private var filter: FleetFilter = .all
     @State private var showAdd = false
     @State private var showBulk = false
+    @State private var editing: ServerRow?
+    @State private var showNewGroup = false
+    /// Servers awaiting the remove confirmation.
+    @State private var removing: [String]?
+    @State private var actionError: String?
     @State private var store = FleetFactsStore.shared
 
     /// Worst open alert per server.
@@ -169,12 +174,57 @@ struct FleetTableView: View {
         .sheet(isPresented: $showBulk) {
             BulkRunSheet(targets: bulkTargets)
         }
+        .sheet(item: $editing) { EditServerSheet(server: $0) }
+        .sheet(isPresented: $showNewGroup) { GroupNameSheet(group: nil) }
+        .confirmationDialog(removeTitle, isPresented: Binding(
+            get: { removing != nil }, set: { if !$0 { removing = nil } }
+        ), titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { removeConfirmed() }
+                .accessibilityIdentifier("fleet.confirmRemove")
+        } message: {
+            Text("Fleet forgets the server: its pinned keys and cached history are deleted "
+                 + "on this Mac. The agent stays on the server; uninstall it first to remove it.")
+        }
+        .alert("Couldn't complete the action", isPresented: Binding(
+            get: { actionError != nil }, set: { if !$0 { actionError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
         .task(id: core.servers.filter { $0.state == .ready }.map(\.id)) {
             store.startActivityStamp()
             while !Task.isCancelled {
                 await store.refresh(core)
                 await store.refreshDigest(core, intel: intel)
                 try? await Task.sleep(for: .seconds(60))
+            }
+        }
+    }
+
+    private var removeTitle: String {
+        let ids = removing ?? []
+        if ids.count == 1, let s = core.servers.first(where: { $0.id == ids[0] }) {
+            return "Remove \(s.name)?"
+        }
+        return "Remove \(ids.count) servers?"
+    }
+
+    private func removeConfirmed() {
+        var failures: [String] = []
+        for id in removing ?? [] {
+            do { try core.removeServer(id) } catch { failures.append(error.fleetMessage) }
+        }
+        selected.subtract(removing ?? [])
+        removing = nil
+        if !failures.isEmpty { actionError = failures.joined(separator: "\n") }
+    }
+
+    private func move(_ ids: Set<String>, to group: String?) {
+        for id in ids {
+            guard let s = core.servers.first(where: { $0.id == id }) else { continue }
+            do { try core.setPlacement(id, groupId: group, tags: s.tags) } catch {
+                actionError = error.fleetMessage
             }
         }
     }
@@ -406,7 +456,22 @@ struct FleetTableView: View {
             .accessibilityIdentifier("fleet.menu.run")
             Button("Reconnect") { ids.forEach(core.reconnect) }
             Divider()
-            Button("Remove", role: .destructive) { ids.forEach { try? core.removeServer($0) } }
+            if ids.count == 1, let id = ids.first, let s = core.servers.first(where: { $0.id == id }) {
+                Button("Edit group and tags…") { editing = s }
+                    .accessibilityIdentifier("fleet.menu.edit")
+            }
+            Menu("Move to group") {
+                Button("None") { move(ids, to: nil) }
+                ForEach(core.groups, id: \.id) { g in
+                    Button(g.name) { move(ids, to: g.id) }
+                }
+                Divider()
+                Button("New group…") { showNewGroup = true }
+            }
+            .accessibilityIdentifier("fleet.menu.moveToGroup")
+            Divider()
+            Button("Remove…", role: .destructive) { removing = Array(ids) }
+                .accessibilityIdentifier("fleet.menu.remove")
         } primaryAction: { ids in
             if let id = ids.first { selection = .server(id) }
         }

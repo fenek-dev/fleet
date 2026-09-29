@@ -352,7 +352,7 @@ impl BulkRunHandle {
     }
 }
 
-fn clip(s: String) -> String {
+pub(crate) fn clip(s: String) -> String {
     let mut s = text::text(s);
     if s.len() > DETAIL_MAX {
         let mut end = DETAIL_MAX;

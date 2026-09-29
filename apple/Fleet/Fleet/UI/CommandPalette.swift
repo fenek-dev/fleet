@@ -9,6 +9,12 @@ struct PaletteAction: Identifiable {
     let run: @MainActor () -> Void
 }
 
+/// Sheets the palette can open from anywhere.
+enum PaletteSheet: String, Identifiable {
+    case addServer, addMac, cloudInit, newGroup
+    var id: String { rawValue }
+}
+
 extension OpDraft.Kind {
     /// Palette wording for the operation.
     var paletteTitle: String {
@@ -50,6 +56,8 @@ struct CommandPalette: View {
     @Binding var selection: NavItem?
     /// Opens the bulk run sheet on `targets` with `draft` filled in.
     var runBulk: ([String], OpDraft) -> Void
+    /// Opens a sheet owned by the content view.
+    var openSheet: (PaletteSheet) -> Void = { _ in }
     @State private var query = ""
     @State private var highlighted = 0
     @State private var snippets: [SnippetRow] = []
@@ -108,13 +116,63 @@ struct CommandPalette: View {
                 })
             }
         }
+        // Sheets and actions that used to need a button on a screen.
+        all.append(.init(id: "add.server", title: "Add server", subtitle: "Fleet",
+                         symbol: "plus") { openSheet(.addServer) })
+        all.append(.init(id: "add.mac", title: "Add a Mac", subtitle: "Devices",
+                         symbol: "laptopcomputer") { openSheet(.addMac) })
+        all.append(.init(id: "cloudinit", title: "Export cloud-init", subtitle: "Provisioning",
+                         symbol: "square.and.arrow.up") { openSheet(.cloudInit) })
+        all.append(.init(id: "group.new", title: "New group", subtitle: "Fleet",
+                         symbol: "square.stack.3d.up") { openSheet(.newGroup) })
+        all.append(.init(id: "sync.now", title: "Sync now", subtitle: "Devices",
+                         symbol: "arrow.triangle.2.circlepath.icloud") {
+            Task { await core.sync?.cycle() }
+        })
+        all.append(.init(id: "releases", title: "Roll back an agent", subtitle: "Settings · Agent releases",
+                         symbol: "arrow.uturn.backward") {
+            UserDefaults.standard.set(SettingsSection.releases.rawValue,
+                                      forKey: SettingsSection.storageKey)
+            selection = .settings
+        })
+        if case .server(let id)? = selection, let s = core.servers.first(where: { $0.id == id }) {
+            all.append(.init(id: "reconnect.\(id)", title: "Reconnect \(s.name)", subtitle: "Server",
+                             symbol: "arrow.clockwise") { core.reconnect(id) })
+        }
+        let down = core.servers.filter { $0.state != .ready }
+        if !down.isEmpty {
+            all.append(.init(id: "reconnect.all", title: "Reconnect all disconnected servers",
+                             subtitle: "\(down.count) server\(down.count == 1 ? "" : "s")",
+                             symbol: "arrow.clockwise") { down.forEach { core.reconnect($0.id) } })
+        }
+        for s in core.servers {
+            all.append(.init(id: "terminal.\(s.id)", title: "Open terminal on \(s.name)",
+                             subtitle: "Terminal", symbol: "terminal") {
+                selection = .server(s.id)
+                // The detail view may not exist yet: post once it has.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(250))
+                    NotificationCenter.default.post(
+                        name: .fleetSelectServerTab, object: nil,
+                        userInfo: ["serverId": s.id, "tab": ServerTab.terminal.rawValue])
+                }
+            })
+        }
         for s in snippets {
-            all.append(.init(id: "snippet.\(s.id)", title: s.name, subtitle: "Snippet",
-                             symbol: "text.alignleft") { selection = .runbooks })
+            all.append(.init(id: "snippet.\(s.id)", title: s.name, subtitle: "Run snippet",
+                             symbol: "text.alignleft") {
+                RunIntent.pending = .snippet(s.id)
+                selection = .runbooks
+                NotificationCenter.default.post(name: .fleetRunIntent, object: nil)
+            })
         }
         for r in runbooks {
-            all.append(.init(id: "runbook.\(r.id)", title: r.name, subtitle: "Runbook",
-                             symbol: "list.bullet.rectangle") { selection = .runbooks })
+            all.append(.init(id: "runbook.\(r.id)", title: r.name, subtitle: "Run runbook",
+                             symbol: "list.bullet.rectangle") {
+                RunIntent.pending = .runbook(r.id)
+                selection = .runbooks
+                NotificationCenter.default.post(name: .fleetRunIntent, object: nil)
+            })
         }
         for g in core.groups {
             all.append(.init(id: "group.\(g.id)", title: g.name, subtitle: "Group",
