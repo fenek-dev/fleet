@@ -16,29 +16,38 @@ final class LogTailModel {
 
     var following: Bool { handle != nil }
 
+    /// Bumped whenever a stream opens or stops; callbacks of an older
+    /// stream (already queued on the main actor) are ignored.
+    @ObservationIgnored private var generation = 0
+
+    /// `path` is the raw path from `LogFileRow.path`, never a display label.
     func open(api: FleetCore, serverId: String, path: String, lines n: UInt16, follow: Bool) {
         stop()
         lines = []
+        let gen = generation
         do {
             handle = try api.tailLogfile(serverId: serverId, path: path, lines: n, follow: follow,
-                                         sink: LogTailRelay(model: self))
+                                         sink: LogTailRelay(model: self, generation: gen))
             error = nil
         } catch { self.error = error.fleetMessage }
     }
 
     func stop() {
+        generation += 1
         handle?.cancel()
         handle = nil
         status = nil
     }
 
-    fileprivate func append(_ new: [String], rotated: Bool) {
+    fileprivate func append(_ new: [String], rotated: Bool, generation gen: Int) {
+        guard gen == generation else { return }
         if rotated { lines.append("— file rotated or truncated —") }
         lines.append(contentsOf: new)
         if lines.count > Self.cap { lines.removeFirst(lines.count - Self.cap) }
     }
 
-    fileprivate func setStatus(_ s: StreamStatus) {
+    fileprivate func setStatus(_ s: StreamStatus, generation gen: Int) {
+        guard gen == generation else { return }
         status = s
         if case .ended(let e) = s {
             handle = nil
@@ -49,12 +58,20 @@ final class LogTailModel {
 
 private final class LogTailRelay: LogLinesSink {
     private let model: LogTailModel
-    init(model: LogTailModel) { self.model = model }
+    private let generation: Int
+    init(model: LogTailModel, generation: Int) {
+        self.model = model
+        self.generation = generation
+    }
     func onLines(lines: [String], rotated: Bool) {
-        Task { @MainActor [model] in model.append(lines, rotated: rotated) }
+        Task { @MainActor [model, generation] in
+            model.append(lines, rotated: rotated, generation: generation)
+        }
     }
     func onStatus(status: StreamStatus) {
-        Task { @MainActor [model] in model.setStatus(status) }
+        Task { @MainActor [model, generation] in
+            model.setStatus(status, generation: generation)
+        }
     }
 }
 
@@ -77,7 +94,7 @@ struct LogFilesView: View {
             fileList.frame(width: 300)
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text(path ?? "Choose a file")
+                    Text(files.first { $0.path == path }?.label ?? "Choose a file")
                         .font(.mono(12)).foregroundStyle(Color.textSecondary).lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
@@ -118,7 +135,7 @@ struct LogFilesView: View {
             }
             List(files, selection: $path) { f in
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(f.path).font(.mono(11)).lineLimit(1).truncationMode(.middle)
+                    Text(f.label).font(.mono(11)).lineLimit(1).truncationMode(.middle)
                     Text(ByteCountFormatter.string(fromByteCount: Int64(clamping: f.sizeBytes),
                                                    countStyle: .file)
                          + " · " + Date(timeIntervalSince1970: TimeInterval(f.mtimeMs) / 1000)
@@ -126,7 +143,7 @@ struct LogFilesView: View {
                         .font(.caption11).foregroundStyle(Color.textMuted)
                 }
                 .tag(Optional(f.path))
-                .accessibilityIdentifier("logs.file.\(f.path)")
+                .accessibilityIdentifier("logs.file.\(f.label)")
             }
             .listStyle(.plain)
             .overlay {

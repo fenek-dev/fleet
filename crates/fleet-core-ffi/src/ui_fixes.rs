@@ -18,7 +18,11 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct LogFileRow {
+    /// The server's path exactly as reported, validated when used. Only
+    /// for `tail_logfile`; never show it (rule 6).
     pub path: String,
+    /// Escaped for display.
+    pub label: String,
     pub size_bytes: u64,
     pub mtime_ms: u64,
 }
@@ -94,10 +98,100 @@ pub(crate) fn weblog_op(
     Ok(op)
 }
 
+pub(crate) fn log_file_row(f: fleet_proto::payload::LogFile) -> LogFileRow {
+    LogFileRow {
+        label: text::line(f.path.clone()),
+        path: f.path,
+        size_bytes: f.size_bytes,
+        mtime_ms: f.mtime_ms,
+    }
+}
+
+/// `logfile.tail` for a raw path from [`LogFileRow::path`].
+pub(crate) fn tail_op(path: String, lines: u16, follow: bool) -> Result<Op, FleetError> {
+    let path = AbsPath::new(path).map_err(|_| invalid("path"))?;
+    let op = Op::LogfileTail {
+        path,
+        lines,
+        follow,
+    };
+    op.check_args().map_err(|_| invalid("lines"))?;
+    Ok(op)
+}
+
 fn count(label: String, count: u64) -> WebLogCount {
     WebLogCount {
         label: text::line(label),
         count,
+    }
+}
+
+/// One runbook step as it will run, after parameter substitution.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RunbookStepPreviewRow {
+    pub name: String,
+    pub op_name: String,
+    pub elevated: bool,
+    /// Exact command or arguments (escaped, clipped).
+    pub command: String,
+}
+
+/// A runbook's target servers by name, for the confirmation sheet.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RunbookPreviewRow {
+    pub steps: Vec<RunbookStepPreviewRow>,
+    /// Target names (ids of removed servers are marked).
+    pub targets: Vec<String>,
+}
+
+#[uniffi::export]
+impl FleetCore {
+    /// What `run_runbook` would run with `params`: every step's resolved
+    /// operation and every target server by name. Fails like a run would
+    /// (missing or invalid parameters).
+    pub fn runbook_preview(
+        &self,
+        id: String,
+        params: std::collections::HashMap<String, String>,
+    ) -> Result<RunbookPreviewRow, FleetError> {
+        let (rb, names) = {
+            let c = lock(&self.cache);
+            let rb = c.runbook(&id)?.ok_or_else(|| invalid("runbook"))?;
+            let names: std::collections::HashMap<String, String> = c
+                .servers()?
+                .into_iter()
+                .map(|s| (s.id.to_string(), s.name))
+                .collect();
+            (rb, names)
+        };
+        let given: std::collections::BTreeMap<String, String> = params.into_iter().collect();
+        let values = rb
+            .resolve_params(&given)
+            .map_err(|e| invalid(&e.to_string()))?;
+        let ops = rb.ops(&values).map_err(|e| invalid(&e.to_string()))?;
+        Ok(RunbookPreviewRow {
+            steps: rb
+                .steps
+                .iter()
+                .zip(&ops)
+                .map(|(s, op)| RunbookStepPreviewRow {
+                    name: text::line(s.name.clone()),
+                    op_name: op.name().to_string(),
+                    elevated: fleet_core::opspec::needs_approval(op) || op.may_escalate(),
+                    command: crate::bulk::clip(fleet_core::bulk::describe(op)),
+                })
+                .collect(),
+            targets: rb
+                .targets
+                .iter()
+                .map(|t| {
+                    names
+                        .get(t)
+                        .map(|n| text::line(n.clone()))
+                        .unwrap_or_else(|| format!("{} (removed)", text::line(t.clone())))
+                })
+                .collect(),
+        })
     }
 }
 
@@ -160,11 +254,7 @@ impl FleetCore {
             Payload::LogFiles(l) => Ok(l
                 .files
                 .into_iter()
-                .map(|f| LogFileRow {
-                    path: text::line(f.path),
-                    size_bytes: f.size_bytes,
-                    mtime_ms: f.mtime_ms,
-                })
+                .map(log_file_row)
                 .collect()),
             p => unexpected(p),
         }
@@ -181,13 +271,7 @@ impl FleetCore {
         sink: Box<dyn LogLinesSink>,
     ) -> Result<Arc<StreamHandle>, FleetError> {
         let id = validate::server_id(&server_id)?;
-        let path = AbsPath::new(path).map_err(|_| invalid("path"))?;
-        let op = Op::LogfileTail {
-            path,
-            lines,
-            follow,
-        };
-        op.check_args().map_err(|_| invalid("lines"))?;
+        let op = tail_op(path, lines, follow)?;
         let (handle, rt) = self.running()?;
         let (h, cancel) = StreamHandle::new();
         let sink: Arc<dyn LogLinesSink> = Arc::from(sink);
@@ -258,6 +342,28 @@ impl FleetCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_uses_raw_path_not_display_label() {
+        let raw = "/var/log/evil\u{202E}txt\u{200B}.log";
+        let row = log_file_row(fleet_proto::payload::LogFile {
+            path: raw.into(),
+            size_bytes: 1,
+            mtime_ms: 2,
+        });
+        assert_eq!(row.path, raw);
+        assert!(!row.label.contains('\u{202E}') && !row.label.contains('\u{200B}'));
+        assert!(row.label.contains("\\u{202E}") && row.label.contains("\\u{200B}"));
+        let want = |p: &str| match tail_op(p.into(), 10, false).unwrap() {
+            Op::LogfileTail { path, .. } => path.as_str().to_owned(),
+            _ => unreachable!(),
+        };
+        assert_eq!(want(&row.path), raw);
+        // The escaped label would name a different file.
+        assert_ne!(want(&row.label), raw);
+        // Control characters are still refused.
+        assert!(tail_op("/var/log/a\nb".into(), 10, false).is_err());
+    }
 
     #[test]
     fn weblog_args_validated() {
