@@ -21,6 +21,10 @@ use std::time::Duration;
 
 /// How long a fresh install may take to reach a Ready session.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// The confirming `agent.health` read.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Generating and storing the server's sudo password (best effort).
+const SUDO_PASSWORD_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Install progress; called on the core thread.
 #[uniffi::export(callback_interface)]
@@ -150,7 +154,15 @@ impl FleetCore {
             core.connect_pinned(&id)?;
             // Per-server sudo password (design §5.9): Keychain + sync.
             // Best effort: sync may not be set up yet.
-            let _ = core.ensure_sudo_password(id.to_string());
+            // It calls into the Keychain (Swift): off the async thread and
+            // bounded, so a stuck Keychain can't stall the install.
+            let sudo_core = core.clone();
+            let sudo_id = id.to_string();
+            let _ = tokio::time::timeout(
+                SUDO_PASSWORD_TIMEOUT,
+                tokio::task::spawn_blocking(move || sudo_core.ensure_sudo_password(sudo_id)),
+            )
+            .await;
 
             listener.on_progress(InstallProgress::step(InstallStep::WaitingForAgent));
             let (handle, _) = core.running()?;
@@ -163,9 +175,12 @@ impl FleetCore {
                 });
             }
             listener.on_progress(InstallProgress::step(InstallStep::CheckingHealth));
-            let reply = handle
-                .request(&id, Op::AgentHealth, Actor::Human, None)
-                .await?;
+            let reply = tokio::time::timeout(
+                HEALTH_TIMEOUT,
+                handle.request(&id, Op::AgentHealth, Actor::Human, None),
+            )
+            .await
+            .map_err(|_| FleetError::Timeout)??;
             match reply.result {
                 Ok(Payload::AgentHealth(h)) => Ok(h.into()),
                 Ok(_) => Err(FleetError::UnexpectedReply),

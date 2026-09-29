@@ -43,6 +43,15 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const RM: &str = "/usr/bin/rm";
 const MAX_OUTPUT: usize = 64 * 1024;
 const STEP_TIMEOUT: Duration = Duration::from_secs(300);
+/// Reading the local artifact (a few MB): only a permission prompt or a
+/// dead network volume makes this slow.
+const READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// Opening the SFTP subsystem (two channels and the version handshake).
+const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// One SFTP upload; the artifact is at most [`MAX_ARTIFACT`], and even a
+/// slow link moves that in this time. A stalled server fails instead of
+/// leaving the install "running" forever.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Largest agent artifact accepted (budget: binary under 10 MB).
 pub const MAX_ARTIFACT: u64 = 64 * 1024 * 1024;
 
@@ -65,6 +74,10 @@ pub enum InstallError {
         status: Option<u32>,
         stderr: String,
     },
+    /// A local step (not a remote command, whose timeout is
+    /// [`SshError::Timeout`]) made no progress in time.
+    #[error("{0} timed out")]
+    StepTimeout(&'static str),
     #[error("agent install printed no keys")]
     NoKeys,
     #[error("rng")]
@@ -224,6 +237,19 @@ pub async fn probe(
     Ok(obs)
 }
 
+async fn read_artifact(path: &Path, limit: Duration) -> Result<Vec<u8>, InstallError> {
+    tokio::time::timeout(limit, tokio::fs::read(path))
+        .await
+        .map_err(|_| {
+            InstallError::Artifact(format!(
+                "reading {} timed out (macOS may be waiting for file access permission; \
+                 grant it in System Settings or use a file outside Documents, Desktop and Downloads)",
+                path.display()
+            ))
+        })?
+        .map_err(|e| InstallError::Artifact(e.to_string()))
+}
+
 /// Runs the install; see the module docs.
 pub async fn install_agent(
     req: InstallRequest<'_>,
@@ -233,9 +259,9 @@ pub async fn install_agent(
     let server_id = value(req.server_id.as_str())?;
     let admin = value(req.admin_user)?;
     let kind = ArtifactKind::of(req.artifact);
-    let artifact = tokio::fs::read(req.artifact)
-        .await
-        .map_err(|e| InstallError::Artifact(e.to_string()))?;
+    // macOS can block a read under ~/Documents, ~/Desktop or ~/Downloads
+    // forever behind a privacy (TCC) prompt nobody sees; fail instead.
+    let artifact = read_artifact(req.artifact, READ_TIMEOUT).await?;
     if artifact.is_empty() || artifact.len() as u64 > MAX_ARTIFACT {
         return Err(InstallError::Artifact("empty or too large".into()));
     }
@@ -268,34 +294,48 @@ pub async fn install_agent(
         };
 
         let outcome = async {
-            let sftp = Sftp::open(&conn).await?;
+            let sftp = tokio::time::timeout(SFTP_OPEN_TIMEOUT, Sftp::open(&conn))
+                .await
+                .map_err(|_| InstallError::StepTimeout("opening SFTP"))??;
             let total = artifact.len() as u64;
             let mode = if kind == ArtifactKind::Binary {
                 0o700
             } else {
                 0o600
             };
-            sftp.upload_bytes(&artifact, &bin, Some(mode), true, &mut |done, total| {
-                progress(InstallStage::Uploading { done, total })
-            })
-            .await?;
+            tokio::time::timeout(
+                UPLOAD_TIMEOUT,
+                sftp.upload_bytes(&artifact, &bin, Some(mode), true, &mut |done, total| {
+                    progress(InstallStage::Uploading { done, total })
+                }),
+            )
+            .await
+            .map_err(|_| InstallError::StepTimeout("uploading the agent"))??;
             let genesis_hex = hex::encode(encode(req.genesis));
-            sftp.upload_bytes(
-                genesis_hex.as_bytes(),
-                &genesis_path,
-                Some(0o600),
-                true,
-                &mut |_, _| {},
+            tokio::time::timeout(
+                STEP_TIMEOUT,
+                sftp.upload_bytes(
+                    genesis_hex.as_bytes(),
+                    &genesis_path,
+                    Some(0o600),
+                    true,
+                    &mut |_, _| {},
+                ),
             )
-            .await?;
-            sftp.upload_bytes(
-                req.policy_toml.as_bytes(),
-                &policy_path,
-                Some(0o600),
-                true,
-                &mut |_, _| {},
+            .await
+            .map_err(|_| InstallError::StepTimeout("uploading the roster"))??;
+            tokio::time::timeout(
+                STEP_TIMEOUT,
+                sftp.upload_bytes(
+                    req.policy_toml.as_bytes(),
+                    &policy_path,
+                    Some(0o600),
+                    true,
+                    &mut |_, _| {},
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| InstallError::StepTimeout("uploading the policy"))??;
             progress(InstallStage::Uploading { done: total, total });
 
             progress(InstallStage::Verifying);
@@ -358,7 +398,11 @@ pub async fn install_agent(
         for p in &temp {
             t.push(value(p)?);
         }
-        let _ = run(&conn, "cleanup", &t).await;
+        if let Ok(cmd) = command_line(&t) {
+            let _ = conn
+                .exec_capture(&cmd, MAX_OUTPUT, Duration::from_secs(15))
+                .await;
+        }
         outcome
     }
     .await;
@@ -398,6 +442,30 @@ mod tests {
         let t = truncate_chars(format!("x{s}"), MAX_STDERR);
         assert!(t.len() <= MAX_STDERR && t.starts_with('x'));
         assert_eq!(truncate_chars("short".into(), MAX_STDERR), "short");
+    }
+
+    /// A read that never returns (what a macOS privacy prompt does to a
+    /// file read) fails within the limit instead of hanging the install.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_artifact_read_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("agent");
+        let ok = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return; // no mkfifo here
+        }
+        let started = std::time::Instant::now();
+        let err = read_artifact(&fifo, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InstallError::Artifact(m) if m.contains("timed out")));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Unblock the abandoned reader thread so the runtime can shut down.
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
     }
 
     #[test]
