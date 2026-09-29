@@ -243,16 +243,23 @@ struct AddServerSheet: View {
     private var installingStep: some View {
         let progress = run.progress
         let current = run.current
+        // "Clean up" runs after a failed step and is reported last; the
+        // failed step is the last real one before it.
+        let failed = run.working
         return VStack(alignment: .leading, spacing: 8) {
             ForEach(Self.steps.indices, id: \.self) { i in
                 let (s, label) = Self.steps[i]
+                let isFailed = error != nil && failed == s
                 HStack(spacing: 10) {
                     Group {
                         if current == s && error == nil {
                             ProgressView().controlSize(.small)
+                        } else if isFailed {
+                            Image(systemName: "xmark.circle")
+                                .foregroundStyle(Tone.critical.text)
                         } else if progress[s] != nil {
-                            Image(systemName: current == s ? "xmark.circle" : "checkmark.circle.fill")
-                                .foregroundStyle(current == s ? Tone.critical.text : Tone.ok.text)
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(Tone.ok.text)
                         } else {
                             Image(systemName: "circle").foregroundStyle(Color.textMuted)
                         }
@@ -283,8 +290,10 @@ struct AddServerSheet: View {
                     Button("Close") { dismiss() }
                         .accessibilityIdentifier("addServer.close")
                     Spacer()
-                    Button("Try again") { error = nil; step = .install }
-                        .accessibilityIdentifier("addServer.retry")
+                    if !run.installed {
+                        Button("Try again") { error = nil; step = .install }
+                            .accessibilityIdentifier("addServer.retry")
+                    }
                 }
             }
         }
@@ -434,9 +443,16 @@ private final class InstallRun {
 
     func setArtifact(_ a: InstallArtifact) { artifact = a }
 
+    /// Last step that is real work (not the best-effort clean-up).
+    private(set) var working: InstallStep?
+    /// The agent is installed and its keys are pinned; a later failure
+    /// must not re-run the install.
+    var installed: Bool { progress[.pinning] != nil }
+
     func update(_ p: InstallProgress) {
         progress[p.step] = p
         current = p.step
+        if p.step != .cleaningUp { working = p.step }
     }
 }
 

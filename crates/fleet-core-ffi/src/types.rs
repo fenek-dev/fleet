@@ -345,7 +345,7 @@ impl From<fleet_core::install::InstallError> for FleetError {
             E::Sftp(s) => s.into(),
             // Carries untrusted server stderr.
             other => Self::Install {
-                message: text::line(other.to_string()),
+                message: text::text(other.to_string()),
             },
         }
     }

@@ -18,7 +18,8 @@ use fleet_core::ssh::{HostKey, P256SshSigner, SshTarget};
 use fleet_crypto::roster::sign_root;
 use fleet_crypto::sig::Ed25519Signer;
 use fleet_it::{ADMIN, Container, Mac, policy_toml};
-use fleet_proto::{FleetId, Roster, ServerId};
+use fleet_core::{CommandSigner, Session, SessionConfig, SessionMode};
+use fleet_proto::{Actor, FleetId, KeyKind, Op, Payload, Roster, ServerId};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -101,7 +102,7 @@ fn app_install_on_fresh_server() {
     assert!(art.is_file(), "artifact {} missing", art.display());
 
     let rt = fleet_it::runtime();
-    let outcome = rt.block_on(async {
+    let attempt = || rt.block_on(async {
         let role = RoleSigner::new(&mac.keys, KeyRole::Ssh).unwrap();
         let ssh = P256SshSigner(role);
         let mut obs = None;
@@ -143,27 +144,95 @@ fn app_install_on_fresh_server() {
         )
         .await
     });
-    let outcome = outcome.expect("install hung past 240 s");
+    let outcome = attempt().expect("install hung past 240 s");
     log(&format!("install finished: ok={}", outcome.is_ok()));
-    match install::ArtifactKind::of(&art) {
-        install::ArtifactKind::Deb => {
-            outcome.expect("deb install");
-            let st = c
-                .exec(&["systemctl", "is-active", "fleet-exec", "fleet-gate"])
-                .unwrap();
-            assert_eq!(st.split_whitespace().collect::<Vec<_>>(), ["active", "active"]);
-        }
-        install::ArtifactKind::Binary => match outcome {
-            // Package already present in the image: works.
-            Ok(_) => {}
-            Err(e) => {
-                // Bare binary without the package: a clear, fast error.
-                assert!(
-                    matches!(e, InstallError::Remote { .. }),
-                    "unexpected error: {e}"
-                );
-                log(&format!("bare binary refused: {e}"));
+    let installed = match install::ArtifactKind::of(&art) {
+        install::ArtifactKind::Deb => outcome.expect("deb install"),
+        install::ArtifactKind::Binary => {
+            // Fresh server without the package: refused before any upload.
+            let e = outcome.expect_err("bare binary must be refused without the package");
+            assert!(matches!(e, InstallError::NeedsPackage), "unexpected error: {e}");
+            log(&format!("bare binary refused: {e}"));
+            // What the package provides (users, units), plus a noexec /tmp
+            // like CIS-hardened servers: the binary must run from
+            // /usr/lib/fleet instead.
+            let units = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packaging/systemd");
+            for (f, to) in [
+                ("fleet-exec.service", "/etc/systemd/system/fleet-exec.service"),
+                ("fleet-gate.service", "/etc/systemd/system/fleet-gate.service"),
+                ("tmpfiles.d/fleet.conf", "/usr/lib/tmpfiles.d/fleet.conf"),
+            ] {
+                c.cp_into(&units.join(f), "/root/unit.tmp").unwrap();
+                c.exec(&["install", "-m", "0644", "/root/unit.tmp", to]).unwrap();
             }
-        },
-    }
+            c.exec(&["sh", "-c", "getent group fleet >/dev/null || groupadd --system fleet"])
+                .unwrap();
+            c.exec(&[
+                "sh",
+                "-c",
+                "getent passwd fleet-gate >/dev/null || useradd --system --user-group \
+                 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin fleet-gate",
+            ])
+            .unwrap();
+            c.exec(&["mount", "-o", "remount,noexec", "/tmp"]).unwrap();
+            attempt()
+                .expect("install hung past 240 s")
+                .expect("bare binary install with the package's users and units")
+        }
+    };
+    let st = c
+        .exec(&["systemctl", "is-active", "fleet-exec", "fleet-gate"])
+        .unwrap();
+    assert_eq!(st.split_whitespace().collect::<Vec<_>>(), ["active", "active"]);
+
+    // A fresh SSH connection (new login: carries group `fleet`), a Noise
+    // session with the pinned agent keys and a signed `agent.health`, as
+    // the app does after install.
+    rt.block_on(async {
+        let ssh = P256SshSigner(RoleSigner::new(&mac.keys, KeyRole::Ssh).unwrap());
+        let obs = install::probe(&target, &ssh).await.expect("probe");
+        let (conn, _) = fleet_core::ssh::SshConnection::connect(&target, &ssh, Some(obs.key))
+            .await
+            .expect("fresh ssh connection");
+        let groups = conn
+            .exec_capture("/usr/bin/id -nG", 4096, Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&groups.stdout)
+                .split_whitespace()
+                .any(|g| g == "fleet"),
+            "admin not in group fleet: {:?}",
+            String::from_utf8_lossy(&groups.stdout)
+        );
+        let stream = tokio::time::timeout(Duration::from_secs(30), conn.open_agent_channel(false))
+            .await
+            .expect("agent channel timed out")
+            .expect("agent channel");
+        let cfg = SessionConfig {
+            mode: SessionMode::Normal,
+            noise: &mac.noise,
+            pinned_agent_noise: installed.noise_static,
+            pinned_agent_signing: installed.signing_key,
+            fleet_id: fleet,
+            server_id: server.clone(),
+            device_id: mac.id,
+            key: KeyKind::Device,
+            signer: CommandSigner::P256(&mac.keys.device),
+        };
+        let mut s = tokio::time::timeout(Duration::from_secs(30), Session::connect_bridged(stream, cfg))
+            .await
+            .expect("session setup timed out")
+            .expect("noise session");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(30),
+            s.request(Op::AgentHealth, &server, Actor::Human, None),
+        )
+        .await
+        .expect("agent.health timed out")
+        .expect("agent.health");
+        assert!(matches!(reply.result, Ok(Payload::AgentHealth(_))), "{:?}", reply.result);
+        conn.disconnect().await;
+    });
+    log("fresh ssh + noise session + signed agent.health ok");
 }
