@@ -93,7 +93,37 @@ private final class JournalRelay: JournalSink {
     }
 }
 
+/// Logs: journald, allow-listed log files and web access logs.
 struct LogsTab: View {
+    enum Source: String, CaseIterable, Identifiable {
+        case journal = "Journal"
+        case files = "Log files"
+        case web = "Web access"
+        var id: String { rawValue }
+    }
+
+    let server: ServerRow
+    @State private var source: Source = .journal
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Picker("Source", selection: $source) {
+                ForEach(Source.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented).labelsHidden()
+            .frame(width: 320)
+            .padding(.horizontal, 24).padding(.top, 16)
+            .accessibilityIdentifier("logs.source")
+            switch source {
+            case .journal: JournalLogsView(server: server)
+            case .files: LogFilesView(server: server)
+            case .web: WebLogsView(server: server)
+            }
+        }
+    }
+}
+
+private struct JournalLogsView: View {
     @Environment(CoreBridge.self) private var core
     let server: ServerRow
     @State private var model = JournalModel()

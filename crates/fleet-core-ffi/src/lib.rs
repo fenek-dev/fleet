@@ -50,6 +50,7 @@ mod terminal;
 mod text;
 mod timeline;
 mod types;
+mod ui_fixes;
 mod ui_fleet;
 mod ui_provision;
 mod ui_security;

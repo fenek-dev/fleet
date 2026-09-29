@@ -228,7 +228,9 @@ enum Format {
     }
 
     static func bytes(_ b: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(clamping: b), countStyle: .memory)
+        // ByteCountFormatter spells zero out ("Zero KB").
+        if b == 0 { return "0 KB" }
+        return ByteCountFormatter.string(fromByteCount: Int64(clamping: b), countStyle: .memory)
     }
 
     static func lastSeen(_ ms: UInt64?) -> String {

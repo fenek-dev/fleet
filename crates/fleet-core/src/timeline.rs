@@ -326,11 +326,79 @@ pub fn op_name(tag: u16) -> &'static str {
         .unwrap_or("unknown")
 }
 
+/// Operations whose tier is always Read (mirror of the `Tier::Read` arm in
+/// `fleet_proto::op::meta`; a unit test checks every name exists). The
+/// app polls these constantly, so they are timeline noise.
+const READ_OPS: &[&str] = &[
+    "system.info", "metrics.subscribe", "metrics.query", "processes.list",
+    "processes.history", "connections.list", "events.query", "health_checks.list",
+    "journal.query", "journal.follow", "logfiles.list", "logfile.tail", "weblog.query",
+    "logins.query", "bans.list", "bans.config.get", "ports.list", "certs.list",
+    "audit.run", "integrity.status", "unit.list", "unit.status", "firewall.get",
+    "firewall.counters", "changes.list", "system.reboot.status", "pkg.list",
+    "pkg.upgradable", "pkg.history", "docker.containers.list", "docker.containers.get",
+    "docker.logs", "docker.stats", "docker.images.list", "docker.volumes.list",
+    "docker.networks.list", "compose.list", "compose.status", "cron.list",
+    "timers.list", "users.list", "authorized_keys.get", "du.scan", "find.large",
+    "config.history", "config.diff", "config.paths.get", "profile.check",
+    "profile.plan", "search.packages", "search.ports", "search.processes",
+    "search.files", "search.journal", "search.users", "mesh.status", "game.status",
+    "game.backups.list", "agent.health", "roster.pending", "roster.get",
+    "alert_rules.get", "audit.query",
+];
+
+/// Whether the operation with this catalog name is Read tier.
+pub fn is_read_op(name: &str) -> bool {
+    READ_OPS.contains(&name)
+}
+
+/// Plain-language title for an operation name (`unit.restart` → "Service
+/// restart"). Unknown names are shown as they are.
+pub fn human_op_title(name: &str) -> String {
+    let (group, rest) = name.split_once('.').unwrap_or((name, ""));
+    let noun = match group {
+        "pkg" => "Packages",
+        "unit" => "Service",
+        "docker" => "Docker",
+        "compose" => "Compose",
+        "firewall" => "Firewall",
+        "bans" => "Bans",
+        "users" => "Users",
+        "groups" => "Groups",
+        "cron" => "Cron",
+        "config" => "Config",
+        "profile" => "Hardening profile",
+        "system" => "System",
+        "process" => "Process",
+        "authorized_keys" => "SSH keys",
+        "change" => "Pending change",
+        "mesh" => "Mesh",
+        "game" => "Game server",
+        "agent" => "Agent",
+        "policy" => "Policy",
+        "roster" => "Roster",
+        "shell" => "Shell",
+        "files" | "file" => "Files",
+        "health_checks" => "Health checks",
+        _ => return name.to_string(),
+    };
+    if rest.is_empty() {
+        return noun.to_string();
+    }
+    let words = rest.replace(['.', '_'], " ");
+    format!("{noun} {words}")
+}
+
 /// The item for an audit entry: results only (each operation writes an
-/// intent entry and a result entry).
+/// intent entry and a result entry). Read-tier operations by anything but
+/// an AI client are left out: the app's own polling would drown the real
+/// events.
 pub fn from_audit(server: &ServerId, e: &AuditEntry) -> Option<TimelineItem> {
     use fleet_proto::{Outcome, Phase, ResultSummary};
     if e.phase != Phase::Result {
+        return None;
+    }
+    if is_read_op(op_name(e.op.tag)) && !matches!(e.actor, Actor::Ai { .. }) {
         return None;
     }
     let outcome = match e.result {
@@ -354,7 +422,7 @@ pub fn from_audit(server: &ServerId, e: &AuditEntry) -> Option<TimelineItem> {
         time_ms: e.time,
         category: Category::Action,
         name: name.to_string(),
-        title: name.to_string(),
+        title: human_op_title(name),
         detail: format!("{outcome} · {who}"),
         severity: None,
         actor: Some(actor),

@@ -16,6 +16,9 @@ struct AgentReleasesSettings: View {
     @State private var busy = false
     @State private var error: String?
     @State private var progress = BulkProgress()
+    @State private var rollbackServer: String?
+    @State private var confirmRollback = false
+    @State private var rollbackNote: String?
 
     private var attestationMatches: Bool {
         guard let hash else { return false }
@@ -76,6 +79,27 @@ struct AgentReleasesSettings: View {
                     }
                 }
             }
+            Section("Roll back an agent") {
+                Text("Swaps the previous agent build back in on one server and restarts it. "
+                     + "Needs Touch ID. Refused while an update is still awaiting confirmation.")
+                    .font(.secondary).foregroundStyle(Color.textMuted)
+                Picker("Server", selection: $rollbackServer) {
+                    Text("Choose…").tag(String?.none)
+                    ForEach(core.servers.filter(\.agentPinned), id: \.id) {
+                        Text($0.name).tag(Optional($0.id))
+                    }
+                }
+                .accessibilityIdentifier("releases.rollbackServer")
+                HStack {
+                    Button("Roll back…") { confirmRollback = true }
+                        .disabled(busy || rollbackServer == nil)
+                        .accessibilityIdentifier("releases.rollback")
+                    if let rollbackNote {
+                        Text(rollbackNote).font(.secondary).foregroundStyle(Tone.ok.text)
+                            .accessibilityIdentifier("releases.rollbackDone")
+                    }
+                }
+            }
             if progress.total > 0 {
                 Section("Rollout") {
                     if let c = progress.canaryPassed {
@@ -99,6 +123,35 @@ struct AgentReleasesSettings: View {
         }
         .formStyle(.grouped)
         .task(id: core.fleetRevision) { load() }
+        .confirmationDialog(
+            "Roll back the agent on \(rollbackName)?", isPresented: $confirmRollback,
+            titleVisibility: .visible
+        ) {
+            Button("Roll back (Touch ID)", role: .destructive) { rollback() }
+                .accessibilityIdentifier("releases.confirmRollback")
+        } message: {
+            Text("The previous build replaces the running one and the agent restarts; "
+                 + "the connection drops briefly.")
+        }
+    }
+
+    private var rollbackName: String {
+        core.servers.first { $0.id == rollbackServer }?.name ?? "this server"
+    }
+
+    private func rollback() {
+        guard let api = core.api, let id = rollbackServer else { return }
+        busy = true
+        error = nil
+        rollbackNote = nil
+        let name = rollbackName
+        Task {
+            defer { busy = false }
+            do {
+                try await api.rollbackAgent(serverId: id)
+                rollbackNote = "Rolled back \(name); it restarts now."
+            } catch { self.error = error.fleetMessage }
+        }
     }
 
     private func load() {

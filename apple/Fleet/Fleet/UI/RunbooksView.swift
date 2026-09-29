@@ -78,7 +78,13 @@ struct RunbooksView: View {
         .toolbar {
             Button("Run on servers…") { bulkShown = true }
         }
-        .task { reload() }
+        .task {
+            reload()
+            consumeIntent()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .fleetRunIntent)) { _ in
+            consumeIntent()
+        }
         .sheet(isPresented: $bulkShown) {
             BulkRunSheet(targets: core.servers.filter { $0.state == .ready }.map(\.id))
         }
@@ -114,6 +120,17 @@ struct RunbooksView: View {
         }
     }
 
+    /// The palette asked to run a saved snippet or runbook: open its run
+    /// sheet, which still shows the exact text and needs confirmation.
+    private func consumeIntent() {
+        guard let intent = RunIntent.pending else { return }
+        RunIntent.pending = nil
+        switch intent {
+        case .snippet(let id): runningSnippet = snippets.first { $0.id == id }
+        case .runbook(let id): runningRunbook = runbooks.first { $0.id == id }
+        }
+    }
+
     private func delete(snippet: SnippetRow) {
         try? core.api?.deleteSnippet(id: snippet.id)
         reload()
@@ -123,6 +140,19 @@ struct RunbooksView: View {
         try? core.api?.deleteRunbook(id: runbook.id)
         reload()
     }
+}
+
+/// Palette to Runbooks screen hand-off (the screen is created after the
+/// selection changes, so the request waits here).
+@MainActor
+enum RunIntent {
+    case snippet(String)
+    case runbook(String)
+    static var pending: RunIntent?
+}
+
+extension Notification.Name {
+    static let fleetRunIntent = Notification.Name("dev.fleet.runIntent")
 }
 
 extension SnippetRow: Identifiable {}

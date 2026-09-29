@@ -50,6 +50,15 @@ enum ChartMetric: String, CaseIterable, Identifiable {
         return isPercent ? "\(Int(x.rounded()))%" : Format.bytes(UInt64(max(0, x))) + "/s"
     }
 
+    /// Short y-axis tick (never scientific notation).
+    func axisLabel(_ x: Double) -> String {
+        if self == .network { return String(format: "%.0f Mbit/s", x * 8 / 1_000_000) }
+        return isPercent ? "\(Int(x.rounded()))%" : Format.bytes(UInt64(max(0, x))) + "/s"
+    }
+
+    /// "1 core", "8 cores".
+    static func coresLabel(_ n: UInt32) -> String { n == 1 ? "1 core" : "\(n) cores" }
+
     /// Big number of the card: memory shows bytes used, the chart plots percent.
     func headline(_ latest: [String: Double], chartValue: Double?) -> String? {
         if self == .memory {
@@ -64,7 +73,7 @@ enum ChartMetric: String, CaseIterable, Identifiable {
         switch self {
         case .cpu:
             var parts: [String] = []
-            if let n = cpuCount { parts.append("\(n) cores") }
+            if let n = cpuCount { parts.append(Self.coresLabel(n)) }
             if let l = latest["load.1"] { parts.append(String(format: "load %.1f", l)) }
             return parts.joined(separator: " · ")
         case .memory:
@@ -75,7 +84,7 @@ enum ChartMetric: String, CaseIterable, Identifiable {
         case .diskIO:
             return "read \(rate(Self.sum(latest, prefix: "disk.read:"))) · write \(rate(Self.sum(latest, prefix: "disk.write:")))"
         case .network:
-            func mbit(_ x: Double?) -> String { String(format: "%.1f", (x ?? 0) * 8 / 1_000_000) }
+            func mbit(_ x: Double?) -> String { String(format: "%.1f Mbit/s", (x ?? 0) * 8 / 1_000_000) }
             return "in \(mbit(Self.sum(latest, prefix: "net.rx:", skipLoopback: true))) · out \(mbit(Self.sum(latest, prefix: "net.tx:", skipLoopback: true)))"
         default: return ""
         }
@@ -553,7 +562,14 @@ struct OverviewTab: View {
             }
             .chartYScale(domain: m.isPercent ? 0...100 : 0...max(1, pts.map(\.value).max() ?? 1))
             .chartXAxis { AxisMarks(values: .automatic(desiredCount: 4)) }
-            .chartYAxis { AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) }
+            .chartYAxis {
+                AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { v in
+                    AxisGridLine()
+                    AxisValueLabel {
+                        if let d = v.as(Double.self) { Text(m.axisLabel(d)) }
+                    }
+                }
+            }
             .frame(height: 72)
         }
         .card()
@@ -581,7 +597,7 @@ struct OverviewTab: View {
             }
             ForEach(processes, id: \.pid) { p in
                 HStack {
-                    Text("\(p.pid)").font(.mono(11)).frame(width: 60, alignment: .leading)
+                    Text(verbatim: String(p.pid)).font(.mono(11)).frame(width: 60, alignment: .leading)
                     Text(p.cmdline.isEmpty ? p.name : p.cmdline).lineLimit(1).help(p.cmdline)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Text(p.user).lineLimit(1).frame(width: 80, alignment: .leading)

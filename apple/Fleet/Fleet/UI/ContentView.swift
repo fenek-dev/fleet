@@ -20,6 +20,7 @@ struct ContentView: View {
     @State private var selection: NavItem? = .fleet
     @State private var acks = AlertAcks()
     @State private var bulk: BulkRequest?
+    @State private var paletteSheet: PaletteSheet?
     /// Redraws the tree when the accent changes (colors read a static).
     @AppStorage(Appearance.accentKey) private var accent = Int(Appearance.defaultAccent)
 
@@ -54,6 +55,14 @@ struct ContentView: View {
         .sheet(item: $bulk) { req in
             BulkRunSheet(targets: req.targets, draft: req.draft)
         }
+        .sheet(item: $paletteSheet) { which in
+            switch which {
+            case .addServer: AddServerSheet()
+            case .addMac: AddMacSheet()
+            case .cloudInit: CloudInitExportSheet(adminUser: "")
+            case .newGroup: GroupNameSheet(group: nil)
+            }
+        }
     }
 
     private var main: some View {
@@ -72,13 +81,18 @@ struct ContentView: View {
                     Color.black.opacity(0.35)
                         .ignoresSafeArea()
                         .onTapGesture { paletteShown = false }
-                    CommandPalette(isPresented: $paletteShown, selection: $selection) { targets, draft in
+                    CommandPalette(isPresented: $paletteShown, selection: $selection,
+                                   runBulk: { targets, draft in
                         bulk = BulkRequest(targets: targets, draft: draft)
-                    }
+                    }, openSheet: { paletteSheet = $0 })
                     .padding(.top, 80)
                 }
             }
         }
+        .navigationTitle(windowTitle)
+        // The screens draw their own 60 px header (breadcrumb, name): the
+        // window title stays in the window menu, not as a second title bar.
+        .toolbar(removing: .title)
         .frame(minWidth: 1100, minHeight: 700)
         .background(Color.window)
         .onReceive(NotificationCenter.default.publisher(for: .fleetSearch)) { _ in
@@ -86,6 +100,23 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
             selection = .settings
+        }
+    }
+
+    /// Window title of the current screen.
+    private var windowTitle: String {
+        switch selection {
+        case .fleet, .none: "Fleet"
+        case .group(let id): core.groups.first { $0.id == id }?.name ?? "Group"
+        case .server(let id): core.servers.first { $0.id == id }?.name ?? "Server"
+        case .tag(let t): t
+        case .alerts: "Alerts"
+        case .timeline: "Timeline"
+        case .search: "Search"
+        case .vulnerabilities: "Vulnerabilities"
+        case .runbooks: "Runbooks"
+        case .provision: "Provisioning"
+        case .settings: "Settings"
         }
     }
 
