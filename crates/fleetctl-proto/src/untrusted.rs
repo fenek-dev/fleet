@@ -58,6 +58,12 @@ pub fn must_escape(c: char) -> bool {
     let u = c as u32;
     c.is_control()
         || is_format(u)
+        // Zl/Zp (line and paragraph separators) and the non-ASCII Zs
+        // spaces: they fake line breaks and alignment.
+        || matches!(
+            u,
+            0x00A0 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000
+        )
         // Co: private use.
         || matches!(u, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x10_0000..=0x10_FFFD)
         // Cn: noncharacters.

@@ -511,52 +511,9 @@ impl Walker {
     }
 }
 
-/// Small glob: `*` and `?` within one component, `**` for any number of
-/// components (zero included). Everything else is literal.
-pub fn glob_match(pattern: &str, path: &str) -> bool {
-    let p: Vec<&str> = pattern.split('/').collect();
-    let s: Vec<&str> = path.split('/').collect();
-    match_components(&p, &s)
-}
-
-fn match_components(p: &[&str], s: &[&str]) -> bool {
-    match p.split_first() {
-        None => s.is_empty(),
-        Some((&"**", rest)) => (0..=s.len()).any(|i| match_components(rest, &s[i..])),
-        Some((first, rest)) => match s.split_first() {
-            Some((c, srest)) => component_match(first, c) && match_components(rest, srest),
-            None => false,
-        },
-    }
-}
-
-/// `*`/`?` wildcard match of one component (iterative, linear backtrack).
-pub fn component_match(pattern: &str, s: &str) -> bool {
-    let (p, s): (Vec<char>, Vec<char>) = (pattern.chars().collect(), s.chars().collect());
-    let (mut pi, mut si) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while si < s.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
-            pi += 1;
-            si += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi, si));
-            pi += 1;
-        } else if let Some((sp, ss)) = star {
-            pi = sp + 1;
-            si = ss + 1;
-            star = Some((sp, ss + 1));
-        } else {
-            return false;
-        }
-    }
-    p[pi..].iter().all(|c| *c == '*')
-}
-
-/// Whether `s` has glob metacharacters.
-pub fn is_glob(s: &str) -> bool {
-    s.contains(['*', '?'])
-}
+/// The shared matcher (`fleet_proto::glob`): `*`/`?` within a component,
+/// `**` across components, bounded cost.
+pub use fleet_proto::glob::{component_match, glob_match, is_glob};
 
 #[cfg(test)]
 mod tests {

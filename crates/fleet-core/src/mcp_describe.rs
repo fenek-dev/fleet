@@ -157,12 +157,18 @@ impl P<'_> {
 fn scalar(n: &Node) -> Option<String> {
     match n {
         Node::Atom(a) => Some(a.clone()),
-        Node::Str(s) if !s.contains('\n') => Some(s.clone()),
+        Node::Str(s) if !s.contains('\n') => Some(quote(s)),
         // `Some(x)` / newtype of a scalar: the value itself.
         Node::Tuple(_, v) if v.len() == 1 => scalar(&v[0]),
         Node::List(v) if v.is_empty() => Some("[]".into()),
         _ => None,
     }
+}
+
+/// A string value shown between quotes with `"` and `\` escaped, so its
+/// text can neither end the value early nor pass for a field.
+fn quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn pad(out: &mut String, indent: usize) {
@@ -171,9 +177,12 @@ fn pad(out: &mut String, indent: usize) {
     }
 }
 
+/// Multi-line text: every line starts with `| `, so no line of it can pass
+/// for a field of the operation.
 fn block(out: &mut String, text: &str, indent: usize) {
     for line in text.split('\n') {
         pad(out, indent);
+        out.push_str("| ");
         out.push_str(line);
         out.push('\n');
     }
@@ -276,18 +285,25 @@ mod tests {
     #[test]
     fn newtypes_collapse() {
         let d = r#"ConfigRollback { path: AbsPath("/etc/ssh/sshd_config"), version: 1 }"#;
-        assert_eq!(humanize(d), "path: /etc/ssh/sshd_config\nversion: 1");
+        assert_eq!(humanize(d), "path: \"/etc/ssh/sshd_config\"\nversion: 1");
         assert_eq!(
             humanize(r#"UnitRestart { unit: UnitName("cron.service") }"#),
-            "unit: cron.service"
+            "unit: \"cron.service\""
         );
+    }
+
+    #[test]
+    fn values_cannot_forge_fields() {
+        // A value with a quote and a fake field stays inside its quotes.
+        let h = humanize(r#"X { a: "v\", b: 1", c: "l1\nb: 2" }"#);
+        assert_eq!(h, "a: \"v\\\", b: 1\"\nc:\n  | l1\n  | b: 2");
     }
 
     #[test]
     fn multiline_strings_and_lists() {
         let d = r#"ComposeDeploy { project: "app", yaml: "a: 1\nb: \"x\"\n", ports: [80, 443] }"#;
         let h = humanize(d);
-        assert!(h.contains("yaml:\n  a: 1\n  b: \"x\""), "{h}");
+        assert!(h.contains("yaml:\n  | a: 1\n  | b: \"x\""), "{h}");
         assert!(h.contains("ports:\n  - 80\n  - 443"), "{h}");
         assert!(!h.contains("\\n"));
     }

@@ -9,6 +9,7 @@ pub mod chunk;
 pub mod codec;
 pub mod domain;
 mod fixed;
+pub mod glob;
 mod tagged;
 pub mod v1;
 pub mod version;

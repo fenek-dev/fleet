@@ -1203,6 +1203,14 @@ fn secret_globs_match_like_the_agent() {
         "/etc/letsencrypt/live/a/privkey.pem",
         "/etc/letsencrypt/**/privkey*"
     ));
+    // A literal `*` in the path must not hide the wildcard.
+    assert!(hit(
+        "/etc/postfix/sasl_passwd*backup",
+        "/etc/postfix/sasl_passwd*"
+    ));
+    // Oversized inputs fail closed.
+    let long = format!("/etc/{}", "a".repeat(5000));
+    assert!(is_secret_match(&long, "/srv/**/.env"));
     // Below a matched directory glob.
     assert!(hit("/etc/app/x/y.conf", "/etc/app*"));
     // Plain entries still cover what is below them.
@@ -1287,5 +1295,24 @@ fn approval_details_are_readable() {
     else {
         panic!()
     };
-    assert_eq!(details, "unit: cron.service");
+    assert_eq!(details, "unit: \"cron.service\"");
+    // Unicode line separators and bidi controls never reach the sheet raw.
+    let (kind, _) = approval_prompt(
+        "c",
+        "t",
+        &Op::UnitRestart {
+            unit: fleet_proto::args::UnitName::new("cron.service").unwrap(),
+        },
+        &[sid(0)],
+        true,
+        false,
+        10_000,
+    )
+    .unwrap();
+    drop(kind);
+    let esc = untrusted::escape_controls("a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{00a0}f");
+    assert!(esc.chars().all(|c| !matches!(
+        c,
+        '\u{2028}' | '\u{2029}' | '\u{202e}' | '\u{2066}' | '\u{00a0}'
+    )));
 }

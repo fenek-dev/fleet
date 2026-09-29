@@ -1540,49 +1540,20 @@ impl McpHost {
 /// matcher: `*`/`?` within a component, `**` across components). A glob
 /// covers what it matches and everything below a match.
 fn is_secret_match(path: &str, entry: &str) -> bool {
-    if entry.contains(['*', '?']) {
-        let comps: Vec<&str> = path.split('/').collect();
-        let pat: Vec<&str> = entry.split('/').collect();
-        return (1..=comps.len()).any(|n| glob_components(&pat, &comps[..n]));
+    // Server-supplied entries and paths beyond the matcher's bounds are
+    // treated as secret (fail closed).
+    if !fleet_proto::glob::within_limits(entry, path) {
+        return true;
+    }
+    if fleet_proto::glob::is_glob(entry) {
+        // The shared matcher (also the agent's): wildcard decided by the
+        // pattern only, bounded cost.
+        return fleet_proto::glob::glob_covers(entry, path);
     }
     match (AbsPath::new(path), AbsPath::new(entry)) {
         (Ok(p), Ok(e)) => p.is_under(&e),
         _ => path == entry,
     }
-}
-
-fn glob_components(p: &[&str], s: &[&str]) -> bool {
-    match p.split_first() {
-        None => s.is_empty(),
-        Some((&"**", rest)) => (0..=s.len()).any(|i| glob_components(rest, &s[i..])),
-        Some((first, rest)) => match s.split_first() {
-            Some((c, srest)) => glob_component(first, c) && glob_components(rest, srest),
-            None => false,
-        },
-    }
-}
-
-/// `*`/`?` wildcard match of one path component.
-fn glob_component(pattern: &str, s: &str) -> bool {
-    let (p, s): (Vec<char>, Vec<char>) = (pattern.chars().collect(), s.chars().collect());
-    let (mut pi, mut si) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while si < s.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
-            pi += 1;
-            si += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi, si));
-            pi += 1;
-        } else if let Some((sp, ss)) = star {
-            pi = sp + 1;
-            si = ss + 1;
-            star = Some((sp, ss + 1));
-        } else {
-            return false;
-        }
-    }
-    p[pi..].iter().all(|c| *c == '*')
 }
 
 #[path = "mcp_describe.rs"]
