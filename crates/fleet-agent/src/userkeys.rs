@@ -32,6 +32,33 @@ pub enum KeysOp {
     Remove,
     /// Appends each stdin line the file doesn't have yet.
     Merge,
+    /// Makes the file's Fleet monitor lines (comment `fleet-monitor-…`)
+    /// exactly the stdin lines, leaving every other line alone. Never
+    /// creates the file just to write nothing.
+    SyncMonitor,
+}
+
+/// Comment prefix that marks a monitor line as Fleet's.
+pub const MONITOR_MARKER: &str = "fleet-monitor-";
+
+fn is_monitor_line(line: &str) -> bool {
+    line.split_whitespace()
+        .last()
+        .is_some_and(|c| c.starts_with(MONITOR_MARKER))
+}
+
+/// `existing` with its Fleet monitor lines replaced by `desired`'s.
+pub fn sync_monitor_lines(existing: &str, desired: &str) -> String {
+    let mut out = String::new();
+    for l in existing.lines().filter(|l| !is_monitor_line(l)) {
+        out.push_str(l);
+        out.push('\n');
+    }
+    for l in desired.lines().map(str::trim).filter(|l| is_monitor_line(l)) {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
 }
 
 impl KeysOp {
@@ -41,6 +68,7 @@ impl KeysOp {
             Self::Set => "set",
             Self::Remove => "remove",
             Self::Merge => "merge",
+            Self::SyncMonitor => "sync-monitor",
         }
     }
 
@@ -50,6 +78,7 @@ impl KeysOp {
             "set" => Self::Set,
             "remove" => Self::Remove,
             "merge" => Self::Merge,
+            "sync-monitor" => Self::SyncMonitor,
             _ => return None,
         })
     }
@@ -115,6 +144,20 @@ pub fn run_helper(op: KeysOp, home: &Path, input: &[u8]) -> std::io::Result<Vec<
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(Vec::new()),
         },
+        KeysOp::SyncMonitor => {
+            let desired = String::from_utf8_lossy(input);
+            let old = match read()? {
+                Some(b) => String::from_utf8_lossy(&b).into_owned(),
+                None if desired.trim().is_empty() => return Ok(Vec::new()),
+                None => String::new(),
+            };
+            let new = sync_monitor_lines(&old, &desired);
+            if new != old {
+                ensure_ssh_dir(home)?;
+                fsutil::write_atomic(&path, new.as_bytes(), 0o600)?;
+            }
+            Ok(Vec::new())
+        }
         KeysOp::Merge => {
             ensure_ssh_dir(home)?;
             let old = read()?.unwrap_or_default();
@@ -166,6 +209,13 @@ pub trait UserKeys {
 
     fn merge(&self, user: &UserEntry, lines: &str) -> Result<(), OpError> {
         self.call(user, KeysOp::Merge, lines.as_bytes()).map(drop)
+    }
+
+    /// Fleet's monitor lines in the user's file become `lines` (empty
+    /// removes them).
+    fn sync_monitor(&self, user: &UserEntry, lines: &str) -> Result<(), OpError> {
+        self.call(user, KeysOp::SyncMonitor, lines.as_bytes())
+            .map(drop)
     }
 }
 
@@ -240,6 +290,37 @@ mod tests {
         assert_eq!(merged("", "a\nb\na\n"), "a\nb\n");
         assert_eq!(merged("a", "a\n c \n"), "a\nc\n");
         assert_eq!(merged("x\n", ""), "x\n");
+    }
+
+    #[test]
+    fn monitor_lines_are_replaced_only() {
+        let mon = |id: &str| {
+            format!("restrict,command=\"/usr/lib/fleet/fleet-agent bridge --monitor\" ecdsa-sha2-nistp256 K{id} fleet-monitor-{id}")
+        };
+        let existing = format!("ssh-ed25519 AAAA mine\n{}\n{}\n", mon("a"), mon("b"));
+        let got = sync_monitor_lines(&existing, &format!("{}\n", mon("c")));
+        assert_eq!(got, format!("ssh-ed25519 AAAA mine\n{}\n", mon("c")));
+        // Only lines whose comment carries the marker are Fleet's.
+        let plain = "ecdsa-sha2-nistp256 X fleet-monitor-lookalike-but-key-first\nssh-rsa A b\n";
+        assert!(sync_monitor_lines(plain, "").contains("ssh-rsa A b"));
+        // A non-monitor line in the desired text is ignored.
+        assert_eq!(sync_monitor_lines("x\n", "evil ssh-rsa A b\n"), "x\n");
+    }
+
+    #[test]
+    fn sync_monitor_helper_never_creates_an_empty_file() {
+        let d = tempfile::tempdir().unwrap();
+        let u = UserEntry {
+            uid: 1000,
+            gid: 1000,
+            home: d.path().to_string_lossy().into_owned(),
+        };
+        Direct.sync_monitor(&u, "").unwrap();
+        assert_eq!(Direct.get(&u).unwrap(), None);
+        Direct.sync_monitor(&u, "k ecdsa-sha2-nistp256 A fleet-monitor-1\n").unwrap();
+        assert!(Direct.get(&u).unwrap().unwrap().ends_with(b"fleet-monitor-1\n"));
+        Direct.sync_monitor(&u, "").unwrap();
+        assert_eq!(Direct.get(&u).unwrap().unwrap(), b"");
     }
 
     #[test]

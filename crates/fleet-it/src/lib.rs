@@ -275,6 +275,14 @@ impl Mac {
         }
     }
 
+    /// [`Mac::entry`] with the Mac's own monitor SSH key (a real Mac has
+    /// one), so the agent pins a forced-command monitor line for it.
+    pub fn entry_with_monitor_ssh(&self, name: &str) -> Device {
+        let mut d = self.entry(name);
+        d.monitor_ssh_key = self.keys.monitor_ssh.public();
+        d
+    }
+
     pub fn ssh_public(&self) -> Res<String> {
         SshPublicKey::EcdsaP256(self.keys.ssh.public())
             .to_openssh()

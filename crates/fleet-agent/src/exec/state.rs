@@ -159,6 +159,7 @@ pub(super) struct StateParts {
     pub(super) reverter: Box<dyn Revert>,
     pub(super) timers: Rc<dyn CommandRunner>,
     pub(super) terminator: Box<dyn SessionTerminator>,
+    pub(super) user_keys: crate::userkeys::UserKeysMode,
 }
 
 pub(super) struct State {
@@ -182,6 +183,10 @@ pub(super) struct State {
     admin_user: Option<String>,
     /// Device lines of the authorized_keys roster section, per roster.
     ak_cache: authorized_keys::DeviceLinesCache,
+    /// How the admin's `~/.ssh/authorized_keys` is reached (as the user).
+    user_keys: crate::userkeys::UserKeysMode,
+    /// `(epoch, version)` whose monitor lines were last pushed there.
+    home_monitor_synced: std::cell::Cell<Option<(u32, u64)>>,
     pub(super) started: Instant,
     /// Random per exec start; binds this run's events (design §6.3).
     pub(super) run_id: [u8; 16],
@@ -307,6 +312,8 @@ impl State {
             policy,
             admin_user,
             ak_cache: authorized_keys::DeviceLinesCache::default(),
+            user_keys: parts.user_keys,
+            home_monitor_synced: std::cell::Cell::new(None),
             started: Instant::now(),
             run_id,
             event_run,
@@ -716,6 +723,26 @@ impl State {
             )
         {
             log("authorized_keys", e);
+        }
+        // While sshd still reads ~/.ssh/authorized_keys (before the §10.1
+        // step 5 switchover) the monitor keys must be there too, or a
+        // locked app can't open monitor sessions.
+        let v = (self.roster.roster.epoch, self.roster.roster.version);
+        if let Some(user) = &self.admin_user
+            && self.home_monitor_synced.get() != Some(v)
+        {
+            // Marked done even on failure: retried on the next roster
+            // change or restart, not every tick.
+            self.home_monitor_synced.set(Some(v));
+            let users = crate::userkeys::user_keys(self.user_keys, self.timers.as_ref());
+            if let Err(e) = authorized_keys::sync_home_monitor(
+                &self.paths,
+                user,
+                Some(&self.roster.roster),
+                users.as_ref(),
+            ) {
+                log("home monitor keys", e);
+            }
         }
     }
 

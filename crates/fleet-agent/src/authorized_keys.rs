@@ -59,6 +59,42 @@ fn device_lines(roster: &Roster) -> String {
     out
 }
 
+/// The monitor lines of every device, in the roster section's format: what
+/// is kept in the admin's `~/.ssh/authorized_keys` while sshd still reads
+/// that file (before the design §10.1 step 5 switchover).
+pub fn monitor_lines(roster: &Roster) -> String {
+    let mut out = String::new();
+    for d in &roster.devices {
+        if d.monitor_ssh_key != d.ssh_key
+            && let Some(line) = ecdsa_line(&d.monitor_ssh_key)
+        {
+            out.push_str(&format!(
+                "{} {line} fleet-monitor-{}\n",
+                monitor_options(),
+                d.id
+            ));
+        }
+    }
+    out
+}
+
+/// Makes the Fleet monitor lines in `admin`'s own `~/.ssh/authorized_keys`
+/// the roster's (added at install, updated on roster changes, removed at
+/// uninstall with an empty roster section). Runs as the user, never as
+/// root in `$HOME`. A missing user is skipped.
+pub fn sync_home_monitor(
+    paths: &crate::paths::Paths,
+    admin: &str,
+    roster: Option<&Roster>,
+    users: &dyn crate::userkeys::UserKeys,
+) -> Result<(), fleet_ops::OpError> {
+    let Some(entry) = fsutil::lookup_user(&paths.passwd, admin) else {
+        return Ok(());
+    };
+    let lines = roster.map(monitor_lines).unwrap_or_default();
+    users.sync_monitor(&entry, &lines)
+}
+
 /// Markers around `devices` (from [`device_lines`]) and the recovery key
 /// accepted at `clock` (the only part that changes with time).
 fn section_from(devices: &str, roster: &Roster, clock: RecoveryClock) -> String {

@@ -120,10 +120,9 @@ pub fn users_plan(paths: &Paths) -> Result<Vec<(String, UserEntry, String)>, OpE
         };
         let text = fs::read_to_string(e.path())
             .map_err(|e| OpError::internal(format!("read keys of {user}: {e}")))?;
-        let lines = portable_lines(&text);
-        if !lines.is_empty() {
-            out.push((user, entry, lines));
-        }
+        // Users without portable keys stay in the plan: their own
+        // `~/.ssh/authorized_keys` may still hold Fleet monitor lines.
+        out.push((user, entry, portable_lines(&text)));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
@@ -190,7 +189,12 @@ pub fn apply_ssh(
     users: &dyn UserKeys,
 ) -> Result<(), OpError> {
     for (_, entry, lines) in users_plan(paths)? {
-        users.merge(&entry, &lines)?;
+        if !lines.is_empty() {
+            users.merge(&entry, &lines)?;
+        }
+        // The monitor lines install (and roster syncs) put there point at
+        // the agent being removed.
+        users.sync_monitor(&entry, "")?;
     }
     for c in FLEET_SSHD_CONFS {
         let p = host(paths, c);

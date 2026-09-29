@@ -14,7 +14,7 @@
 
 use fleet_core::install::{self, InstallError, InstallRequest, InstallStage};
 use fleet_core::signer::{KeyRole, RoleSigner};
-use fleet_core::ssh::{HostKey, P256SshSigner, SshTarget};
+use fleet_core::ssh::{HostKey, P256SshSigner, SshConnection, SshTarget};
 use fleet_crypto::roster::sign_root;
 use fleet_crypto::sig::Ed25519Signer;
 use fleet_it::{ADMIN, Container, Mac, policy_toml};
@@ -45,6 +45,7 @@ fn app_install_on_fresh_server() {
     let c = Container::start(&image).expect("container");
     log("container up");
     let mac = Mac::generate().unwrap();
+    let mac_b = Mac::generate().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let ak = dir.path().join("authorized_keys");
     std::fs::write(&ak, format!("{} it\n", mac.ssh_public().unwrap())).unwrap();
@@ -84,7 +85,10 @@ fn app_install_on_fresh_server() {
             version: 1,
             prev_hash: [0; 32],
             issued_at_ms: fleet_core::now_ms(),
-            devices: vec![mac.entry("Mac A")],
+            devices: vec![
+                mac.entry_with_monitor_ssh("Mac A"),
+                mac_b.entry_with_monitor_ssh("Mac B"),
+            ],
             recovery_key: recovery.public(),
             recovery_ssh_key: recovery_ssh.public(),
             recovery_escrow_key: escrow.public(),
@@ -191,7 +195,7 @@ fn app_install_on_fresh_server() {
     rt.block_on(async {
         let ssh = P256SshSigner(RoleSigner::new(&mac.keys, KeyRole::Ssh).unwrap());
         let obs = install::probe(&target, &ssh).await.expect("probe");
-        let (conn, _) = fleet_core::ssh::SshConnection::connect(&target, &ssh, Some(obs.key))
+        let (conn, _) = fleet_core::ssh::SshConnection::connect(&target, &ssh, Some(obs.key.clone()))
             .await
             .expect("fresh ssh connection");
         let groups = conn
@@ -205,25 +209,43 @@ fn app_install_on_fresh_server() {
             "admin not in group fleet: {:?}",
             String::from_utf8_lossy(&groups.stdout)
         );
-        let stream = tokio::time::timeout(Duration::from_secs(30), conn.open_agent_channel(false))
-            .await
-            .expect("agent channel timed out")
-            .expect("agent channel");
-        let cfg = SessionConfig {
-            mode: SessionMode::Normal,
-            noise: &mac.noise,
-            pinned_agent_noise: installed.noise_static,
-            pinned_agent_signing: installed.signing_key,
-            fleet_id: fleet,
-            server_id: server.clone(),
-            device_id: mac.id,
-            key: KeyKind::Device,
-            signer: CommandSigner::P256(&mac.keys.device),
-        };
-        let mut s = tokio::time::timeout(Duration::from_secs(30), Session::connect_bridged(stream, cfg))
-            .await
-            .expect("session setup timed out")
-            .expect("noise session");
+        // The units were just started: the gate may not have bound
+        // agent.sock yet (the app's wait_ready retries the same way).
+        let mut s = None;
+        let mut last = String::new();
+        for _ in 0..30 {
+            let stream =
+                tokio::time::timeout(Duration::from_secs(30), conn.open_agent_channel(false))
+                    .await
+                    .expect("agent channel timed out")
+                    .expect("agent channel");
+            let cfg = SessionConfig {
+                mode: SessionMode::Normal,
+                noise: &mac.noise,
+                pinned_agent_noise: installed.noise_static,
+                pinned_agent_signing: installed.signing_key,
+                fleet_id: fleet,
+                server_id: server.clone(),
+                device_id: mac.id,
+                key: KeyKind::Device,
+                signer: CommandSigner::P256(&mac.keys.device),
+            };
+            match tokio::time::timeout(Duration::from_secs(30), Session::connect_bridged(stream, cfg))
+                .await
+                .expect("session setup timed out")
+            {
+                Ok(x) => {
+                    s = Some(x);
+                    break;
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    log(&format!("session retry: {last}"));
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+        let mut s = s.unwrap_or_else(|| panic!("noise session: {last}"));
         let reply = tokio::time::timeout(
             Duration::from_secs(30),
             s.request(Op::AgentHealth, &server, Actor::Human, None),
@@ -232,6 +254,84 @@ fn app_install_on_fresh_server() {
         .expect("agent.health timed out")
         .expect("agent.health");
         assert!(matches!(reply.result, Ok(Payload::AgentHealth(_))), "{:?}", reply.result);
+
+        // Monitor sessions (locked app): sshd still reads ~/.ssh, so the
+        // install put both Macs' forced-command monitor lines there.
+        let home_keys = || c.exec(&["cat", "/home/ops/.ssh/authorized_keys"]).unwrap();
+        let before = home_keys();
+        let marker = |m: &Mac| format!("fleet-monitor-{}", m.id);
+        for m in [&mac, &mac_b] {
+            assert!(before.contains(&marker(m)), "no monitor line for {}:\n{before}", m.id);
+        }
+        assert!(
+            before.lines().any(|l| l.contains(&marker(&mac))
+                && l.starts_with("restrict,command=\"/usr/lib/fleet/fleet-agent bridge --monitor\"")),
+            "{before}"
+        );
+        assert!(before.contains(&mac.ssh_public().unwrap()), "device key line kept");
+        {
+            let mon_ssh = P256SshSigner(RoleSigner::new(&mac.keys, KeyRole::MonitorSsh).unwrap());
+            let (mconn, _) = SshConnection::connect(&target, &mon_ssh, Some(obs.key.clone()))
+                .await
+                .expect("monitor SSH key authenticates");
+            let stream = mconn
+                .open_agent_channel_mode(SessionMode::Monitor)
+                .await
+                .expect("monitor bridge");
+            let cfg = SessionConfig {
+                mode: SessionMode::Monitor,
+                noise: &mac.noise,
+                pinned_agent_noise: installed.noise_static,
+                pinned_agent_signing: installed.signing_key,
+                fleet_id: fleet,
+                server_id: server.clone(),
+                device_id: mac.id,
+                key: KeyKind::Monitor,
+                signer: CommandSigner::P256(&mac.keys.monitor),
+            };
+            let mut ms = tokio::time::timeout(
+                Duration::from_secs(30),
+                Session::connect_bridged(stream, cfg),
+            )
+            .await
+            .expect("monitor session timed out")
+            .expect("monitor session");
+            let r = ms
+                .request(Op::AgentHealth, &server, Actor::Human, None)
+                .await
+                .expect("monitor agent.health");
+            assert!(matches!(r.result, Ok(Payload::AgentHealth(_))), "{:?}", r.result);
+            mconn.disconnect().await;
+        }
+
+        // Revoking Mac B removes its monitor line (exec syncs on roster
+        // changes) and keeps Mac A's.
+        let mut next = genesis.roster.clone();
+        next.version += 1;
+        next.prev_hash = fleet_crypto::roster::roster_hash(&genesis);
+        next.issued_at_ms = fleet_core::now_ms();
+        next.devices.retain(|d| d.id != mac_b.id);
+        let next = sign_root(next, mac.id, &mac.keys.root).unwrap();
+        let r = s
+            .request(
+                Op::RosterUpdate { roster: Box::new(next) },
+                &server,
+                Actor::Human,
+                None,
+            )
+            .await
+            .expect("roster.update");
+        assert_eq!(r.result, Ok(Payload::Empty));
+        let deadline = Instant::now() + Duration::from_secs(40);
+        loop {
+            let now = home_keys();
+            if !now.contains(&marker(&mac_b)) {
+                assert!(now.contains(&marker(&mac)), "Mac A's monitor line kept:\n{now}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "monitor line of Mac B not removed:\n{now}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         conn.disconnect().await;
     });
     log("fresh ssh + noise session + signed agent.health ok");
