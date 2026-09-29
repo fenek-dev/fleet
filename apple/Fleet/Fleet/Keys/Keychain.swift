@@ -23,9 +23,23 @@ enum Keychain {
         switch status {
         case errSecSuccess: return out as? Data
         case errSecItemNotFound: return nil
+        case errSecMissingEntitlement:
+            // Unsigned build: enclave-bound file store for key blobs, and
+            // "nothing stored" for Keychain-only secrets (sync stays off).
+            noteUnsigned()
+            return LocalKeyStore.supports(account) ? try LocalKeyStore.load(account) : nil
         default: throw Failure.status(status)
         }
     }
+
+    /// True once the Keychain refused for lack of entitlements: this is an
+    /// unsigned build and Keychain-only features (sync key, sudo passwords,
+    /// iCloud) are unavailable. Design §5.2 "Unsigned builds".
+    nonisolated(unsafe) private(set) static var unsigned = false
+    private static func noteUnsigned() { unsigned = true }
+
+    static let needsSignedBuild =
+        "Needs a signed build: this copy of Fleet is not signed with a team, so the Keychain is unavailable. Sync keys and sudo passwords are not stored."
 
     /// Adds `data`; never overwrites an existing item (keys are generated
     /// once, a silent replace would orphan the roster entry).
@@ -41,6 +55,12 @@ enum Keychain {
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         let status = SecItemAdd(query as CFDictionary, nil)
+        if status == errSecMissingEntitlement, LocalKeyStore.supports(account) {
+            noteUnsigned()
+            guard (try? LocalKeyStore.add(account, data)) == true
+            else { throw Failure.status(errSecDuplicateItem) }
+            return
+        }
         guard status == errSecSuccess else { throw Failure.status(status) }
     }
 
@@ -74,6 +94,11 @@ enum Keychain {
         }
         #endif
         let status = SecItemDelete(base(account) as CFDictionary)
+        if status == errSecMissingEntitlement {
+            noteUnsigned()
+            try? LocalKeyStore.delete(account)
+            return
+        }
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw Failure.status(status)
         }

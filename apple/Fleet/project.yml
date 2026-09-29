@@ -79,6 +79,14 @@ targets:
         script: |
           "${SRCROOT}/../../scripts/build-fleetctl.sh"
         basedOnDependencyAnalysis: false
+      # Agent .debs (arm64 + amd64) in Contents/Resources/agent/ for the
+      # install flow (design §10.1). FLEET_SKIP_AGENT_BUNDLE=1 skips
+      # (scripts/build-app-test.sh sets it: Debug test builds use
+      # FLEET_TEST_AGENT_ARTIFACT). Docker builds, slow the first time.
+      - name: Embed agent packages
+        script: |
+          "${SRCROOT}/../../scripts/bundle-agent.sh"
+        basedOnDependencyAnalysis: false
 
   FleetTests:
     type: bundle.unit-test

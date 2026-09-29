@@ -42,7 +42,9 @@ cd apple/Fleet && xcodegen generate
 xcodebuild -project Fleet.xcodeproj -scheme Fleet -destination 'platform=macOS,arch=arm64' build
 ```
 
-Local ad-hoc or unsigned builds compile but can't store keys: the data-protection keychain needs the `keychain-access-groups` entitlement, which needs team signing (iCloud sync likewise). Without a Secure Enclave, `FLEET_SOFTWARE_KEYS=1` uses software keys (development only). See [apple/Fleet/README.md](apple/Fleet/README.md).
+**Release app:** `scripts/build-release-app.sh` → `dist/Fleet.app` + `dist/Fleet-<version>.zip`, with `fleetctl` and both agent `.deb`s (arm64, amd64) embedded so Add server needs no file. `FLEET_TEAM_ID=<team>` signs with the real entitlements; without it the app is ad hoc signed and works except for Keychain-only features (sync key, sudo passwords, iCloud). Details in [apple/Fleet/README.md](apple/Fleet/README.md).
+
+Unsigned builds keep Secure Enclave keys in an enclave-bound file store (design §5.2); the data-protection keychain needs the `keychain-access-groups` entitlement, which needs team signing (sync key, sudo passwords and iCloud sync likewise). Without a Secure Enclave, `FLEET_SOFTWARE_KEYS=1` uses software keys (development only). See [apple/Fleet/README.md](apple/Fleet/README.md).
 
 ## Test
 
