@@ -292,6 +292,7 @@ impl FleetCore {
     }
 
     /// `weblog.query` (Caddy/nginx JSON access logs), newest first.
+    #[allow(clippy::too_many_arguments)] // flat UniFFI signature for Swift
     pub async fn weblog_query(
         &self,
         server_id: String,

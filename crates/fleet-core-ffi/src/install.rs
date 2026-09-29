@@ -7,7 +7,7 @@
 use crate::api::{FleetCore, id16, lock};
 use crate::rows::{InstallProgress, InstallStep};
 use crate::types::{
-    AgentHealthRow, ConnState, FleetError, HostKeyPrompt, SecurityModeArg, SecurityModeStatus,
+    AgentHealthRow, FleetError, HostKeyPrompt, SecurityModeArg, SecurityModeStatus,
 };
 use crate::validate;
 use fleet_core::cache::PinnedKeys;
@@ -89,6 +89,7 @@ impl FleetCore {
     /// alone (no bans, no `authorized_keys` rewriting) until the operator
     /// switches it later. Needs a confirmed host key, an unlocked app (SSH
     /// key) and passwordless sudo (or root).
+    #[allow(clippy::too_many_arguments)] // flat UniFFI signature for Swift
     pub async fn install_agent(
         self: Arc<Self>,
         server_id: String,

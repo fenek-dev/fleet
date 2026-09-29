@@ -138,17 +138,6 @@ fn add_to_fleet_group(user: &str) -> Result<(), InstallError> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn usermod_appends_to_fleet() {
-        assert_eq!(
-            super::usermod_args("ops"),
-            ["--append", "--groups", "fleet", "ops"]
-        );
-    }
-}
-
 pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, InstallError> {
     // Validate everything before touching the filesystem.
     verify_genesis(&input.genesis, crate::now_ms()).map_err(InstallError::Genesis)?;
@@ -264,4 +253,15 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
         noise_static: noise.public(),
         signing_key: signer.public(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn usermod_appends_to_fleet() {
+        assert_eq!(
+            super::usermod_args("ops"),
+            ["--append", "--groups", "fleet", "ops"]
+        );
+    }
 }
