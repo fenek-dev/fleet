@@ -4,17 +4,22 @@ enum NavItem: Hashable {
     case fleet
     case group(String)
     case server(String)
+    case tag(String)
     case alerts
     case timeline
     case search
     case vulnerabilities
     case runbooks
     case provision
+    case settings
 }
 
+/// Sidebar of Main.dc.html: search button, navigation, groups, tags, then
+/// Settings and the lock / AI card pinned to the bottom.
 struct SidebarView: View {
     @Environment(CoreBridge.self) private var core
     @Environment(AppLock.self) private var lock
+    @Environment(AlertAcks.self) private var acks
     @Binding var selection: NavItem?
     var openPalette: () -> Void
 
@@ -25,12 +30,12 @@ struct SidebarView: View {
                     Image(systemName: "magnifyingglass")
                     Text("Search or run…")
                     Spacer()
-                    Text("⌘K").font(.caption11).foregroundStyle(Color.textMuted)
+                    Text("⌘K").font(.mono(11)).foregroundStyle(Color.textMuted)
                 }
                 .font(.base)
                 .foregroundStyle(Color.textSecondary)
                 .padding(.horizontal, 10)
-                .frame(height: 30)
+                .frame(height: 34)
                 .background(Color.control, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.borderControl))
             }
@@ -38,100 +43,216 @@ struct SidebarView: View {
             .accessibilityIdentifier("sidebar.palette")
             .padding(.horizontal, 12)
             .padding(.top, 8)
+            .padding(.bottom, 20)
 
-            List(selection: $selection) {
-                Section {
-                    Label("Fleet", systemImage: "server.rack").tag(NavItem.fleet)
-                        .accessibilityIdentifier("sidebar.fleet")
-                    Label {
-                        HStack {
-                            Text("Alerts")
-                            Spacer()
-                            if !core.alerts.isEmpty {
-                                Text("\(core.alerts.count)")
-                                    .font(.caption11)
-                                    .foregroundStyle(Tone.critical.text)
-                            }
-                        }
-                    } icon: {
-                        Image(systemName: "bell")
-                    }
-                    .tag(NavItem.alerts)
-                    .accessibilityIdentifier("sidebar.alerts")
-                    Label("Timeline", systemImage: "clock").tag(NavItem.timeline)
-                        .accessibilityIdentifier("sidebar.timeline")
-                    Label("Search", systemImage: "magnifyingglass").tag(NavItem.search)
-                        .accessibilityIdentifier("sidebar.search")
-                    Label("Vulnerabilities", systemImage: "shield.lefthalf.filled")
-                        .tag(NavItem.vulnerabilities)
-                        .accessibilityIdentifier("sidebar.vulnerabilities")
-                    Label("Snippets & Runbooks", systemImage: "list.bullet").tag(NavItem.runbooks)
-                        .accessibilityIdentifier("sidebar.runbooks")
-                    Label("Provisioning", systemImage: "plus.square").tag(NavItem.provision)
-                        .accessibilityIdentifier("sidebar.provisioning")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    navSection
+                    groupsSection
+                    serversSection
+                    tagsSection
                 }
-                Section("Groups") {
-                    ForEach(core.groups, id: \.id) { g in
-                        HStack {
-                            Text(g.name)
-                            Spacer()
-                            Text("\(core.servers.filter { $0.groupId == g.id }.count)")
-                                .font(.caption11).foregroundStyle(Color.textMuted)
-                        }
-                        .tag(NavItem.group(g.id))
-                        .accessibilityIdentifier("sidebar.group.\(g.name)")
-                    }
-                }
-                Section("Servers") {
-                    ForEach(core.servers, id: \.id) { s in
-                        HStack(spacing: 8) {
-                            Circle().fill(s.state.tone.dot).frame(width: 6, height: 6)
-                            Text(s.name).lineLimit(1)
-                        }
-                        .accessibilityLabel("\(s.name), \(s.state.label)")
-                        .tag(NavItem.server(s.id))
-                        .accessibilityIdentifier("sidebar.server.\(s.name)")
-                    }
-                }
+                .padding(.horizontal, 12)
             }
-            .listStyle(.sidebar)
-            .scrollContentBackground(.hidden)
+            .scrollIndicators(.never)
 
-            Divider().overlay(Color.divider)
-            LockFooter()
-                .padding(12)
+            VStack(spacing: 8) {
+                row(.settings, id: "settings", title: "Settings", symbol: "slider.horizontal.3")
+                FooterCard()
+            }
+            .padding(12)
         }
         .background(Color.sidebar)
     }
+
+    // MARK: sections
+
+    private var navSection: some View {
+        VStack(spacing: 2) {
+            row(.fleet, id: "fleet", title: "Fleet", symbol: "server.rack",
+                trailing: AnyView(Text("\(core.servers.count)").font(.secondary).foregroundStyle(Color.textMuted)))
+            row(.alerts, id: "alerts", title: "Alerts", symbol: "bell",
+                trailing: AnyView(AlertBadge(count: core.unackedAlertCount(acks))))
+            row(.timeline, id: "timeline", title: "Timeline", symbol: "clock")
+            row(.search, id: "search", title: "Search", symbol: "magnifyingglass")
+            row(.vulnerabilities, id: "vulnerabilities", title: "Vulnerabilities",
+                symbol: "shield.lefthalf.filled")
+            row(.runbooks, id: "runbooks", title: "Runbooks", symbol: "list.bullet")
+            row(.provision, id: "provisioning", title: "Provision", symbol: "plus.square")
+        }
+    }
+
+    private var groupsSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            header("Groups")
+            ForEach(core.groups, id: \.id) { g in
+                let count = core.servers.filter { $0.groupId == g.id }.count
+                SidebarRow(selected: selection == .group(g.id), height: 30, action: { selection = .group(g.id) }) {
+                    RoundedRectangle(cornerRadius: 2).fill(Color(hex: 0x7b818b)).frame(width: 8, height: 8)
+                    Text(g.name).lineLimit(1)
+                    Spacer()
+                    Text("\(count)").font(.secondary).foregroundStyle(Color.textMuted)
+                }
+                .accessibilityIdentifier("sidebar.group.\(g.name)")
+            }
+        }
+    }
+
+    private var serversSection: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            header("Servers")
+            ForEach(core.servers, id: \.id) { s in
+                SidebarRow(selected: selection == .server(s.id), height: 30, action: { selection = .server(s.id) }) {
+                    Circle().fill(s.state.tone.dot).frame(width: 6, height: 6)
+                    Text(s.name).lineLimit(1)
+                    Spacer()
+                    // Status is never color alone: unhealthy states say so.
+                    if s.state != .ready {
+                        Text(s.state.label).font(.caption11).foregroundStyle(s.state.tone.text)
+                    }
+                }
+                .accessibilityLabel("\(s.name), \(s.state.label)")
+                .accessibilityIdentifier("sidebar.server.\(s.name)")
+            }
+        }
+    }
+
+    private var tagsSection: some View {
+        let tags = Array(Set(core.servers.flatMap(\.tags))).sorted()
+        return Group {
+            if !tags.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    header("Tags")
+                    FlowLayout(spacing: 6) {
+                        ForEach(tags, id: \.self) { t in
+                            Button { selection = .tag(t) } label: {
+                                Text(t).font(.secondary)
+                                    .foregroundStyle(selection == .tag(t) ? Color.text : Color(hex: 0xc3c6cb))
+                                    .padding(.horizontal, 8).frame(height: 22)
+                                    .background(selection == .tag(t) ? Color.accent.opacity(0.35) : Color.selected,
+                                                in: RoundedRectangle(cornerRadius: 6))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("sidebar.tag.\(t)")
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                }
+            }
+        }
+    }
+
+    private func header(_ title: String) -> some View {
+        Text(title).font(Typeface.ui(11, .semibold)).foregroundStyle(Color.textMuted)
+            .padding(.horizontal, 10).padding(.bottom, 4)
+    }
+
+    private func row(_ item: NavItem, id: String, title: String, symbol: String,
+                     trailing: AnyView? = nil) -> some View {
+        let on = selection == item
+        return SidebarRow(selected: on, height: 32, action: { selection = item }) {
+            Image(systemName: symbol).frame(width: 16)
+                .foregroundStyle(on ? Color.accentText : Color(hex: 0xd4d6da))
+            Text(title).font(.base.weight(.medium))
+            Spacer()
+            if let trailing { trailing }
+        }
+        .accessibilityIdentifier("sidebar.\(id)")
+    }
 }
 
-/// "MacBook Pro · Unlocked · locks in 14 min" plus lock/unlock.
-private struct LockFooter: View {
+private struct SidebarRow<Content: View>: View {
+    let selected: Bool
+    let height: CGFloat
+    let action: () -> Void
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) { content() }
+                .font(.base)
+                .foregroundStyle(selected ? Color.text : Color(hex: 0xd4d6da))
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: height)
+                .background(selected ? Color.selected : .clear, in: RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// Warn pill with the open, unacknowledged alert count.
+private struct AlertBadge: View {
+    let count: Int
+
+    var body: some View {
+        if count > 0 {
+            Text("\(count)")
+                .font(Typeface.ui(11, .semibold))
+                .foregroundStyle(Tone.warn.text)
+                .padding(.horizontal, 6)
+                .frame(minWidth: 20, minHeight: 18)
+                .background(Tone.warn.bg, in: Capsule())
+                .accessibilityLabel("\(count) open alerts")
+                .accessibilityIdentifier("sidebar.alerts.badge")
+        }
+    }
+}
+
+/// "MacBook Pro · Unlocked · locks in 14 min" with lock/unlock, and the
+/// AI agents row with its pause button.
+private struct FooterCard: View {
     @Environment(AppLock.self) private var lock
+    @Environment(AIModel.self) private var ai
     private static let macName = Host.current().localizedName ?? "This Mac"
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { _ in
-            HStack(spacing: 10) {
-                Image(systemName: lock.isLocked ? "lock.fill" : "lock.open")
-                    .foregroundStyle(lock.isLocked ? Tone.warn.text : Color.textSecondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(Self.macName)
-                        .font(.secondary).foregroundStyle(Color.text).lineLimit(1)
-                    Text(subtitle).font(.caption11).foregroundStyle(Color.textMuted)
-                }
-                Spacer()
-                Button(lock.isLocked ? "Unlock" : "Lock") {
-                    if lock.isLocked {
-                        Task { await lock.unlock() }
-                    } else {
-                        lock.lock()
+        VStack(alignment: .leading, spacing: 10) {
+            TimelineView(.periodic(from: .now, by: 30)) { _ in
+                HStack(spacing: 10) {
+                    Image(systemName: lock.isLocked ? "lock.fill" : "lock.open")
+                        .foregroundStyle(lock.isLocked ? Tone.warn.text : Color.textSecondary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(Self.macName)
+                            .font(.base.weight(.medium)).foregroundStyle(Color.text).lineLimit(1)
+                        Text(subtitle).font(.caption11).foregroundStyle(Color.textMuted)
+                            .accessibilityIdentifier("sidebar.lockState")
                     }
+                    Spacer()
+                    Button(lock.isLocked ? "Unlock" : "Lock") {
+                        if lock.isLocked {
+                            Task { await lock.unlock() }
+                        } else {
+                            lock.lock()
+                        }
+                    }
+                    .controlSize(.small)
+                    .accessibilityIdentifier("sidebar.lock")
                 }
-                .controlSize(.small)
-                .accessibilityIdentifier("sidebar.lock")
+            }
+            HStack(spacing: 10) {
+                Image(systemName: "sparkle")
+                    .foregroundStyle(ai.paused ? Color.textMuted : Color.accentText)
+                Text(ai.paused ? "AI agents paused" : "AI agents active")
+                    .font(.secondary).foregroundStyle(Color(hex: 0xd4d6da))
+                    .accessibilityIdentifier("sidebar.aiState")
+                Spacer()
+                Button { ai.setPaused(!ai.paused) } label: {
+                    Image(systemName: ai.paused ? "play" : "pause")
+                        .frame(width: 28, height: 28)
+                        .background(Color.control, in: RoundedRectangle(cornerRadius: 7))
+                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.borderControl))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(ai.paused ? "Resume AI agents" : "Pause AI agents")
+                .accessibilityIdentifier("sidebar.aiPause")
             }
         }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(Color(hex: 0x1d1e22), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.border))
     }
 
     private var subtitle: String {

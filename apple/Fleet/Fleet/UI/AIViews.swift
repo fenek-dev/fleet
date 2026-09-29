@@ -1,19 +1,53 @@
 import SwiftUI
 
-/// Settings → AI (design §8): pause switch, paired MCP clients, setup.
+/// What AI clients did, from the mirrored audit logs.
+enum AIActivity {
+    /// Operations AI clients started since local midnight.
+    static func actionsToday(_ api: FleetCore) async -> UInt32? {
+        let since = UInt64(Calendar.current.startOfDay(for: .now).timeIntervalSince1970 * 1000)
+        return await Task.detached { api.aiActionsSince(sinceMs: since) }.value
+    }
+
+    static func summary(clients: [McpClientRow], actionsToday: UInt32?) -> String {
+        let names = clients.map(\.clientName)
+        var s = names.isEmpty
+            ? "No AI client is paired yet."
+            : "\(names.joined(separator: ", ")) connected through fleetctl mcp."
+        if let n = actionsToday {
+            s += " \(n) action\(n == 1 ? "" : "s") today, all in the audit log."
+        }
+        return s
+    }
+}
+
+/// Settings → AI agents (design §8): status, pause, paired MCP clients, setup.
 struct AISettings: View {
     @Environment(AIModel.self) private var ai
 
+    @Environment(CoreBridge.self) private var core
+    @State private var actionsToday: UInt32?
+
     var body: some View {
-        Form {
-            Section {
-                Toggle("Pause all AI agents", isOn: Binding(
-                    get: { ai.paused }, set: { ai.setPaused($0) }))
-                    .accessibilityIdentifier("ai.pause")
-                Text("While paused, every MCP call is rejected at once.")
-                    .font(.caption11).foregroundStyle(Color.textMuted)
+        SettingsPage("AI agents",
+                     subtitle: "AI clients reach Fleet through fleetctl mcp. Every action is in the audit log.") {
+            Button { ai.setPaused(!ai.paused) } label: {
+                Label(ai.paused ? "Resume AI agents" : "Pause AI agents",
+                      systemImage: ai.paused ? "play" : "pause")
             }
-            Section("Paired clients") {
+            .buttonStyle(.fleetSecondary)
+            .accessibilityIdentifier("ai.pause")
+        } content: {
+            SectionCard(icon: "sparkles", title: "Status",
+                        pill: ai.paused ? ("Paused", Tone.warn) : ("Full access", Tone.info)) {
+                Text(AIActivity.summary(clients: ai.clients, actionsToday: actionsToday))
+                    .font(.base).foregroundStyle(Color.textSecondary)
+                    .accessibilityIdentifier("ai.summary")
+                Text(ai.paused
+                     ? "Paused: every MCP call is rejected at once."
+                     : "Keys, roster and policies always need Touch ID.")
+                    .font(.secondary).foregroundStyle(Color.textMuted)
+            }
+            SectionCard(icon: "person.2", title: "Paired clients") {
                 if ai.clients.isEmpty {
                     Text("None yet. A client is paired the first time it connects, with Touch ID. Clients started from a shell, a script interpreter or an unsigned program are asked on every connection and never listed here.")
                         .foregroundStyle(Color.textMuted)
@@ -30,13 +64,13 @@ struct AISettings: View {
                         Text(Date(timeIntervalSince1970: Double(c.pairedMs) / 1000)
                             .formatted(date: .abbreviated, time: .omitted))
                             .font(.caption11).foregroundStyle(Color.textMuted)
-                        Button("Revoke", role: .destructive) { ai.revoke(c) }
+                        Button("Revoke") { ai.revoke(c) }
+                            .buttonStyle(.fleetDestructive)
                             .accessibilityIdentifier("ai.client.revoke")
-                            .controlSize(.small)
                     }
                 }
             }
-            Section("Setup") {
+            SectionCard(icon: "terminal", title: "Setup") {
                 Text("Add to your MCP client: command `\(fleetctlPath)` with argument `mcp`.")
                     .font(.secondary).textSelection(.enabled)
                 if let p = ai.socketPath {
@@ -50,8 +84,10 @@ struct AISettings: View {
                     .font(.caption11).foregroundStyle(Color.textMuted)
             }
         }
-        .formStyle(.grouped)
-        .onAppear { ai.reloadClients() }
+        .task {
+            ai.reloadClients()
+            if let api = core.api { actionsToday = await AIActivity.actionsToday(api) }
+        }
     }
 
     private var fleetctlPath: String {

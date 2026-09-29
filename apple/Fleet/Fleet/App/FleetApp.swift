@@ -30,25 +30,26 @@ struct FleetApp: App {
                 .onChange(of: core.status, initial: true) { startServices() }
         }
         .commands {
+            // Settings is a screen of the main window, not a separate scene.
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    NotificationCenter.default.post(name: .openSettings, object: nil)
+                }
+                .keyboardShortcut(",")
+            }
             CommandGroup(after: .newItem) {
                 Button("Command Palette…") { paletteShown.toggle() }
                     .keyboardShortcut("k")
+                // ⌘F stays the standard Find of logs, terminal and files.
                 Button("Fleet Search…") {
                     NotificationCenter.default.post(name: .fleetSearch, object: nil)
                 }
-                .keyboardShortcut("f")
+                .keyboardShortcut("f", modifiers: [.command, .shift])
                 Button(lock.isLocked ? "Unlock" : "Lock") {
                     if lock.isLocked { Task { await lock.unlock() } } else { lock.lock() }
                 }
                 .keyboardShortcut("l", modifiers: [.command, .control])
             }
-        }
-
-        Settings {
-            SettingsView()
-                .environment(core)
-                .environment(lock)
-                .environment(ai)
         }
 
         MenuBarExtra {

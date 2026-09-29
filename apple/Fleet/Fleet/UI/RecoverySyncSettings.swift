@@ -12,10 +12,13 @@ struct RecoverySettings: View {
     @State private var busy = false
     @State private var error: String?
 
+    @State private var extras: RosterExtrasRow?
+
     var body: some View {
-        Form {
-            Section("Pending recoveries") {
-                let pending = core.api?.pendingRecoveries() ?? []
+        SettingsPage("Recovery",
+                     subtitle: "The 24-word code on paper restores access if every Mac is lost.") {
+            SectionCard(icon: "clock.badge.exclamationmark", title: "Pending recoveries",
+                        pill: pending.isEmpty ? nil : ("\(pending.count) pending", Tone.critical)) {
                 if pending.isEmpty {
                     Text("None.").foregroundStyle(Color.textMuted)
                 }
@@ -27,16 +30,26 @@ struct RecoverySettings: View {
                                 .font(.secondary).foregroundStyle(Tone.critical.text)
                         }
                         Spacer()
-                        Button("Veto…", role: .destructive) { veto(p) }.disabled(busy)
+                        Button("Veto…") { veto(p) }
+                            .buttonStyle(.fleetDestructive)
+                            .disabled(busy || locked)
+                            .accessibilityIdentifier("recovery.veto")
                     }
                 }
             }
-            Section("Recovery drill") {
+            SectionCard(icon: "key", title: "Recovery code", pill: statusPill) {
+                Text(codeStatus).font(.base).foregroundStyle(Color.textSecondary)
+                    .accessibilityIdentifier("recovery.status")
                 Text("Type the code to check it still matches every server's roster. Nothing changes on the servers.")
-                    .font(.secondary).foregroundStyle(Color.textSecondary)
+                    .font(.secondary).foregroundStyle(Color.textMuted)
                 SecureField("24 words", text: $words)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("recovery.words")
                 SecureField("Passphrase (if any)", text: $passphrase)
-                Button("Check code") { runDrill() }
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("recovery.passphrase")
+                Button("Run recovery drill") { runDrill() }
+                    .buttonStyle(.fleetPrimary)
                     .accessibilityIdentifier("recovery.checkCode")
                     .disabled(busy || words.split(separator: " ").count != 24)
                 ForEach(drill, id: \.serverId) { r in
@@ -48,14 +61,17 @@ struct RecoverySettings: View {
                         .font(.secondary).foregroundStyle(Color.textSecondary)
                 }
             }
-            Section("Replace the recovery code") {
+            SectionCard(icon: "arrow.triangle.2.circlepath", title: "Replace the recovery code") {
                 if newWords.isEmpty {
                     SecureField("New passphrase (optional)", text: $newPassphrase)
+                        .textFieldStyle(.roundedBorder)
                     Text(recoveryPassphraseIsStrong(passphrase: newPassphrase)
                          ? "Strong passphrase: recovery without delay."
                          : "Without a strong passphrase recovery waits 72 hours and can be vetoed.")
                         .font(.secondary).foregroundStyle(Color.textMuted)
-                    Button("Replace with Touch ID") { rotate() }.disabled(busy)
+                    Button("Replace with Touch ID") { rotate() }
+                        .buttonStyle(.fleetSecondary)
+                        .disabled(busy || locked)
                         .accessibilityIdentifier("recovery.replaceCode")
                 } else {
                     Text("Write these words down. The old code keeps working for 72 hours.")
@@ -63,13 +79,39 @@ struct RecoverySettings: View {
                     Text(newWords.enumerated().map { "\($0 + 1). \($1)" }.joined(separator: "   "))
                         .font(.mono(12)).textSelection(.disabled).privacySensitive()
                     Button("I wrote them down") { newWords = [] }
+                        .buttonStyle(.fleetSecondary)
                         .accessibilityIdentifier("recovery.wroteDown")
                 }
             }
             if let error { Text(error).foregroundStyle(Tone.critical.text) }
         }
-        .formStyle(.grouped)
+        .task(id: core.fleetRevision) { await loadExtras() }
         .onDisappear(perform: clearSecrets)
+    }
+
+    @Environment(\.fleetLocked) private var locked
+
+    private var pending: [PendingRecoveryRow] { core.api?.pendingRecoveries() ?? [] }
+
+    private var statusPill: (String, Tone) {
+        guard let ms = extras?.lastDrillMs else { return ("Never tested", Tone.warn) }
+        return ("Tested " + Date(timeIntervalSince1970: Double(ms) / 1000)
+            .formatted(.relative(presentation: .named)), Tone.ok)
+    }
+
+    private var codeStatus: String {
+        guard let e = extras else { return "24 words on paper, plus an optional passphrase." }
+        let created = Date(timeIntervalSince1970: Double(e.recoveryCreatedMs) / 1000)
+            .formatted(date: .abbreviated, time: .omitted)
+        let tested = e.lastDrillMs.map {
+            "Last drill " + Date(timeIntervalSince1970: Double($0) / 1000).formatted(.relative(presentation: .named))
+        } ?? "Never tested"
+        return "Created \(created) · \(tested)"
+    }
+
+    private func loadExtras() async {
+        guard let api = core.api else { return }
+        extras = await Task.detached { try? api.rosterExtras() }.value
     }
 
     /// Drops every recovery word and passphrase this view holds (Swift
@@ -100,7 +142,14 @@ struct RecoverySettings: View {
         passphrase = ""
         Task {
             defer { busy = false }
-            do { drill = try await api.recoveryDrill(words: w, passphrase: p) } catch {
+            do {
+                drill = try await api.recoveryDrill(words: w, passphrase: p)
+                // Only a drill every server agreed with counts as a test.
+                if !drill.isEmpty && drill.allSatisfy(\.ok) {
+                    try? api.recordRecoveryDrill()
+                    await loadExtras()
+                }
+            } catch {
                 self.error = error.fleetMessage
             }
         }
@@ -132,31 +181,43 @@ struct SyncSettings: View {
     @State private var error: String?
 
     var body: some View {
-        Form {
-            Section("iCloud") {
-                if let sync = core.sync {
-                    LabeledContent("Transport", value: sync.available ? "CloudKit private database" : "Unavailable (build without iCloud entitlement)")
-                    LabeledContent("Last sync", value: sync.lastSync?.formatted() ?? "never")
-                    if let e = sync.lastError { Text(e).foregroundStyle(Tone.warn.text) }
-                    Button("Sync now") { Task { await sync.cycle(); load() } }
-                        .accessibilityIdentifier("sync.syncNow")
-                        .disabled(sync.running)
-                }
-                Text("Records are encrypted on this Mac with the fleet's sync key; Apple stores only ciphertext.")
-                    .font(.secondary).foregroundStyle(Color.textMuted)
+        SettingsPage("Sync",
+                     subtitle: "iCloud, end-to-end encrypted with a key only your Macs hold. Apple stores ciphertext only.") {
+            if let sync = core.sync {
+                Button("Sync now") { Task { await sync.cycle(); load() } }
+                    .buttonStyle(.fleetPrimary)
+                    .accessibilityIdentifier("sync.syncNow")
+                    .disabled(sync.running)
             }
-            Section("Pinned-key changes from other Macs") {
+        } content: {
+            SectionCard(icon: "icloud", title: "iCloud", pill: statusPill) {
+                if let sync = core.sync {
+                    Text(sync.available
+                         ? "Transport: CloudKit private database. Records are encrypted on this Mac with the fleet's sync key."
+                         : "Unavailable: this build has no iCloud entitlement.")
+                        .font(.base).foregroundStyle(Color.textSecondary)
+                    if let e = sync.lastError { Text(e).foregroundStyle(Tone.warn.text) }
+                }
+                Text("Synced").font(.caption11.weight(.semibold)).foregroundStyle(Color.textMuted)
+                FlowLayout(spacing: 6) {
+                    ForEach(syncedCollections(), id: \.self) { Chip(text: $0) }
+                }
+                .accessibilityIdentifier("sync.collections")
+            }
+            SectionCard(icon: "key.horizontal", title: "Pinned-key changes from other Macs") {
                 if pins.isEmpty { Text("None.").foregroundStyle(Color.textMuted) }
                 ForEach(pins, id: \.serverId) { p in
                     HStack {
                         Text("\(p.serverName.isEmpty ? p.serverId : p.serverName) — by \(p.changedBy)")
                         Spacer()
                         Button("Reject") { act { try core.api?.rejectPinChange(serverId: p.serverId) } }
+                            .buttonStyle(.fleetDestructive)
                         Button("Accept") { act { try core.api?.confirmPinChange(serverId: p.serverId) } }
+                            .buttonStyle(.fleetSecondary)
                     }
                 }
             }
-            Section("Edited on two Macs") {
+            SectionCard(icon: "arrow.triangle.merge", title: "Edited on two Macs") {
                 if conflicts.isEmpty { Text("None.").foregroundStyle(Color.textMuted) }
                 ForEach(conflicts, id: \.key) { c in
                     VStack(alignment: .leading, spacing: 6) {
@@ -174,15 +235,23 @@ struct SyncSettings: View {
                         }
                         HStack {
                             Button("Keep mine") { resolve(c, .keepLocal) }
+                                .buttonStyle(.fleetSecondary)
                             Button("Take theirs") { resolve(c, .takeRemote) }
+                                .buttonStyle(.fleetSecondary)
                         }
                     }
                 }
             }
             if let error { Text(error).foregroundStyle(Tone.critical.text) }
         }
-        .formStyle(.grouped)
         .task(id: core.fleetRevision) { load() }
+    }
+
+    private var statusPill: (String, Tone)? {
+        guard let sync = core.sync else { return nil }
+        guard sync.available else { return ("Unavailable", Tone.neutral) }
+        guard let last = sync.lastSync else { return ("Never synced", Tone.warn) }
+        return (last.formatted(.relative(presentation: .named)), Tone.ok)
     }
 
     private func load() {

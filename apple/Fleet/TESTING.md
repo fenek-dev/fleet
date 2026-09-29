@@ -67,6 +67,8 @@ scripts/build-app-test.sh test -only-testing:FleetUITests
 
 `FleetUITests/FleetUITestCase.swift` is the base class: fresh `FLEET_DATA_DIR` (`/tmp/fleet-ui-<id>`) per test, signer on, helpers `wait`, `tap`, `type`, `sidebar("fleet")`, `serverTab("firewall")`, `createFleet()`, `snap("name")` (XCTAttachment, kept always), `approvalsLog`, `waitForFile("ssh_pubkey")`. Environment for the runner: `FLEET_UI_KEEP_DATA=1` keeps the data dir; `FLEET_UI_ENV_<NAME>=v` is forwarded to the app as `<NAME>=v` (e.g. `FLEET_UI_ENV_FLEET_TEST_AGENT_ARTIFACT`). The runner is sandboxed: it can read the data dir but not create it (the app does).
 
+Settings is an in-window screen: `sidebar.settings` or ⌘, opens it, `settings.nav.<section>` (`devices`, `recovery`, `ai`, `sync`, `releases`, `alertRules`, `profiles`, `appearance`, `general`) switches sections, and each page keeps its `settings.<section>` identifier.
+
 Accessibility identifiers are `area.element`: `sidebar.*`, `serverTab.*`, `server.*`, `fleet.*`, `onboarding.*`, `addServer.*`, `provision.*`, `bulk.*`, `settings.*`, `devices.*`, `addMac.*`, `recovery.*`, `sync.*`, `releases.*`, `cloudInit.*`, `ai.*`, `aiPrompt.*`, `alerts.*`, `palette.*`. List them: `grep -rhoE 'accessibilityIdentifier\("[^"]+' apple/Fleet/Fleet | sort -u`.
 
 ## Release safety
