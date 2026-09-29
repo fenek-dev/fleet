@@ -17,12 +17,16 @@ final class ShellTests: FleetUITestCase {
         XCTAssertTrue(exists("sidebar.lock"))
         XCTAssertTrue(exists("sidebar.aiState"))
 
-        // Palette: navigation and run actions.
+        // Palette: navigation and run actions (the app starts locked, and
+        // run actions only exist unlocked).
+        tap("sidebar.lock")
+        XCTAssertTrue(shellWaitGone("locked.banner", in: self))
         openCommandPalette()
         wait("palette.query")
         snap("shell-02-palette")
         for id in ["nav.timeline", "nav.runbooks", "nav.provision", "nav.settings",
-                   "nav.search", "nav.vulnerabilities", "settings.alertRules", "lock"] {
+                   "nav.search", "nav.vulnerabilities", "settings.alertRules", "lock",
+                   "run.agent.health", "run.shell.exec"] {
             XCTAssertTrue(exists("palette.item.\(id)"), "palette item \(id) missing")
         }
         type("palette.query", "settings appearance")
@@ -87,15 +91,27 @@ final class ShellTests: FleetUITestCase {
         wait("alerts.empty")
         snap("shell-alerts-empty")
 
-        // Locking shows the banner on every screen and disables writes.
-        tap("sidebar.lock")
+        // The app starts locked (monitor key only): every screen says so.
         wait("locked.banner")
         snap("shell-locked")
         sidebar("provisioning")
         XCTAssertTrue(exists("locked.banner"))
+        sidebar("runbooks")
+        XCTAssertTrue(exists("locked.banner"))
+        // Run actions are not offered while locked.
+        openCommandPalette()
+        wait("palette.query")
+        XCTAssertFalse(exists("palette.item.run.agent.health", timeout: 1))
+        XCTAssertTrue(exists("palette.item.lock"))
+        app.typeKey(.escape, modifierFlags: [])
+
         tap("locked.unlock")
         XCTAssertTrue(shellWaitGone("locked.banner", in: self))
         XCTAssertTrue(approvalsLog.contains("app-unlock"), "approvals.log: \(approvalsLog)")
+
+        // Locking again brings the banner back.
+        tap("sidebar.lock")
+        wait("locked.banner")
     }
 }
 

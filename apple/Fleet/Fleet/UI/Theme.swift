@@ -57,7 +57,7 @@ enum Appearance {
 }
 
 /// Fixed metrics from ui-design.md §Layout.
-enum Layout {
+enum Metrics {
     static let toolbarHeight: CGFloat = 60
     static let tableRowHeight: CGFloat = 42
     static let tableHeaderHeight: CGFloat = 36
@@ -146,7 +146,7 @@ struct ScreenHeader<Trailing: View>: View {
             trailing()
         }
         .padding(.horizontal, 24)
-        .frame(height: Layout.toolbarHeight)
+        .frame(height: Metrics.toolbarHeight)
         .background(Color.header)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.border).frame(height: 1) }
     }

@@ -98,15 +98,14 @@ struct CommandPalette: View {
         })
         if !lock.isLocked {
             let t = runTargets
-            if !t.ids.isEmpty {
-                for kind in OpDraft.Kind.allCases {
-                    all.append(.init(id: "run.\(kind.rawValue)", title: kind.paletteTitle,
-                                     subtitle: "Run on \(t.label)", symbol: kind.paletteSymbol) {
-                        var d = OpDraft()
-                        d.kind = kind
-                        runBulk(t.ids, d)
-                    })
-                }
+            for kind in OpDraft.Kind.allCases {
+                all.append(.init(id: "run.\(kind.rawValue)", title: kind.paletteTitle,
+                                 subtitle: t.ids.isEmpty ? "Run · choose servers" : "Run on \(t.label)",
+                                 symbol: kind.paletteSymbol) {
+                    var d = OpDraft()
+                    d.kind = kind
+                    runBulk(t.ids, d)
+                })
             }
         }
         for s in snippets {

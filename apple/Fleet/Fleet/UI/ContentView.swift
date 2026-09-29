@@ -59,7 +59,7 @@ struct ContentView: View {
     private var main: some View {
         NavigationSplitView {
             SidebarView(selection: $selection) { paletteShown = true }
-                .navigationSplitViewColumnWidth(Layout.sidebarWidth)
+                .navigationSplitViewColumnWidth(Metrics.sidebarWidth)
         } detail: {
             VStack(spacing: 0) {
                 if lock.isLocked { LockedBanner() }

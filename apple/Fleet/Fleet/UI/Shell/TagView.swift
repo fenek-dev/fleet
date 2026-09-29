@@ -31,7 +31,7 @@ struct TagView: View {
                                     StatusPill(label: s.state.label, tone: s.state.tone)
                                 }
                                 .padding(.horizontal, 16)
-                                .frame(height: Layout.tableRowHeight + 8)
+                                .frame(height: Metrics.tableRowHeight + 8)
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
