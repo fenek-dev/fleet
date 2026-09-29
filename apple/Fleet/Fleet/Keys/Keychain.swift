@@ -40,6 +40,10 @@ enum Keychain {
     enum Failure: Error {
         case status(OSStatus)
         case refused(KeyStoreChoice.Refusal)
+        /// The Keychain and the fallback file hold different keys for the
+        /// same account (a migration was interrupted, or keys were made by
+        /// two builds). Nothing is deleted or overwritten.
+        case conflict(String)
     }
 
     /// The fallback file store may be used only by an ad-hoc signed build
@@ -89,7 +93,7 @@ enum Keychain {
         let c = KeyStoreChoice.decide(
             keychainUsable: status != errSecMissingEntitlement,
             fallbackAllowed: fallbackAllowed,
-            fileKeysExist: LocalKeyStore.hasFiles(),
+            fileKeysExist: (try? LocalKeyStore.hasFiles()) ?? true,
             keychainMarker: hasMarker())
         if c == .fallback { unsigned = true }
         return c
@@ -130,12 +134,25 @@ enum Keychain {
         #if FLEET_TEST_HOOKS
         if let dir = TestHooks.dataDir { return TestHooks.FileKeychain.load(dir, service, account) }
         #endif
+        // Finish or discard an interrupted wrap-key reseal before any
+        // migration or reconcile read of the key files (every build mode).
+        try LocalKeyStore.recoverPendingReseal()
         let (status, data) = copy(account)
         switch status {
-        case errSecSuccess: return data
+        case errSecSuccess:
+            // The Keychain holds keys: remember it (so an ad-hoc build later
+            // refuses to make a second set), even for keys created by an
+            // older build that wrote no marker.
+            guard writeMarker() else { throw Failure.status(errSecIO) }
+            // An interrupted migration may have left the file behind.
+            if let data, account != LocalKeyStore.wrapAccount,
+               try LocalKeyStore.existsIfSupported(account) {
+                try reconcile(account, keychain: data)
+            }
+            return data
         case errSecItemNotFound:
             // Keys an earlier ad-hoc run left in files: move them over once.
-            if account != LocalKeyStore.wrapAccount, LocalKeyStore.exists(account) {
+            if account != LocalKeyStore.wrapAccount, try LocalKeyStore.existsIfSupported(account) {
                 return try migrate(account)
             }
             return nil
@@ -151,6 +168,15 @@ enum Keychain {
         }
     }
 
+    /// Both stores have `account`: equal -> the file is stale, delete it;
+    /// different -> refuse (never guess which key is the real one).
+    private static func reconcile(_ account: String, keychain: Data) throws {
+        guard let file = try LocalKeyStore.load(account, prompt: true) else { return }
+        guard file == keychain else { throw Failure.conflict(account) }
+        try LocalKeyStore.delete(account)
+        try LocalKeyStore.removeWrapIfAlone()
+    }
+
     /// Fallback file -> Keychain: read (may prompt), add, verify by reading
     /// back, then delete the file. A failure leaves the file in place.
     private static func migrate(_ account: String) throws -> Data? {
@@ -164,7 +190,7 @@ enum Keychain {
         guard copy(account).1 == data else { throw Failure.status(errSecInternalError) }
         try LocalKeyStore.delete(account)
         // The wrap key goes once nothing else is left in the directory.
-        LocalKeyStore.removeWrapIfAlone()
+        try LocalKeyStore.removeWrapIfAlone()
         return data
     }
 

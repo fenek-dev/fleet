@@ -258,8 +258,23 @@ final class McpSocketServer: @unchecked Sendable {
         let bundled = Bundle.main.bundleURL
             .appendingPathComponent("Contents/MacOS/fleetctl").resolvingSymlinksInPath()
         guard (url as URL).resolvingSymlinksInPath() == bundled else { return false }
-        return Self.cdhashAccepted(actual: Self.cdhash(of: stat),
-                                   pinned: BundledArtifacts.fleetctlCDHash)
+        let pinned = BundledArtifacts.fleetctlCDHash
+        if pinned.isEmpty {
+            // Debug builds without a pinned cdhash: the bundled path only.
+            return Self.cdhashAccepted(actual: nil, pinned: pinned)
+        }
+        // `code` is the PEER process (from its audit token), not the file on
+        // disk: it must satisfy "cdhash == the compiled-in one" and be
+        // strictly valid, so a swapped or modified running binary fails.
+        guard pinned.count == 40, pinned.allSatisfy({ $0.isHexDigit }) else { return false }
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(
+            "cdhash H\"\(pinned.lowercased())\"" as CFString, [], &requirement) == errSecSuccess,
+            let requirement
+        else { return false }
+        return SecCodeCheckValidity(
+            code, SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckNestedCode),
+            requirement) == errSecSuccess
     }
 
     /// Ad-hoc trust decision: the cdhash must equal the compiled-in one.

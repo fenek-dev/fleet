@@ -29,6 +29,7 @@ private struct CaptureShield: NSViewRepresentable {
 /// check passes, then they are dropped; Rust wipes its copy in `finish`.
 struct EnrollmentView: View {
     @Environment(CoreBridge.self) private var core
+    @Environment(AppLock.self) private var lock
 
     private enum Step: Int, CaseIterable {
         case name, words, verify, passphrase, finishing, done
@@ -240,7 +241,15 @@ struct EnrollmentView: View {
                 .foregroundStyle(Color.textSecondary)
             HStack {
                 Spacer()
-                Button("Open fleet") { core.startManager() }
+                Button("Open fleet") {
+                    // The app starts locked: unlock now (part of onboarding)
+                    // so the first Add server doesn't fail late with
+                    // "Unlock Fleet first." Cancelling stays locked.
+                    Task {
+                        if lock.isLocked { await lock.unlock() }
+                        core.startManager()
+                    }
+                }
                     .accessibilityIdentifier("onboarding.openFleet")
                     .buttonStyle(.borderedProminent).tint(.accent)
             }
