@@ -7,6 +7,8 @@ set -euo pipefail
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The scan only needs the binary, not the agent packages (slow to build).
+export FLEET_SKIP_AGENT_BUNDLE=1
 derived="$root/build/DerivedDataRelease"
 app="$derived/Build/Products/Release/Fleet.app"
 bin="$app/Contents/MacOS/Fleet"

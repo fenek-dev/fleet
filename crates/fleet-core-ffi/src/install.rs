@@ -30,6 +30,20 @@ const SUDO_PASSWORD_TIMEOUT: Duration = Duration::from_secs(20);
 #[uniffi::export(callback_interface)]
 pub trait InstallListener: Send + Sync {
     fn on_progress(&self, progress: InstallProgress);
+    /// The artifact about to be uploaded (after the server preflight).
+    fn on_artifact(&self, artifact: InstallArtifact);
+}
+
+/// The agent package chosen for an install. `blake3` (hex) is over the
+/// agent binary: compare with an independent reproducible build (design
+/// §5.7).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct InstallArtifact {
+    pub name: String,
+    pub blake3: String,
+    /// Debian architecture of the server (`amd64` / `arm64`).
+    pub arch: String,
+    pub bundled: bool,
 }
 
 fn ssh_signer(core: &FleetCore) -> Result<P256SshSigner<RoleSigner<'_>>, FleetError> {
@@ -79,13 +93,23 @@ impl FleetCore {
         self: Arc<Self>,
         server_id: String,
         admin_user: Option<String>,
-        artifact_path: String,
+        artifact_path: Option<String>,
+        bundled_dir: Option<String>,
         security_mode: SecurityModeArg,
         listener: Box<dyn InstallListener>,
     ) -> Result<AgentHealthRow, FleetError> {
         let id = validate::server_id(&server_id)?;
         let rec = self.server_record(&id)?;
-        let artifact = validate::local_path(&artifact_path)?;
+        // An explicit file wins over the bundled packages.
+        let (artifact, bundled) = match (artifact_path, bundled_dir) {
+            (Some(p), _) => (validate::local_path(&p)?, false),
+            (None, Some(d)) => (validate::local_path(&d)?, true),
+            (None, None) => {
+                return Err(FleetError::Internal {
+                    message: "no agent artifact".into(),
+                });
+            }
+        };
         let admin = validate::user(admin_user.as_deref().unwrap_or(&rec.target.user))?;
         let (host_key, genesis, policy_toml, device_id) = {
             let cache = lock(&self.cache);
@@ -121,14 +145,27 @@ impl FleetCore {
         self.on_core(async move {
             let ssh = ssh_signer(&core)?;
             let l = listener.clone();
-            let mut progress = move |s: InstallStage| l.on_progress(s.into());
+            let mut progress = move |s: InstallStage| match s {
+                InstallStage::Artifact(a) => l.on_artifact(InstallArtifact {
+                    name: a.name,
+                    blake3: a.blake3,
+                    arch: a.arch,
+                    bundled: a.bundled,
+                }),
+                s => l.on_progress(s.into()),
+            };
+            let source = if bundled {
+                install::ArtifactSource::Bundled(&artifact)
+            } else {
+                install::ArtifactSource::File(&artifact)
+            };
             let installed = install::install_agent(
                 InstallRequest {
                     server_id: &id,
                     target: &rec.target,
                     host_key: host_key.clone(),
                     admin_user: &admin,
-                    artifact: &artifact,
+                    artifact: source,
                     genesis: &genesis,
                     policy_toml: &policy_toml,
                 },

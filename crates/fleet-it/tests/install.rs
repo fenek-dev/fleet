@@ -132,7 +132,7 @@ fn app_install_on_fresh_server() {
                     target: &target,
                     host_key: obs.key.clone(),
                     admin_user: ADMIN,
-                    artifact: &art,
+                    artifact: install::ArtifactSource::File(&art),
                     genesis: &genesis,
                     policy_toml: &policy,
                 },

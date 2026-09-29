@@ -167,14 +167,21 @@ struct AddServerSheet: View {
 
     private var installStep: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Choose the agent package (`fleet-agent_*.deb`) or a `fleet-agent` binary. The user needs passwordless sudo (or be root).")
+            Text(Self.bundledAgentDir != nil
+                 ? "Fleet installs its bundled agent, matched to the server's architecture (Debian 12+ / Ubuntu 22.04+). The user needs passwordless sudo (or be root)."
+                 : "Choose the agent package (`fleet-agent_*.deb`) or a `fleet-agent` binary. The user needs passwordless sudo (or be root).")
                 .font(.base).foregroundStyle(Color.textSecondary)
             HStack {
-                Text(artifact?.lastPathComponent ?? "No file chosen")
+                Text(artifact?.lastPathComponent
+                     ?? (Self.bundledAgentDir != nil ? "Bundled agent (.deb)" : "No file chosen"))
                     .font(.mono(12))
-                    .foregroundStyle(artifact == nil ? Color.textMuted : Color.text)
+                    .foregroundStyle(canInstall ? Color.text : Color.textMuted)
                     .accessibilityIdentifier("addServer.artifactName")
                 Spacer()
+                if artifact != nil, Self.bundledAgentDir != nil, TestHooks.agentArtifact == nil {
+                    Button("Use bundled") { artifact = nil }
+                        .accessibilityIdentifier("addServer.useBundled")
+                }
                 Button("Choose…") { chooseArtifact() }
                     .accessibilityIdentifier("addServer.chooseArtifact")
             }
@@ -197,10 +204,22 @@ struct AddServerSheet: View {
                 Button("Install") { install() }
                     .accessibilityIdentifier("addServer.install")
                     .buttonStyle(.borderedProminent).tint(.accent)
-                    .disabled(artifact == nil)
+                    .disabled(!canInstall)
             }
         }
     }
+
+    /// `Contents/Resources/agent` when this build embeds agent packages
+    /// (scripts/bundle-agent.sh).
+    private static let bundledAgentDir: URL? = {
+        guard let dir = Bundle.main.resourceURL?.appendingPathComponent("agent", isDirectory: true),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path),
+              names.contains(where: { $0.hasSuffix(".deb") })
+        else { return nil }
+        return dir
+    }()
+
+    private var canInstall: Bool { artifact != nil || Self.bundledAgentDir != nil }
 
     private var securityModeHint: some View {
         Text(securityMode == .managed
@@ -247,6 +266,17 @@ struct AddServerSheet: View {
                             .font(.mono(11)).foregroundStyle(Color.textMuted)
                     }
                 }
+            }
+            if let a = run.artifact {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(a.bundled ? "Bundled" : "Chosen") package for \(a.arch): \(a.name)")
+                        .font(.secondary).foregroundStyle(Color.textSecondary)
+                    Text("BLAKE3 \(a.blake3)")
+                        .font(.mono(11)).foregroundStyle(Color.textMuted)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("addServer.artifactHash")
+                }
+                .card(padding: 10)
             }
             if error != nil {
                 HStack {
@@ -366,20 +396,25 @@ struct AddServerSheet: View {
     }
 
     private func install() {
-        guard let api = core.api, let id = serverId, let artifact else { return }
+        guard let api = core.api, let id = serverId, canInstall else { return }
+        // Priority: the test hook, a file chosen with "Choose…", the bundle.
+        let file = TestHooks.agentArtifact ?? artifact
         error = nil
         let run = InstallRun()
         self.run = run
         step = .installing
-        let relay = InstallRelay { p in
+        let relay = InstallRelay({ p in
             Task { @MainActor in run.update(p) }
-        }
+        }, artifact: { a in
+            Task { @MainActor in run.setArtifact(a) }
+        })
         let admin = adminUser.trimmingCharacters(in: .whitespaces)
         Task {
             do {
                 health = try await api.installAgent(
                     serverId: id, adminUser: admin.isEmpty ? nil : admin,
-                    artifactPath: artifact.path, securityMode: securityMode, listener: relay)
+                    artifactPath: file?.path, bundledDir: Self.bundledAgentDir?.path,
+                    securityMode: securityMode, listener: relay)
                 core.reload()
                 step = .done
             } catch {
@@ -394,6 +429,9 @@ struct AddServerSheet: View {
 private final class InstallRun {
     private(set) var progress: [InstallStep: InstallProgress] = [:]
     private(set) var current: InstallStep?
+    private(set) var artifact: InstallArtifact?
+
+    func setArtifact(_ a: InstallArtifact) { artifact = a }
 
     func update(_ p: InstallProgress) {
         progress[p.step] = p
@@ -404,6 +442,12 @@ private final class InstallRun {
 /// Install progress from the core thread to the main actor.
 private final class InstallRelay: InstallListener {
     private let handler: @Sendable (InstallProgress) -> Void
-    init(_ handler: @escaping @Sendable (InstallProgress) -> Void) { self.handler = handler }
+    private let artifactHandler: @Sendable (InstallArtifact) -> Void
+    init(_ handler: @escaping @Sendable (InstallProgress) -> Void,
+         artifact: @escaping @Sendable (InstallArtifact) -> Void) {
+        self.handler = handler
+        self.artifactHandler = artifact
+    }
     func onProgress(progress: InstallProgress) { handler(progress) }
+    func onArtifact(artifact: InstallArtifact) { artifactHandler(artifact) }
 }

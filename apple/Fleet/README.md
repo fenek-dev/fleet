@@ -14,9 +14,19 @@ xcodebuild -project Fleet.xcodeproj -scheme Fleet -destination 'platform=macOS,a
 
 `Fleet.xcodeproj` and `Generated/` are gitignored. The `Fleet` target runs `scripts/build-core.sh` as a pre-build phase, so after the first `xcodegen generate` a normal Xcode build keeps the core and bindings current.
 
+## Release app
+
+`scripts/build-release-app.sh` builds the Release configuration with `fleetctl` and the agent `.deb` packages (arm64 and amd64, `scripts/bundle-agent.sh`, Docker) embedded in the bundle, runs `scripts/check-release-hooks.sh`, and writes `dist/Fleet.app` and `dist/Fleet-<version>.zip`. The first run builds the amd64 agent under emulation and takes many minutes.
+
+- Signed: `FLEET_TEAM_ID=<team> [FLEET_SIGN_IDENTITY=...] [FLEET_ICLOUD=1] scripts/build-release-app.sh` (real entitlements: Keychain; with `FLEET_ICLOUD=1` also iCloud). Needs a provisioning profile for the team.
+- Without `FLEET_TEAM_ID`: ad-hoc signed with `Fleet-AdHoc.entitlements`. Works: enrollment, Secure Enclave keys (enclave-wrapped file store, design §5.2 "Unsigned builds"), servers, provisioning. Doesn't: sync key and sudo passwords (Keychain-only), iCloud. Other Macs need right-click > Open or `xattr -cr` (Gatekeeper).
+- `FLEET_SKIP_AGENT_BUNDLE=1` skips the agent packages (Add server then needs "Choose…"). `scripts/build-app-test.sh` skips them by default (tests use `FLEET_TEST_AGENT_ARTIFACT`); `FLEET_SKIP_AGENT_BUNDLE=0 scripts/build-app-test.sh` embeds them.
+
+Add server installs the bundled package matching the server (`uname -m`; Debian 12+ / Ubuntu 22.04+ only, checked before any upload) and shows its BLAKE3 for comparison with a reproducible build. "Choose…" overrides it; `FLEET_TEST_AGENT_ARTIFACT` (Debug) overrides both.
+
 ## Notes
 
-- **Signing:** keys live in the data protection keychain, which needs a signed build with the `keychain-access-groups` entitlement (set a development team). Unsigned builds (`CODE_SIGNING_ALLOWED=NO`) compile but can't store keys.
+- **Signing:** with a team, keys live in the data protection keychain (`keychain-access-groups`). Ad-hoc/unsigned builds fall back to an enclave-bound file store (see Release app); without a Secure Enclave they can't store keys.
 - **No Secure Enclave** (VMs, CI): launch with `FLEET_SOFTWARE_KEYS=1` to use Keychain-stored software keys. The UI shows a warning. Development only.
 - **App Sandbox is off** for now (Hardened Runtime is on). The core opens outbound SSH itself; sandboxing waits until the MCP socket and file transfer paths are settled.
 - **Enrollment:** on first launch the app shows onboarding (fleet name, 24-word recovery code shown once, re-type 4 words, optional passphrase, Touch ID signs the genesis roster). Until then nothing connects.
