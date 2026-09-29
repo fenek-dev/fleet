@@ -41,10 +41,32 @@ pub enum KeysOp {
 /// Comment prefix that marks a monitor line as Fleet's.
 pub const MONITOR_MARKER: &str = "fleet-monitor-";
 
+/// Exactly the line exec writes for a monitor key: the fixed forced-command
+/// options, `ecdsa-sha2-nistp256`, a base64 blob and `fleet-monitor-<device
+/// id>`. Anything else (an operator's own key that merely mentions the
+/// marker) is never touched.
 fn is_monitor_line(line: &str) -> bool {
-    line.split_whitespace()
-        .last()
-        .is_some_and(|c| c.starts_with(MONITOR_MARKER))
+    // The options contain a space (inside the quoted command), so strip
+    // them as a whole before splitting the rest.
+    let Some(rest) = line
+        .trim()
+        .strip_prefix(&crate::authorized_keys::monitor_options())
+        .and_then(|r| r.strip_prefix(' '))
+    else {
+        return false;
+    };
+    let f: Vec<&str> = rest.split(' ').collect();
+    let [kind, blob, marker] = f.as_slice() else {
+        return false;
+    };
+    *kind == "ecdsa-sha2-nistp256"
+        && !blob.is_empty()
+        && blob
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        && marker
+            .strip_prefix(MONITOR_MARKER)
+            .is_some_and(|id| id.parse::<fleet_proto::DeviceId>().is_ok())
 }
 
 /// `existing` with its Fleet monitor lines replaced by `desired`'s.
@@ -294,15 +316,37 @@ mod tests {
 
     #[test]
     fn monitor_lines_are_replaced_only() {
-        let mon = |id: &str| {
-            format!("restrict,command=\"/usr/lib/fleet/fleet-agent bridge --monitor\" ecdsa-sha2-nistp256 K{id} fleet-monitor-{id}")
+        let mon = |n: u8| {
+            format!(
+                "{} ecdsa-sha2-nistp256 K{n} fleet-monitor-d_{}",
+                crate::authorized_keys::monitor_options(),
+                hex::encode([n; 16])
+            )
         };
-        let existing = format!("ssh-ed25519 AAAA mine\n{}\n{}\n", mon("a"), mon("b"));
-        let got = sync_monitor_lines(&existing, &format!("{}\n", mon("c")));
-        assert_eq!(got, format!("ssh-ed25519 AAAA mine\n{}\n", mon("c")));
-        // Only lines whose comment carries the marker are Fleet's.
-        let plain = "ecdsa-sha2-nistp256 X fleet-monitor-lookalike-but-key-first\nssh-rsa A b\n";
-        assert!(sync_monitor_lines(plain, "").contains("ssh-rsa A b"));
+        let existing = format!("ssh-ed25519 AAAA mine\n{}\n{}\n", mon(1), mon(2));
+        let got = sync_monitor_lines(&existing, &format!("{}\n", mon(3)));
+        assert_eq!(got, format!("ssh-ed25519 AAAA mine\n{}\n", mon(3)));
+        // Lookalike operator lines are kept.
+        let id = hex::encode([9u8; 16]);
+        let lookalikes = [
+            "ecdsa-sha2-nistp256 X fleet-monitor-lookalike".to_string(),
+            format!("ecdsa-sha2-nistp256 X fleet-monitor-d_{id}"),
+            format!("command=\"/bin/sh\" ecdsa-sha2-nistp256 X fleet-monitor-d_{id}"),
+            format!(
+                "{} ecdsa-sha2-nistp256 X fleet-monitor-d_zz",
+                crate::authorized_keys::monitor_options()
+            ),
+            format!(
+                "{} ssh-rsa X fleet-monitor-d_{id}",
+                crate::authorized_keys::monitor_options()
+            ),
+            format!(
+                "{} ecdsa-sha2-nistp256 X fleet-monitor-d_{id} extra",
+                crate::authorized_keys::monitor_options()
+            ),
+        ];
+        let text = lookalikes.join("\n") + "\n";
+        assert_eq!(sync_monitor_lines(&text, ""), text);
         // A non-monitor line in the desired text is ignored.
         assert_eq!(sync_monitor_lines("x\n", "evil ssh-rsa A b\n"), "x\n");
     }
@@ -317,8 +361,13 @@ mod tests {
         };
         Direct.sync_monitor(&u, "").unwrap();
         assert_eq!(Direct.get(&u).unwrap(), None);
-        Direct.sync_monitor(&u, "k ecdsa-sha2-nistp256 A fleet-monitor-1\n").unwrap();
-        assert!(Direct.get(&u).unwrap().unwrap().ends_with(b"fleet-monitor-1\n"));
+        let line = format!(
+            "{} ecdsa-sha2-nistp256 A fleet-monitor-d_{}\n",
+            crate::authorized_keys::monitor_options(),
+            hex::encode([1u8; 16])
+        );
+        Direct.sync_monitor(&u, &line).unwrap();
+        assert_eq!(Direct.get(&u).unwrap().unwrap(), line.as_bytes());
         Direct.sync_monitor(&u, "").unwrap();
         assert_eq!(Direct.get(&u).unwrap().unwrap(), b"");
     }

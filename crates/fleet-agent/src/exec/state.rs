@@ -162,6 +162,9 @@ pub(super) struct StateParts {
     pub(super) user_keys: crate::userkeys::UserKeysMode,
 }
 
+/// Failed monitor-line syncs (5 s ticks) before an alert is raised.
+const MONITOR_SYNC_ALERT_AFTER: u32 = 3;
+
 pub(super) struct State {
     pub(super) store: Store,
     pub(super) paths: Paths,
@@ -187,6 +190,8 @@ pub(super) struct State {
     user_keys: crate::userkeys::UserKeysMode,
     /// `(epoch, version)` whose monitor lines were last pushed there.
     home_monitor_synced: std::cell::Cell<Option<(u32, u64)>>,
+    /// Consecutive failed monitor-line syncs (alert after a few).
+    home_monitor_failures: std::cell::Cell<u32>,
     pub(super) started: Instant,
     /// Random per exec start; binds this run's events (design §6.3).
     pub(super) run_id: [u8; 16],
@@ -314,6 +319,7 @@ impl State {
             ak_cache: authorized_keys::DeviceLinesCache::default(),
             user_keys: parts.user_keys,
             home_monitor_synced: std::cell::Cell::new(None),
+            home_monitor_failures: std::cell::Cell::new(0),
             started: Instant::now(),
             run_id,
             event_run,
@@ -457,6 +463,11 @@ impl State {
         }
         self.pending_dir.create()?;
         self.pending_dir.repair_updates()?;
+        // Installs from before the marker existed: uninstall.prepare needs
+        // the admin user even when no key file lists it (Agent-only).
+        if let Some(u) = &self.admin_user {
+            crate::uninstall::record_admin(&self.paths, u);
+        }
         let rearm = self.recover_pending(now);
         self.process_markers(now);
         self.prune(true);
@@ -707,7 +718,7 @@ impl State {
         }
     }
 
-    fn sync_authorized_keys(&self, now: u64) {
+    fn sync_authorized_keys(&mut self, now: u64) {
         // Agent-only mode (design §5.4): never write or rewrite the admin's
         // `authorized_keys` file — the operator owns it.
         if self.policy.security == fleet_proto::policy::SecurityMode::AgentOnly {
@@ -728,20 +739,46 @@ impl State {
         // step 5 switchover) the monitor keys must be there too, or a
         // locked app can't open monitor sessions.
         let v = (self.roster.roster.epoch, self.roster.roster.version);
-        if let Some(user) = &self.admin_user
+        if let Some(user) = self.admin_user.clone()
             && self.home_monitor_synced.get() != Some(v)
         {
-            // Marked done even on failure: retried on the next roster
-            // change or restart, not every tick.
-            self.home_monitor_synced.set(Some(v));
             let users = crate::userkeys::user_keys(self.user_keys, self.timers.as_ref());
-            if let Err(e) = authorized_keys::sync_home_monitor(
+            let res = authorized_keys::sync_home_monitor(
                 &self.paths,
-                user,
+                &user,
                 Some(&self.roster.roster),
                 users.as_ref(),
-            ) {
-                log("home monitor keys", e);
+            );
+            drop(users);
+            const RULE: &str = "monitor-keys-sync";
+            match res {
+                Ok(()) => {
+                    // Cached only on success; a failure retries every tick.
+                    self.home_monitor_synced.set(Some(v));
+                    if self.home_monitor_failures.replace(0) >= MONITOR_SYNC_ALERT_AFTER {
+                        self.emit(Event::AlertCleared {
+                            rule_id: RULE.into(),
+                            subject: user,
+                        });
+                    }
+                }
+                Err(e) => {
+                    let n = self.home_monitor_failures.get().saturating_add(1);
+                    self.home_monitor_failures.set(n);
+                    if n == 1 {
+                        log("home monitor keys", &e);
+                    }
+                    if n == MONITOR_SYNC_ALERT_AFTER {
+                        // A revoked device's monitor key may still be
+                        // accepted by sshd: tell the operator.
+                        self.emit(Event::AlertFired {
+                            rule_id: RULE.into(),
+                            severity: fleet_proto::alert::Severity::Warning,
+                            subject: user,
+                            value: u64::from(n),
+                        });
+                    }
+                }
             }
         }
     }

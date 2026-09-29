@@ -256,6 +256,7 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
     ];
     if let Some(u) = &input.admin_user {
         changes.push((MetaKey::AdminUser, Some(u.as_bytes())));
+        crate::uninstall::record_admin(paths, u);
     }
     store.meta().update(&changes)?;
 
