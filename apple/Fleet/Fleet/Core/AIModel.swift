@@ -22,6 +22,9 @@ final class AIModel {
     private(set) var prompts: [McpPromptRow] = []
     private(set) var socketError: String?
     private(set) var socketPath: String?
+    /// Bulk AI actions above this many servers wait for Touch ID (the
+    /// strictest pushed policy's `ai_bulk_confirm_above`; default 5).
+    private(set) var bulkThreshold: Int = 5
 
     var current: McpPromptRow? { prompts.first }
 
@@ -64,6 +67,7 @@ final class AIModel {
 
     func reloadClients() {
         clients = (try? core?.mcpClients()) ?? []
+        if let core { bulkThreshold = Int(core.mcpBulkConfirmThreshold()) }
     }
 
     func revoke(_ client: McpClientRow) {

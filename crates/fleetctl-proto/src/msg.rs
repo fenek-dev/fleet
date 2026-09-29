@@ -67,6 +67,10 @@ pub struct Welcome {
 pub struct ToolOutput {
     pub summary: serde_json::Value,
     pub untrusted: Vec<UntrustedItem>,
+    /// The call did not succeed (a change failed on some server); the MCP
+    /// result is flagged `isError` and still carries `summary`.
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 /// Server-derived text, already redacted and truncated by the app.
@@ -86,7 +90,10 @@ pub struct UntrustedItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case", tag = "error")]
 pub enum ProtoError {
-    #[error("the Fleet app is not running")]
+    #[error(
+        "the Fleet app is not reachable: it is not running, or it has no fleet set up yet \
+         (ask the operator to open Fleet and finish setting it up)"
+    )]
     NotRunning,
     #[error("the Fleet app is locked; ask the operator to unlock it")]
     Locked,
@@ -100,6 +107,11 @@ pub enum ProtoError {
     ApprovalRequired,
     #[error("the operator declined this action")]
     ApprovalDenied,
+    #[error(
+        "the operator did not answer the approval request in time (not declined); \
+         tell the operator to check the Fleet app, then retry"
+    )]
+    ApprovalTimedOut,
     #[error("rate limit reached; retry after {retry_after_ms} ms")]
     RateLimited { retry_after_ms: u64 },
     #[error("invalid argument: {field}")]
@@ -286,12 +298,64 @@ args!(
     }
 );
 
+/// The shape `firewall_apply` accepts (`FirewallRuleSet`).
+#[cfg(feature = "schema")]
+fn ruleset_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mode", "rules"],
+        "properties": {
+            "mode": {"type": "string", "enum": ["Managed", "BansOnly"]},
+            "rules": {
+                "type": "array",
+                "maxItems": 512,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["chain", "action", "proto", "ports", "source", "rate_limit", "comment"],
+                    "properties": {
+                        "chain": {"type": "string", "enum": ["Input", "Forward"]},
+                        "action": {"type": "string", "enum": ["Accept", "Drop", "Reject"]},
+                        "proto": {"type": "string", "enum": ["Tcp", "Udp"]},
+                        "ports": {
+                            "type": "array", "minItems": 1, "maxItems": 16,
+                            "items": {
+                                "type": "array", "minItems": 2, "maxItems": 2,
+                                "items": {"type": "integer", "minimum": 1, "maximum": 65535}
+                            }
+                        },
+                        "source": {
+                            "description": "null = any source; else [address, prefix]",
+                            "type": ["array", "null"], "minItems": 2, "maxItems": 2
+                        },
+                        "rate_limit": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "per_minute": {"type": "integer", "minimum": 1, "maximum": 100000},
+                                "burst": {"type": "integer", "minimum": 0}
+                            }
+                        },
+                        "comment": {"type": "string"}
+                    }
+                }
+            }
+        }
+    })
+}
+
 args!(
     FirewallApplyArgs {
         pub server: String,
-        /// The ruleset as `firewall_get` returned it, edited.
+        /// The complete desired ruleset: `{"mode": "Managed"|"BansOnly", "rules": [..]}`.
+        /// `BansOnly` takes no rules. Each rule: chain (Input|Forward), action
+        /// (Accept|Drop|Reject), proto (Tcp|Udp), ports (list of [start, end]),
+        /// source (null = any, or [address, prefix]), rate_limit (null or
+        /// {per_minute, burst}) and comment (string).
+        #[cfg_attr(feature = "schema", schemars(schema_with = "ruleset_schema"))]
         pub ruleset: serde_json::Value,
-        /// The version `firewall_get` reported.
+        /// The `version` that `firewall_get` reported; a concurrent edit is
+        /// refused instead of overwritten.
         pub expected_version: u64,
     }
 );

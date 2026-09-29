@@ -114,6 +114,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "glob_match"
+path = "fuzz_targets/glob_match.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "reboot_parse"
 path = "fuzz_targets/reboot_parse.rs"
 test = false

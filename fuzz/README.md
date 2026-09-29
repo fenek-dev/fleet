@@ -57,6 +57,7 @@ the minimized input.
 | `access_log` | web access-log JSON (`webscan`) | no panic |
 | `journal_json` | `logs::journal::parse_line` | no panic |
 | `nft_json` | `firewall::parse::parse_table`, `parse_counters`, `parse_ufw` | no panic |
+| `glob_match` | `fleet_proto::glob` (`glob_match`, `glob_covers`, `component_match`) | no panic; match implies cover; wildcard-free pattern matches itself; `**` matches everything |
 | `reboot_parse` | `reboot::parse_status` (`systemctl show`), `parse_local_seconds` (`date`) | no panic; seconds ≤ 86 400 |
 | `dpkg_status` | dpkg-query, dpkg status, extended_states, dpkg.log, history.log | no panic |
 | `apt_sim` | `parse_apt_sim` | no panic |

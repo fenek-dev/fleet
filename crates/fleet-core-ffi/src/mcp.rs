@@ -212,6 +212,15 @@ impl McpBackend for Backend {
         Some(AiLimits::from_policy(&p))
     }
 
+    fn shell_exec_allowed(&self, server: &ServerId, user: &str) -> Option<bool> {
+        let core = self.core().ok()?;
+        let p = fleet_core::policy::pushed(&lock(&core.cache), server)?;
+        Some(
+            p.capabilities.shell_exec
+                && p.capabilities.shell_exec_users.iter().any(|u| u == user),
+        )
+    }
+
     fn confirm_change(
         &self,
         server: ServerId,
@@ -330,6 +339,13 @@ impl FleetCore {
 
     pub fn mcp_paused(self: Arc<Self>) -> bool {
         self.mcp_host().paused()
+    }
+
+    /// Bulk AI actions on more servers than this wait for the operator's
+    /// Touch ID: the strictest `ai_bulk_confirm_above` of the pushed
+    /// policies (default 5).
+    pub fn mcp_bulk_confirm_threshold(self: Arc<Self>) -> u32 {
+        u32::try_from(self.mcp_host().strictest_bulk_confirm()).unwrap_or(u32::MAX)
     }
 
     /// The operator's answer to prompt `id`. `digest` is the prompt's (an

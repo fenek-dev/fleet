@@ -1,12 +1,12 @@
 //! Which paths are tracked, which are secrets, and which may never be
 //! rolled back (design §4.9).
 //!
-//! A rule is an absolute path or a glob ([`crate::files::walk::glob_match`]:
+//! A rule is an absolute path or a glob ([`fleet_proto::glob`]:
 //! `*`/`?` within a component, `**` across components). A plain path
 //! covers itself and everything below it.
 
 use super::store::OperatorPaths;
-use crate::files::walk::{self, MAX_WALK_DEPTH, glob_match, is_glob};
+use crate::files::walk::{self, MAX_WALK_DEPTH, allow_match, deny_match, is_glob};
 use fleet_proto::args::AbsPath;
 
 /// Tracked by default: `/etc` plus role files (Compose projects and
@@ -49,7 +49,8 @@ pub const NETPLAN: &[&str] = &["/etc/netplan/*.yaml", "/etc/netplan/*.yml"];
 
 /// Whether `path` is a netplan file.
 pub fn is_netplan(path: &str) -> bool {
-    NETPLAN.iter().any(|r| glob_match(r, path))
+    // Netplan files get the secret-content check; oversized: treated as one.
+    NETPLAN.iter().any(|r| deny_match(r, path))
 }
 
 /// Never rolled back through config history, beyond `AbsPath::is_fleet_owned`
@@ -64,7 +65,7 @@ pub const OPERATOR_ROOTS: &[&str] = &["/etc", "/srv", "/opt", "/usr/local/etc"];
 
 /// Whether an operator tracked rule stays under [`OPERATOR_ROOTS`].
 pub fn under_operator_roots(rule: &str) -> bool {
-    OPERATOR_ROOTS.iter().any(|r| covers(r, rule))
+    OPERATOR_ROOTS.iter().any(|r| covers_allow(r, rule))
 }
 
 /// Fleet's own state (its database changes constantly; never tracked).
@@ -73,13 +74,29 @@ pub const NEVER_TRACKED: &[&str] = &["/var/lib/fleet", "/run/fleet"];
 /// Temp files of a rollback in progress (never tracked).
 pub const TMP_MARKER: &str = ".fleet-rollback-";
 
-fn covers(rule: &str, path: &str) -> bool {
+fn plain_covers(rule: &str, path: &str) -> bool {
+    path == rule
+        || rule == "/"
+        || (path.starts_with(rule) && path.as_bytes().get(rule.len()) == Some(&b'/'))
+}
+
+/// A rule of a list that GRANTS (tracked paths, operator roots): a glob
+/// over the matcher's bounds does not match.
+fn covers_allow(rule: &str, path: &str) -> bool {
     if is_glob(rule) {
-        glob_match(rule, path)
+        allow_match(rule, path)
     } else {
-        path == rule
-            || rule == "/"
-            || (path.starts_with(rule) && path.as_bytes().get(rule.len()) == Some(&b'/'))
+        plain_covers(rule, path)
+    }
+}
+
+/// A rule of a list that REFUSES or PROTECTS (secret paths, no-rollback,
+/// never-tracked): a glob over the matcher's bounds counts as matched.
+fn covers_deny(rule: &str, path: &str) -> bool {
+    if is_glob(rule) {
+        deny_match(rule, path)
+    } else {
+        plain_covers(rule, path)
     }
 }
 
@@ -147,21 +164,21 @@ impl PathRules {
         if name.contains(TMP_MARKER) || path.contains(char::REPLACEMENT_CHARACTER) {
             return false;
         }
-        if NEVER_TRACKED.iter().any(|r| covers(r, path)) {
+        if NEVER_TRACKED.iter().any(|r| covers_deny(r, path)) {
             return false;
         }
-        self.tracked_rules().any(|r| covers(r, path))
+        self.tracked_rules().any(|r| covers_allow(r, path))
     }
 
     /// Path-based secret check (content with a `PRIVATE KEY` block is a
     /// secret too; see `content`).
     pub fn is_secret(&self, path: &str) -> bool {
-        self.secret_rules().any(|r| covers(r, path))
+        self.secret_rules().any(|r| covers_deny(r, path))
     }
 
     /// Whether `config.rollback` may write `path`.
     pub fn rollback_allowed(path: &AbsPath) -> bool {
-        !path.is_fleet_owned() && !NO_ROLLBACK.iter().any(|r| covers(r, path.as_str()))
+        !path.is_fleet_owned() && !NO_ROLLBACK.iter().any(|r| covers_deny(r, path.as_str()))
     }
 
     /// Walks a full scan makes (one per tracked rule).
@@ -245,6 +262,26 @@ mod tests {
         assert!(!r.is_tracked("/etc/.x.fleet-rollback-7"));
         assert!(!r.is_tracked("/var/lib/fleet/exec/state.redb"));
         assert!(!r.is_tracked("/etcetera"));
+    }
+
+    #[test]
+    fn oversized_input_fails_closed_per_call_site() {
+        let long = format!("/etc/{}", "a".repeat(5000));
+        let r = PathRules::default();
+        // Deny-type: secret, never-tracked, netplan (content check).
+        assert!(r.is_secret(&long));
+        assert!(is_netplan(&long));
+        assert!(covers_deny("/etc/*x*", &long));
+        // Allow-type: tracked glob rules and operator roots grant nothing.
+        assert!(!covers_allow("/srv/*/compose.yaml", &long));
+        let huge_rule = format!("/opt/{}*", "a".repeat(5000));
+        let ops = PathRules::new(OperatorPaths {
+            tracked: vec![huge_rule.clone()],
+            secret: vec![huge_rule],
+            version: 1,
+        });
+        assert!(!ops.is_tracked("/opt/x"), "oversized tracked rule grants nothing");
+        assert!(ops.is_secret("/opt/x"), "oversized secret rule protects");
     }
 
     #[test]

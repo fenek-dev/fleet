@@ -20,9 +20,14 @@ struct Backend {
     server_limits: Mutex<HashMap<ServerId, AiLimits>>,
     confirmed: Mutex<Vec<(ServerId, fleet_proto::ChangeId, Actor)>>,
     saved: Mutex<Vec<McpClientRecord>>,
+    /// The pushed policy has `shell_exec = false`.
+    shell_off: AtomicBool,
 }
 
 impl McpBackend for Backend {
+    fn shell_exec_allowed(&self, _server: &ServerId, _user: &str) -> Option<bool> {
+        self.shell_off.load(Ordering::SeqCst).then_some(false)
+    }
     fn executor(&self) -> Result<Arc<dyn BulkExecutor>, ProtoError> {
         if !self.running.load(Ordering::SeqCst) {
             return Err(ProtoError::NotRunning);
@@ -114,6 +119,7 @@ fn harness(n: usize, cfg: McpConfig) -> Harness {
         server_limits: Mutex::new(HashMap::new()),
         confirmed: Mutex::new(Vec::new()),
         saved: Mutex::new(Vec::new()),
+        shell_off: AtomicBool::new(false),
     });
     let host = McpHost::new(backend.clone(), cfg);
     let (tx, mut rx) = mpsc::unbounded_channel::<Prompt>();
@@ -1179,4 +1185,134 @@ fn confirm_failures_are_fixed_codes() {
         "agent_NotFound"
     );
     assert_eq!(ConfirmFailure::Unavailable.code(), "unavailable");
+}
+
+#[test]
+fn secret_globs_match_like_the_agent() {
+    let hit = |p, e| is_secret_match(p, e);
+    // Leading-segment globs must not swallow every path under /etc.
+    assert!(!hit("/etc/hostname", "/etc/*shadow*"));
+    assert!(!hit("/etc/ssh/sshd_config", "/etc/*shadow*"));
+    assert!(hit("/etc/shadow.bak", "/etc/*shadow*"));
+    assert!(!hit("/srv/x", "/srv/**/.env"));
+    assert!(!hit("/srv/x/compose.yaml", "/srv/**/.env"));
+    assert!(hit("/srv/x/y/.env", "/srv/**/.env"));
+    assert!(hit("/etc/ssh/ssh_host_ed25519_key", "/etc/ssh/ssh_host_*_key"));
+    assert!(!hit("/etc/ssh/ssh_host_ed25519_key.pub", "/etc/ssh/ssh_host_*_key"));
+    assert!(hit(
+        "/etc/letsencrypt/live/a/privkey.pem",
+        "/etc/letsencrypt/**/privkey*"
+    ));
+    // A literal `*` in the path must not hide the wildcard.
+    assert!(hit(
+        "/etc/postfix/sasl_passwd*backup",
+        "/etc/postfix/sasl_passwd*"
+    ));
+    // Oversized inputs fail closed.
+    let long = format!("/etc/{}", "a".repeat(5000));
+    assert!(is_secret_match(&long, "/srv/**/.env"));
+    // Below a matched directory glob.
+    assert!(hit("/etc/app/x/y.conf", "/etc/app*"));
+    // Plain entries still cover what is below them.
+    assert!(hit("/etc/ssl/private/a.pem", "/etc/ssl/private"));
+    assert!(!hit("/etc/ssl/certs/a.pem", "/etc/ssl/private"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shell_exec_with_policy_off_refuses_before_any_prompt() {
+    let h = harness(2, McpConfig::default());
+    h.backend.shell_off.store(true, Ordering::SeqCst);
+    let mut s = paired_session(&h).await;
+    let before = lock(&h.prompts).len();
+    let r = send(
+        &h,
+        &mut s,
+        call(
+            "shell_exec",
+            json!({"servers": servers(0..1), "user": "root", "command": "id"}),
+        ),
+    )
+    .await;
+    assert!(matches!(r, Err(ProtoError::Unsupported { .. })), "{r:?}");
+    assert_eq!(lock(&h.prompts).len(), before, "no approval sheet");
+    assert!(h.backend.exec.calls().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unanswered_approval_is_a_timeout_not_a_denial() {
+    let h = harness(
+        2,
+        McpConfig {
+            prompt_timeout: Duration::from_millis(50),
+            ..Default::default()
+        },
+    );
+    let mut s = paired_session(&h).await;
+    *lock(&h.answer) = None;
+    let r = send(
+        &h,
+        &mut s,
+        call(
+            "shell_exec",
+            json!({"servers": servers(0..1), "user": "deploy", "command": "uptime"}),
+        ),
+    )
+    .await;
+    assert_eq!(r, Err(ProtoError::ApprovalTimedOut));
+    assert!(h.backend.exec.calls().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_changes_are_errors_with_human_status() {
+    let h = harness(2, McpConfig::default());
+    h.backend
+        .exec
+        .behave
+        .lock()
+        .unwrap()
+        .insert(sid(0), Behave::Fail(0));
+    let mut s = paired_session(&h).await;
+    let r = send(&h, &mut s, restart(servers(0..1))).await;
+    let Ok(ResponseBody::Tool(out)) = r else {
+        panic!("{r:?}")
+    };
+    assert!(out.is_error, "{:?}", out.summary);
+    let status = out.summary["servers"][0]["status"].as_str().unwrap();
+    assert!(status.starts_with("failed: "), "{status}");
+    assert!(
+        !status.contains('{') && !status.contains("Internal"),
+        "{status}"
+    );
+}
+
+#[test]
+fn approval_details_are_readable() {
+    let op = Op::UnitRestart {
+        unit: fleet_proto::args::UnitName::new("cron.service").unwrap(),
+    };
+    let (PromptKind::Approval { details, .. }, _) =
+        approval_prompt("c", "t", &op, &[sid(0)], true, false, 10_000).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(details, "unit: \"cron.service\"");
+    // Unicode line separators and bidi controls never reach the sheet raw.
+    let (kind, _) = approval_prompt(
+        "c",
+        "t",
+        &Op::UnitRestart {
+            unit: fleet_proto::args::UnitName::new("cron.service").unwrap(),
+        },
+        &[sid(0)],
+        true,
+        false,
+        10_000,
+    )
+    .unwrap();
+    drop(kind);
+    let esc = untrusted::escape_controls("a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{00a0}f");
+    assert!(esc.chars().all(|c| !matches!(
+        c,
+        '\u{2028}' | '\u{2029}' | '\u{202e}' | '\u{2066}' | '\u{00a0}'
+    )));
 }

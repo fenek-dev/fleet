@@ -326,18 +326,10 @@ pub fn parse_sshd_ports(text: &str) -> Vec<u16> {
     cfg.ports
 }
 
-/// `*`/`?` glob on one path component; a leading `.` is only matched
-/// literally.
-fn glob_match(pat: &[u8], name: &[u8]) -> bool {
-    match (pat.first(), name.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => {
-            glob_match(&pat[1..], name) || (!name.is_empty() && glob_match(pat, &name[1..]))
-        }
-        (Some(b'?'), Some(_)) => glob_match(&pat[1..], &name[1..]),
-        (Some(a), Some(b)) if a == b => glob_match(&pat[1..], &name[1..]),
-        _ => false,
-    }
+/// `*`/`?` glob on one path component (the shared bounded matcher; the
+/// caller handles a leading `.`).
+fn glob_match(pat: &str, name: &str) -> bool {
+    fleet_proto::glob::component_match(pat, name)
 }
 
 fn read_capped(p: &Path) -> Result<Option<String>, &'static str> {
@@ -419,7 +411,7 @@ impl SshdReader<'_> {
                 continue;
             };
             let hidden = n.starts_with('.') && !pat.starts_with('.');
-            if !hidden && glob_match(pat.as_bytes(), n.as_bytes()) {
+            if !hidden && glob_match(pat, &n) {
                 if names.len() >= MAX_SSHD_FILES {
                     return Err("too many sshd config files");
                 }

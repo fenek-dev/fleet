@@ -80,7 +80,7 @@ struct AISettings: View {
                 if let e = ai.socketError {
                     Text(e).foregroundStyle(Tone.critical.text)
                 }
-                Text("Elevated operations and bulk actions on more than 5 servers wait for your Touch ID. Tools for keys, roster, policy and recovery don't exist.")
+                Text("Elevated operations and bulk actions on more than \(ai.bulkThreshold) servers wait for your Touch ID. Tools for keys, roster, policy and recovery don't exist.")
                     .font(.caption11).foregroundStyle(Color.textMuted)
             }
         }
