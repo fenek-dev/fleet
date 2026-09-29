@@ -98,6 +98,12 @@ pub enum BulkOpRow {
     SystemReboot {
         delay_s: u32,
     },
+    /// Daily reboot window in each server's local time, minutes since
+    /// local midnight (`system.reboot.schedule`).
+    SystemRebootWindow {
+        start_min: u32,
+        end_min: u32,
+    },
     ShellExec {
         user: String,
         command: String,
@@ -151,6 +157,12 @@ impl BulkOpRow {
                 roles: Vec::new(),
             },
             BulkOpRow::SystemReboot { delay_s } => OpSpec::SystemReboot { delay_s },
+            // Out-of-range minutes saturate to a value `Op::check_args`
+            // refuses (the preview and the run report it).
+            BulkOpRow::SystemRebootWindow { start_min, end_min } => OpSpec::SystemRebootWindow {
+                start_min: u16::try_from(start_min).unwrap_or(u16::MAX),
+                end_min: u16::try_from(end_min).unwrap_or(u16::MAX),
+            },
             BulkOpRow::ShellExec {
                 user,
                 command,
@@ -207,6 +219,10 @@ impl BulkOpRow {
                 },
             },
             OpSpec::SystemReboot { delay_s } => BulkOpRow::SystemReboot { delay_s },
+            OpSpec::SystemRebootWindow { start_min, end_min } => BulkOpRow::SystemRebootWindow {
+                start_min: start_min.into(),
+                end_min: end_min.into(),
+            },
             OpSpec::ShellExec {
                 user,
                 command,
@@ -1003,6 +1019,11 @@ mod tests {
             BulkOpRow::ProfileCheck {
                 level: ProfileLevelRow::Strict,
             },
+            BulkOpRow::SystemReboot { delay_s: 60 },
+            BulkOpRow::SystemRebootWindow {
+                start_min: 180,
+                end_min: 300,
+            },
             BulkOpRow::ShellExec {
                 user: "deploy".into(),
                 command: "uptime".into(),
@@ -1011,6 +1032,36 @@ mod tests {
         ];
         for r in rows {
             assert_eq!(BulkOpRow::from_spec(&r.spec()), r);
+        }
+    }
+
+    #[test]
+    fn reboot_window_rows_become_schedule_ops_and_bad_minutes_are_refused() {
+        use fleet_core::opspec::to_op;
+        use fleet_proto::Op;
+        use fleet_proto::op::RebootWhen;
+        let op = to_op(
+            &BulkOpRow::SystemRebootWindow {
+                start_min: 1380,
+                end_min: 60,
+            }
+            .spec(),
+        )
+        .unwrap();
+        assert_eq!(
+            op,
+            Op::SystemRebootSchedule {
+                when: RebootWhen::Window {
+                    start_min: 1380,
+                    end_min: 60
+                }
+            }
+        );
+        for (start_min, end_min) in [(60, 60), (1440, 0), (0, 70_000)] {
+            assert!(
+                to_op(&BulkOpRow::SystemRebootWindow { start_min, end_min }.spec()).is_err(),
+                "{start_min}-{end_min}"
+            );
         }
     }
 

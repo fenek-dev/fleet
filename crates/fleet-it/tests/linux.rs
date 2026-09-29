@@ -878,6 +878,54 @@ fn firewall_managed_confirm_then_auto_revert() {
     });
 }
 
+/// `firewall.counters` reads the `counter` statements the renderer emits
+/// from the real kernel table, and `change.revert` puts the previous table
+/// back at once over the very session that applied the change (the timer
+/// is stopped and never fires).
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn firewall_counters_and_revert_now() {
+    let fx = fixture();
+    run(Duration::from_secs(120), async {
+        let (c, mut s) = open(fx).await;
+        let before = fw_get(&mut s, fx).await;
+        let set = FirewallRuleSet {
+            mode: FirewallMode::Managed,
+            rules: vec![accept_tcp(22, "ssh"), accept_tcp(8081, "it-revert")],
+        };
+        let change = match fw_apply(&mut s, fx, set.clone(), before.version).await {
+            Ok(Payload::ChangePending { change, .. }) => change,
+            other => panic!("firewall.apply: {other:?}"),
+        };
+        let table = nft(fx, &["list", "table", "inet", "fleet"]);
+        assert!(table.contains("counter"), "no counter in the kernel:\n{table}");
+        match call(&mut s, fx, Op::FirewallCounters).await {
+            Ok(Payload::FirewallCounters(cn)) => {
+                assert_eq!(Some(cn.version), change.new_version);
+                let idx: Vec<_> = cn.rules.iter().map(|r| r.rule).collect();
+                assert_eq!(idx, [0, 1], "{cn:?}");
+            }
+            other => panic!("firewall.counters: {other:?}"),
+        }
+        // Revert now, over the same session.
+        let r = call(&mut s, fx, Op::ChangeRevert { change_id: change.change_id }).await;
+        assert_eq!(r, Ok(Payload::Empty), "change.revert");
+        let table = nft(fx, &["list", "table", "inet", "fleet"]);
+        assert!(!table.contains("dport 8081"), "not reverted:\n{table}");
+        let after = fw_get(&mut s, fx).await;
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.rules, before.rules);
+        // Nothing left pending, and a second revert has nothing to do.
+        match call(&mut s, fx, Op::ChangesList).await {
+            Ok(Payload::PendingChanges(p)) => assert!(p.changes.is_empty(), "{p:?}"),
+            other => panic!("changes.list: {other:?}"),
+        }
+        let r = call(&mut s, fx, Op::ChangeRevert { change_id: change.change_id }).await;
+        assert_eq!(r, Err(ErrorCode::NotFound));
+        c.disconnect().await;
+    });
+}
+
 // ---------------------------------------------------------------- streams
 
 /// Opens `op` as a verified stream; feeds items to `f` until it returns
@@ -1618,6 +1666,75 @@ fn w6b_system_reboot_schedules_timer_then_cancel() {
     assert!(timers.contains("fleet-reboot.timer"), "{timers}");
     let (active, _) = c.exec_status(&["systemctl", "is-active", "fleet-reboot.timer"], 30);
     assert!(!active);
+}
+
+/// `system.reboot.schedule` (window and absolute), `.status` and `.cancel`
+/// against real systemd: the timer's description carries the target, the
+/// window's lead follows the container's local offset, cancel disarms.
+#[test]
+#[ignore = "needs Docker; run tests/vm/run.sh"]
+fn w6c_reboot_window_status_cancel() {
+    use fleet_proto::op::RebootWhen;
+    let fx = fixture();
+    let c = &fx.container;
+    run(LIMIT, async {
+        let (conn, mut s) = open(fx).await;
+        // A window that is closed for the next minutes at most: a start a
+        // few hours ahead of "now" in the container's local time.
+        let (_, hm) = c.exec_status(&["date", "+%H:%M"], 30);
+        let now_min: u16 = {
+            let (h, m) = hm.trim().split_once(':').unwrap();
+            h.parse::<u16>().unwrap() * 60 + m.parse::<u16>().unwrap()
+        };
+        let start_min = (now_min + 180) % 1440;
+        let end_min = (now_min + 240) % 1440;
+        let r = call(
+            &mut s,
+            fx,
+            Op::SystemRebootSchedule {
+                when: RebootWhen::Window { start_min, end_min },
+            },
+        )
+        .await;
+        assert_eq!(r, Ok(Payload::Empty));
+        let Ok(Payload::RebootStatus(st)) = call(&mut s, fx, Op::SystemRebootStatus).await else {
+            panic!("status")
+        };
+        let at = st.at_ms.expect("armed");
+        let lead_s = at / 1000 - fleet_core::now_ms() / 1000;
+        // About three hours ahead (a DST switch in between may shift it).
+        assert!((3 * 3600 - 300..=3 * 3600 + 3900).contains(&lead_s), "{lead_s}");
+        let (armed, _) = c.exec_status(&["systemctl", "is-active", "fleet-reboot.timer"], 30);
+        assert!(armed, "the timer is armed");
+
+        // An absolute time replaces it.
+        let target = fleet_core::now_ms() + 2 * 3_600_000;
+        let r = call(
+            &mut s,
+            fx,
+            Op::SystemRebootSchedule {
+                when: RebootWhen::At { at_ms: target },
+            },
+        )
+        .await;
+        assert_eq!(r, Ok(Payload::Empty));
+        let Ok(Payload::RebootStatus(st)) = call(&mut s, fx, Op::SystemRebootStatus).await else {
+            panic!("status")
+        };
+        assert!(st.at_ms.unwrap().abs_diff(target) < 60_000);
+
+        let r = call(&mut s, fx, Op::SystemRebootCancel).await;
+        assert_eq!(r, Ok(Payload::Empty));
+        let r = call(&mut s, fx, Op::SystemRebootCancel).await;
+        assert_eq!(r, Ok(Payload::Empty), "idempotent");
+        let Ok(Payload::RebootStatus(st)) = call(&mut s, fx, Op::SystemRebootStatus).await else {
+            panic!("status")
+        };
+        assert_eq!(st.at_ms, None);
+        conn.disconnect().await;
+    });
+    // Never leave a timer behind.
+    let _ = c.exec_status(&["systemctl", "stop", "fleet-reboot.timer"], 30);
 }
 
 /// Last by name: footprint after every other test in this run.

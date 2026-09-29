@@ -7,7 +7,7 @@ use fleet_proto::args::{
     UnitName, UserName,
 };
 use fleet_proto::op::{
-    ProfileLevel, ProfileRole, ProfileSource, ProfileSpec, ShellExec, UpgradeScope,
+    ProfileLevel, ProfileRole, ProfileSource, ProfileSpec, RebootWhen, ShellExec, UpgradeScope,
 };
 use fleet_proto::{Op, Tier};
 use fleetctl_proto::OpSpec;
@@ -143,6 +143,12 @@ pub fn to_op(spec: &OpSpec) -> Result<Op, InvalidSpec> {
             }
             Op::SystemReboot { delay_s: *delay_s }
         }
+        OpSpec::SystemRebootWindow { start_min, end_min } => Op::SystemRebootSchedule {
+            when: RebootWhen::Window {
+                start_min: *start_min,
+                end_min: *end_min,
+            },
+        },
         OpSpec::ShellExec {
             user,
             command,
@@ -203,6 +209,27 @@ mod tests {
             })
             .is_err()
         );
+        let w = to_op(&OpSpec::SystemRebootWindow {
+            start_min: 180,
+            end_min: 300,
+        })
+        .unwrap();
+        assert_eq!(
+            w,
+            Op::SystemRebootSchedule {
+                when: RebootWhen::Window {
+                    start_min: 180,
+                    end_min: 300
+                }
+            }
+        );
+        assert!(!needs_approval(&w));
+        for (start_min, end_min) in [(60, 60), (1440, 5), (5, 1440)] {
+            assert_eq!(
+                to_op(&OpSpec::SystemRebootWindow { start_min, end_min }),
+                Err(InvalidSpec("arguments"))
+            );
+        }
         let c = to_op(&OpSpec::Container {
             container: "0123456789ab".into(),
             action: ContainerActionKind::Restart,

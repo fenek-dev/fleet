@@ -186,6 +186,12 @@ struct OpDraft: Equatable {
     var version: UInt64 = 1
     var strict = false
     var delay: UInt32 = 0
+    /// `system.reboot.schedule`: reboot at the start of a daily window in
+    /// each server's local time (minutes since local midnight) instead of
+    /// after `delay`.
+    var rebootWindow = false
+    var windowStart: UInt32 = 180
+    var windowEnd: UInt32 = 300
     var user = ""
     var command = ""
     var timeout: UInt32 = 60
@@ -201,7 +207,9 @@ struct OpDraft: Equatable {
         case .composeRestart: .composeRestart(project: project)
         case .configRollback: .configRollback(path: path, version: version)
         case .profileCheck: .profileCheck(level: strict ? .strict : .baseline)
-        case .reboot: .systemReboot(delayS: delay)
+        case .reboot:
+            rebootWindow ? .systemRebootWindow(startMin: windowStart, endMin: windowEnd)
+                : .systemReboot(delayS: delay)
         case .shell: .shellExec(user: user, command: command, timeoutS: timeout)
         }
     }
@@ -221,6 +229,8 @@ struct OpDraft: Equatable {
         case .configRollback(let p, let v): kind = .configRollback; path = p; version = v
         case .profileCheck(let l): kind = .profileCheck; strict = l == .strict
         case .systemReboot(let d): kind = .reboot; delay = d
+        case .systemRebootWindow(let s, let e):
+            kind = .reboot; rebootWindow = true; windowStart = s; windowEnd = e
         case .shellExec(let u, let c, let t): kind = .shell; user = u; command = c; timeout = t
         }
     }
@@ -297,8 +307,18 @@ struct OpEditor: View {
             Toggle("Strict profile", isOn: $draft.strict)
                 .accessibilityIdentifier("bulk.strict")
         case .reboot:
-            TextField("Delay (s)", value: $draft.delay, format: .number)
-                .accessibilityIdentifier("bulk.delay")
+            Picker("When", selection: $draft.rebootWindow) {
+                Text("After a delay").tag(false)
+                Text("In a daily window").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("bulk.rebootWhen")
+            if draft.rebootWindow {
+                RebootWindowFields(start: $draft.windowStart, end: $draft.windowEnd)
+            } else {
+                TextField("Delay (s)", value: $draft.delay, format: .number)
+                    .accessibilityIdentifier("bulk.delay")
+            }
         case .shell:
             TextField("Run as user", text: $draft.user)
                 .accessibilityIdentifier("bulk.shellUser")
@@ -654,16 +674,71 @@ struct BulkProgressView: View {
     }
 }
 
+/// Minutes since midnight as `HH:MM`.
+enum MinuteOfDay {
+    static func text(_ minutes: UInt32) -> String {
+        String(format: "%02d:%02d", minutes / 60, minutes % 60)
+    }
+}
+
+/// A time of day (minutes since midnight) as a compact picker.
+struct MinuteOfDayPicker: View {
+    let title: String
+    @Binding var minutes: UInt32
+
+    private var date: Binding<Date> {
+        Binding(
+            get: {
+                Calendar.current.date(
+                    bySettingHour: Int(minutes / 60) % 24, minute: Int(minutes % 60), second: 0,
+                    of: Date()) ?? Date()
+            },
+            set: { d in
+                let c = Calendar.current.dateComponents([.hour, .minute], from: d)
+                minutes = UInt32((c.hour ?? 0) * 60 + (c.minute ?? 0))
+            })
+    }
+
+    var body: some View {
+        DatePicker(title, selection: date, displayedComponents: .hourAndMinute)
+    }
+}
+
+/// From/To of a reboot window: the server's local time, minutes since its
+/// midnight; an end before the start wraps past midnight.
+struct RebootWindowFields: View {
+    @Binding var start: UInt32
+    @Binding var end: UInt32
+
+    var body: some View {
+        HStack {
+            MinuteOfDayPicker(title: "From", minutes: $start)
+                .accessibilityIdentifier("bulk.windowStart")
+            MinuteOfDayPicker(title: "To", minutes: $end)
+                .accessibilityIdentifier("bulk.windowEnd")
+        }
+        Text(start == end
+            ? "The window needs different start and end times."
+            : "Server-local time. Each server reboots at the window's start, or right away when the window is open now.")
+            .font(.caption11).foregroundStyle(start == end ? Tone.critical.text : Color.textMuted)
+            .accessibilityIdentifier("bulk.windowNote")
+    }
+}
+
 /// Schedules a reboot on servers whose upgrade said one is required, after
 /// the rollout finished. Progress lines land on the run's rows.
 private final class RebootFollowUp: BulkListener, @unchecked Sendable {
     weak var progress: BulkProgress?
-    init(progress: BulkProgress) { self.progress = progress }
+    let scheduledNote: String
+    init(progress: BulkProgress, scheduledNote: String) {
+        self.progress = progress
+        self.scheduledNote = scheduledNote
+    }
     func onEvent(event: BulkEventRow) {
         guard case .server(let id, let status, let detail) = event else { return }
         switch status {
         case .succeeded:
-            Task { @MainActor [weak progress] in progress?.note(id, "Reboot scheduled in 60 s") }
+            Task { @MainActor [weak progress, scheduledNote] in progress?.note(id, scheduledNote) }
         case .failed:
             Task { @MainActor [weak progress] in
                 progress?.note(id, "Reboot not scheduled: \(detail.prefix(200))")
@@ -683,6 +758,10 @@ struct BulkRunSheet: View {
     @State private var batchSize = 4
     @State private var stopOnFailure = true
     @State private var rebootIfRequired = false
+    /// Reboot in a daily window (server-local time) instead of 60 s after.
+    @State private var rebootInWindow = false
+    @State private var rebootStart: UInt32 = 180
+    @State private var rebootEnd: UInt32 = 300
     @State private var timeout: UInt32 = 0
     @State private var preview: BulkPreviewRow?
     @State private var previewError: String?
@@ -806,9 +885,19 @@ struct BulkRunSheet: View {
                 Toggle("Stop on first failure", isOn: $stopOnFailure)
                     .accessibilityIdentifier("bulk.stopOnFailure")
                 if draft.kind == .pkgUpgrade {
-                    Toggle("Reboot if required, 60 s after the rollout", isOn: $rebootIfRequired)
+                    Toggle("Reboot if required", isOn: $rebootIfRequired)
                         .accessibilityIdentifier("bulk.reboot")
-                        .help("The agent has no per-server reboot windows yet; reboots are scheduled after the whole rollout finished")
+                        .help("Servers whose upgrade says a reboot is required are rebooted once the whole rollout finished")
+                    if rebootIfRequired {
+                        Picker("When", selection: $rebootInWindow) {
+                            Text("60 s after the rollout").tag(false)
+                            Text("In a daily window").tag(true)
+                        }
+                        .accessibilityIdentifier("bulk.rebootTiming")
+                        if rebootInWindow {
+                            RebootWindowFields(start: $rebootStart, end: $rebootEnd)
+                        }
+                    }
                 }
                 TextField("Per-server timeout (s, 0 = default)", value: $timeout, format: .number)
                     .accessibilityIdentifier("bulk.timeout")
@@ -1024,9 +1113,15 @@ struct BulkRunSheet: View {
             let opts = BulkOptionsRow(
                 concurrency: 4, canary: false, healthCheck: false, stopOnFailure: false,
                 perServerTimeoutS: 0, dryRun: false)
+            let op: BulkOpRow = rebootInWindow
+                ? .systemRebootWindow(startMin: rebootStart, endMin: rebootEnd)
+                : .systemReboot(delayS: 60)
+            let note = rebootInWindow
+                ? "Reboot scheduled for the window \(MinuteOfDay.text(rebootStart))–\(MinuteOfDay.text(rebootEnd)) (server time)"
+                : "Reboot scheduled in 60 s"
             _ = try? api.bulkRun(
-                targets: ids, op: .systemReboot(delayS: 60), options: opts,
-                listener: RebootFollowUp(progress: run))
+                targets: ids, op: op, options: opts,
+                listener: RebootFollowUp(progress: run, scheduledNote: note))
         }
     }
 }

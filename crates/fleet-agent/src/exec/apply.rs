@@ -114,6 +114,58 @@ impl Exec {
         }
     }
 
+    /// `change.revert`: the timer's restore, now. Claiming (an atomic
+    /// rename) makes it exclusive with the timers and with maintenance, so
+    /// exactly one restore runs; the loser of a race with a timer that
+    /// reverted the change a moment earlier answers success too (the
+    /// change is reverted either way), and a change already confirmed or
+    /// long gone is `NotFound`. The origin op's audit entry and the
+    /// `change.reverted` event come from the marker, exactly as for a
+    /// timer's revert.
+    pub(super) async fn revert_now(&self, id: ChangeId) -> Result<Payload, ErrorCode> {
+        {
+            let mut st = self.st.borrow_mut();
+            // Still applying, or maintenance already restoring it: retry.
+            if st.applying.contains(&id) || !st.reverting.insert(id) {
+                return Err(ErrorCode::Busy);
+            }
+        }
+        let outcome = self.revert_change(id).await;
+        self.st.borrow_mut().reverted(id);
+        let outcome = outcome.map_err(|e| {
+            log("revert change", e);
+            ErrorCode::Internal
+        })?;
+        let (timers, dir) = {
+            let st = self.st.borrow();
+            (st.timers.clone(), st.pending_dir.clone())
+        };
+        if outcome != RevertOutcome::NotPending
+            && let Err(e) = revert::disarm_timer_async(timers.as_ref(), id).await
+        {
+            // Harmless: the timer's revert finds nothing to claim.
+            log("disarm revert timers", e);
+        }
+        let marker = dir
+            .markers()
+            .ok()
+            .and_then(|m| m.into_iter().find(|(i, _)| *i == id))
+            .map(|(_, m)| m);
+        let conflict = marker.as_ref().and_then(|m| m.conflict);
+        let already = outcome == RevertOutcome::NotPending && marker.is_some_and(|m| m.restored);
+        // Audit and announce now rather than at the next maintenance tick.
+        self.st.borrow_mut().process_markers(now_ms());
+        match outcome {
+            RevertOutcome::Reverted => Ok(Payload::Empty),
+            RevertOutcome::NotPending if already => Ok(Payload::Empty),
+            RevertOutcome::NotPending => Err(ErrorCode::NotFound),
+            RevertOutcome::Kept => Err(ErrorCode::VersionConflict {
+                current: conflict.unwrap_or(0),
+            }),
+            RevertOutcome::Failed => Err(ErrorCode::Internal),
+        }
+    }
+
     /// Restores a change whose apply failed and stops its timers. If the
     /// restore itself fails, the guard timer still reverts it later.
     async fn abort_change(&self, id: ChangeId) {

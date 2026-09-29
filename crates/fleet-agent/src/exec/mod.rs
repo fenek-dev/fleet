@@ -513,10 +513,15 @@ impl Exec {
         let Some(c) = st.pending_change(op)? else {
             return Ok(None);
         };
-        if let Op::ChangeConfirm { change_id } = op
+        if let Op::ChangeConfirm { change_id } | Op::ChangeRevert { change_id } = op
             && (c.applying || st.applying.contains(&crate::pending::ChangeId(*change_id)))
         {
             return Err(ErrorCode::Busy);
+        }
+        // Reverting needs no fresh connection: it only returns to the
+        // state from before the change, which is what a lockout wants.
+        if matches!(op, Op::ChangeRevert { .. }) {
+            return Ok(None);
         }
         let same_run = c.origin.run_id == st.run_id;
         if c.origin.session == session.id || (same_run && session.conn <= c.origin.applied_conn) {
@@ -550,6 +555,9 @@ impl Exec {
         let op = &a.meta.command.body.op;
         if let Some((kind, r, _)) = &a.revertible {
             return self.apply_reverting(a, session, *kind, r.as_ref()).await;
+        }
+        if let Op::ChangeRevert { change_id } = op {
+            return self.revert_now(crate::pending::ChangeId(*change_id)).await;
         }
         if let Some(c) = &a.confirms {
             self.await_sshd_login(a.meta.command.device_id, c.origin.created_ms)

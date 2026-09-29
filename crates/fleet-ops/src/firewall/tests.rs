@@ -1178,6 +1178,7 @@ proptest! {
     #[test]
     fn parsers_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..512), s in ".{0,300}") {
         let _ = parse_table(&bytes);
+        let _ = parse::parse_counters(&bytes);
         let _ = summarize_ruleset(&bytes);
         let _ = parse_ufw(&s);
         let _ = parse_sshd_ports(&s);
