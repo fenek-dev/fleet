@@ -397,13 +397,113 @@
       "additionalProperties": false,
       "properties": {
         "expected_version": {
-          "description": "The version `firewall_get` reported.",
+          "description": "The `version` that `firewall_get` reported; a concurrent edit is\nrefused instead of overwritten.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "ruleset": {
-          "description": "The ruleset as `firewall_get` returned it, edited."
+          "additionalProperties": false,
+          "description": "The complete desired ruleset: `{\"mode\": \"Managed\"|\"BansOnly\", \"rules\": [..]}`.\n`BansOnly` takes no rules. Each rule: chain (Input|Forward), action\n(Accept|Drop|Reject), proto (Tcp|Udp), ports (list of [start, end]),\nsource (null = any, or [address, prefix]), rate_limit (null or\n{per_minute, burst}) and comment (string).",
+          "properties": {
+            "mode": {
+              "enum": [
+                "Managed",
+                "BansOnly"
+              ],
+              "type": "string"
+            },
+            "rules": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "action": {
+                    "enum": [
+                      "Accept",
+                      "Drop",
+                      "Reject"
+                    ],
+                    "type": "string"
+                  },
+                  "chain": {
+                    "enum": [
+                      "Input",
+                      "Forward"
+                    ],
+                    "type": "string"
+                  },
+                  "comment": {
+                    "type": "string"
+                  },
+                  "ports": {
+                    "items": {
+                      "items": {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "maxItems": 2,
+                      "minItems": 2,
+                      "type": "array"
+                    },
+                    "maxItems": 16,
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "proto": {
+                    "enum": [
+                      "Tcp",
+                      "Udp"
+                    ],
+                    "type": "string"
+                  },
+                  "rate_limit": {
+                    "properties": {
+                      "burst": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "per_minute": {
+                        "maximum": 100000,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "source": {
+                    "description": "null = any source; else [address, prefix]",
+                    "maxItems": 2,
+                    "minItems": 2,
+                    "type": [
+                      "array",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "chain",
+                  "action",
+                  "proto",
+                  "ports",
+                  "source",
+                  "rate_limit",
+                  "comment"
+                ],
+                "type": "object"
+              },
+              "maxItems": 512,
+              "type": "array"
+            }
+          },
+          "required": [
+            "mode",
+            "rules"
+          ],
+          "type": "object"
         },
         "server": {
           "type": "string"

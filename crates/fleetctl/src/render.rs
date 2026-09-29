@@ -52,7 +52,11 @@ fn success_with(out: &ToolOutput, nonce: Option<String>) -> CallToolResult {
             "{dropped} more server result(s) omitted (size limit)."
         )));
     }
-    CallToolResult::success(blocks)
+    if out.is_error {
+        CallToolResult::error(blocks)
+    } else {
+        CallToolResult::success(blocks)
+    }
 }
 
 pub fn error(e: &ProtoError) -> CallToolResult {
@@ -88,6 +92,7 @@ mod tests {
     #[test]
     fn marks_and_redacts_server_text() {
         let out = ToolOutput {
+            is_error: false,
             summary: serde_json::json!({"server": "srv_a", "ok": true}),
             untrusted: vec![UntrustedItem {
                 server: "srv_a".into(),
@@ -115,6 +120,7 @@ mod tests {
     fn enforces_result_budget() {
         let big = "x".repeat(MAX_ITEM_BYTES * 2);
         let out = ToolOutput {
+            is_error: false,
             summary: serde_json::json!({}),
             untrusted: (0..20)
                 .map(|i| UntrustedItem {
@@ -136,6 +142,7 @@ mod tests {
     #[test]
     fn rng_failure_refuses_to_render() {
         let out = ToolOutput {
+            is_error: false,
             summary: serde_json::json!({"ok": true}),
             untrusted: vec![UntrustedItem {
                 server: "srv_a".into(),
@@ -159,6 +166,7 @@ mod tests {
     #[test]
     fn server_text_escapes_invisible_characters() {
         let out = ToolOutput {
+            is_error: false,
             summary: serde_json::json!({}),
             untrusted: vec![UntrustedItem {
                 server: "srv_a".into(),
@@ -172,6 +180,26 @@ mod tests {
         assert!(t[1].contains("ok\\u{200b}\\u{e0049}\\u{e000}"));
         assert!(t[1].contains("--token [REDACTED]"));
         assert!(!t[1].contains('\u{200B}'));
+    }
+
+    #[test]
+    fn failed_change_is_flagged_and_redaction_counted_once() {
+        let out = ToolOutput {
+            is_error: true,
+            summary: serde_json::json!({"failed": 1}),
+            untrusted: vec![UntrustedItem {
+                server: "srv_a".into(),
+                source: "journal.query".into(),
+                // Already redacted by the app (redactions: 1).
+                text: "password=[REDACTED]".into(),
+                truncated: false,
+                redactions: 1,
+            }],
+        };
+        let r = success(&out);
+        assert_eq!(r.is_error, Some(true));
+        let t = texts(&r);
+        assert!(t[1].contains("1 secret(s) redacted"), "{}", t[1]);
     }
 
     #[test]

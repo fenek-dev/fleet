@@ -351,7 +351,10 @@ fn apply(s: &str, mut ranges: Vec<(usize, usize, &'static str)>) -> (String, u32
         out.push_str(&s[pos..start]);
         out.push_str(rep);
         pos = end;
-        n += 1;
+        // Already-redacted text is not a new redaction (idempotent count).
+        if &s[start..end] != rep {
+            n += 1;
+        }
     }
     out.push_str(&s[pos..]);
     (out, n)

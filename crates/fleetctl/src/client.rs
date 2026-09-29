@@ -199,6 +199,7 @@ mod tests {
                 Ok(ResponseBody::Tool(ToolOutput {
                     summary: serde_json::json!({"servers": []}),
                     untrusted: vec![],
+                    is_error: false,
                 })),
             )
             .await;

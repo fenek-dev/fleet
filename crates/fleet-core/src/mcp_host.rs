@@ -268,6 +268,12 @@ pub trait McpBackend: Send + Sync {
     fn ai_limits(&self, _server: &ServerId) -> Option<AiLimits> {
         None
     }
+    /// Whether the policy this Mac last pushed to `server` allows
+    /// `shell.exec` as `user` (`capabilities.shell_exec` and
+    /// `shell_exec_users`). `None`: no policy copy, the agent decides.
+    fn shell_exec_allowed(&self, _server: &ServerId, _user: &str) -> Option<bool> {
+        None
+    }
     /// `change.confirm` of an auto-revert change over a fresh connection
     /// (`crate::autorevert::confirm_pending`, budget from the change's
     /// deadline), sent as `actor`. Without it the change reverts on its own.
@@ -478,21 +484,50 @@ fn invalid(field: &str) -> ProtoError {
 fn agent_error(server: &ServerId, f: &Failure) -> ProtoError {
     ProtoError::Agent {
         server: server.to_string(),
-        code: failure_code(f),
+        code: failure_text(f, None),
     }
 }
 
-fn failure_code(f: &Failure) -> String {
+/// A fixed, human-readable reason (never Rust `Debug` text). `op` adds a
+/// hint where the bare agent code says too little.
+fn failure_text(f: &Failure, op: Option<&str>) -> String {
     match f {
-        Failure::Agent(code) => format!("{code:?}"),
-        Failure::UnknownServer => "UnknownServer".into(),
-        Failure::NotReady(s) => format!("NotReady({s})"),
-        Failure::Locked => "Locked".into(),
-        Failure::Timeout => "Timeout".into(),
-        Failure::OutcomeUnknown => "OutcomeUnknown".into(),
+        Failure::Agent(code) => match code {
+            ErrorCode::Unauthorized => "not authorized on this server".into(),
+            ErrorCode::SignatureInvalid => "the agent rejected the signature".into(),
+            ErrorCode::Stale => "the request was too old; retry".into(),
+            ErrorCode::Replay => "the agent rejected a replayed request".into(),
+            ErrorCode::PolicyDenied => {
+                "denied by the server's policy (the op is off, or the server is Agent-only)".into()
+            }
+            ErrorCode::ApprovalRequired => "needs a root-key approval".into(),
+            ErrorCode::ApprovalInvalid => "the root approval was not valid".into(),
+            ErrorCode::InvalidArgument => "the agent rejected the arguments".into(),
+            ErrorCode::VersionConflict { .. } => {
+                "changed since expected_version was read; read it again and retry".into()
+            }
+            ErrorCode::NotFound => "not found on the server".into(),
+            ErrorCode::Busy => "the agent is busy; retry shortly".into(),
+            ErrorCode::Timeout => "timed out on the server".into(),
+            ErrorCode::Unsupported => "not supported on this server".into(),
+            ErrorCode::Internal => match op {
+                Some(o) if o.starts_with("docker.") || o.starts_with("compose.") => {
+                    "the agent reported an internal error (is Docker installed and running?)".into()
+                }
+                _ => "the agent reported an internal error".into(),
+            },
+        },
+        Failure::UnknownServer => "the server is not connected".into(),
+        Failure::NotReady(s) => format!("the server is not ready ({s})"),
+        Failure::Locked => "Fleet is locked; ask the operator to unlock it".into(),
+        Failure::Timeout => "timed out".into(),
+        Failure::OutcomeUnknown => "no receipt came back; the change may or may not have run".into(),
         // Transport detail is Mac-generated but may quote server text.
-        Failure::Transport(_) => "Transport".into(),
-        Failure::ExitStatus { status, .. } => format!("ExitStatus({status:?})"),
+        Failure::Transport(_) => "connection problem".into(),
+        Failure::ExitStatus { status, .. } => match status {
+            Some(n) => format!("the command exited with status {n}"),
+            None => "the command did not finish normally".into(),
+        },
     }
 }
 
@@ -519,7 +554,7 @@ fn approval_prompt(
     escalation: bool,
     max_details: usize,
 ) -> Result<(PromptKind, String), ProtoError> {
-    let details = untrusted::escape_controls(&format!("{op:#?}"));
+    let details = untrusted::escape_controls(&describe::humanize(&format!("{op:?}")));
     if details.len() > max_details {
         return Err(invalid(DETAILS_TOO_LARGE));
     }
@@ -671,6 +706,11 @@ impl McpHost {
         if self.paused() {
             return Err(ProtoError::Paused);
         }
+        // No answer within the window is not a "no": the AI is told to
+        // have the operator look at the Mac.
+        if answer.is_err() {
+            return Err(ProtoError::ApprovalTimedOut);
+        }
         Ok(matches!(answer, Ok(Ok(true))))
     }
 
@@ -715,6 +755,13 @@ impl McpHost {
             .map(|s| self.limits(&s.id).commands_per_minute)
             .min()
             .unwrap_or(self.cfg.per_minute)
+    }
+
+    /// The strictest `ai_bulk_confirm_above` over every server (missing
+    /// policy: the default). Shown in Settings.
+    pub fn strictest_bulk_confirm(&self) -> usize {
+        let all: Vec<ServerId> = self.backend.servers().into_iter().map(|s| s.id).collect();
+        self.bulk_confirm_above(&all)
     }
 
     /// The strictest `ai_bulk_confirm_above` among `servers` (missing
@@ -931,7 +978,11 @@ impl McpHost {
                     true,
                     ProtoError::PairingRequired,
                 )
-                .await?;
+                .await
+                .or_else(|e| match e {
+                    ProtoError::ApprovalTimedOut => Ok(false),
+                    e => Err(e),
+                })?;
             if !ok {
                 return Err(ProtoError::PairingDenied);
             }
@@ -1015,6 +1066,7 @@ impl McpHost {
         Ok(ToolOutput {
             summary: json!({ "server": server.as_str(), "op": name, "ok": true }),
             untrusted: payload_item(&server, name, &p).into_iter().collect(),
+            is_error: false,
         })
     }
 
@@ -1152,7 +1204,7 @@ impl McpHost {
                         _ => "succeeded".to_string(),
                     }
                 }
-                Outcome::Failed(f) => format!("failed: {}", failure_code(f)),
+                Outcome::Failed(f) => format!("failed: {}", failure_text(f, Some(name))),
                 Outcome::Skipped(r) => format!(
                     "skipped: {}",
                     match r {
@@ -1189,6 +1241,8 @@ impl McpHost {
                 "servers": rows,
             }),
             untrusted: items,
+            // Any failed server: MCP clients must notice (`isError`).
+            is_error: s.failed > 0,
         })
     }
 
@@ -1212,6 +1266,7 @@ impl McpHost {
                 Ok(ToolOutput {
                     summary: json!({ "servers": list }),
                     untrusted: vec![],
+                    is_error: false,
                 })
             }
             Call::FleetSearch(a) => {
@@ -1245,6 +1300,7 @@ impl McpHost {
                     return Ok(ToolOutput {
                         summary: json!({ "op": op.name(), "servers": [] }),
                         untrusted: vec![],
+                        is_error: false,
                     });
                 }
                 self.change(caller, tool, actor, servers, op, false, None)
@@ -1421,6 +1477,20 @@ impl McpHost {
                 let servers = self.servers_arg(&a.servers)?;
                 let op = opspec::shell_exec(&a.user, &a.command, a.timeout_s)
                     .map_err(|e| invalid(&e.to_string()))?;
+                // The policy is checked before any approval: a call it
+                // forbids must not raise a root Touch ID the operator can
+                // only waste.
+                if let Some(s) = servers
+                    .iter()
+                    .find(|s| self.backend.shell_exec_allowed(s, &a.user) == Some(false))
+                {
+                    return Err(ProtoError::Unsupported {
+                        what: format!(
+                            "shell.exec is off for user {} in the policy of server {s}",
+                            untrusted::truncate(&untrusted::escape_controls(&a.user), 32).0
+                        ),
+                    });
+                }
                 self.change(caller, tool, actor, servers, op, true, None)
                     .await
             }
@@ -1466,16 +1536,57 @@ impl McpHost {
     }
 }
 
-/// `entry` is an absolute path, a directory, or a glob (prefix up to `*`).
+/// `entry` is an absolute path, a directory, or a glob (the agent's
+/// matcher: `*`/`?` within a component, `**` across components). A glob
+/// covers what it matches and everything below a match.
 fn is_secret_match(path: &str, entry: &str) -> bool {
-    if let Some(star) = entry.find('*') {
-        return path.starts_with(&entry[..star]);
+    if entry.contains(['*', '?']) {
+        let comps: Vec<&str> = path.split('/').collect();
+        let pat: Vec<&str> = entry.split('/').collect();
+        return (1..=comps.len()).any(|n| glob_components(&pat, &comps[..n]));
     }
     match (AbsPath::new(path), AbsPath::new(entry)) {
         (Ok(p), Ok(e)) => p.is_under(&e),
         _ => path == entry,
     }
 }
+
+fn glob_components(p: &[&str], s: &[&str]) -> bool {
+    match p.split_first() {
+        None => s.is_empty(),
+        Some((&"**", rest)) => (0..=s.len()).any(|i| glob_components(rest, &s[i..])),
+        Some((first, rest)) => match s.split_first() {
+            Some((c, srest)) => glob_component(first, c) && glob_components(rest, srest),
+            None => false,
+        },
+    }
+}
+
+/// `*`/`?` wildcard match of one path component.
+fn glob_component(pattern: &str, s: &str) -> bool {
+    let (p, s): (Vec<char>, Vec<char>) = (pattern.chars().collect(), s.chars().collect());
+    let (mut pi, mut si) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, si));
+            pi += 1;
+        } else if let Some((sp, ss)) = star {
+            pi = sp + 1;
+            si = ss + 1;
+            star = Some((sp, ss + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
+#[path = "mcp_describe.rs"]
+mod describe;
 
 #[path = "mcp_render.rs"]
 pub mod render;
