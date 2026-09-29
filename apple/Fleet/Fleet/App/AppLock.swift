@@ -27,6 +27,10 @@ final class AppLock {
     /// Called with the new state; `CoreBridge` switches the session kind.
     var onChange: ((_ locked: Bool) -> Void)?
 
+    /// Called with the evaluated unlock context on every successful unlock,
+    /// before `onChange` (unsigned builds open their sealed keys with it).
+    var onUnlocked: ((_ context: LAContext) -> Void)?
+
     let gate: KeyGate
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private var eventMonitor: Any?
@@ -91,7 +95,9 @@ final class AppLock {
         if TestHooks.approve("app-unlock: unlock Fleet") {
             lastError = nil
             lastActivity = .now
-            gate.unlock(with: LAContext())
+            let ctx = LAContext()
+            gate.unlock(with: ctx)
+            onUnlocked?(ctx)
             isLocked = false
             onChange?(false)
             return
@@ -114,6 +120,7 @@ final class AppLock {
         lastError = nil
         lastActivity = .now
         gate.unlock(with: ctx)
+        onUnlocked?(ctx)
         isLocked = false
         onChange?(false)
     }

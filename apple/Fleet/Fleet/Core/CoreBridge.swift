@@ -16,6 +16,8 @@ final class CoreBridge {
     }
 
     private(set) var status: Status = .starting
+    /// Ad-hoc build: the core opens after the first unlock of this run.
+    var awaitingFirstUnlock = false
     private(set) var servers: [ServerRow] = []
     private(set) var groups: [GroupRow] = []
     /// Open alerts, keyed by server + rule + subject.

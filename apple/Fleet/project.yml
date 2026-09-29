@@ -35,6 +35,11 @@ targets:
       - path: Generated/fleet_core.swift
         optional: true
         group: Generated
+      # Hashes of the embedded agent packages and fleetctl, compiled into the
+      # signed executable (scripts/gen-bundled-artifacts.sh, pre-build phase).
+      - path: Generated/BundledArtifacts.swift
+        optional: true
+        group: Generated
     dependencies:
       - package: SwiftTerm
     settings:
@@ -73,11 +78,19 @@ targets:
           - $(SRCROOT)/Generated/fleet_core.swift
           - $(SRCROOT)/Generated/include/fleet_coreFFI.h
           - $(SRCROOT)/../../target/aarch64-apple-darwin/release/libfleet_core_ffi.a
+      # Builds fleetctl and the agent packages first, so their hashes can be
+      # compiled into the executable (design §10.1 pins, §8 MCP socket).
+      - name: Stage embedded artifacts
+        script: |
+          "${SRCROOT}/../../scripts/gen-bundled-artifacts.sh"
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/Generated/BundledArtifacts.swift
     postBuildScripts:
       # `fleetctl mcp` ships inside the app (Contents/MacOS/fleetctl).
-      - name: Build and embed fleetctl
+      - name: Embed fleetctl
         script: |
-          "${SRCROOT}/../../scripts/build-fleetctl.sh"
+          "${SRCROOT}/../../scripts/build-fleetctl.sh" embed
         basedOnDependencyAnalysis: false
       # Agent .debs (arm64 + amd64) in Contents/Resources/agent/ for the
       # install flow (design §10.1). FLEET_SKIP_AGENT_BUNDLE=1 skips
@@ -85,7 +98,7 @@ targets:
       # FLEET_TEST_AGENT_ARTIFACT). Docker builds, slow the first time.
       - name: Embed agent packages
         script: |
-          "${SRCROOT}/../../scripts/bundle-agent.sh"
+          "${SRCROOT}/../../scripts/bundle-agent.sh" embed
         basedOnDependencyAnalysis: false
 
   FleetTests:

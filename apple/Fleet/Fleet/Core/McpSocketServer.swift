@@ -245,7 +245,11 @@ final class McpSocketServer: @unchecked Sendable {
             else { return false }
             return SecCodeCheckValidity(code, [], requirement) == errSecSuccess
         }
-        #if DEBUG
+        // No team: only an ad-hoc signed app trusts a bundled fleetctl (a
+        // build with a broken signature trusts nothing), and only the one
+        // inside this bundle whose cdhash is the one recorded at build time
+        // in this executable (`BundledArtifacts.fleetctlCDHash`).
+        guard CodeIdentity.isAdHoc else { return false }
         var stat: SecStaticCode?
         var url: CFURL?
         guard SecCodeCopyStaticCode(code, [], &stat) == errSecSuccess, let stat,
@@ -253,10 +257,34 @@ final class McpSocketServer: @unchecked Sendable {
         else { return false }
         let bundled = Bundle.main.bundleURL
             .appendingPathComponent("Contents/MacOS/fleetctl").resolvingSymlinksInPath()
-        return (url as URL).resolvingSymlinksInPath() == bundled
-        #else
-        return false
-        #endif
+        guard (url as URL).resolvingSymlinksInPath() == bundled else { return false }
+        return Self.cdhashAccepted(actual: Self.cdhash(of: stat),
+                                   pinned: BundledArtifacts.fleetctlCDHash)
+    }
+
+    /// Ad-hoc trust decision: the cdhash must equal the compiled-in one.
+    /// Debug builds (test hooks) accept the bundled path alone when no
+    /// cdhash was pinned.
+    static func cdhashAccepted(actual: String?, pinned: String) -> Bool {
+        if pinned.isEmpty {
+            #if DEBUG
+            return true
+            #else
+            return false
+            #endif
+        }
+        guard let actual else { return false }
+        return actual.lowercased() == pinned.lowercased()
+    }
+
+    private static func cdhash(of stat: SecStaticCode) -> String? {
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            stat, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+            let dict = info as? [String: Any],
+            let unique = dict[kSecCodeInfoUnique as String] as? Data
+        else { return nil }
+        return unique.map { String(format: "%02x", $0) }.joined()
     }
 
     private static func procInfo(_ pid: pid_t) -> kinfo_proc? {

@@ -125,11 +125,14 @@ struct ContentView: View {
 /// Shown on every screen while only the monitor key is usable.
 private struct LockedBanner: View {
     @Environment(AppLock.self) private var lock
+    @Environment(CoreBridge.self) private var core
 
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "lock.fill")
-            Text("Locked: telemetry and events only. Changes need Touch ID.")
+            Text(core.awaitingFirstUnlock
+                 ? "Unlock once to start monitoring (unsigned build)."
+                 : "Locked: telemetry and events only. Changes need Touch ID.")
                 .font(.secondary)
             Spacer()
             Button("Unlock") { Task { await lock.unlock() } }

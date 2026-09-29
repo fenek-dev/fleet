@@ -14,6 +14,7 @@ app="$derived/Build/Products/Release/Fleet.app"
 bin="$app/Contents/MacOS/Fleet"
 
 if [[ "${1:-}" != "--no-build" ]]; then
+    "$root/scripts/gen-bundled-artifacts.sh" --stub
     cd "$root/apple/Fleet"
     xcodegen generate >/dev/null
     xcodebuild -project Fleet.xcodeproj -scheme Fleet -configuration Release \

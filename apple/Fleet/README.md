@@ -20,6 +20,7 @@ xcodebuild -project Fleet.xcodeproj -scheme Fleet -destination 'platform=macOS,a
 
 - Signed: `FLEET_TEAM_ID=<team> [FLEET_SIGN_IDENTITY=...] [FLEET_ICLOUD=1] scripts/build-release-app.sh` (real entitlements: Keychain; with `FLEET_ICLOUD=1` also iCloud). Needs a provisioning profile for the team.
 - Without `FLEET_TEAM_ID`: ad-hoc signed with `Fleet-AdHoc.entitlements`. Works: enrollment, Secure Enclave keys (enclave-wrapped file store, design §5.2 "Unsigned builds"), servers, provisioning. Doesn't: sync key and sudo passwords (Keychain-only), iCloud. Other Macs need right-click > Open or `xattr -cr` (Gatekeeper).
+- Ad-hoc builds keep Noise/cache keys sealed to the Secure Enclave: Touch ID once per run opens them, and the app core starts after that first unlock ("Unlock once to start monitoring (unsigned build)"). The SHA-256 of each bundled `.deb` and the cdhash of the embedded `fleetctl` are compiled into the executable (`scripts/gen-bundled-artifacts.sh`); MCP works in the ad-hoc app because of that cdhash.
 - `FLEET_SKIP_AGENT_BUNDLE=1` skips the agent packages (Add server then needs "Choose…"). `scripts/build-app-test.sh` skips them by default (tests use `FLEET_TEST_AGENT_ARTIFACT`); `FLEET_SKIP_AGENT_BUNDLE=0 scripts/build-app-test.sh` embeds them.
 
 Add server installs the bundled package matching the server (`uname -m`; Debian 12+ / Ubuntu 22.04+ only, checked before any upload) and shows its BLAKE3 for comparison with a reproducible build. "Choose…" overrides it; `FLEET_TEST_AGENT_ARTIFACT` (Debug) overrides both.

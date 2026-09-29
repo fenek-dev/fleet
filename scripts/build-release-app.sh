@@ -39,7 +39,10 @@ if [[ -n "${FLEET_TEAM_ID:-}" ]]; then
     echo "signing: team $FLEET_TEAM_ID, identity '$identity', entitlements $ent"
 else
     sign_args+=(CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO
-        FLEET_ENTITLEMENTS=Fleet/Fleet-AdHoc.entitlements)
+        FLEET_ENTITLEMENTS=Fleet/Fleet-AdHoc.entitlements
+        # The file key store fallback exists only in ad-hoc builds (and
+        # even then only when the runtime code signature is ad hoc).
+        'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) FLEET_ADHOC_KEYSTORE')
     cat >&2 <<'EOF'
 WARNING: FLEET_TEAM_ID not set: ad-hoc signed build. Works: Secure Enclave
 keys (kept in a 0600 file under Application Support, enclave-wrapped), SSH,
@@ -51,6 +54,7 @@ EOF
 fi
 
 mkdir -p "$root/build"
+"$root/scripts/gen-bundled-artifacts.sh" --stub
 cd "$root/apple/Fleet"
 xcodegen generate >/dev/null
 rm -rf "$built"
@@ -70,6 +74,15 @@ if [[ "${FLEET_SKIP_AGENT_BUNDLE:-}" != "1" ]]; then
 fi
 
 "$root/scripts/check-release-hooks.sh" --no-build
+
+# The embedded fleetctl must be the staged, ad-hoc signed one whose cdhash
+# is compiled into the executable (the MCP socket compares them).
+if [[ -z "${FLEET_TEAM_ID:-}" ]]; then
+    want="$(cat "$root/build/embed/fleetctl.cdhash")"
+    got="$(codesign -d -vvv "$built/Contents/MacOS/fleetctl" 2>&1 | sed -n 's/^CDHash=//p' | head -n1)"
+    [[ -n "$want" && "$want" == "$got" ]] || { echo "embedded fleetctl cdhash $got != staged $want" >&2; exit 1; }
+    grep -aq "$want" "$built/Contents/MacOS/Fleet" || { echo "cdhash $want not compiled into the app" >&2; exit 1; }
+fi
 
 if [[ -n "${FLEET_TEAM_ID:-}" ]]; then
     # The socket accepts only a fleetctl signed as dev.fleet.fleetctl with

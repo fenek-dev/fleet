@@ -191,6 +191,25 @@ pub fn pick_bundled(dir: &Path, arch: ServerArch) -> Result<std::path::PathBuf, 
     })
 }
 
+/// A bundled package must hash (SHA-256 of the whole `.deb`) to the value
+/// pinned in the signed app executable at build time, so a swapped file in
+/// the bundle's Resources is refused before anything is uploaded.
+pub fn verify_pin(
+    name: &str,
+    sha256_hex: &str,
+    pins: &std::collections::BTreeMap<String, String>,
+) -> Result<(), InstallError> {
+    match pins.get(name) {
+        Some(p) if p.eq_ignore_ascii_case(sha256_hex) => Ok(()),
+        Some(_) => Err(InstallError::Artifact(format!(
+            "bundled package {name} does not match the hash pinned in this app; refusing to upload it"
+        ))),
+        None => Err(InstallError::Artifact(format!(
+            "bundled package {name} has no hash pinned in this app; refusing to upload it"
+        ))),
+    }
+}
+
 /// Progress for the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallStage {
@@ -284,6 +303,9 @@ pub struct InstallRequest<'a> {
     /// `--admin-user`: whose `authorized_keys` Fleet will manage.
     pub admin_user: &'a str,
     pub artifact: ArtifactSource<'a>,
+    /// Pinned SHA-256 (hex) of each bundled package by file name, compiled
+    /// into the app; checked for `ArtifactSource::Bundled` only.
+    pub bundled_pins: &'a std::collections::BTreeMap<String, String>,
     pub genesis: &'a SignedRoster,
     pub policy_toml: &'a str,
 }
@@ -412,8 +434,15 @@ pub async fn install_agent(
             InstallError::Artifact("no artifact".into())
         })?;
         let kind = ArtifactKind::of(&path);
+        // Every digest below is computed from these captured bytes: the
+        // file is never reopened, so it can't change between the check
+        // and the upload.
         let local_hash = hex::encode(Sha256::digest(&artifact));
-        let blake3 = crate::release::artifact_hash(&path)
+        if bundled {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            verify_pin(name, &local_hash, req.bundled_pins)?;
+        }
+        let blake3 = crate::release::bytes_hash(&artifact, kind)
             .map_err(|e| InstallError::Artifact(e.to_string()))?;
         progress(InstallStage::Artifact(ArtifactInfo {
             name: path
@@ -605,6 +634,16 @@ mod tests {
         // Debian testing has no VERSION_ID.
         assert!(check_distro("ID=debian\n").is_err());
         assert!(check_distro("").is_err());
+    }
+
+    #[test]
+    fn pin_check() {
+        let mut pins = std::collections::BTreeMap::new();
+        pins.insert("a.deb".to_string(), "AB12".to_string());
+        assert!(verify_pin("a.deb", "ab12", &pins).is_ok());
+        assert!(verify_pin("a.deb", "ab13", &pins).is_err());
+        assert!(verify_pin("b.deb", "ab12", &pins).is_err());
+        assert!(verify_pin("a.deb", "ab12", &Default::default()).is_err());
     }
 
     #[test]
