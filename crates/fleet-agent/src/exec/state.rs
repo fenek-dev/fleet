@@ -955,7 +955,7 @@ impl State {
 
     /// The pending change `change.confirm` names, if it's still pending.
     pub(super) fn pending_change(&self, op: &Op) -> Result<Option<PendingChange>, ErrorCode> {
-        let Op::ChangeConfirm { change_id } = op else {
+        let (Op::ChangeConfirm { change_id } | Op::ChangeRevert { change_id }) = op else {
             return Ok(None);
         };
         self.pending_dir.get(ChangeId(*change_id)).map_err(|e| {
@@ -977,11 +977,13 @@ impl State {
         {
             return Err(ErrorCode::PolicyDenied);
         }
-        // `change.confirm` is in the `firewall` group, but it confirms any
-        // auto-revert change (mesh, profile, authorized keys, …). The device
-        // that made the change may always confirm it (design §5.4): its
-        // original command already passed policy, and refusing the confirm
-        // would only revert an allowed change.
+        // `change.confirm` and `change.revert` are in the `firewall` group,
+        // but they act on any auto-revert change (mesh, profile, authorized
+        // keys, …). The device that made the change may always confirm or
+        // revert it (design §5.4): its original command already passed
+        // policy, and refusing the confirm would only revert an allowed
+        // change (and refusing the revert would keep a change the operator
+        // wants gone).
         let own_change = || {
             self.pending_change(op)
                 .ok()

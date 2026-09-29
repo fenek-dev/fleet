@@ -167,3 +167,11 @@ pub struct HealthChecks {
     pub config: HealthCheckSet,
     pub results: Vec<HealthCheckResult>,
 }
+
+/// `system.reboot.status`: the reboot timer, if one is armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebootStatus {
+    /// When the armed reboot fires (ms since the Unix epoch); `None` when
+    /// nothing is scheduled.
+    pub at_ms: Option<u64>,
+}

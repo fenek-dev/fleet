@@ -4,6 +4,8 @@
 
 use super::mesh::validate_peers;
 use super::{Authorization, Group, NAMES, Op, Tier};
+#[cfg(test)]
+use super::RebootWhen;
 use crate::v1::args::{AbsPath, ArgError, at_most, ensure};
 
 impl Op {
@@ -42,7 +44,9 @@ impl Op {
             | Op::UnitList
             | Op::UnitStatus { .. }
             | Op::FirewallGet
+            | Op::FirewallCounters
             | Op::ChangesList
+            | Op::SystemRebootStatus
             | Op::PkgList { .. }
             | Op::PkgUpgradable
             | Op::PkgHistory { .. }
@@ -85,6 +89,8 @@ impl Op {
             | Op::ProcessRenice { .. }
             | Op::HealthChecksUpdate(_)
             | Op::SystemReboot { .. }
+            | Op::SystemRebootSchedule { .. }
+            | Op::SystemRebootCancel
             | Op::BansAdd { .. }
             | Op::BansRemove { .. }
             | Op::BansConfigSet(_)
@@ -96,6 +102,12 @@ impl Op {
             | Op::UnitDisable { .. }
             | Op::FirewallApply(_)
             | Op::ChangeConfirm { .. }
+            // Reverting restores the snapshot exec itself took before the
+            // change (a known-good state) through the same code the timer
+            // runs, so it grants nothing `change.confirm` or the timer
+            // doesn't: tier Change, not Elevated. It can't restore
+            // anything else and never applies new state.
+            | Op::ChangeRevert { .. }
             | Op::PkgRefresh
             | Op::PkgUpgrade { .. }
             | Op::PkgInstall { .. }
@@ -346,6 +358,7 @@ impl Op {
             }
             Op::HealthChecksUpdate(set) => set.validate(),
             Op::SystemReboot { delay_s } => ensure(*delay_s <= 3600, "reboot delay"),
+            Op::SystemRebootSchedule { when } => ensure(when.is_valid(), "reboot schedule"),
             Op::JournalQuery(q) | Op::JournalFollow(q) => q.validate(),
             Op::LogfileTail { lines, .. } => ensure(*lines <= 10_000, "lines"),
             Op::BansAdd { duration_s, .. } => {
@@ -438,8 +451,12 @@ impl Op {
             | Op::UnitList
             | Op::UnitStatus { .. }
             | Op::FirewallGet
+            | Op::FirewallCounters
             | Op::ChangeConfirm { .. }
+            | Op::ChangeRevert { .. }
             | Op::ChangesList
+            | Op::SystemRebootCancel
+            | Op::SystemRebootStatus
             | Op::PkgList { .. }
             | Op::PkgUpgradable
             | Op::PkgRefresh
@@ -519,6 +536,20 @@ mod agent_only_tests {
     fn takes_over_security_flags_the_security_takeover_ops() {
         // Read-only ops: never refused in Agent-only mode.
         assert!(!Op::FirewallGet.takes_over_security());
+        // Counters are read-only; reboot scheduling and reverting a
+        // pending change are not security takeovers (a revert restores
+        // the state from before an already-admitted change).
+        assert!(!Op::FirewallCounters.takes_over_security());
+        assert!(!Op::ChangeRevert { change_id: [1; 16] }.takes_over_security());
+        assert!(!Op::SystemReboot { delay_s: 60 }.takes_over_security());
+        assert!(
+            !Op::SystemRebootSchedule {
+                when: RebootWhen::In { delay_s: 60 }
+            }
+            .takes_over_security()
+        );
+        assert!(!Op::SystemRebootCancel.takes_over_security());
+        assert!(!Op::SystemRebootStatus.takes_over_security());
         assert!(!Op::BansList.takes_over_security());
         assert!(!Op::BansConfigGet.takes_over_security());
         // Mutating: these are what Agent-only refuses.

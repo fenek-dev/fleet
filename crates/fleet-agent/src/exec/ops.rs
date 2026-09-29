@@ -48,7 +48,7 @@ pub(super) enum Plan {
 pub(super) struct StateOps(pub(super) Rc<RefCell<State>>);
 
 /// Tags handled by [`ChangeOps`].
-pub(super) const CHANGE_TAGS: [u16; 2] = [tag::CHANGE_CONFIRM, tag::CHANGES_LIST];
+pub(super) const CHANGE_TAGS: [u16; 3] = [tag::CHANGE_CONFIRM, tag::CHANGE_REVERT, tag::CHANGES_LIST];
 
 /// `change.confirm` and `changes.list` over `pending/` (design §4.10).
 /// Exec's pipeline has already checked that the confirm comes over a
@@ -69,6 +69,22 @@ impl OpHandler for ChangeOps {
                     .get(ChangeId(*change_id))
                     .map_err(pending_err)?
                 {
+                    Some(_) => Ok(()),
+                    None => Err(ErrorCode::NotFound.into()),
+                }
+            }
+            Op::ChangeRevert { change_id } => {
+                let st = self.0.borrow();
+                match st
+                    .pending_dir
+                    .get(ChangeId(*change_id))
+                    .map_err(pending_err)?
+                {
+                    // An agent update is rolled back by `agent.update.
+                    // rollback` (it restarts exec itself).
+                    Some(c) if c.kind == crate::pending::ChangeKind::AgentUpdate => {
+                        Err(ErrorCode::Unsupported.into())
+                    }
                     Some(_) => Ok(()),
                     None => Err(ErrorCode::NotFound.into()),
                 }

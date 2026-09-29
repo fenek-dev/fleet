@@ -198,6 +198,11 @@ struct SyncSettings: View {
                         .font(.base).foregroundStyle(Color.textSecondary)
                     if let e = sync.lastError { Text(e).foregroundStyle(Tone.warn.text) }
                 }
+                if Keychain.unsigned {
+                    Text(Keychain.needsSignedBuild)
+                        .font(.base).foregroundStyle(Tone.warn.text)
+                        .accessibilityIdentifier("sync.needsSignedBuild")
+                }
                 Text("Synced").font(.caption11.weight(.semibold)).foregroundStyle(Color.textMuted)
                 FlowLayout(spacing: 6) {
                     ForEach(syncedCollections(), id: \.self) { Chip(text: $0) }

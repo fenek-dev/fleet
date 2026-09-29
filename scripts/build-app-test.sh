@@ -12,6 +12,11 @@ set -euo pipefail
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Bundling both agent .debs needs two Docker builds (amd64 under emulation:
+# many minutes cold). Test builds install via FLEET_TEST_AGENT_ARTIFACT, so
+# skip by default; FLEET_SKIP_AGENT_BUNDLE=0 scripts/build-app-test.sh embeds
+# them (needed to exercise the bundled-agent install path).
+export FLEET_SKIP_AGENT_BUNDLE="${FLEET_SKIP_AGENT_BUNDLE:-1}"
 cd "$root/apple/Fleet"
 xcodegen generate >/dev/null
 

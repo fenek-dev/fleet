@@ -86,6 +86,8 @@ tagged_enum! {
         HealthChecks(v: HealthChecks) = HEALTH_CHECKS(17, "health_checks"),
         /// `events.query`: the persisted signed event log.
         SignedEvents(v: SignedEventPage) = SIGNED_EVENTS(18, "signed_events"),
+        /// `system.reboot.status`.
+        RebootStatus(v: RebootStatus) = REBOOT_STATUS(19, "reboot_status"),
 
         // logs
         /// `journal.query` page and `journal.follow` item.
@@ -117,6 +119,8 @@ tagged_enum! {
         ChangePending { change: PendingChange, inner: Option<Box<Payload>> }
             = CHANGE_PENDING(51, "change_pending"),
         PendingChanges(v: PendingChanges) = PENDING_CHANGES(52, "pending_changes"),
+        /// `firewall.counters`.
+        FirewallCounters(v: FirewallCounters) = FIREWALL_COUNTERS(53, "firewall_counters"),
 
         // packages
         Packages(v: Packages) = PACKAGES(60, "packages"),

@@ -41,8 +41,19 @@ const SHA256SUM: &str = "/usr/bin/sha256sum";
 const DPKG: &str = "/usr/bin/dpkg";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const RM: &str = "/usr/bin/rm";
+const CAT: &str = "/usr/bin/cat";
+const UNAME: &str = "/usr/bin/uname";
 const MAX_OUTPUT: usize = 64 * 1024;
 const STEP_TIMEOUT: Duration = Duration::from_secs(300);
+/// Reading the local artifact (a few MB): only a permission prompt or a
+/// dead network volume makes this slow.
+const READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// Opening the SFTP subsystem (two channels and the version handshake).
+const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// One SFTP upload; the artifact is at most [`MAX_ARTIFACT`], and even a
+/// slow link moves that in this time. A stalled server fails instead of
+/// leaving the install "running" forever.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Largest agent artifact accepted (budget: binary under 10 MB).
 pub const MAX_ARTIFACT: u64 = 64 * 1024 * 1024;
 
@@ -56,6 +67,9 @@ pub enum InstallError {
     UnsafeToken(String),
     #[error("agent artifact: {0}")]
     Artifact(String),
+    /// The server is not a supported target (checked before any upload).
+    #[error("unsupported server: {0}")]
+    Unsupported(String),
     #[error("uploaded file hash differs (transport error)")]
     HashMismatch,
     /// A remote step failed; `stderr` is untrusted server text.
@@ -65,16 +79,124 @@ pub enum InstallError {
         status: Option<u32>,
         stderr: String,
     },
+    /// A local step (not a remote command, whose timeout is
+    /// [`SshError::Timeout`]) made no progress in time.
+    #[error("{0} timed out")]
+    StepTimeout(&'static str),
     #[error("agent install printed no keys")]
     NoKeys,
     #[error("rng")]
     Rng,
 }
 
-/// Progress for the UI.
+/// Where the agent artifact comes from.
+#[derive(Debug, Clone, Copy)]
+pub enum ArtifactSource<'a> {
+    /// An operator-chosen file (`.deb` or bare binary); no arch check.
+    File(&'a Path),
+    /// The app's bundled directory of `fleet-agent_<ver>_<debarch>.deb`;
+    /// the one matching the server's architecture is picked after the
+    /// preflight.
+    Bundled(&'a Path),
+}
+
+/// The artifact chosen for this install, reported before the upload so
+/// the operator can compare `blake3` with a reproducible build (design
+/// §5.7). `blake3` is over the agent binary, as in release manifests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactInfo {
+    pub name: String,
+    pub blake3: String,
+    /// Server architecture (`uname -m`), or empty for an operator file.
+    pub arch: String,
+    pub bundled: bool,
+}
+
+/// Server CPU architecture, from `uname -m`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerArch {
+    Amd64,
+    Arm64,
+}
+
+impl ServerArch {
+    /// Debian architecture name (the `.deb` suffix).
+    pub fn deb(self) -> &'static str {
+        match self {
+            Self::Amd64 => "amd64",
+            Self::Arm64 => "arm64",
+        }
+    }
+}
+
+/// Parses `uname -m` output; anything but x86_64 / aarch64 is refused.
+pub fn parse_arch(uname: &str) -> Result<ServerArch, InstallError> {
+    match uname.trim() {
+        "x86_64" => Ok(ServerArch::Amd64),
+        "aarch64" | "arm64" => Ok(ServerArch::Arm64),
+        other => Err(InstallError::Unsupported(format!(
+            "CPU architecture {:?} (only x86_64 and aarch64 are supported)",
+            truncate_chars(other.to_string(), 40)
+        ))),
+    }
+}
+
+/// Checks `/etc/os-release` text: Debian 12+ or Ubuntu 22.04+.
+pub fn check_distro(os_release: &str) -> Result<(), InstallError> {
+    let field = |key: &str| -> Option<String> {
+        os_release.lines().find_map(|l| {
+            let v = l.strip_prefix(key)?.strip_prefix('=')?;
+            Some(v.trim().trim_matches('"').trim_matches('\'').to_string())
+        })
+    };
+    let id = field("ID").unwrap_or_default();
+    let version = field("VERSION_ID").unwrap_or_default();
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().ok());
+    let (major, minor) = (parts.next().flatten(), parts.next().flatten().unwrap_or(0));
+    let ok = match (id.as_str(), major) {
+        ("debian", Some(m)) => m >= 12,
+        ("ubuntu", Some(m)) => (m, minor) >= (22, 4),
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(InstallError::Unsupported(format!(
+            "distribution {:?} {:?} (Debian 12+ and Ubuntu 22.04+ only)",
+            truncate_chars(id, 40),
+            truncate_chars(version, 40)
+        )))
+    }
+}
+
+/// The bundled package for `arch` in `dir` (`fleet-agent_*_<arch>.deb`;
+/// the highest name if several).
+pub fn pick_bundled(dir: &Path, arch: ServerArch) -> Result<std::path::PathBuf, InstallError> {
+    let suffix = format!("_{}.deb", arch.deb());
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| InstallError::Artifact(format!("bundled agent directory: {e}")))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("fleet-agent_") && n.ends_with(&suffix))
+        })
+        .collect();
+    found.sort();
+    found.pop().ok_or_else(|| {
+        InstallError::Artifact(format!(
+            "this app build has no bundled agent for {} (choose a package manually)",
+            arch.deb()
+        ))
+    })
+}
+
+/// Progress for the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallStage {
     Connecting,
+    /// Server checked; the artifact that will be uploaded.
+    Artifact(ArtifactInfo),
     Uploading { done: u64, total: u64 },
     Verifying,
     Installing,
@@ -161,7 +283,7 @@ pub struct InstallRequest<'a> {
     pub host_key: HostKey,
     /// `--admin-user`: whose `authorized_keys` Fleet will manage.
     pub admin_user: &'a str,
-    pub artifact: &'a Path,
+    pub artifact: ArtifactSource<'a>,
     pub genesis: &'a SignedRoster,
     pub policy_toml: &'a str,
 }
@@ -224,6 +346,29 @@ pub async fn probe(
     Ok(obs)
 }
 
+async fn read_artifact(path: &Path, limit: Duration) -> Result<Vec<u8>, InstallError> {
+    tokio::time::timeout(limit, tokio::fs::read(path))
+        .await
+        .map_err(|_| {
+            InstallError::Artifact(format!(
+                "reading {} timed out (macOS may be waiting for file access permission; \
+                 grant it in System Settings or use a file outside Documents, Desktop and Downloads)",
+                path.display()
+            ))
+        })?
+        .map_err(|e| InstallError::Artifact(e.to_string()))
+}
+
+async fn read_checked(path: &Path) -> Result<Vec<u8>, InstallError> {
+    // macOS can block a read under ~/Documents, ~/Desktop or ~/Downloads
+    // forever behind a privacy (TCC) prompt nobody sees; fail instead.
+    let artifact = read_artifact(path, READ_TIMEOUT).await?;
+    if artifact.is_empty() || artifact.len() as u64 > MAX_ARTIFACT {
+        return Err(InstallError::Artifact("empty or too large".into()));
+    }
+    Ok(artifact)
+}
+
 /// Runs the install; see the module docs.
 pub async fn install_agent(
     req: InstallRequest<'_>,
@@ -232,14 +377,12 @@ pub async fn install_agent(
 ) -> Result<InstalledAgent, InstallError> {
     let server_id = value(req.server_id.as_str())?;
     let admin = value(req.admin_user)?;
-    let kind = ArtifactKind::of(req.artifact);
-    let artifact = tokio::fs::read(req.artifact)
-        .await
-        .map_err(|e| InstallError::Artifact(e.to_string()))?;
-    if artifact.is_empty() || artifact.len() as u64 > MAX_ARTIFACT {
-        return Err(InstallError::Artifact("empty or too large".into()));
+    // An operator-chosen file is read up front (fail fast); a bundled one
+    // is picked after the server's architecture is known.
+    let mut chosen: Option<(std::path::PathBuf, Vec<u8>)> = None;
+    if let ArtifactSource::File(path) = req.artifact {
+        chosen = Some((path.to_path_buf(), read_checked(path).await?));
     }
-    let local_hash = hex::encode(Sha256::digest(&artifact));
 
     progress(InstallStage::Connecting);
     let (conn, obs) =
@@ -251,6 +394,37 @@ pub async fn install_agent(
         return Err(SshError::HostKeyUnconfirmed.into());
     }
     let result = async {
+        // Preflight (fixed commands, before anything is uploaded): the
+        // distribution, and for a bundled package the architecture.
+        let os = run(&conn, "os-release", &[CAT, "/etc/os-release"]).await?;
+        check_distro(&String::from_utf8_lossy(&os.stdout))?;
+        let uname = run(&conn, "uname", &[UNAME, "-m"]).await?;
+        let arch = parse_arch(&String::from_utf8_lossy(&uname.stdout))?;
+        let bundled = if let ArtifactSource::Bundled(dir) = req.artifact {
+            let path = pick_bundled(dir, arch)?;
+            let bytes = read_checked(&path).await?;
+            chosen = Some((path, bytes));
+            true
+        } else {
+            false
+        };
+        let (path, artifact) = chosen.take().ok_or_else(|| {
+            InstallError::Artifact("no artifact".into())
+        })?;
+        let kind = ArtifactKind::of(&path);
+        let local_hash = hex::encode(Sha256::digest(&artifact));
+        let blake3 = crate::release::artifact_hash(&path)
+            .map_err(|e| InstallError::Artifact(e.to_string()))?;
+        progress(InstallStage::Artifact(ArtifactInfo {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            blake3,
+            arch: arch.deb().to_string(),
+            bundled,
+        }));
+
         let mut suffix = [0u8; 8];
         fleet_crypto::random_bytes(&mut suffix).map_err(|_| InstallError::Rng)?;
         let suffix = hex::encode(suffix);
@@ -268,34 +442,48 @@ pub async fn install_agent(
         };
 
         let outcome = async {
-            let sftp = Sftp::open(&conn).await?;
+            let sftp = tokio::time::timeout(SFTP_OPEN_TIMEOUT, Sftp::open(&conn))
+                .await
+                .map_err(|_| InstallError::StepTimeout("opening SFTP"))??;
             let total = artifact.len() as u64;
             let mode = if kind == ArtifactKind::Binary {
                 0o700
             } else {
                 0o600
             };
-            sftp.upload_bytes(&artifact, &bin, Some(mode), true, &mut |done, total| {
-                progress(InstallStage::Uploading { done, total })
-            })
-            .await?;
+            tokio::time::timeout(
+                UPLOAD_TIMEOUT,
+                sftp.upload_bytes(&artifact, &bin, Some(mode), true, &mut |done, total| {
+                    progress(InstallStage::Uploading { done, total })
+                }),
+            )
+            .await
+            .map_err(|_| InstallError::StepTimeout("uploading the agent"))??;
             let genesis_hex = hex::encode(encode(req.genesis));
-            sftp.upload_bytes(
-                genesis_hex.as_bytes(),
-                &genesis_path,
-                Some(0o600),
-                true,
-                &mut |_, _| {},
+            tokio::time::timeout(
+                STEP_TIMEOUT,
+                sftp.upload_bytes(
+                    genesis_hex.as_bytes(),
+                    &genesis_path,
+                    Some(0o600),
+                    true,
+                    &mut |_, _| {},
+                ),
             )
-            .await?;
-            sftp.upload_bytes(
-                req.policy_toml.as_bytes(),
-                &policy_path,
-                Some(0o600),
-                true,
-                &mut |_, _| {},
+            .await
+            .map_err(|_| InstallError::StepTimeout("uploading the roster"))??;
+            tokio::time::timeout(
+                STEP_TIMEOUT,
+                sftp.upload_bytes(
+                    req.policy_toml.as_bytes(),
+                    &policy_path,
+                    Some(0o600),
+                    true,
+                    &mut |_, _| {},
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| InstallError::StepTimeout("uploading the policy"))??;
             progress(InstallStage::Uploading { done: total, total });
 
             progress(InstallStage::Verifying);
@@ -358,7 +546,11 @@ pub async fn install_agent(
         for p in &temp {
             t.push(value(p)?);
         }
-        let _ = run(&conn, "cleanup", &t).await;
+        if let Ok(cmd) = command_line(&t) {
+            let _ = conn
+                .exec_capture(&cmd, MAX_OUTPUT, Duration::from_secs(15))
+                .await;
+        }
         outcome
     }
     .await;
@@ -387,9 +579,47 @@ mod tests {
             "sudo -n dpkg -i /tmp/x.deb"
         );
         assert!(command_line(&["rm", "-f", "/tmp/a b"]).is_err());
-        for bin in [SUDO, SHA256SUM, DPKG, SYSTEMCTL, RM] {
+        for bin in [SUDO, SHA256SUM, DPKG, SYSTEMCTL, RM, CAT, UNAME] {
             assert!(bin.starts_with("/usr/bin/") && is_token(bin));
         }
+    }
+
+    #[test]
+    fn arch_parse() {
+        assert_eq!(parse_arch("x86_64\n").unwrap(), ServerArch::Amd64);
+        assert_eq!(parse_arch("aarch64").unwrap(), ServerArch::Arm64);
+        for bad in ["armv7l", "i686", "riscv64", "", "x86_64; rm"] {
+            assert!(matches!(parse_arch(bad), Err(InstallError::Unsupported(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn distro_gate() {
+        let os = |id: &str, v: &str| format!("NAME=x\nID={id}\nVERSION_ID=\"{v}\"\nID_LIKE=debian\n");
+        for (id, v) in [("debian", "12"), ("debian", "13"), ("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04")] {
+            check_distro(&os(id, v)).unwrap_or_else(|e| panic!("{id} {v}: {e}"));
+        }
+        for (id, v) in [("debian", "11"), ("ubuntu", "20.04"), ("ubuntu", "21.10"), ("centos", "9"), ("debian", ""), ("linuxmint", "21")] {
+            assert!(check_distro(&os(id, v)).is_err(), "{id} {v}");
+        }
+        // Debian testing has no VERSION_ID.
+        assert!(check_distro("ID=debian\n").is_err());
+        assert!(check_distro("").is_err());
+    }
+
+    #[test]
+    fn bundled_pick() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["fleet-agent_0.1.0_amd64.deb", "fleet-agent_0.1.0_arm64.deb", "other.deb"] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let p = pick_bundled(dir.path(), ServerArch::Arm64).unwrap();
+        assert!(p.ends_with("fleet-agent_0.1.0_arm64.deb"));
+        let empty = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            pick_bundled(empty.path(), ServerArch::Amd64),
+            Err(InstallError::Artifact(_))
+        ));
     }
 
     #[test]
@@ -398,6 +628,30 @@ mod tests {
         let t = truncate_chars(format!("x{s}"), MAX_STDERR);
         assert!(t.len() <= MAX_STDERR && t.starts_with('x'));
         assert_eq!(truncate_chars("short".into(), MAX_STDERR), "short");
+    }
+
+    /// A read that never returns (what a macOS privacy prompt does to a
+    /// file read) fails within the limit instead of hanging the install.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_artifact_read_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("agent");
+        let ok = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return; // no mkfifo here
+        }
+        let started = std::time::Instant::now();
+        let err = read_artifact(&fifo, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InstallError::Artifact(m) if m.contains("timed out")));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Unblock the abandoned reader thread so the runtime can shut down.
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
     }
 
     #[test]

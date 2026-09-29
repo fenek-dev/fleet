@@ -43,6 +43,8 @@ struct FirewallTab: View {
     @Environment(CoreBridge.self) private var core
     let server: ServerRow
     @State private var fw: FirewallRow?
+    /// Hit counters of the applied rules; nil on an agent without them.
+    @State private var counters: FirewallCountersRow?
     @State private var managed = true
     @State private var drafts: [RuleDraft] = []
     @State private var bans: BansRow?
@@ -90,7 +92,7 @@ struct FirewallTab: View {
                 TabHeader(title: "Firewall", loading: loading, error: error, refresh: { Task { await load() } })
                 SecurityModeNotice(model: security)
                 AutoRevertBanner(model: revert, what: changeSummary ?? "Firewall rules changed",
-                                 retry: retryConfirm)
+                                 retry: retryConfirm, revertNow: revertNow)
                 if let fw {
                     rulesCard(fw)
                     if containers != nil { containerCard }
@@ -179,6 +181,9 @@ struct FirewallTab: View {
             Text("Ports").frame(width: 130, alignment: .leading)
             Text("Source").frame(width: 150, alignment: .leading)
             Text("Rate / min").frame(width: 110, alignment: .leading)
+            Text("Hits · since apply").frame(width: 100, alignment: .trailing)
+                .help("Packets this rule matched since the table was last applied. nftables keeps no timestamps, so there is no 24 h window; every apply restarts the count.")
+                .accessibilityIdentifier("firewall.hitsHeader")
             Text("Comment").frame(maxWidth: .infinity, alignment: .leading)
         }
         .font(.caption11).foregroundStyle(Color.textMuted).padding(.leading, 8)
@@ -193,6 +198,27 @@ struct FirewallTab: View {
         let recent = history.count > 1
             && Date().timeIntervalSince1970 - Double(history[0].timeMs) / 1000 < 1800
         return recent && !previousRules.contains(a) ? "Added" : nil
+    }
+
+    /// Packet/byte hits of the applied rule this draft is (unsaved rules,
+    /// and counters of another ruleset version, have none).
+    private func hits(for d: RuleDraft) -> (text: String, help: String) {
+        guard let fw, let counters, counters.version == fw.version,
+              let index = baseArgs?.rules.firstIndex(of: d.args),
+              let c = counters.rules.first(where: { Int($0.rule) == index })
+        else { return ("–", "No counter: unsaved rule, or the table predates hit counters until it is applied again") }
+        return (Self.compact(c.packets),
+                "\(c.packets) packets, \(ByteCountFormatter.string(fromByteCount: Int64(clamping: c.bytes), countStyle: .binary)) since the table was last applied")
+    }
+
+    /// 0, 999, 1.2k, 3.4M, 5.6G.
+    static func compact(_ n: UInt64) -> String {
+        switch n {
+        case ..<1_000: "\(n)"
+        case ..<1_000_000: String(format: "%.1fk", Double(n) / 1e3)
+        case ..<1_000_000_000: String(format: "%.1fM", Double(n) / 1e6)
+        default: String(format: "%.1fG", Double(n) / 1e9)
+        }
     }
 
     private func ruleRow(_ d: Binding<RuleDraft>) -> some View {
@@ -223,6 +249,11 @@ struct FirewallTab: View {
                 TextField("burst", text: d.burst).frame(width: 50)
             }
             .frame(width: 110)
+            let hit = hits(for: d.wrappedValue)
+            Text(hit.text).foregroundStyle(Color.textSecondary)
+                .frame(width: 100, alignment: .trailing)
+                .help(hit.help)
+                .accessibilityIdentifier("firewall.hits")
             TextField("Comment", text: d.comment)
             if let tag { StatusPill(label: tag, tone: .info).accessibilityIdentifier("firewall.ruleTag") }
             Button { drafts.removeAll { $0.id == d.wrappedValue.id } } label: {
@@ -512,6 +543,11 @@ struct FirewallTab: View {
         revert.confirm(api: api, serverId: server.id, change: c) { Task { await load() } }
     }
 
+    private func revertNow() {
+        guard let api = core.api else { return }
+        revert.revertNow(api: api, serverId: server.id) { Task { await load() } }
+    }
+
     private func askUnban(_ addr: String) {
         pending = PendingAction(title: "Unban \(addr)?", message: "It can connect again right away.",
                                 button: "Unban") {
@@ -570,6 +606,7 @@ struct FirewallTab: View {
             resetDrafts()
             error = nil
             observe(api, state)
+            counters = try? await api.firewallCounters(serverId: server.id)
         } catch {
             self.error = error.fleetMessage
         }

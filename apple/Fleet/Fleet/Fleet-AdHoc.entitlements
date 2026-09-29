@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Ad-hoc Release builds (scripts/build-release-app.sh without
+	     FLEET_TEAM_ID): no keychain-access-groups or iCloud, which need a
+	     provisioning profile (the app would be killed at launch). Keys use
+	     the Secure Enclave with a file store, see design §5.2 "Unsigned
+	     builds". No test hooks: those are compiled out of Release. -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+</dict>
+</plist>

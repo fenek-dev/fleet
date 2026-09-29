@@ -123,6 +123,9 @@ pub(super) fn samples() -> Vec<Op> {
             | Op::HealthChecksList
             | Op::HealthChecksUpdate(_)
             | Op::SystemReboot { .. }
+            | Op::SystemRebootSchedule { .. }
+            | Op::SystemRebootCancel
+            | Op::SystemRebootStatus
             | Op::JournalQuery(_)
             | Op::JournalFollow(_)
             | Op::LogfilesList
@@ -147,8 +150,10 @@ pub(super) fn samples() -> Vec<Op> {
             | Op::UnitEnable { .. }
             | Op::UnitDisable { .. }
             | Op::FirewallGet
+            | Op::FirewallCounters
             | Op::FirewallApply(_)
             | Op::ChangeConfirm { .. }
+            | Op::ChangeRevert { .. }
             | Op::ChangesList
             | Op::PkgList { .. }
             | Op::PkgUpgradable
@@ -288,6 +293,14 @@ pub(super) fn samples() -> Vec<Op> {
             }],
         }),
         Op::SystemReboot { delay_s: 60 },
+        Op::SystemRebootSchedule {
+            when: RebootWhen::Window {
+                start_min: 180,
+                end_min: 300,
+            },
+        },
+        Op::SystemRebootCancel,
+        Op::SystemRebootStatus,
         Op::JournalQuery(journal()),
         Op::JournalFollow(journal()),
         Op::LogfilesList,
@@ -354,8 +367,10 @@ pub(super) fn samples() -> Vec<Op> {
             unit: unit("cups.socket"),
         },
         Op::FirewallGet,
+        Op::FirewallCounters,
         Op::FirewallApply(ruleset()),
         Op::ChangeConfirm { change_id: [9; 16] },
+        Op::ChangeRevert { change_id: [9; 16] },
         Op::ChangesList,
         Op::PkgList { filter: None },
         Op::PkgUpgradable,
@@ -735,7 +750,9 @@ fn tier_table() {
         "unit.list",
         "unit.status",
         "firewall.get",
+        "firewall.counters",
         "changes.list",
+        "system.reboot.status",
         "pkg.list",
         "pkg.upgradable",
         "pkg.history",
@@ -1005,6 +1022,40 @@ fn check_args_rejects() {
         assert!(peers(&[bad]).check_args().is_err(), "{bad}");
     }
     assert!(Op::SystemReboot { delay_s: 3601 }.check_args().is_err());
+    let sched = |when| Op::SystemRebootSchedule { when };
+    for ok in [
+        RebootWhen::In { delay_s: 0 },
+        RebootWhen::In {
+            delay_s: REBOOT_MAX_LEAD_S,
+        },
+        RebootWhen::At { at_ms: 1 },
+        RebootWhen::Window {
+            start_min: 1380,
+            end_min: 60,
+        },
+    ] {
+        assert!(sched(ok).check_args().is_ok(), "{ok:?}");
+    }
+    for bad in [
+        RebootWhen::In {
+            delay_s: REBOOT_MAX_LEAD_S + 1,
+        },
+        RebootWhen::At { at_ms: 0 },
+        RebootWhen::Window {
+            start_min: 60,
+            end_min: 60,
+        },
+        RebootWhen::Window {
+            start_min: 1440,
+            end_min: 60,
+        },
+        RebootWhen::Window {
+            start_min: 0,
+            end_min: 1440,
+        },
+    ] {
+        assert!(sched(bad).check_args().is_err(), "{bad:?}");
+    }
     let weblog = |limit, status| Op::WeblogQuery {
         range: TimeRange::default(),
         limit,

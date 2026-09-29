@@ -66,6 +66,8 @@ fn render(p: &Payload, out: &mut String, indent: usize) {
         Payload::UnitStatus(v) => fields!(v),
         Payload::Firewall(v) => fields!(v),
         Payload::PendingChanges(v) => fields!(v),
+        Payload::FirewallCounters(v) => fields!(v),
+        Payload::RebootStatus(v) => fields!(v),
         Payload::Packages(v) => fields!(v),
         Payload::Upgradable(v) => fields!(v),
         Payload::PackageHistory(v) => fields!(v),

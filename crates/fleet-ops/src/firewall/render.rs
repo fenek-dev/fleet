@@ -197,7 +197,13 @@ fn operator_rule(i: usize, r: &FirewallRule, slot: Option<usize>) -> Vec<String>
             ));
         }
     }
-    out.push(format!("{m} {} comment \"{comment}\"", verdict(r.action)));
+    // The final verdict rule counts its hits (`firewall.counters`); the
+    // rate-limit drops above don't, so the counter is what the rule let
+    // through or refused by its own action.
+    out.push(format!(
+        "{m} counter {} comment \"{comment}\"",
+        verdict(r.action)
+    ));
     out
 }
 

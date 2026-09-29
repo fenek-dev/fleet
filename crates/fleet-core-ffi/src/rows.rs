@@ -50,7 +50,8 @@ pub struct InstallProgress {
 impl From<InstallStage> for InstallProgress {
     fn from(s: InstallStage) -> Self {
         let (step, done_bytes, total_bytes) = match s {
-            InstallStage::Connecting => (InstallStep::Connecting, 0, 0),
+            // Reported through `InstallListener::on_artifact` instead.
+            InstallStage::Connecting | InstallStage::Artifact(_) => (InstallStep::Connecting, 0, 0),
             InstallStage::Uploading { done, total } => (InstallStep::Uploading, done, total),
             InstallStage::Verifying => (InstallStep::Verifying, 0, 0),
             InstallStage::Installing => (InstallStep::Installing, 0, 0),
