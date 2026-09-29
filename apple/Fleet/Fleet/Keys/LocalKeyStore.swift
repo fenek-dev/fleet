@@ -69,15 +69,17 @@ enum LocalKeyStore {
 
     /// The validated key directory (created 0700 when missing).
     private static func dir(create: Bool = true) throws -> String {
-        let base = try AppPaths.dataDir()
-        let path = base.appendingPathComponent("keystore", isDirectory: true).path
-        // No symlink anywhere on the path.
-        var walk = ""
-        for c in URL(fileURLWithPath: path).pathComponents where c != "/" {
-            walk += "/" + c
-            if walk == path { break }
-            guard let m = try lstatMode(walk), m.mode & S_IFMT != S_IFLNK else { throw Failure.unsafe }
-        }
+        try keyDir(base: try AppPaths.dataDir(), create: create)
+    }
+
+    /// `base` is canonicalized (symlinked ancestors such as /tmp or a linked
+    /// home are fine); the strict checks (not a symlink, owner, 0700) apply
+    /// to the `keystore` directory itself, and its files are opened with
+    /// O_NOFOLLOW.
+    static func keyDir(base: URL, create: Bool) throws -> String {
+        guard let real = realpath(base.path, nil) else { throw Failure.io(errno) }
+        defer { free(real) }
+        let path = String(cString: real) + "/keystore"
         if create {
             if mkdir(path, 0o700) != 0 && errno != EEXIST { throw Failure.unavailable }
         } else if try lstatMode(path) == nil {
@@ -283,7 +285,12 @@ enum LocalKeyStore {
         unlink(tmp)
         guard try createFile(tmp, fresh.dataRepresentation) else { throw Failure.unavailable }
         guard rename(tmp, np) == 0 else { throw Failure.io(errno) }
-        syncDir(wp)
+        do { try syncDir(wp) } catch {
+            // Marker not known durable: withdraw it, keep the old keys.
+            unlink(np)
+            for a in sealed { unlink(try path(a) + ".new") }
+            throw error
+        }
         try finishWrapUpgrade(wp, np)
     }
 
@@ -304,6 +311,7 @@ enum LocalKeyStore {
         let np = wp + ".new"
         unlink(np + ".tmp")  // marker never published
         if let marker = try readFile(np), try markerValid(marker) {
+            try syncDir(wp)  // roll forward only from a durable marker
             try finishWrapUpgrade(wp, np)
             return true
         }
@@ -331,9 +339,12 @@ enum LocalKeyStore {
         return true
     }
 
-    private static func syncDir(_ file: String) {
+    /// fsync of the file's directory; open and fsync failures propagate.
+    private static func syncDir(_ file: String) throws {
         let fd = open((file as NSString).deletingLastPathComponent, O_RDONLY | O_CLOEXEC)
-        if fd >= 0 { fsync(fd); close(fd) }
+        guard fd >= 0 else { throw Failure.io(errno) }
+        defer { close(fd) }
+        guard fsync(fd) == 0 else { throw Failure.io(errno) }
     }
 
     private static func finishWrapUpgrade(_ wp: String, _ np: String) throws {
@@ -344,7 +355,7 @@ enum LocalKeyStore {
             }
         }
         guard rename(np, wp) == 0 else { throw Failure.io(errno) }
-        syncDir(wp)
+        try syncDir(wp)
     }
 
     /// `exists`, but false for accounts this store doesn't hold (Keychain-only
