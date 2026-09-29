@@ -247,19 +247,15 @@ enum LocalKeyStore {
     static func upgradeLegacyWrap() throws {
         ioLock.lock()
         defer { ioLock.unlock() }
+        guard try recoverLocked() else { return }
         let wp = try path(wrapAccount)
         let np = wp + ".new"
-        if try readFile(np) != nil {
-            try finishWrapUpgrade(wp, np)
-            return
-        }
         guard let blob = try readFile(wp), isLegacyWrap(blob) else { return }
         let legacy = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob)
         // 1. Plaintext of everything sealed, opened with the legacy key.
         var plain: [String: Data] = [:]
         for a in sealed {
             let f = try path(a)
-            unlink(f + ".new")  // debris of a run that died before np existed
             guard let raw = try readFile(f) else { continue }
             guard raw.count > 65 else { throw Failure.corrupt }
             let peer = try P256.KeyAgreement.PublicKey(x963Representation: raw.prefix(65))
@@ -280,9 +276,64 @@ enum LocalKeyStore {
                 throw Failure.unavailable
             }
         }
-        // np goes last: it is what marks the `.new` files valid.
-        guard try createFile(np, fresh.dataRepresentation) else { throw Failure.unavailable }
+        // 3. Publish the commit marker atomically: temp file, fsync, rename,
+        // fsync dir. A crash leaves either no marker (roll back) or a
+        // complete one (roll forward), never a partial one.
+        let tmp = np + ".tmp"
+        unlink(tmp)
+        guard try createFile(tmp, fresh.dataRepresentation) else { throw Failure.unavailable }
+        guard rename(tmp, np) == 0 else { throw Failure.io(errno) }
+        syncDir(wp)
         try finishWrapUpgrade(wp, np)
+    }
+
+    /// Completes or discards an interrupted reseal. Call before any read of
+    /// the key files (migration, reconcile, unlock). No-op when none is
+    /// pending or the key directory doesn't exist.
+    static func recoverPendingReseal() throws {
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        _ = try recoverLocked()
+    }
+
+    /// Returns false when there is no key directory (nothing to do).
+    private static func recoverLocked() throws -> Bool {
+        let d: String
+        do { d = try dir(create: false) } catch Failure.missing { return false }
+        let wp = d + "/" + wrapAccount
+        let np = wp + ".new"
+        unlink(np + ".tmp")  // marker never published
+        if let marker = try readFile(np), try markerValid(marker) {
+            try finishWrapUpgrade(wp, np)
+            return true
+        }
+        // No complete marker: the old wrap key and sealed files are intact.
+        unlink(np)
+        for a in sealed { unlink(d + "/" + a + ".new") }
+        return true
+    }
+
+    /// The marker decodes as a Secure Enclave key and every `.new` sealed
+    /// file is structurally complete (opening them needs Touch ID).
+    private static func markerValid(_ marker: Data) throws -> Bool {
+        let ctx = LAContext()
+        ctx.interactionNotAllowed = true
+        guard (try? SecureEnclave.P256.KeyAgreement.PrivateKey(
+            dataRepresentation: marker, authenticationContext: ctx)) != nil
+        else { return false }
+        for a in sealed {
+            guard let raw = try readFile(try path(a) + ".new") else { continue }
+            guard raw.count > 65,
+                  (try? P256.KeyAgreement.PublicKey(x963Representation: raw.prefix(65))) != nil,
+                  (try? ChaChaPoly.SealedBox(combined: raw.dropFirst(65))) != nil
+            else { return false }
+        }
+        return true
+    }
+
+    private static func syncDir(_ file: String) {
+        let fd = open((file as NSString).deletingLastPathComponent, O_RDONLY | O_CLOEXEC)
+        if fd >= 0 { fsync(fd); close(fd) }
     }
 
     private static func finishWrapUpgrade(_ wp: String, _ np: String) throws {
@@ -293,8 +344,13 @@ enum LocalKeyStore {
             }
         }
         guard rename(np, wp) == 0 else { throw Failure.io(errno) }
-        let fd = open((wp as NSString).deletingLastPathComponent, O_RDONLY | O_CLOEXEC)
-        if fd >= 0 { fsync(fd); close(fd) }
+        syncDir(wp)
+    }
+
+    /// `exists`, but false for accounts this store doesn't hold (Keychain-only
+    /// secrets in signed builds) instead of throwing `notSupported`.
+    static func existsIfSupported(_ account: String) throws -> Bool {
+        supports(account) ? try exists(account) : false
     }
 
     private static func symmetric(_ shared: SharedSecret, _ account: String) -> SymmetricKey {

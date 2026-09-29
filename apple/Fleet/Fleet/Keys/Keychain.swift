@@ -134,6 +134,9 @@ enum Keychain {
         #if FLEET_TEST_HOOKS
         if let dir = TestHooks.dataDir { return TestHooks.FileKeychain.load(dir, service, account) }
         #endif
+        // Finish or discard an interrupted wrap-key reseal before any
+        // migration or reconcile read of the key files (every build mode).
+        try LocalKeyStore.recoverPendingReseal()
         let (status, data) = copy(account)
         switch status {
         case errSecSuccess:
@@ -142,13 +145,14 @@ enum Keychain {
             // older build that wrote no marker.
             guard writeMarker() else { throw Failure.status(errSecIO) }
             // An interrupted migration may have left the file behind.
-            if let data, account != LocalKeyStore.wrapAccount, try LocalKeyStore.exists(account) {
+            if let data, account != LocalKeyStore.wrapAccount,
+               try LocalKeyStore.existsIfSupported(account) {
                 try reconcile(account, keychain: data)
             }
             return data
         case errSecItemNotFound:
             // Keys an earlier ad-hoc run left in files: move them over once.
-            if account != LocalKeyStore.wrapAccount, try LocalKeyStore.exists(account) {
+            if account != LocalKeyStore.wrapAccount, try LocalKeyStore.existsIfSupported(account) {
                 return try migrate(account)
             }
             return nil

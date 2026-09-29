@@ -61,6 +61,13 @@ struct KeyStoreTests {
         #expect(SecCodeCheckValidity(me, [], req) != errSecSuccess)
     }
 
+    /// Signed builds probe the fallback files for every account, including
+    /// Keychain-only ones ("sync-key"): that must be false, never a throw.
+    @Test func signedModeFileProbeForKeychainOnlyAccount() throws {
+        #expect(!LocalKeyStore.supports("sync-key"))
+        #expect(try !LocalKeyStore.existsIfSupported("sync-key"))
+    }
+
     @Test func cdhashDecision() {
         #expect(McpSocketServer.cdhashAccepted(actual: "ab12", pinned: "AB12"))
         #expect(!McpSocketServer.cdhashAccepted(actual: "ab13", pinned: "ab12"))
