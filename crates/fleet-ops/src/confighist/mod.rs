@@ -40,7 +40,7 @@ pub use store::{
 
 use crate::ctx::SysCtx;
 use crate::files::Pacer;
-use crate::files::walk::{self, Ev, Kind, WalkOpts, Walker, glob_match, open_file};
+use crate::files::walk::{self, Ev, Kind, WalkOpts, Walker, allow_match, open_file};
 use crate::handler::OpError;
 use crate::security::EventSink;
 use fleet_proto::payload::{ChangeSource, ConfigVersion};
@@ -361,7 +361,8 @@ impl ConfigTracker {
                     && root
                         .pattern
                         .as_deref()
-                        .is_none_or(|p| glob_match(p, &e.path))
+                        // Filter that grants tracking: oversized: no match.
+                        .is_none_or(|p| allow_match(p, &e.path))
                     && rules.is_tracked(&e.path)
                 {
                     if found.len() >= MAX_SCAN_FILES {

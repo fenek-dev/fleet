@@ -7,8 +7,10 @@
 //! literal `*` or `?` in the *text* is just a character (the wildcard is
 //! decided by the pattern only). Matching is a dynamic program, so cost is
 //! bounded by pattern size times text size whatever the pattern looks like;
-//! inputs over [`MAX_LEN`] bytes never match (callers that use a match to
-//! *deny* must check [`within_limits`] and fail closed).
+//! inputs over [`MAX_LEN`] bytes are not matched. What that means depends
+//! on the list, so the API has no neutral entry point: use `allow_*` for
+//! lists that grant (over-limit: no match) and `deny_*` for lists that
+//! refuse or protect (over-limit: matched).
 
 /// Longest pattern or text (bytes) that is matched.
 pub const MAX_LEN: usize = 4096;
@@ -74,15 +76,42 @@ fn prefix_row(pattern: &str, text: &str) -> Option<Vec<bool>> {
     Some(row)
 }
 
-/// Whether `pattern` matches all of `text`.
-pub fn glob_match(pattern: &str, text: &str) -> bool {
-    prefix_row(pattern, text).is_some_and(|r| r[r.len() - 1])
+/// Bounded match; `None` when an input is over [`MAX_LEN`].
+fn glob_match(pattern: &str, text: &str) -> Option<bool> {
+    prefix_row(pattern, text).map(|r| r[r.len() - 1])
 }
 
-/// Whether `pattern` matches `text` or a leading run of its components
-/// (a directory above it): a glob covers what is below a match.
-pub fn glob_covers(pattern: &str, text: &str) -> bool {
-    prefix_row(pattern, text).is_some_and(|r| r[1..].iter().any(|b| *b))
+/// Bounded cover check; `None` when an input is over [`MAX_LEN`].
+fn glob_covers(pattern: &str, text: &str) -> Option<bool> {
+    prefix_row(pattern, text).map(|r| r[1..].iter().any(|b| *b))
+}
+
+// The public API names the failure direction, so a caller has to choose:
+// `allow_*` is for lists that GRANT something (tracked paths, walk
+// filters, operator roots): oversized input does not match, so nothing is
+// granted. `deny_*` is for lists that REFUSE or PROTECT (secret, protected,
+// deny-lists): oversized input counts as matched, so the path is refused.
+
+/// Allow-list match of the whole `text`; over-limit input: no match.
+pub fn allow_match(pattern: &str, text: &str) -> bool {
+    glob_match(pattern, text).unwrap_or(false)
+}
+
+/// Allow-list cover (`text` or a directory above it); over-limit: no match.
+pub fn allow_covers(pattern: &str, text: &str) -> bool {
+    glob_covers(pattern, text).unwrap_or(false)
+}
+
+/// Deny/secret/protected-list match of the whole `text`; over-limit input:
+/// matched (refuse).
+pub fn deny_match(pattern: &str, text: &str) -> bool {
+    glob_match(pattern, text).unwrap_or(true)
+}
+
+/// Deny/secret/protected-list cover (`text` or a directory above it);
+/// over-limit input: matched (refuse).
+pub fn deny_covers(pattern: &str, text: &str) -> bool {
+    glob_covers(pattern, text).unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -129,38 +158,46 @@ mod tests {
 
     #[test]
     fn literal_star_in_text_does_not_hide_the_wildcard() {
-        assert!(glob_match(
+        assert!(deny_match(
             "/etc/postfix/sasl_passwd*",
             "/etc/postfix/sasl_passwd*backup"
         ));
         assert!(component_match("a*b", "a*xb"));
         assert!(component_match("*", "*"));
         assert!(component_match("a*", "a*"));
-        assert!(glob_covers("/etc/*shadow*", "/etc/*shadow*/x"));
+        assert!(deny_covers("/etc/*shadow*", "/etc/*shadow*/x"));
     }
 
     #[test]
     fn repeated_globstars_are_cheap() {
         let pat = format!("/{}x", "**/".repeat(200));
         let text = format!("/{}y", "a/".repeat(200));
-        assert!(!glob_match(&pat, &text));
+        assert!(!allow_match(&pat, &text));
         let stars = format!("/{}b", "*a".repeat(500));
         let t = format!("/{}", "a".repeat(1000));
-        assert!(!glob_match(&stars, &t));
+        assert!(!allow_match(&stars, &t));
     }
 
     #[test]
     fn oversized_inputs_never_match() {
         let big = "a".repeat(MAX_LEN + 1);
-        assert!(!glob_match("/**", &big));
+        assert!(!allow_match("/**", &big));
+        assert!(!allow_covers("/**", &big));
+        // Deny lists treat oversized input as matched (refuse).
+        assert!(deny_match("/nothing", &big));
+        assert!(deny_covers("/nothing", &big));
+        assert!(deny_match(&big, "/x"));
+        assert!(!deny_match("/nothing", "/x"));
         assert!(!within_limits("/**", &big));
     }
 
     proptest! {
         #[test]
         fn matches_the_reference(p in "[ab*?/.]{0,12}", s in "[ab*?/.]{0,12}") {
-            prop_assert_eq!(glob_match(&p, &s), ref_match(&p, &s), "{} {}", p, s);
-            prop_assert_eq!(glob_covers(&p, &s), ref_covers(&p, &s), "{} {}", p, s);
+            prop_assert_eq!(allow_match(&p, &s), ref_match(&p, &s), "{} {}", p, s);
+            prop_assert_eq!(deny_match(&p, &s), ref_match(&p, &s), "{} {}", p, s);
+            prop_assert_eq!(allow_covers(&p, &s), ref_covers(&p, &s), "{} {}", p, s);
+            prop_assert_eq!(deny_covers(&p, &s), ref_covers(&p, &s), "{} {}", p, s);
         }
 
         #[test]

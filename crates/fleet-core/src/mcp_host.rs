@@ -1540,15 +1540,11 @@ impl McpHost {
 /// matcher: `*`/`?` within a component, `**` across components). A glob
 /// covers what it matches and everything below a match.
 fn is_secret_match(path: &str, entry: &str) -> bool {
-    // Server-supplied entries and paths beyond the matcher's bounds are
-    // treated as secret (fail closed).
-    if !fleet_proto::glob::within_limits(entry, path) {
-        return true;
-    }
-    if fleet_proto::glob::is_glob(entry) {
-        // The shared matcher (also the agent's): wildcard decided by the
-        // pattern only, bounded cost.
-        return fleet_proto::glob::glob_covers(entry, path);
+    // The shared matcher (also the agent's), deny-list flavour: wildcard
+    // decided by the pattern only, bounded cost, and server-supplied
+    // entries or paths beyond its bounds count as secret (fail closed).
+    if fleet_proto::glob::is_glob(entry) || !fleet_proto::glob::within_limits(entry, path) {
+        return fleet_proto::glob::deny_covers(entry, path);
     }
     match (AbsPath::new(path), AbsPath::new(entry)) {
         (Ok(p), Ok(e)) => p.is_under(&e),

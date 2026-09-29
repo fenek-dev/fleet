@@ -513,10 +513,15 @@ impl Walker {
 
 /// The shared matcher (`fleet_proto::glob`): `*`/`?` within a component,
 /// `**` across components, bounded cost.
-pub use fleet_proto::glob::{component_match, glob_match, is_glob};
+///
+/// There is no neutral `glob_match`: `allow_*` for lists that grant
+/// (oversized input: no match), `deny_*` for lists that refuse or protect
+/// (oversized input: matched).
+pub use fleet_proto::glob::{allow_match, component_match, deny_match, is_glob};
 
 #[cfg(test)]
 mod tests {
+    use super::allow_match as glob_match;
     use super::*;
     use crate::testutil::ctx;
     use std::os::unix::fs::symlink;
