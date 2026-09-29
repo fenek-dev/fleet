@@ -502,11 +502,17 @@ impl FleetCore {
         let cid = change_id(&change_id_hex)?;
         let (handle, _) = self.running()?;
         let budget = autorevert::budget(deadline_ms, fleet_core::now_ms());
+        let confirms = self.confirms.clone();
         self.on_core(async move {
+            let run = confirms.run(
+                &id,
+                autorevert::confirm_fresh(&handle, &id, cid, Actor::Human, budget),
+            );
             Ok(
-                match autorevert::confirm_fresh(&handle, &id, cid, Actor::Human, budget).await {
+                match run.await {
                     Ok(()) => ConfirmOutcome::Confirmed,
                     Err(ConfirmError::Reverted) => ConfirmOutcome::Reverted,
+                    Err(ConfirmError::Cancelled) => ConfirmOutcome::Cancelled,
                     Err(ConfirmError::NoConnection | ConfirmError::Reconnect(_)) => {
                         ConfirmOutcome::NoConnection
                     }
@@ -543,6 +549,10 @@ impl FleetCore {
         change_id_hex: String,
     ) -> Result<(), FleetError> {
         let change_id = change_id(&change_id_hex)?;
+        // Stop the automatic confirmation first (and wait until it is
+        // gone): a confirm still reconnecting must not race the revert.
+        let id = validate::server_id(&server_id)?;
+        self.confirms.cancel(&id).await;
         self.send_op(&server_id, Op::ChangeRevert { change_id }, None)
             .await
             .map(|_| ())

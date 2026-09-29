@@ -56,7 +56,8 @@ the minimized input.
 | `sshd_log` | `authlog::parse_sshd`, sshd_config / `sshd -T` parsers | no panic |
 | `access_log` | web access-log JSON (`webscan`) | no panic |
 | `journal_json` | `logs::journal::parse_line` | no panic |
-| `nft_json` | `firewall::parse::parse_table`, `parse_ufw` | no panic |
+| `nft_json` | `firewall::parse::parse_table`, `parse_counters`, `parse_ufw` | no panic |
+| `reboot_parse` | `reboot::parse_status` (`systemctl show`), `parse_local_seconds` (`date`) | no panic; seconds ≤ 86 400 |
 | `dpkg_status` | dpkg-query, dpkg status, extended_states, dpkg.log, history.log | no panic |
 | `apt_sim` | `parse_apt_sim` | no panic |
 | `utmp` | wtmp records, wtmpdb JSON | no panic |

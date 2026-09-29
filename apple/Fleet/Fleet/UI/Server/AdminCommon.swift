@@ -144,6 +144,7 @@ final class AutoRevertModel {
                                                    deadlineMs: change.deadlineMs) {
                 case .confirmed: outcome = .confirmed
                 case .reverted: outcome = .reverted
+                case .cancelled: return  // "Revert now" decides the phase
                 case .noConnection: outcome = .noConnection
                 case .failed(let m): outcome = .failed(agentCodeMessage(m))
                 }

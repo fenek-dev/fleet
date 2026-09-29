@@ -170,6 +170,8 @@ pub enum ConfirmOutcome {
     Confirmed,
     /// The revert timer restored the previous state.
     Reverted,
+    /// Stopped because the operator chose "Revert now".
+    Cancelled,
     /// No fresh connection before the deadline: the timer will revert.
     NoConnection,
     Failed {
