@@ -16,10 +16,14 @@ final class MCPTests: XCTestCase {
     var app: XCUIApplication!
 
     override func setUpWithError() throws {
-        continueAfterFailure = true
+        // Stop at the first failure: the driver sees the missing ack, and
+        // the machine-wide UI lock is released quickly.
+        continueAfterFailure = false
         guard (try? String(contentsOf: Self.ctl.appendingPathComponent("cmd"), encoding: .utf8)) != nil
         else { throw XCTSkip("no MCP step (tests/mcp/run.py) pending") }
-        app = XCUIApplication(bundleIdentifier: "dev.fleet.FleetMCP")
+        // By path: the runner can't resolve this copy by bundle id.
+        // (/private/tmp: the running app's bundle URL, symlinks resolved.)
+        app = XCUIApplication(url: URL(fileURLWithPath: "/private/tmp/fl-mcp-app/FleetMCP.app"))
     }
 
     /// Runs every line of `cmd` in order; appends `<i> ok|fail <detail>` per
@@ -32,7 +36,10 @@ final class MCPTests: XCTestCase {
         try? FileManager.default.removeItem(at: ackURL)
         guard app.state != .notRunning else { return ack("start fail app not running") }
         app.activate()
-        ack("start ok")
+        // Every session starts unlocked (the app locks on launch and idle);
+        // before onboarding there is no lock control yet.
+        let wasLocked = element("sidebar.lock").waitForExistence(timeout: 3) && unlockIfLocked()
+        ack("start ok\(wasLocked ? " (was locked)" : "")")
         for (i, parts) in lines.enumerated() {
             let (ok, detail) = perform(parts[0], Array(parts.dropFirst()))
             ack("\(i) \(ok ? "ok" : "fail") \(detail)")
@@ -111,6 +118,18 @@ final class MCPTests: XCTestCase {
             if b.label == (verb == "lock" ? "Lock" : "Unlock") { b.click() }
             snap("after-\(verb)")
             return (true, "label was \(was)")
+        case "idle8h":  // Settings → General → Lock after idle: 8 hours
+            app.typeKey(",", modifierFlags: .command)
+            let g = app.toolbars.buttons["General"]
+            if g.waitForExistence(timeout: 5) { g.click() }
+            let p = element("settings.general.idleLock")
+            guard p.waitForExistence(timeout: 5) else { closeSettings(); return (false, "no picker") }
+            p.click()
+            let item = app.menuItems["8 hours"]
+            guard item.waitForExistence(timeout: 5) else { closeSettings(); return (false, "no item") }
+            item.click()
+            closeSettings()
+            return (true, "")
         case "waitfile":  // waitfile <name> [seconds]: driver's go signal in ctl dir
             let url = Self.ctl.appendingPathComponent(a[0])
             let deadline = Date().addingTimeInterval(Double(a.count > 1 ? a[1] : "300") ?? 300)
@@ -157,9 +176,10 @@ final class MCPTests: XCTestCase {
                 done.click()
                 return (true, info)
             }
-            if retry.exists {
+            if retry.exists || element("addServer.close").exists {
                 let info = sheetText()
                 snap("install-failed-\(name)")
+                element("addServer.close").click()
                 return (false, info)
             }
             Thread.sleep(forTimeInterval: 1)

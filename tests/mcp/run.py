@@ -111,10 +111,13 @@ def app_start(auto_pair=True):
         # XCUIApplication(bundleIdentifier:) needs LaunchServices to know it.
         subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/"
                         "LaunchServices.framework/Support/lsregister", "-f", APP], check=True)
-    env =dict(os.environ, FLEET_DATA_DIR=DATA, FLEET_TEST_SIGNER="1",
-               FLEET_TEST_AGENT_ARTIFACT=AGENT, FLEET_TEST_AUTO_PAIR="1" if auto_pair else "0")
-    subprocess.Popen([f"{APP}/Contents/MacOS/Fleet"], env=env, start_new_session=True,
-                     stdout=open(f"{CTL}/app.log", "a"), stderr=subprocess.STDOUT)
+    env = {"FLEET_DATA_DIR": DATA, "FLEET_TEST_SIGNER": "1", "FLEET_TEST_AGENT_ARTIFACT": AGENT,
+           "FLEET_TEST_AUTO_PAIR": "1" if auto_pair else "0"}
+    # Through LaunchServices, so the UI runner can attach to it.
+    args = ["open", "-n", APP, "--stdout", f"{CTL}/app.log", "--stderr", f"{CTL}/app.log"]
+    for k, v in env.items():
+        args += ["--env", f"{k}={v}"]
+    subprocess.run(args, check=True)
     state["auto_pair"] = auto_pair
     save()
     time.sleep(5)
@@ -277,10 +280,15 @@ def phase_setup():
         state["pool"] = json.loads(out.stdout)
         save()
     pool = state["pool"]
+    # The pool's /tmp is noexec, and the app runs the uploaded binary from
+    # /tmp (bug MCP-4): allow exec so the install itself can be tested.
+    for p in pool:
+        sh(p["name"], "mount -o remount,exec /tmp")
     modes = ["managed", "agentonly"]
     steps = ["create", "waitfile go-keys 600"]
     steps += [f"add mcp{i + 1} {p['port']} {modes[i]}" for i, p in enumerate(pool)]
     steps += [f"addonly extra{i + 1} {i + 1}" for i in range(4)]
+    steps += ["idle8h"]  # MCP calls don't count as activity (§5.10)
     s = Session(steps)
     s.ready()
     ok, d = s.step(0)
