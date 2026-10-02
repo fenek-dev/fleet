@@ -38,6 +38,7 @@
 /// Audit mirror: `audit.query` pages verified and stored (§5.8).
 pub mod audit_mirror;
 pub mod autorevert;
+pub mod bootstrap;
 pub mod bulk;
 pub mod cache;
 pub mod catchup;
@@ -63,6 +64,7 @@ pub mod release;
 pub mod roster_mgmt;
 pub mod runbook;
 pub mod runner;
+pub mod secret;
 pub mod session;
 pub mod sftp;
 pub mod signer;

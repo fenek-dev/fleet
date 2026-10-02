@@ -44,6 +44,19 @@ use tokio::time::timeout;
 
 pub const SERVER: &str = "srv_itest01";
 pub const ADMIN: &str = "ops";
+/// The admin's password in the test image (`setup-image.sh`); a fixture.
+pub const ADMIN_PASSWORD: &str = "fleet-it-password";
+
+/// sshd login methods for [`Container::password_login`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshdAuth {
+    /// The image default: keys only.
+    KeyOnly,
+    /// `PasswordAuthentication yes`.
+    Password,
+    /// Keyboard-interactive (PAM) only.
+    KbdInteractive,
+}
 /// Per network step (SSH connect, channel, one request).
 pub const STEP: Duration = Duration::from_secs(20);
 
@@ -190,6 +203,42 @@ impl Container {
             Ok((ok, out, _)) => (ok, out),
             Err(e) => (false, e),
         }
+    }
+
+    /// Password-bootstrap variant of the image (design §10.1): `ops` has no
+    /// authorized key and no passwordless sudo (the image's `sudo` group
+    /// asks for the password), and sshd takes `mode` logins. The password
+    /// is [`ADMIN_PASSWORD`], a fixture of the image.
+    pub fn password_login(&self, mode: SshdAuth) -> Res<()> {
+        let (pw, kbd) = match mode {
+            SshdAuth::KeyOnly => ("no", "no"),
+            SshdAuth::Password => ("yes", "no"),
+            SshdAuth::KbdInteractive => ("no", "yes"),
+        };
+        // `00-` sorts before the image's `fleet-it.conf`: sshd keeps the
+        // first value it reads.
+        let conf = format!(
+            "PasswordAuthentication {pw}\\nKbdInteractiveAuthentication {kbd}\\nUsePAM yes\\n"
+        );
+        self.exec(&[
+            "sh",
+            "-c",
+            &format!(
+                "printf '{conf}' >/etc/ssh/sshd_config.d/00-fleet-it-password.conf \
+                 && sshd -t && (systemctl reload ssh 2>/dev/null || true)"
+            ),
+        ])?;
+        Ok(())
+    }
+
+    /// Removes the admin's authorized keys and passwordless sudo.
+    pub fn strip_key_and_nopasswd(&self) -> Res<()> {
+        self.exec(&[
+            "sh",
+            "-c",
+            "rm -f /etc/sudoers.d/fleet-pool /home/ops/.ssh/authorized_keys",
+        ])?;
+        Ok(())
     }
 
     pub fn cp_into(&self, src: &Path, dst: &str) -> Res<()> {

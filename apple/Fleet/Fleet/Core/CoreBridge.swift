@@ -343,6 +343,10 @@ extension Error {
         case .Cancelled: return "Cancelled."
         case .HostKeyNotConfirmed: return "Confirm the server's host key first."
         case .SshKeyRefused: return "The server refused this Mac's SSH key. Add it to the user's authorized_keys."
+        case .PasswordRefused: return "The server refused the password."
+        case .PasswordLoginUnavailable(let m): return m
+        case .SudoPasswordRequired: return "sudo needs a password on this server. Enter the user's password (used once, not stored)."
+        case .SudoPasswordRefused: return "sudo refused the password. Check it and try again."
         case .HostKeyChanged: return "The server's host key changed. Check the server before trusting it."
         case .Ssh(let m): return "SSH failed: \(m)"
         case .Install(let m): return "Install failed: \(m)"

@@ -29,6 +29,8 @@ pub struct EnrollmentResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum InstallStep {
+    /// One-time password setup: adding this Mac's SSH key.
+    AddingKey,
     Connecting,
     Uploading,
     Verifying,
@@ -51,6 +53,7 @@ impl From<InstallStage> for InstallProgress {
     fn from(s: InstallStage) -> Self {
         let (step, done_bytes, total_bytes) = match s {
             // Reported through `InstallListener::on_artifact` instead.
+            InstallStage::AddingKey => (InstallStep::AddingKey, 0, 0),
             InstallStage::Connecting | InstallStage::Artifact(_) => (InstallStep::Connecting, 0, 0),
             InstallStage::Uploading { done, total } => (InstallStep::Uploading, done, total),
             InstallStage::Verifying => (InstallStep::Verifying, 0, 0),

@@ -11,7 +11,9 @@ use crate::types::{
 };
 use crate::validate;
 use fleet_core::cache::PinnedKeys;
+use fleet_core::bootstrap;
 use fleet_core::install::{self, InstallRequest, InstallStage};
+use fleet_core::secret::SecretString;
 use fleet_core::manager::ConnState as CoreState;
 use fleet_core::signer::{KeyRole, RoleSigner};
 use fleet_core::ssh::P256SshSigner;
@@ -80,6 +82,27 @@ impl FleetCore {
         .await
     }
 
+    /// Like `probe_host_key` but the final hop is **not authenticated**: for
+    /// a server that doesn't accept this Mac's SSH key yet. The operator
+    /// confirms the fingerprint (`accept_host_key`) before any password is
+    /// sent (`install_agent` with `password`).
+    pub async fn probe_host_key_only(
+        self: Arc<Self>,
+        server_id: String,
+    ) -> Result<HostKeyPrompt, FleetError> {
+        let id = validate::server_id(&server_id)?;
+        let rec = self.server_record(&id)?;
+        let core = self.clone();
+        self.on_core(async move {
+            let ssh = ssh_signer(&core)?;
+            let obs = install::probe_host_key_only(&rec.target, &ssh).await?;
+            let prompt = crate::api::host_key_prompt(&id, &obs);
+            core.remember_host_key(id, obs);
+            Ok(prompt)
+        })
+        .await
+    }
+
     /// Installs the agent (a `.deb` package or a bare `fleet-agent`
     /// binary at `artifact_path`) with the genesis roster and a default
     /// policy, pins the printed agent keys and connects. `admin_user`
@@ -88,7 +111,13 @@ impl FleetCore {
     /// security as before; `AgentOnly` leaves an already-configured server
     /// alone (no bans, no `authorized_keys` rewriting) until the operator
     /// switches it later. Needs a confirmed host key, an unlocked app (SSH
-    /// key) and passwordless sudo (or root).
+    /// key) and passwordless sudo (or root), or the one-time `password`
+    /// (design §10.1): with `add_key` it is first used to log in and add
+    /// this Mac's SSH key to the user's `authorized_keys` (the install then
+    /// proves the key works); either way it answers `sudo -S` during the
+    /// install when the user has no passwordless sudo. The password is
+    /// wiped as soon as the install steps end and is never stored, logged
+    /// or sent anywhere but that SSH session.
     #[allow(clippy::too_many_arguments)] // flat UniFFI signature for Swift
     pub async fn install_agent(
         self: Arc<Self>,
@@ -98,8 +127,24 @@ impl FleetCore {
         bundled_dir: Option<String>,
         bundled_pins: std::collections::HashMap<String, String>,
         security_mode: SecurityModeArg,
+        password: Option<Vec<u8>>,
+        add_key: bool,
         listener: Box<dyn InstallListener>,
     ) -> Result<AgentHealthRow, FleetError> {
+        // Into the zeroizing type before anything else can fail or await.
+        let password = match password {
+            Some(bytes) => Some(SecretString::from_bytes(bytes).map_err(|_| {
+                FleetError::InvalidArgument {
+                    field: "password".into(),
+                }
+            })?),
+            None => None,
+        };
+        if add_key && password.is_none() {
+            return Err(FleetError::InvalidArgument {
+                field: "password".into(),
+            });
+        }
         let id = validate::server_id(&server_id)?;
         let rec = self.server_record(&id)?;
         // An explicit file wins over the bundled packages.
@@ -163,6 +208,20 @@ impl FleetCore {
             };
             let pins: std::collections::BTreeMap<String, String> =
                 bundled_pins.into_iter().collect();
+            if add_key && let Some(pw) = password.as_ref() {
+                let r = bootstrap::bootstrap_key(
+                    &rec.target,
+                    host_key.clone(),
+                    pw,
+                    &ssh,
+                    &mut progress,
+                )
+                .await;
+                if let Err(e) = r {
+                    drop(password);
+                    return Err(e.into());
+                }
+            }
             let installed = install::install_agent(
                 InstallRequest {
                     bundled_pins: &pins,
@@ -173,11 +232,15 @@ impl FleetCore {
                     artifact: source,
                     genesis: &genesis,
                     policy_toml: &policy_toml,
+                    sudo_password: password.as_ref(),
                 },
                 &ssh,
                 &mut progress,
             )
-            .await?;
+            .await;
+            // Nothing after the install steps needs the password.
+            drop(password);
+            let installed = installed?;
 
             listener.on_progress(InstallProgress::step(InstallStep::Pinning));
             {

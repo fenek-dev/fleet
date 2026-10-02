@@ -32,6 +32,8 @@ Keep the dir path short (under about 60 characters): it holds `mcp.sock`, and Un
 | `FLEET_TEST_AUTO_PAIR=0` | With the signer on, MCP pairing prompts are answered automatically (approval logged). `0` keeps the pairing sheet (`aiPrompt.approve` / `aiPrompt.deny`). |
 | `FLEET_TEST_AGENT_ARTIFACT=<path>` | "Choose…" in the install step picks this file (no file panel). Use the `.deb` (`agent-artifact.sh --deb-only`): a bare binary is refused on a fresh pool server (no fleet-gate user/units). |
 
+| `FLEET_TEST_SERVER_PASSWORD=<pw>` | Prefills the one-time password field in Add server (`addServer.password`; also opens it, like the `addServer.usePassword` link). Use with `tests/vm/pool.sh up 1 --password-auth` (user `ops`, no key, sudo asks for the password `fleet-it-password`; the JSON has `"password"`). Without the key authorized the flow is: probe refused → host-key-only probe → `addServer.fingerprint` → `addServer.trust` → password step → Install ("Add SSH key" step first). |
+
 Once the keys exist (after onboarding, and on every later launch) the app writes `<dir>/ssh_pubkey` and `<dir>/monitor_ssh_pubkey` (OpenSSH lines). Authorize `ssh_pubkey` on a server before "Add and connect". The monitor key is pinned by the agent install itself.
 
 Notes: `approvals.log` lines are `TEST-APPROVE app-unlock: ...`, `root-sign: ...`, `mcp-approval: ...`, `sudo-reveal: ...`, `sudo-store: ...`. Elevated MCP approvals still show their sheet; only the Touch ID part is automatic.
