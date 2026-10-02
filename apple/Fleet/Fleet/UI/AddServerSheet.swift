@@ -11,7 +11,23 @@ struct AddServerSheet: View {
     @Environment(\.dismiss) private var dismiss
     var existing: ServerRow?
 
-    private enum Step { case details, probing, hostKey, install, installing, done }
+    private enum Step { case details, probing, hostKey, install, existingAgent, installing, done }
+
+    /// What preflight found when the server already has a Fleet agent
+    /// (nothing was changed yet).
+    private struct ExistingInfo {
+        var execActive: Bool
+        var stateKnown: Bool
+        var keysKnown: Bool
+        /// This Mac opened a verified session: it is in the agent's roster.
+        var sameFleet: Bool
+        var sshSwitched: Bool
+    }
+    @State private var existingInfo: ExistingInfo?
+    /// The one-time password, kept (wipeable) while the operator decides
+    /// what to do with an existing agent, so it needn't be typed twice.
+    @State private var heldSecret: SecretBytes?
+    @State private var adopting = false
 
     @State private var step: Step = .details
     @State private var serverId: String?
@@ -48,6 +64,7 @@ struct AddServerSheet: View {
             case .probing: busy("Connecting with this Mac's SSH key…")
             case .hostKey: hostKeyStep
             case .install: installStep
+            case .existingAgent: existingAgentStep
             case .installing: installingStep
             case .done: doneStep
             }
@@ -60,6 +77,7 @@ struct AddServerSheet: View {
         .padding(24)
         .frame(width: 540)
         .onAppear(perform: resume)
+        .onDisappear { heldSecret?.wipe(); heldSecret = nil }
     }
 
     private var title: String {
@@ -67,7 +85,8 @@ struct AddServerSheet: View {
         case .details: "Add server"
         case .probing, .hostKey: "Confirm host key"
         case .install, .installing: "Install agent"
-        case .done: "Agent installed"
+        case .existingAgent: "Existing agent found"
+        case .done: adopting ? "Agent adopted" : "Agent installed"
         }
     }
 
@@ -268,8 +287,67 @@ struct AddServerSheet: View {
             .font(.secondary).foregroundStyle(Color.textSecondary)
     }
 
+    /// An agent is already on the server (nothing was changed): adopt it
+    /// when this Mac is in its roster, otherwise replace it (explicitly).
+    @ViewBuilder
+    private var existingAgentStep: some View {
+        let info = existingInfo
+        VStack(alignment: .leading, spacing: 12) {
+            if info?.sameFleet == true {
+                Text("This server already has a Fleet agent from this fleet, and it accepts this Mac. Fleet can use it as it is: nothing is uploaded, restarted or changed.")
+                    .font(.base).foregroundStyle(Color.textSecondary)
+                    .accessibilityIdentifier("addServer.existing.same")
+            } else {
+                Text("This server already has a Fleet agent from another fleet. Replace it?")
+                    .font(.base).foregroundStyle(Color.text)
+                    .accessibilityIdentifier("addServer.existing.other")
+                Text("The old agent is stopped and its history is archived on the server in /var/lib/fleet-audit (not deleted). This fleet's roster and policy are installed in its place; Macs of the old fleet lose access to this server.")
+                    .font(.secondary).foregroundStyle(Color.textSecondary)
+                if info?.sshSwitched == true {
+                    Text("The old fleet moved this server's SSH keys to /etc/fleet/authorized_keys. This Mac's key stays valid: the keys already there are kept, and the new roster adds this fleet's Macs.")
+                        .font(.secondary).foregroundStyle(Color.textSecondary)
+                }
+            }
+            Text(existingFacts(info)).font(.mono(11)).foregroundStyle(Color.textMuted)
+                .accessibilityIdentifier("addServer.existing.facts")
+            HStack {
+                Button("Cancel") { heldSecret?.wipe(); heldSecret = nil; dismiss() }
+                    .accessibilityIdentifier("addServer.existing.cancel")
+                Spacer()
+                if info?.sameFleet == true {
+                    Button("Reinstall anyway") { install(existing: .reinstall) }
+                        .accessibilityIdentifier("addServer.existing.reinstall")
+                    Button("Use existing agent") { install(existing: .adopt) }
+                        .accessibilityIdentifier("addServer.existing.adopt")
+                        .buttonStyle(.borderedProminent).tint(.accent)
+                } else {
+                    Button("Replace agent") { install(existing: .replace) }
+                        .accessibilityIdentifier("addServer.existing.replace")
+                        .buttonStyle(.borderedProminent).tint(Tone.critical.text)
+                }
+            }
+        }
+    }
+
+    private func existingFacts(_ i: ExistingInfo?) -> String {
+        guard let i else { return "" }
+        return [
+            i.execActive ? "agent running" : "agent not running",
+            i.stateKnown ? "state present" : "no state",
+            i.keysKnown ? "keys readable" : "keys unreadable",
+        ].joined(separator: " · ")
+    }
+
+    private static let adoptSteps: [(InstallStep, String)] = [
+        (.connecting, "Connect"),
+        (.pinning, "Pin agent keys"),
+        (.waitingForAgent, "Connect to agent"),
+        (.checkingHealth, "Signed health check"),
+    ]
+
     private var steps: [(InstallStep, String)] {
-        (addingKey ? [(InstallStep.addingKey, "Add SSH key")] : []) + Self.steps
+        if adopting { return Self.adoptSteps }
+        return (addingKey ? [(InstallStep.addingKey, "Add SSH key")] : []) + Self.steps
     }
 
     private static let steps: [(InstallStep, String)] = [
@@ -466,7 +544,7 @@ struct AddServerSheet: View {
         if panel.runModal() == .OK { artifact = panel.url }
     }
 
-    private func install() {
+    private func install(existing action: ExistingAgentAction = .ask) {
         guard let api = core.api, let id = serverId, canInstall else { return }
         // Priority: the test hook, a file chosen with "Choose…", the bundle.
         let file = TestHooks.agentArtifact ?? artifact
@@ -482,28 +560,56 @@ struct AddServerSheet: View {
         let admin = adminUser.trimmingCharacters(in: .whitespaces)
         // The password moves out of the view state into a wipeable buffer;
         // nothing else holds it once the install call returns.
-        let secret = usePassword && !password.isEmpty ? SecretBytes(password) : nil
+        // A choice after "existing agent found" reuses the held password.
+        let secret = heldSecret
+            ?? (usePassword && !password.isEmpty ? SecretBytes(password) : nil)
+        heldSecret = nil
         password = ""
         let addKey = keyRefused && secret != nil
         addingKey = addKey
+        adopting = action == .adopt
         Task {
-            defer { secret?.wipe() }
+            var keep = false
+            defer { if !keep { secret?.wipe() } }
             do {
                 health = try await api.installAgent(
                     serverId: id, adminUser: admin.isEmpty ? nil : admin,
                     artifactPath: file?.path, bundledDir: Self.bundledAgentDir?.path,
                     bundledPins: BundledArtifacts.agentPins,
                     securityMode: securityMode, password: secret?.data, addKey: addKey,
-                    listener: relay)
+                    existing: action, listener: relay)
                 core.reload()
                 step = .done
+            } catch FleetError.ExistingAgent(_, let execActive, _, let stateKnown, let keysKnown,
+                                             let sameFleet, let sshSwitched) {
+                // Nothing was changed: ask what to do. The password stays
+                // (wipeable) until the choice is made or the sheet closes.
+                existingInfo = ExistingInfo(
+                    execActive: execActive, stateKnown: stateKnown, keysKnown: keysKnown,
+                    sameFleet: sameFleet, sshSwitched: sshSwitched)
+                adopting = false
+                heldSecret = secret
+                keep = true
+                error = nil
+                step = .existingAgent
             } catch {
                 switch error as? FleetError {
                 case .PasswordRefused, .SudoPasswordRequired, .SudoPasswordRefused:
                     usePassword = true
                 default: break
                 }
-                self.error = error.fleetMessage
+                if action == .adopt {
+                    // The agent didn't accept this Mac: back to the choices,
+                    // where only Replace is left.
+                    existingInfo?.sameFleet = false
+                    adopting = false
+                    heldSecret = secret
+                    keep = true
+                    self.error = error.fleetMessage
+                    step = .existingAgent
+                } else {
+                    self.error = error.fleetMessage
+                }
             }
         }
     }

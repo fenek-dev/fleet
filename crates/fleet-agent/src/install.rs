@@ -46,10 +46,78 @@ pub enum InstallError {
     NoGroup(&'static str),
     #[error("adding the admin user to group fleet failed: {0}")]
     AdminGroup(String),
-    #[error("already installed (a roster is stored)")]
+    #[error("already installed (a roster is stored); use --keep-state or --replace")]
     AlreadyInstalled,
     #[error("key file {0} is corrupt")]
     Key(String),
+    /// `state.redb` is locked by a running `fleet-exec`.
+    #[error("the agent is running (its state database is locked); stop fleet-exec.service first")]
+    AgentRunning,
+    #[error("no agent keys found (key file {0} is missing)")]
+    NoKeys(String),
+}
+
+/// What `install` does when a roster is already stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstallMode {
+    /// Refuse with [`InstallError::AlreadyInstalled`].
+    #[default]
+    Fresh,
+    /// Repair or upgrade: a stored roster, policy and keys are left
+    /// untouched (a missing roster is installed normally).
+    KeepState,
+    /// A different fleet takes over: the old state database is archived
+    /// (never deleted) and pending changes, staged builds and the update
+    /// record are cleared; the key files are kept. The caller stops both
+    /// units first.
+    Replace,
+}
+
+/// Where a replaced fleet's state database is archived (shared with
+/// `uninstall --keep-audit`).
+fn archive_dir(paths: &Paths) -> std::path::PathBuf {
+    crate::uninstall::host(paths, crate::uninstall::AUDIT_KEEP_DIR)
+}
+
+/// Moves `state.redb*` to `<archive>/replaced-<ms>/` and empties the
+/// directories holding the old fleet's pending work. Keys stay.
+fn reset_state(paths: &Paths) -> Result<(), InstallError> {
+    let dest = archive_dir(paths).join(format!("replaced-{}", crate::now_ms()));
+    ensure_dir(&archive_dir(paths), 0o700)?;
+    ensure_dir(&dest, 0o700)?;
+    for e in std::fs::read_dir(&paths.exec_dir)?.flatten() {
+        let name = e.file_name();
+        if name.to_str().is_some_and(|n| n.starts_with("state.redb")) {
+            std::fs::rename(e.path(), dest.join(&name))?;
+        }
+    }
+    for dir in [&paths.pending_dir, &paths.reverted_dir, &paths.staging_dir] {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            match std::fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&p)?,
+                Ok(_) => std::fs::remove_file(&p)?,
+                Err(_) => {}
+            }
+        }
+    }
+    match std::fs::remove_file(&paths.update_state) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// The public halves of the key files, read without opening the state
+/// database (which a running `fleet-exec` locks): `fleet-agent keys`.
+pub fn read_public_keys(paths: &Paths) -> Result<InstallOutput, InstallError> {
+    let noise = read_key(&paths.noise_key)?
+        .ok_or_else(|| InstallError::NoKeys(paths.noise_key.display().to_string()))?;
+    let signing = read_key(&paths.signing_key)?
+        .ok_or_else(|| InstallError::NoKeys(paths.signing_key.display().to_string()))?;
+    Ok(InstallOutput {
+        noise_static: StaticKeypair::from_bytes(&noise).public(),
+        signing_key: Ed25519Signer::from_seed(&signing).public(),
+    })
 }
 
 pub struct InstallInput {
@@ -138,7 +206,25 @@ fn add_to_fleet_group(user: &str) -> Result<(), InstallError> {
     }
 }
 
+/// Opens the state database; a lock held by a running `fleet-exec` becomes
+/// [`InstallError::AgentRunning`].
+fn open_store(paths: &Paths) -> Result<crate::store::Store, InstallError> {
+    use crate::store::schema::SchemaError;
+    crate::store::schema::open_versioned(&paths.state_db).map_err(|e| match e {
+        SchemaError::Store(s) if s.is_locked() => InstallError::AgentRunning,
+        other => other.into(),
+    })
+}
+
 pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, InstallError> {
+    install_with(paths, input, InstallMode::Fresh)
+}
+
+pub fn install_with(
+    paths: &Paths,
+    input: &InstallInput,
+    mode: InstallMode,
+) -> Result<InstallOutput, InstallError> {
     // Validate everything before touching the filesystem.
     verify_genesis(&input.genesis, crate::now_ms()).map_err(InstallError::Genesis)?;
     let policy =
@@ -172,6 +258,19 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
         (Some(o.gate_uid), Some(o.fleet_gid), Some(o.gate_gid))
     });
     ensure_dir(&paths.exec_dir, 0o700)?;
+    // A running agent holds the database lock: find out first, before
+    // anything else is written, so a refusal leaves nothing half-done.
+    let mut store = open_store(paths)?;
+    let has_roster = store.meta().get(MetaKey::Roster)?.is_some();
+    if has_roster && mode == InstallMode::Fresh {
+        return Err(InstallError::AlreadyInstalled);
+    }
+    if mode == InstallMode::Replace {
+        drop(store);
+        reset_state(paths)?;
+        store = open_store(paths)?;
+    }
+    let keep_roster = has_roster && mode == InstallMode::KeepState;
     ensure_dir(&paths.pending_dir, 0o700)?;
     ensure_dir(&paths.reverted_dir, 0o700)?;
     ensure_dir(&paths.staging_dir, 0o700)?;
@@ -187,11 +286,6 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
     // root:fleet-gate 0710: the gate can reach exec.sock, not replace it.
     ensure_dir(&paths.exec_run_dir, 0o710)?;
     own(&paths.exec_run_dir, None, gate_gid)?;
-
-    let store = crate::store::schema::open_versioned(&paths.state_db)?;
-    if store.meta().get(MetaKey::Roster)?.is_some() {
-        return Err(InstallError::AlreadyInstalled);
-    }
 
     let noise = match read_key(&paths.noise_key)? {
         Some(b) => StaticKeypair::from_bytes(&b),
@@ -230,6 +324,12 @@ pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, Ins
         add_to_fleet_group(u)?;
     }
 
+    if keep_roster {
+        return Ok(InstallOutput {
+            noise_static: noise.public(),
+            signing_key: signer.public(),
+        });
+    }
     let roster = encode(&input.genesis);
     let policy = encode(&StoredPolicy {
         toml: input.policy_toml.clone(),

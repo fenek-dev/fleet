@@ -350,6 +350,7 @@ extension Error {
         case .HostKeyChanged: return "The server's host key changed. Check the server before trusting it."
         case .Ssh(let m): return "SSH failed: \(m)"
         case .Install(let m): return "Install failed: \(m)"
+        case .ExistingAgent: return "This server already has a Fleet agent."
         case .FileNotFound: return "No such file."
         case .FilePermissionDenied: return "Permission denied."
         case .FileChanged: return "The file changed on the server since it was opened."

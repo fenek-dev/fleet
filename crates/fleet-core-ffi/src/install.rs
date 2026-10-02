@@ -7,7 +7,8 @@
 use crate::api::{FleetCore, id16, lock};
 use crate::rows::{InstallProgress, InstallStep};
 use crate::types::{
-    AgentHealthRow, FleetError, HostKeyPrompt, SecurityModeArg, SecurityModeStatus,
+    AgentHealthRow, ExistingAgentAction, FleetError, HostKeyPrompt, SecurityModeArg,
+    SecurityModeStatus,
 };
 use crate::validate;
 use fleet_core::cache::PinnedKeys;
@@ -46,6 +47,63 @@ pub struct InstallArtifact {
     /// Debian architecture of the server (`amd64` / `arm64`).
     pub arch: String,
     pub bundled: bool,
+}
+
+/// How long the "is this Mac in the agent's roster" check may take.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Pins `keys` with `host_key`, opens a session and reads a signed
+/// `agent.health`: success proves the agent accepts this Mac's device key,
+/// i.e. this Mac is in its roster. The caller [`unpin`]s unless it keeps
+/// the server.
+async fn try_session(
+    core: &Arc<FleetCore>,
+    id: &fleet_proto::ServerId,
+    host_key: &fleet_core::ssh::HostKey,
+    keys: install::InstalledAgent,
+    timeout: Duration,
+) -> Result<(), FleetError> {
+    {
+        let cache = lock(&core.cache);
+        cache.set_pins(
+            id,
+            &PinnedKeys {
+                host_key: Some(host_key.clone()),
+                agent_noise: Some(keys.noise_static),
+                agent_signing: Some(keys.signing_key),
+            },
+        )?;
+    }
+    core.connect_pinned(id)?;
+    let (handle, _) = core.running()?;
+    if handle.wait_ready(id, timeout).await != Some(CoreState::Ready) {
+        return Err(FleetError::Timeout);
+    }
+    let reply = tokio::time::timeout(
+        timeout,
+        handle.request(id, Op::AgentHealth, Actor::Human, None),
+    )
+    .await
+    .map_err(|_| FleetError::Timeout)??;
+    match reply.result {
+        Ok(Payload::AgentHealth(_)) => Ok(()),
+        _ => Err(FleetError::UnexpectedReply),
+    }
+}
+
+/// Back to a host-key-only pin and out of the connection manager.
+fn unpin(core: &Arc<FleetCore>, id: &fleet_proto::ServerId, host_key: &fleet_core::ssh::HostKey) {
+    let _ = lock(&core.cache).set_pins(
+        id,
+        &PinnedKeys {
+            host_key: Some(host_key.clone()),
+            agent_noise: None,
+            agent_signing: None,
+        },
+    );
+    if let Ok((handle, _)) = core.running() {
+        handle.remove_server(id);
+    }
 }
 
 fn ssh_signer(core: &FleetCore) -> Result<P256SshSigner<RoleSigner<'_>>, FleetError> {
@@ -129,6 +187,7 @@ impl FleetCore {
         security_mode: SecurityModeArg,
         password: Option<Vec<u8>>,
         add_key: bool,
+        existing: ExistingAgentAction,
         listener: Box<dyn InstallListener>,
     ) -> Result<AgentHealthRow, FleetError> {
         // Into the zeroizing type before anything else can fail or await.
@@ -233,6 +292,7 @@ impl FleetCore {
                     genesis: &genesis,
                     policy_toml: &policy_toml,
                     sudo_password: password.as_ref(),
+                    existing: existing.into(),
                 },
                 &ssh,
                 &mut progress,
@@ -240,7 +300,32 @@ impl FleetCore {
             .await;
             // Nothing after the install steps needs the password.
             drop(password);
-            let installed = installed?;
+            let installed = match installed {
+                Ok(i) => i,
+                Err(install::InstallError::ExistingAgent(info)) => {
+                    // Tell the operator what is there, and whether this
+                    // Mac is already in its roster (a verified session).
+                    let same_fleet = match info.keys {
+                        Some(keys) if info.exec_active && info.gate_active => {
+                            let r = try_session(&core, &id, &host_key, keys, CHECK_TIMEOUT).await;
+                            unpin(&core, &id, &host_key);
+                            r.is_ok()
+                        }
+                        _ => false,
+                    };
+                    return Err(FleetError::ExistingAgent {
+                        units_present: info.units_present,
+                        exec_active: info.exec_active,
+                        gate_active: info.gate_active,
+                        state_present: info.state_present,
+                        keys_known: info.keys.is_some(),
+                        same_fleet,
+                        ssh_switched: info.ssh_switched,
+                    });
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let adopting = existing == ExistingAgentAction::Adopt;
 
             listener.on_progress(InstallProgress::step(InstallStep::Pinning));
             {
@@ -248,30 +333,47 @@ impl FleetCore {
                 cache.set_pins(
                     &id,
                     &PinnedKeys {
-                        host_key: Some(host_key),
+                        host_key: Some(host_key.clone()),
                         agent_noise: Some(installed.noise_static),
                         agent_signing: Some(installed.signing_key),
                     },
                 )?;
                 // The Mac's copy of what the agent enforces (MCP limits).
-                fleet_core::policy::remember_pushed(&cache, &id, &policy_toml)?;
+                // An adopted agent runs somebody else's policy: not ours
+                // to claim; the Mac learns it from the agent.
+                if !adopting {
+                    fleet_core::policy::remember_pushed(&cache, &id, &policy_toml)?;
+                }
             }
             core.connect_pinned(&id)?;
             // Per-server sudo password (design §5.9): Keychain + sync.
             // Best effort: sync may not be set up yet.
             // It calls into the Keychain (Swift): off the async thread and
             // bounded, so a stuck Keychain can't stall the install.
-            let sudo_core = core.clone();
-            let sudo_id = id.to_string();
-            let _ = tokio::time::timeout(
-                SUDO_PASSWORD_TIMEOUT,
-                tokio::task::spawn_blocking(move || sudo_core.ensure_sudo_password(sudo_id)),
-            )
-            .await;
+            if !adopting {
+                let sudo_core = core.clone();
+                let sudo_id = id.to_string();
+                let _ = tokio::time::timeout(
+                    SUDO_PASSWORD_TIMEOUT,
+                    tokio::task::spawn_blocking(move || sudo_core.ensure_sudo_password(sudo_id)),
+                )
+                .await;
+            }
 
             listener.on_progress(InstallProgress::step(InstallStep::WaitingForAgent));
             let (handle, _) = core.running()?;
             let state = handle.wait_ready(&id, READY_TIMEOUT).await;
+            if state != Some(CoreState::Ready) && adopting {
+                // This Mac is not in the agent's roster (or the keys were
+                // stale): leave no pin for an agent we don't control.
+                unpin(&core, &id, &host_key);
+                return Err(FleetError::Install {
+                    message: "The existing agent did not accept this Mac (it belongs to another \
+                              fleet, or this Mac is not in its roster). Choose Replace to install \
+                              this fleet's agent over it."
+                        .into(),
+                });
+            }
             if state != Some(CoreState::Ready) {
                 // The agent is installed and pinned; only the session
                 // failed. Say so, so the operator doesn't re-run the install.

@@ -4,6 +4,7 @@
 //! (`Paths::under`) for development and tests.
 
 use crate::bridge::BridgeMode;
+use crate::install::InstallMode;
 use crate::pending::ChangeId;
 use std::path::PathBuf;
 
@@ -13,6 +14,7 @@ pub struct InstallArgs {
     pub policy: PathBuf,
     pub server_id: String,
     pub admin_user: Option<String>,
+    pub mode: InstallMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +23,9 @@ pub enum Mode {
     Exec,
     Bridge(BridgeMode),
     Install(InstallArgs),
+    /// `keys`: prints `noise_static=` / `signing_key=` from the key files
+    /// only (never opens the state database a running exec locks).
+    Keys,
     Revert(ChangeId),
     /// `uninstall [--ssh-restored] [--keep-audit] [--remove-firewall]`.
     Uninstall(crate::uninstall::UninstallOpts),
@@ -40,6 +45,7 @@ pub struct Cli {
 pub const USAGE: &str = "usage: fleet-agent [--root <dir>] gate | exec \
      | bridge [--recovery | --monitor] \
      | install --genesis <file> --policy <file> --server-id <id> [--admin-user <name>] \
+       [--keep-state | --replace] | keys \
      | revert <change-id> \
      | uninstall [--ssh-restored] [--keep-audit] [--remove-firewall] \
      | user-keys get|set|merge|remove <home> | version";
@@ -67,6 +73,7 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Option<Mode> {
         ["exec"] => Some(Mode::Exec),
         ["bridge", rest @ ..] => Some(Mode::Bridge(bridge_mode(rest))),
         ["install", flags @ ..] => parse_install(flags).map(Mode::Install),
+        ["keys"] => Some(Mode::Keys),
         ["revert", id] => ChangeId::parse(id).map(Mode::Revert),
         ["uninstall", flags @ ..] => {
             crate::uninstall::UninstallOpts::parse(flags).map(Mode::Uninstall)
@@ -97,17 +104,30 @@ fn bridge_mode(flags: &[&str]) -> BridgeMode {
 
 fn parse_install(flags: &[&str]) -> Option<InstallArgs> {
     let (mut genesis, mut policy, mut server_id, mut admin_user) = (None, None, None, None);
-    let mut it = flags.chunks(2);
-    for pair in it.by_ref() {
-        let [flag, value] = pair else { return None };
-        let slot = match *flag {
+    let mut mode = InstallMode::Fresh;
+    let mut it = flags.iter().copied().peekable();
+    while let Some(flag) = it.next() {
+        let new_mode = match flag {
+            "--keep-state" => Some(InstallMode::KeepState),
+            "--replace" => Some(InstallMode::Replace),
+            _ => None,
+        };
+        if let Some(m) = new_mode {
+            if mode != InstallMode::Fresh {
+                return None;
+            }
+            mode = m;
+            continue;
+        }
+        let value = it.next()?;
+        let slot = match flag {
             "--genesis" => &mut genesis,
             "--policy" => &mut policy,
             "--server-id" => &mut server_id,
             "--admin-user" => &mut admin_user,
             _ => return None,
         };
-        if slot.replace((*value).to_owned()).is_some() {
+        if slot.replace(value.to_owned()).is_some() {
             return None;
         }
     }
@@ -116,5 +136,45 @@ fn parse_install(flags: &[&str]) -> Option<InstallArgs> {
         policy: policy?.into(),
         server_id: server_id?,
         admin_user,
+        mode,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: [&str; 6] = ["--genesis", "g", "--policy", "p", "--server-id", "srv_x"];
+
+    fn install(extra: &[&str]) -> Option<InstallArgs> {
+        let mut a = vec!["install"];
+        a.extend(BASE);
+        a.extend(extra);
+        match parse(&a)? {
+            Mode::Install(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn install_modes() {
+        assert_eq!(install(&[]).unwrap().mode, InstallMode::Fresh);
+        assert_eq!(
+            install(&["--keep-state"]).unwrap().mode,
+            InstallMode::KeepState
+        );
+        assert_eq!(
+            install(&["--admin-user", "ops", "--replace"]).unwrap().mode,
+            InstallMode::Replace
+        );
+        assert!(install(&["--keep-state", "--replace"]).is_none());
+        assert!(install(&["--admin-user"]).is_none());
+        assert!(install(&["--bogus", "x"]).is_none());
+    }
+
+    #[test]
+    fn keys_mode() {
+        assert_eq!(parse(&["keys"]), Some(Mode::Keys));
+        assert!(parse(&["keys", "x"]).is_none());
+    }
 }
