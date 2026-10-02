@@ -374,7 +374,7 @@ fn install_over_running_agent_refuses_cleanly() {
     use fleet_agent::install::{InstallError, InstallMode};
     let fx = Fixture::new(1, 0);
     for mode in [InstallMode::Fresh, InstallMode::KeepState, InstallMode::Replace] {
-        let e = install::install_with(&fx.paths, &input_for(&fx), mode).unwrap_err();
+        let e = install::install_with(&fx.paths, &input_for(&fx), mode, None).unwrap_err();
         assert!(matches!(e, InstallError::AgentRunning), "{mode:?}: {e}");
         assert!(e.to_string().contains("stop fleet-exec.service"));
     }
@@ -393,17 +393,48 @@ fn install_keep_state_and_replace_when_stopped() {
     fx.exec = None;
     let input = input_for(&fx);
     assert!(matches!(
-        install::install_with(&fx.paths, &input, InstallMode::Fresh),
+        install::install_with(&fx.paths, &input, InstallMode::Fresh, None),
         Err(InstallError::AlreadyInstalled)
     ));
-    let kept = install::install_with(&fx.paths, &input, InstallMode::KeepState).unwrap();
+    let kept = install::install_with(&fx.paths, &input, InstallMode::KeepState, None).unwrap();
     assert_eq!(kept, fx.keys);
 
-    std::fs::write(fx.paths.pending_dir.join("x.bin"), b"old").unwrap();
-    let replaced = install::install_with(&fx.paths, &input, InstallMode::Replace).unwrap();
-    assert_eq!(replaced, fx.keys, "keys are kept");
-    assert!(!exists(&fx.paths.pending_dir.join("x.bin")));
+    // A pending change (its rollback snapshot) blocks both, untouched.
+    let pending = fx.paths.pending_dir.join("x.bin");
+    std::fs::write(&pending, b"snapshot").unwrap();
+    assert_eq!(install::pending_changes(&fx.paths), 1);
+    for mode in [InstallMode::KeepState, InstallMode::Replace] {
+        let e = install::install_with(&fx.paths, &input, mode, None).unwrap_err();
+        assert!(matches!(e, InstallError::PendingChange), "{mode:?}: {e}");
+        assert!(e.to_string().contains("confirm or wait for the pending change to revert"));
+    }
+    assert!(exists(&pending), "snapshot kept");
+    assert!(!exists(&fx.paths.root.join("var/lib/fleet-audit/replaced-0")));
+    std::fs::remove_file(&pending).unwrap();
+
+    // A failure after the swap restores the original database; nothing is
+    // left archived and the roster is still there.
+    let e = install::install_hooked(&fx.paths, &input, InstallMode::Replace, None, &|| {
+        Err(InstallError::Policy("injected".into()))
+    })
+    .unwrap_err();
+    assert!(e.to_string().contains("injected"));
     let archive = fx.paths.root.join("var/lib/fleet-audit");
+    assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 0);
+    {
+        let store = fleet_agent::store::schema::open_versioned(&fx.paths.state_db).unwrap();
+        assert!(
+            store
+                .meta()
+                .get(fleet_agent::store::MetaKey::Roster)
+                .unwrap()
+                .is_some(),
+            "original database restored"
+        );
+    }
+
+    let replaced = install::install_with(&fx.paths, &input, InstallMode::Replace, None).unwrap();
+    assert_eq!(replaced, fx.keys, "keys are kept");
     let dirs: Vec<_> = std::fs::read_dir(&archive).unwrap().flatten().collect();
     assert_eq!(dirs.len(), 1);
     assert!(exists(&dirs[0].path().join("state.redb")));

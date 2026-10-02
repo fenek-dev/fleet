@@ -100,19 +100,13 @@ fn run_install(paths: &Paths, a: &InstallArgs, dev: bool) -> Result<(), String> 
         server_id: ServerId::new(a.server_id.clone()).map_err(|_| "invalid --server-id")?,
         admin_user: a.admin_user.clone(),
     };
-    if a.mode == install::InstallMode::Replace && !dev {
-        // The old fleet's armed auto-revert timers must not fire against
-        // the new state (best effort; the units are already stopped).
-        use fleet_ops::CommandRunner as _;
-        let _ = fleet_ops::SystemRunner.run_blocking(
-            fleet_ops::CommandSpec::new(fleet_agent::paths::SYSTEMCTL).args([
-                "stop",
-                "fleet-revert-*.timer",
-                "fleet-agent-restart-*.timer",
-            ]),
-        );
-    }
-    let out = install::install_with(paths, &input, a.mode).map_err(|e| e.to_string())?;
+    // Armed revert timers are never disarmed: install refuses while a
+    // change is pending and waits out revert/restart units (development
+    // roots have no systemd to ask).
+    let runner = fleet_ops::SystemRunner;
+    let runner: Option<&dyn fleet_ops::CommandRunner> = (!dev).then_some(&runner);
+    let out =
+        install::install_with(paths, &input, a.mode, runner).map_err(|e| e.to_string())?;
     // Monitor sessions authenticate with their own SSH key, which must be
     // in the file sshd reads: still ~/.ssh/authorized_keys (design §5.9,
     // §10.1). Done here too because Agent-only never syncs keys later.
@@ -144,6 +138,9 @@ fn run_keys(paths: &Paths) -> Result<(), String> {
     let out = install::read_public_keys(paths).map_err(|e| e.to_string())?;
     println!("noise_static={}", hex::encode(out.noise_static.0));
     println!("signing_key={}", hex::encode(out.signing_key.0));
+    // Unconfirmed changes (their rollback snapshots): the app refuses to
+    // reinstall or replace while any exist.
+    println!("pending_changes={}", install::pending_changes(paths));
     Ok(())
 }
 

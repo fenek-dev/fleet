@@ -54,8 +54,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Pins `keys` with `host_key`, opens a session and reads a signed
 /// `agent.health`: success proves the agent accepts this Mac's device key,
-/// i.e. this Mac is in its roster. The caller [`unpin`]s unless it keeps
-/// the server.
+/// i.e. this Mac is in its roster. The caller holds a [`TrialGuard`].
 async fn try_session(
     core: &Arc<FleetCore>,
     id: &fleet_proto::ServerId,
@@ -91,18 +90,56 @@ async fn try_session(
     }
 }
 
-/// Back to a host-key-only pin and out of the connection manager.
-fn unpin(core: &Arc<FleetCore>, id: &fleet_proto::ServerId, host_key: &fleet_core::ssh::HostKey) {
-    let _ = lock(&core.cache).set_pins(
-        id,
-        &PinnedKeys {
-            host_key: Some(host_key.clone()),
+/// Guards the pins and the connection-manager entry of a server while an
+/// agent's keys are only being tried (adoption, the same-fleet check). On
+/// drop, unless [`TrialGuard::keep`] ran, the pins go back to what they
+/// were (host key only if there were none) and the manager entry is
+/// removed, or re-added when the server was connected with agent keys
+/// before. Covers every error path, including early `?` returns.
+struct TrialGuard {
+    core: Arc<FleetCore>,
+    id: fleet_proto::ServerId,
+    host_key: fleet_core::ssh::HostKey,
+    prev: Option<PinnedKeys>,
+    armed: bool,
+}
+
+impl TrialGuard {
+    fn new(core: &Arc<FleetCore>, id: &fleet_proto::ServerId, host_key: &fleet_core::ssh::HostKey) -> Self {
+        let prev = lock(&core.cache).pins(id).ok().flatten();
+        Self {
+            core: core.clone(),
+            id: id.clone(),
+            host_key: host_key.clone(),
+            prev,
+            armed: true,
+        }
+    }
+
+    /// Verification succeeded: the new pins stay.
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TrialGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let restore = self.prev.clone().unwrap_or(PinnedKeys {
+            host_key: Some(self.host_key.clone()),
             agent_noise: None,
             agent_signing: None,
-        },
-    );
-    if let Ok((handle, _)) = core.running() {
-        handle.remove_server(id);
+        });
+        let had_agent = restore.agent_noise.is_some();
+        let _ = lock(&self.core.cache).set_pins(&self.id, &restore);
+        if had_agent {
+            // Was connected before the trial: put that connection back.
+            let _ = self.core.connect_pinned(&self.id);
+        } else if let Ok((handle, _)) = self.core.running() {
+            handle.remove_server(&self.id);
+        }
     }
 }
 
@@ -307,9 +344,11 @@ impl FleetCore {
                     // Mac is already in its roster (a verified session).
                     let same_fleet = match info.keys {
                         Some(keys) if info.exec_active && info.gate_active => {
-                            let r = try_session(&core, &id, &host_key, keys, CHECK_TIMEOUT).await;
-                            unpin(&core, &id, &host_key);
-                            r.is_ok()
+                            // Pins and manager entry go back however this ends.
+                            let _guard = TrialGuard::new(&core, &id, &host_key);
+                            try_session(&core, &id, &host_key, keys, CHECK_TIMEOUT)
+                                .await
+                                .is_ok()
                         }
                         _ => false,
                     };
@@ -326,6 +365,16 @@ impl FleetCore {
                 Err(e) => return Err(e.into()),
             };
             let adopting = existing == ExistingAgentAction::Adopt;
+            // Adoption pins the agent's keys before they are verified: until
+            // the signed health check succeeds, every exit (an error, a
+            // timeout, a dropped future) puts the old pins and manager
+            // state back.
+            let trial = adopting.then(|| TrialGuard::new(&core, &id, &host_key));
+            // The server keeps its own policy on Adopt and Reinstall.
+            let keeps_policy = matches!(
+                existing,
+                ExistingAgentAction::Adopt | ExistingAgentAction::Reinstall
+            );
 
             listener.on_progress(InstallProgress::step(InstallStep::Pinning));
             {
@@ -339,9 +388,13 @@ impl FleetCore {
                     },
                 )?;
                 // The Mac's copy of what the agent enforces (MCP limits).
-                // An adopted agent runs somebody else's policy: not ours
-                // to claim; the Mac learns it from the agent.
-                if !adopting {
+                // An adopted or reinstalled agent keeps the policy it has,
+                // not the default pushed here: a cached copy stays, and
+                // without one the policy is marked unknown so Mac-side
+                // checks (AI bulk confirm, shell.exec) stay strict.
+                if keeps_policy {
+                    fleet_core::policy::keep_or_mark_unknown(&cache, &id)?;
+                } else {
                     fleet_core::policy::remember_pushed(&cache, &id, &policy_toml)?;
                 }
             }
@@ -365,8 +418,8 @@ impl FleetCore {
             let state = handle.wait_ready(&id, READY_TIMEOUT).await;
             if state != Some(CoreState::Ready) && adopting {
                 // This Mac is not in the agent's roster (or the keys were
-                // stale): leave no pin for an agent we don't control.
-                unpin(&core, &id, &host_key);
+                // stale): the guard leaves no pin for an agent we don't
+                // control.
                 return Err(FleetError::Install {
                     message: "The existing agent did not accept this Mac (it belongs to another \
                               fleet, or this Mac is not in its roster). Choose Replace to install \
@@ -394,7 +447,12 @@ impl FleetCore {
             .await
             .map_err(|_| FleetError::Timeout)??;
             match reply.result {
-                Ok(Payload::AgentHealth(h)) => Ok(h.into()),
+                Ok(Payload::AgentHealth(h)) => {
+                    if let Some(t) = trial {
+                        t.keep();
+                    }
+                    Ok(h.into())
+                }
                 Ok(_) => Err(FleetError::UnexpectedReply),
                 Err(code) => Err(FleetError::Agent {
                     code: format!("{code:?}"),

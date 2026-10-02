@@ -144,6 +144,12 @@ pub enum InstallError {
     /// Adoption needs the agent's key files, which could not be read.
     #[error("the existing agent's keys could not be read; choose Replace or Reinstall")]
     ExistingKeysUnreadable,
+    /// Replace/Reinstall refused: a change is pending on the server.
+    #[error(
+        "a change is pending on this server: confirm or wait for the pending change to revert, \
+         then try again"
+    )]
+    PendingChange,
 }
 
 /// What to do when the server already has a Fleet agent (design §10.1).
@@ -177,6 +183,10 @@ pub struct ExistingAgent {
     /// Public keys from `fleet-agent keys` (key files only; the state
     /// database is locked by a running exec). `None`: not readable.
     pub keys: Option<InstalledAgent>,
+    /// `pending_changes=` from `fleet-agent keys`: unconfirmed changes
+    /// whose rollback snapshots a Replace or Reinstall must not lose.
+    /// `None`: an older agent that doesn't say.
+    pub pending_changes: Option<u32>,
     /// A Fleet sshd drop-in moved `AuthorizedKeysFile` to
     /// `/etc/fleet/authorized_keys` (SSH switchover done).
     pub ssh_switched: bool,
@@ -420,6 +430,13 @@ pub fn parse_keys(stdout: &[u8]) -> Result<(X25519Public, Ed25519Public), Instal
     }
 }
 
+/// `pending_changes=<n>` from `fleet-agent keys`.
+pub fn parse_pending(stdout: &[u8]) -> Option<u32> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("pending_changes=")?.trim().parse().ok())
+}
+
 /// Everything needed for one install.
 pub struct InstallRequest<'a> {
     pub server_id: &'a ServerId,
@@ -626,21 +643,24 @@ async fn detect_existing(
     }
     // Only the key files are read; a running exec keeps its database
     // locked, and an older agent without `keys` simply yields `None`.
-    let keys = match run_sudo(conn, "fleet-agent keys", sudo, user, &[INSTALLED_AGENT, "keys"])
-        .await
-    {
-        Ok(out) => parse_keys(&out.stdout).ok().map(|(n, s)| InstalledAgent {
-            noise_static: n,
-            signing_key: s,
-        }),
-        Err(_) => None,
-    };
+    let (keys, pending_changes) =
+        match run_sudo(conn, "fleet-agent keys", sudo, user, &[INSTALLED_AGENT, "keys"]).await {
+            Ok(out) => (
+                parse_keys(&out.stdout).ok().map(|(n, s)| InstalledAgent {
+                    noise_static: n,
+                    signing_key: s,
+                }),
+                parse_pending(&out.stdout),
+            ),
+            Err(_) => (None, None),
+        };
     Ok(Some(ExistingAgent {
         units_present,
         exec_active,
         gate_active,
         state_present,
         keys,
+        pending_changes,
         ssh_switched,
     }))
 }
@@ -808,7 +828,14 @@ async fn install_agent_inner(
                 ExistingAction::Adopt => {
                     return info.keys.ok_or(InstallError::ExistingKeysUnreadable);
                 }
-                ExistingAction::Replace | ExistingAction::Reinstall => {}
+                ExistingAction::Replace | ExistingAction::Reinstall => {
+                    // A pending change's rollback snapshot must survive:
+                    // refuse before anything is uploaded or stopped (the
+                    // agent checks again under its database lock).
+                    if info.pending_changes.is_some_and(|n| n > 0) {
+                        return Err(InstallError::PendingChange);
+                    }
+                }
             }
         }
         let bundled = if let ArtifactSource::Bundled(dir) = req.artifact {
@@ -932,6 +959,10 @@ async fn install_agent_inner(
             // Stopped only now, after the upload verified, so a failed
             // transfer leaves the running agent alone.
             if existing.as_ref().is_some_and(|e| e.units_present) {
+                // Recovery first: whatever happens to the stop (a partial
+                // stop, a lost connection), a failure ends with both units
+                // started again.
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
                 run_sudo(
                     &conn,
                     "systemctl stop",
@@ -940,7 +971,6 @@ async fn install_agent_inner(
                     &[SYSTEMCTL, "stop", EXEC_UNIT, GATE_UNIT],
                 )
                 .await?;
-                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             let agent = match kind {
                 ArtifactKind::Deb => {
@@ -1278,6 +1308,14 @@ mod tests {
         assert_eq!(e.to_string(), "fleet-agent install failed (exit 1): sudo: nope");
         let e = InstallError::Remote { step: "x", status: None, stderr: String::new() };
         assert_eq!(e.to_string(), "x failed (killed by a signal)");
+    }
+
+    #[test]
+    fn pending_parse() {
+        assert_eq!(parse_pending(b"noise_static=00\npending_changes=2\n"), Some(2));
+        assert_eq!(parse_pending(b"pending_changes=0"), Some(0));
+        assert_eq!(parse_pending(b"noise_static=00\n"), None);
+        assert_eq!(parse_pending(b"pending_changes=x"), None);
     }
 
     #[test]

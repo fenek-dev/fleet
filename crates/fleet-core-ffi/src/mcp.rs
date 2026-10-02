@@ -208,13 +208,25 @@ impl McpBackend for Backend {
 
     fn ai_limits(&self, server: &ServerId) -> Option<AiLimits> {
         let core = self.core().ok()?;
-        let p = fleet_core::policy::pushed(&lock(&core.cache), server)?;
+        let cache = lock(&core.cache);
+        let Some(p) = fleet_core::policy::pushed(&cache, server) else {
+            // An adopted or reinstalled agent's real policy is unknown:
+            // every AI bulk action asks for approval until it is known.
+            return fleet_core::policy::is_unknown(&cache, server).then_some(AiLimits {
+                commands_per_minute: 60,
+                bulk_confirm_above: 0,
+            });
+        };
         Some(AiLimits::from_policy(&p))
     }
 
     fn shell_exec_allowed(&self, server: &ServerId, user: &str) -> Option<bool> {
         let core = self.core().ok()?;
-        let p = fleet_core::policy::pushed(&lock(&core.cache), server)?;
+        let cache = lock(&core.cache);
+        let Some(p) = fleet_core::policy::pushed(&cache, server) else {
+            // Unknown policy: shell.exec stays off Mac-side.
+            return fleet_core::policy::is_unknown(&cache, server).then_some(false);
+        };
         Some(
             p.capabilities.shell_exec
                 && p.capabilities.shell_exec_users.iter().any(|u| u == user),
