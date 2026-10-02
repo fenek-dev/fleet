@@ -83,11 +83,27 @@ enum Keychain {
         #if FLEET_TEST_HOOKS
         if TestHooks.dataDir != nil { return .keychain }
         #endif
-        var q = base("startup-probe")
-        q[kSecReturnData as String] = false
-        let status = SecItemCopyMatching(q as CFDictionary, nil)
-        return choice(status: status)
+        return choice(status: writeProbe())
     }
+
+    /// Whether this build may WRITE to the data-protection Keychain. A read
+    /// can't tell: without the entitlement `SecItemCopyMatching` answers
+    /// `errSecItemNotFound`, and only `SecItemAdd` answers
+    /// `errSecMissingEntitlement`. Adds a throwaway item and removes it;
+    /// the answer can't change during a run, so it is cached.
+    private static let probeStatus: OSStatus = {
+        var q = base("startup-probe")
+        q[kSecValueData as String] = Data([0])
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        let status = SecItemAdd(q as CFDictionary, nil)
+        if status == errSecSuccess || status == errSecDuplicateItem {
+            SecItemDelete(base("startup-probe") as CFDictionary)
+            return errSecSuccess
+        }
+        return status
+    }()
+
+    private static func writeProbe() -> OSStatus { probeStatus }
 
     private static func choice(status: OSStatus) -> KeyStoreChoice {
         let c = KeyStoreChoice.decide(
@@ -137,7 +153,14 @@ enum Keychain {
         // Finish or discard an interrupted wrap-key reseal before any
         // migration or reconcile read of the key files (every build mode).
         try LocalKeyStore.recoverPendingReseal()
-        let (status, data) = copy(account)
+        var (status, data) = copy(account)
+        // No entitlement: reads say "not found", only writes say why. Never
+        // treat that as an empty Keychain (it would try to migrate the file
+        // keys into a Keychain that refuses them).
+        if status == errSecItemNotFound, writeProbe() == errSecMissingEntitlement {
+            status = errSecMissingEntitlement
+            data = nil
+        }
         switch status {
         case errSecSuccess:
             // The Keychain holds keys: remember it (so an ad-hoc build later
@@ -262,7 +285,10 @@ enum Keychain {
             return
         }
         #endif
-        let status = SecItemDelete(base(account) as CFDictionary)
+        var status = SecItemDelete(base(account) as CFDictionary)
+        if status == errSecItemNotFound, writeProbe() == errSecMissingEntitlement {
+            status = errSecMissingEntitlement
+        }
         if status == errSecMissingEntitlement {
             if case .fallback = choice(status: status) {
                 try? LocalKeyStore.delete(account)
