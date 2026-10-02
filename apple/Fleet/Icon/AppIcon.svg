@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- macOS icon grid: 824pt rounded square centred on a 1024 canvas. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c2740"/>
+      <stop offset="1" stop-color="#0b1020"/>
+    </linearGradient>
+    <linearGradient id="unit" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3a5c"/>
+      <stop offset="1" stop-color="#1f2b47"/>
+    </linearGradient>
+    <linearGradient id="unitOn" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0" stop-color="#2563eb" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#2563eb" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+    <clipPath id="clip">
+      <rect x="100" y="100" width="824" height="824" rx="185" ry="185"/>
+    </clipPath>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#bg)" filter="url(#shadow)"/>
+  <g clip-path="url(#clip)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#glow)"/>
+
+    <!-- Three server units; the top one is the selected (accent) one. -->
+    <g>
+      <rect x="252" y="300" width="520" height="116" rx="30" fill="url(#unitOn)"/>
+      <circle cx="312" cy="358" r="17" fill="#ffffff"/>
+      <rect x="356" y="346" width="210" height="24" rx="12" fill="#ffffff" fill-opacity="0.9"/>
+      <rect x="664" y="346" width="64" height="24" rx="12" fill="#ffffff" fill-opacity="0.45"/>
+    </g>
+    <g>
+      <rect x="252" y="454" width="520" height="116" rx="30" fill="url(#unit)"/>
+      <circle cx="312" cy="512" r="17" fill="#34d399"/>
+      <rect x="356" y="500" width="250" height="24" rx="12" fill="#8fa3c8" fill-opacity="0.75"/>
+      <rect x="664" y="500" width="64" height="24" rx="12" fill="#8fa3c8" fill-opacity="0.35"/>
+    </g>
+    <g>
+      <rect x="252" y="608" width="520" height="116" rx="30" fill="url(#unit)"/>
+      <circle cx="312" cy="666" r="17" fill="#34d399"/>
+      <rect x="356" y="654" width="170" height="24" rx="12" fill="#8fa3c8" fill-opacity="0.75"/>
+      <rect x="664" y="654" width="64" height="24" rx="12" fill="#8fa3c8" fill-opacity="0.35"/>
+    </g>
+
+    <!-- Top highlight edge. -->
+    <rect x="101.5" y="101.5" width="821" height="821" rx="183.5" ry="183.5" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  </g>
+</svg>
