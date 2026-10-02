@@ -139,6 +139,37 @@ pub enum InstallError {
     Rng,
 }
 
+impl InstallError {
+    /// Every server-provided text in the error (stderr, SFTP status
+    /// messages, protocol errors) with `secret` scrubbed, for use while the
+    /// password is still in scope, before the error leaves fleet-core.
+    pub fn scrubbed(self, secret: &SecretString) -> Self {
+        let s = |m: String| secret.scrub(&m);
+        match self {
+            Self::Remote { step, status, stderr } => Self::Remote {
+                step,
+                status,
+                stderr: s(stderr),
+            },
+            Self::Sftp(SftpError::Failed(m)) => Self::Sftp(SftpError::Failed(s(m))),
+            Self::Sftp(SftpError::Local(m)) => Self::Sftp(SftpError::Local(s(m))),
+            Self::Ssh(SshError::Sftp(m)) => Self::Ssh(SshError::Sftp(s(m))),
+            Self::Ssh(SshError::BadKey(m)) => Self::Ssh(SshError::BadKey(s(m))),
+            Self::Ssh(SshError::Ssh(e)) => {
+                let text = e.to_string();
+                if text.contains(secret.expose()) {
+                    Self::Ssh(SshError::Sftp(s(text)))
+                } else {
+                    Self::Ssh(SshError::Ssh(e))
+                }
+            }
+            Self::Artifact(m) => Self::Artifact(s(m)),
+            Self::Unsupported(m) => Self::Unsupported(s(m)),
+            other => other,
+        }
+    }
+}
+
 /// Where the agent artifact comes from.
 #[derive(Debug, Clone, Copy)]
 pub enum ArtifactSource<'a> {
@@ -376,11 +407,13 @@ enum SudoMode<'a> {
     Password(&'a SecretString),
 }
 
-/// Fixed sudo prefix for password mode (a constant: the empty quoted
-/// prompt is why this one string is not built by [`command_line`]).
-/// `-k` ignores cached credentials so sudo always consumes the password
-/// line and nothing stays readable on stdin for the command it runs.
-const SUDO_STDIN_PREFIX: &str = "/usr/bin/sudo -S -k -p ''";
+/// sudo's prompt in password mode: a fixed unique token. The password line
+/// is written only after this text appears on stderr (sudo asked), never
+/// speculatively, so a command sudo runs without asking (NOPASSWD) can't
+/// receive it on stdin. `-k` ignores cached credentials so a prompt is
+/// always the first thing sudo does.
+const SUDO_PROMPT: &str = "fleet-sudo-prompt-7c1e9a42";
+const SUDO_PASSWORD_PREFIX: &[&str] = &[SUDO, "-S", "-k", "-p", SUDO_PROMPT];
 const TRUE: &str = "/usr/bin/true";
 
 /// Why sudo failed, from its stderr (untrusted text, matched by phrase).
@@ -424,8 +457,8 @@ fn sudo_error(failure: SudoFailure, user: &str, had_password: bool) -> Option<In
 }
 
 /// Runs `tokens` with privileges per `mode`. With a password, the command
-/// is [`SUDO_STDIN_PREFIX`] + the validated tokens and the password line
-/// goes to the channel's stdin.
+/// is [`SUDO_PASSWORD_PREFIX`] + the validated tokens and the password line
+/// goes to the channel's stdin once sudo prompts for it.
 async fn run_sudo(
     conn: &SshConnection,
     step: &'static str,
@@ -441,10 +474,18 @@ async fn run_sudo(
             run(conn, step, &t).await
         }
         SudoMode::Password(secret) => {
-            let cmd = format!("{SUDO_STDIN_PREFIX} {}", command_line(tokens)?);
+            let mut t = SUDO_PASSWORD_PREFIX.to_vec();
+            t.extend_from_slice(tokens);
+            let cmd = command_line(&t)?;
+            // Sent only once sudo has printed SUDO_PROMPT on stderr.
             let stdin = secret.sudo_stdin();
             let out = conn
-                .exec_capture_stdin(&cmd, Some(&stdin[..]), MAX_OUTPUT, STEP_TIMEOUT)
+                .exec_capture_prompted(
+                    &cmd,
+                    Some((SUDO_PROMPT, &stdin[..])),
+                    MAX_OUTPUT,
+                    STEP_TIMEOUT,
+                )
                 .await?;
             if out.status == Some(0) {
                 return Ok(out);
@@ -453,11 +494,13 @@ async fn run_sudo(
             if let Some(e) = sudo_error(classify_sudo(&stderr), user, true) {
                 return Err(e);
             }
-            let mut e = remote_failure(step, &out);
-            if let InstallError::Remote { stderr, .. } = &mut e {
-                *stderr = secret.scrub(stderr);
-            }
-            Err(e)
+            // Scrub the whole capture first, then trim and truncate.
+            let text = secret.scrub_capture(&out.stderr, out.stderr_truncated);
+            Err(InstallError::Remote {
+                step,
+                status: out.status,
+                stderr: truncate_chars(text.trim().to_string(), MAX_STDERR),
+            })
         }
     }
 }
@@ -604,8 +647,21 @@ async fn read_checked(path: &Path) -> Result<Vec<u8>, InstallError> {
     Ok(artifact)
 }
 
-/// Runs the install; see the module docs.
+/// Runs the install; see the module docs. Server text in errors is
+/// scrubbed of the one-time password before it leaves.
 pub async fn install_agent(
+    req: InstallRequest<'_>,
+    ssh_key: &dyn SshSigner,
+    progress: &mut (dyn FnMut(InstallStage) + Send),
+) -> Result<InstalledAgent, InstallError> {
+    let secret = req.sudo_password;
+    match (install_agent_inner(req, ssh_key, progress).await, secret) {
+        (Err(e), Some(p)) => Err(e.scrubbed(p)),
+        (r, _) => r,
+    }
+}
+
+async fn install_agent_inner(
     req: InstallRequest<'_>,
     ssh_key: &dyn SshSigner,
     progress: &mut (dyn FnMut(InstallStage) + Send),
@@ -924,11 +980,33 @@ mod tests {
 
     #[test]
     fn sudo_prefix_is_fixed_and_password_never_in_tokens() {
-        // The one literal with quotes; every other token stays validated.
-        assert_eq!(SUDO_STDIN_PREFIX, "/usr/bin/sudo -S -k -p ''");
+        // Every token, the prompt marker included, passes the validator.
+        assert_eq!(
+            command_line(SUDO_PASSWORD_PREFIX).unwrap(),
+            "/usr/bin/sudo -S -k -p fleet-sudo-prompt-7c1e9a42"
+        );
         assert!(is_token(TRUE) && TRUE.starts_with("/usr/bin/"));
         // A password-looking value can't become a token.
         assert!(command_line(&[DPKG, "-i", "p@ss word'"]).is_err());
+    }
+
+    #[test]
+    fn server_text_in_errors_is_scrubbed() {
+        let secret = SecretString::from_string("s3cr3t-pw".into()).unwrap();
+        let e = InstallError::Remote {
+            step: "x",
+            status: Some(1),
+            stderr: "boom s3cr3t-pw".into(),
+        }
+        .scrubbed(&secret);
+        assert!(!e.to_string().contains("s3cr3t"));
+        for e in [
+            InstallError::Sftp(SftpError::Failed("status: s3cr3t-pw".into())),
+            InstallError::Ssh(SshError::Sftp("s3cr3t-pw".into())),
+            InstallError::Artifact("s3cr3t-pw".into()),
+        ] {
+            assert!(!e.scrubbed(&secret).to_string().contains("s3cr3t"));
+        }
     }
 
     #[test]

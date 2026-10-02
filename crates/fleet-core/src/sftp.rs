@@ -314,7 +314,18 @@ impl Sftp {
     /// (and at worst a `.fleet-*.tmp`). The caller has checked what is at
     /// `path` (a rename replaces a symlink, never follows it). Without
     /// `posix-rename@openssh.com` only a missing target can be written.
-    pub async fn write_atomic(&self, path: &str, data: &[u8], mode: u32) -> Result<(), SftpError> {
+    ///
+    /// With `expect_uid`, the freshly created temp file is checked through
+    /// its open handle (fstat: a regular file owned by that uid) before
+    /// anything is written, so a directory swapped under the path can't
+    /// make the write land in someone else's file.
+    pub async fn write_atomic(
+        &self,
+        path: &str,
+        data: &[u8],
+        mode: u32,
+        expect_uid: Option<u32>,
+    ) -> Result<(), SftpError> {
         let path = remote_path(path)?;
         let (dir, name) = split_parent(&path)?;
         let mut suffix = [0u8; 8];
@@ -331,6 +342,14 @@ impl Sftp {
             )
             .await?;
         let result = async {
+            if let Some(uid) = expect_uid {
+                let m = f.metadata().await?;
+                if m.file_type() != FileType::File || m.uid != Some(uid) {
+                    return Err(SftpError::Failed(
+                        "the new temp file is not a regular file of the login user".into(),
+                    ));
+                }
+            }
             f.write_all(data)
                 .await
                 .map_err(|e| SftpError::Failed(e.to_string()))?;

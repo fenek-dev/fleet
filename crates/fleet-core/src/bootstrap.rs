@@ -91,6 +91,22 @@ fn check_entry(entry: &RemoteEntry, want: EntryKind, uid: u32, what: &str) -> Re
     }
 }
 
+/// lstat of `path`: a real directory owned by `uid` that group and others
+/// can't write (sshd's StrictModes wants that too, and a writable parent
+/// lets another user swap what we operate on).
+async fn verify_dir(sftp: &Sftp, path: &str, uid: u32, what: &str) -> Result<(), InstallError> {
+    let e = sftp.stat(path).await?;
+    check_entry(&e, EntryKind::Dir, uid, what)?;
+    if e.mode & 0o022 != 0 {
+        return Err(unsafe_path(format!(
+            "{what} is writable by group or others (mode {:o}); another user could swap files \
+             under it. Fix it on the server (chmod go-w) or add the key manually",
+            e.mode
+        )));
+    }
+    Ok(())
+}
+
 /// Adds `key_line` to the login user's `authorized_keys` over `sftp`.
 /// `uid`: the login user's uid.
 pub async fn install_key_over_sftp(
@@ -98,23 +114,26 @@ pub async fn install_key_over_sftp(
     uid: u32,
     key_line: &str,
 ) -> Result<BootstrapOutcome, InstallError> {
+    // SFTP has no `openat`, so paths are resolved by the server on every
+    // call. To keep the race window small, each directory on the path is
+    // lstat-checked (a real directory, ours, not group/world-writable)
+    // right before every operation that follows it, and the temp file is
+    // checked through its open handle before anything is written.
     let home = sftp.home().await?;
     let ssh_dir = join(&home, ".ssh")?;
+    verify_dir(sftp, &home, uid, "the home directory").await?;
     match sftp.stat(&ssh_dir).await {
         Err(SftpError::NotFound) => {
+            verify_dir(sftp, &home, uid, "the home directory").await?;
             sftp.mkdir(&ssh_dir).await?;
             sftp.chmod(&ssh_dir, 0o700).await?;
         }
         Err(e) => return Err(e.into()),
-        Ok(e) => {
-            check_entry(&e, EntryKind::Dir, uid, "~/.ssh")?;
-            // sshd (StrictModes) ignores keys in a group/world-writable dir.
-            if e.mode & 0o077 != 0 {
-                sftp.chmod(&ssh_dir, 0o700).await?;
-            }
-        }
+        Ok(_) => {}
     }
+    verify_dir(sftp, &ssh_dir, uid, "~/.ssh").await?;
     let file = join(&ssh_dir, "authorized_keys")?;
+    verify_dir(sftp, &home, uid, "the home directory").await?;
     let existing = match sftp.stat(&file).await {
         Err(SftpError::NotFound) => String::new(),
         Err(e) => return Err(e.into()),
@@ -128,8 +147,19 @@ pub async fn install_key_over_sftp(
     let Some(new) = plan_authorized_keys(&existing, key_line) else {
         return Ok(BootstrapOutcome::AlreadyPresent);
     };
-    sftp.write_atomic(&file, new.as_bytes(), 0o600).await?;
-    // Read back what the server now has.
+    verify_dir(sftp, &home, uid, "the home directory").await?;
+    verify_dir(sftp, &ssh_dir, uid, "~/.ssh").await?;
+    sftp.write_atomic(&file, new.as_bytes(), 0o600, Some(uid)).await?;
+    // Re-verify the chain and the result, then read back what the server
+    // now has.
+    verify_dir(sftp, &home, uid, "the home directory").await?;
+    verify_dir(sftp, &ssh_dir, uid, "~/.ssh").await?;
+    check_entry(
+        &sftp.stat(&file).await?,
+        EntryKind::File,
+        uid,
+        "~/.ssh/authorized_keys",
+    )?;
     let after = sftp.read_file(&file, MAX_AUTHORIZED_KEYS).await?;
     let mut parts = key_line.split_whitespace();
     let (alg, b64) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
@@ -141,7 +171,21 @@ pub async fn install_key_over_sftp(
 
 /// Runs the whole bootstrap (see the module docs). `host_key` must be the
 /// pinned key; `password` is sent only after it matched.
+/// Server-provided text in errors (SFTP status messages, protocol errors)
+/// is scrubbed of the password before it leaves.
 pub async fn bootstrap_key(
+    target: &SshTarget,
+    host_key: HostKey,
+    password: &SecretString,
+    ssh_key: &dyn SshSigner,
+    progress: &mut (dyn FnMut(InstallStage) + Send),
+) -> Result<BootstrapOutcome, InstallError> {
+    bootstrap_key_inner(target, host_key, password, ssh_key, progress)
+        .await
+        .map_err(|e| e.scrubbed(password))
+}
+
+async fn bootstrap_key_inner(
     target: &SshTarget,
     host_key: HostKey,
     password: &SecretString,

@@ -61,6 +61,23 @@ impl SecretString {
         v
     }
 
+    /// Server output `raw` made displayable: the password scrubbed on the
+    /// **whole** buffer (before any trimming or truncation). If the capture
+    /// was cut (`truncated`) and its end could be the start of the
+    /// password (a prefix of 4+ bytes), the text is withheld entirely: the
+    /// rest of the password was dropped and can't be scrubbed. Exact bytes
+    /// only; other encodings of the password are not recognised.
+    pub fn scrub_capture(&self, raw: &[u8], truncated: bool) -> String {
+        let pw = self.0.as_bytes();
+        if truncated {
+            let max = pw.len().saturating_sub(1).min(raw.len());
+            if (4..=max).any(|n| raw.ends_with(&pw[..n])) {
+                return "<server output withheld>".into();
+            }
+        }
+        self.scrub(&String::from_utf8_lossy(raw))
+    }
+
     /// `text` with every occurrence of the password replaced, for any
     /// server text that is about to be shown (defense in depth).
     pub fn scrub(&self, text: &str) -> String {
@@ -115,6 +132,18 @@ mod tests {
         );
         // Spaces and symbols are fine.
         assert!(SecretString::from_string("p@ss w0rd'\"$".into()).is_ok());
+    }
+
+    #[test]
+    fn capture_scrub_handles_cut_passwords() {
+        let s = SecretString::from_string("abcdefgh".into()).unwrap();
+        assert_eq!(s.scrub_capture(b"x abcdefgh y", false), "x <redacted> y");
+        // Cut mid-password: withheld; cut elsewhere: shown.
+        assert_eq!(s.scrub_capture(b"err abcde", true), "<server output withheld>");
+        assert_eq!(s.scrub_capture(b"err abc", true), "err abc");
+        assert_eq!(s.scrub_capture(b"err ok", true), "err ok");
+        // Not truncated: a trailing prefix is just text.
+        assert_eq!(s.scrub_capture(b"err abcde", false), "err abcde");
     }
 
     #[test]

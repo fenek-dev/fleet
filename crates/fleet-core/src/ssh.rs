@@ -868,44 +868,77 @@ impl SshConnection {
         max_output: usize,
         limit: Duration,
     ) -> Result<ExecOutput, SshError> {
-        self.exec_capture_stdin(command, None, max_output, limit)
+        self.exec_capture_prompted(command, None, max_output, limit)
             .await
     }
 
-    /// Like [`Self::exec_capture`], writing `stdin` to the command first and
-    /// then closing its stdin (EOF). For `sudo -S`: the secret travels on the
-    /// channel, never on the command line. The caller keeps `stdin` in a
-    /// zeroizing buffer.
-    pub async fn exec_capture_stdin(
+    /// Like [`Self::exec_capture`] for `sudo -S -p <marker>`: `answer`
+    /// (the password line) is written **only after** `marker` shows up on
+    /// stderr, i.e. after sudo itself asked for it, and stdin is closed right
+    /// after. If the command finishes, or writes to stdout, without the
+    /// marker (sudo needed no password), nothing is ever sent, so the
+    /// secret can't reach the command sudo runs. The marker is removed from
+    /// the returned stderr. Bounded by `limit` like any exec. The caller
+    /// keeps `answer` in a zeroizing buffer.
+    pub async fn exec_capture_prompted(
         &self,
         command: &str,
-        stdin: Option<&[u8]>,
+        prompt: Option<(&str, &[u8])>,
         max_output: usize,
         limit: Duration,
     ) -> Result<ExecOutput, SshError> {
         let mut ch = self.open_session().await?;
         ch.exec(true, command).await?;
-        if let Some(data) = stdin {
-            // The command may already have exited (and closed the channel)
-            // without reading; its status still tells the story.
-            let _ = ch.data(data).await;
-            let _ = ch.eof().await;
-        }
         let run = async {
             let mut out = ExecOutput::default();
             let mut replied = false;
+            // Rolling window so a marker split across packets is found even
+            // once the capture cap is reached.
+            let mut window: Vec<u8> = Vec::new();
+            let mut done = prompt.is_none();
             loop {
                 match ch.wait().await {
                     Some(ChannelMsg::Success) => replied = true,
                     Some(ChannelMsg::Failure) if !replied => return Err(SshError::ChannelRejected),
                     Some(ChannelMsg::Data { data }) => {
+                        if !done {
+                            // The command is already running: sudo needed no
+                            // password. Send nothing; just close stdin.
+                            done = true;
+                            let _ = ch.eof().await;
+                        }
                         cap_extend(&mut out.stdout, &data, max_output)
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        cap_extend(&mut out.stderr, &data, max_output)
+                        if !done && let Some((marker, answer)) = prompt {
+                            window.extend_from_slice(&data);
+                            if window
+                                .windows(marker.len())
+                                .any(|w| w == marker.as_bytes())
+                            {
+                                done = true;
+                                // The command may have exited already; its
+                                // status still tells the story.
+                                let _ = ch.data(answer).await;
+                                let _ = ch.eof().await;
+                            } else {
+                                let keep = marker.len().saturating_sub(1);
+                                let drop = window.len().saturating_sub(keep);
+                                window.drain(..drop);
+                            }
+                        }
+                        cap_extend(&mut out.stderr, &data, max_output);
+                        if out.stderr.len() >= max_output {
+                            out.stderr_truncated = true;
+                        }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => out.status = Some(exit_status),
-                    Some(ChannelMsg::Close) | None => return Ok(out),
+                    Some(ChannelMsg::Close) | None => {
+                        if let Some((marker, _)) = prompt {
+                            out.stderr = remove_all(&out.stderr, marker.as_bytes());
+                        }
+                        return Ok(out);
+                    }
                     Some(_) => {}
                 }
             }
@@ -940,6 +973,26 @@ pub struct ExecOutput {
     pub stderr: Vec<u8>,
     /// `None` when the server sent no exit status (killed by a signal).
     pub status: Option<u32>,
+    /// stderr hit the capture cap: bytes were dropped after it.
+    pub stderr_truncated: bool,
+}
+
+/// `hay` without any occurrence of `needle`.
+fn remove_all(hay: &[u8], needle: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len());
+    let mut i = 0;
+    while i < hay.len() {
+        if hay[i..].starts_with(needle) {
+            i += needle.len();
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn cap_extend(buf: &mut Vec<u8>, data: &[u8], max: usize) {

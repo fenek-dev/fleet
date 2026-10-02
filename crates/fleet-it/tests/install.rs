@@ -542,6 +542,53 @@ fn password_bootstrap_then_sudo_install() {
 
         // Install: key via the password, sudo via the password.
         assert_eq!(boot(ADMIN_PASSWORD).await.unwrap(), BootstrapOutcome::Added);
+
+        // The password goes to sudo only after sudo prompts. A NOPASSWD
+        // command never prompts, so it must never see the password on its
+        // stdin; a command that needs the password still gets it.
+        c.exec(&[
+            "sh",
+            "-c",
+            "printf '#!/bin/sh\\ntimeout 3 cat >/tmp/stdin-dump\\necho ran\\n' \
+             >/usr/local/bin/fleet-dump-stdin && chmod 0755 /usr/local/bin/fleet-dump-stdin \
+             && echo 'ops ALL=(ALL) NOPASSWD: /usr/local/bin/fleet-dump-stdin' \
+             >/etc/sudoers.d/fleet-dump && chmod 0440 /etc/sudoers.d/fleet-dump",
+        ])
+        .unwrap();
+        {
+            const MARK: &str = "fleet-sudo-prompt-test";
+            let line = format!("{ADMIN_PASSWORD}\n");
+            let (kconn, _) = SshConnection::connect(&target, &ssh, Some(host_key.clone()))
+                .await
+                .expect("key login");
+            let out = kconn
+                .exec_capture_prompted(
+                    &format!("/usr/bin/sudo -S -k -p {MARK} /usr/local/bin/fleet-dump-stdin"),
+                    Some((MARK, line.as_bytes())),
+                    4096,
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap();
+            assert_eq!(out.status, Some(0), "{:?}", String::from_utf8_lossy(&out.stderr));
+            assert!(String::from_utf8_lossy(&out.stdout).contains("ran"));
+            let dump = c.exec(&["cat", "/tmp/stdin-dump"]).unwrap();
+            assert!(dump.is_empty(), "password reached the NOPASSWD command: {dump:?}");
+            let out = kconn
+                .exec_capture_prompted(
+                    &format!("/usr/bin/sudo -S -k -p {MARK} /usr/bin/id -u"),
+                    Some((MARK, line.as_bytes())),
+                    4096,
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
+            assert!(!String::from_utf8_lossy(&out.stderr).contains(MARK));
+            kconn.disconnect().await;
+            c.exec(&["rm", "-f", "/etc/sudoers.d/fleet-dump"]).unwrap();
+        }
+        log("password sent only after sudo prompted");
         async fn install_once(
             req: InstallRequest<'_>,
             ssh: &dyn fleet_core::ssh::SshSigner,
