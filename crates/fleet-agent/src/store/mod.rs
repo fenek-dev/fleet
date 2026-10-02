@@ -59,6 +59,13 @@ pub enum StoreError {
     NotOpenIntent(u64),
 }
 
+impl StoreError {
+    /// Another process (a running `fleet-exec`) holds the database lock.
+    pub fn is_locked(&self) -> bool {
+        matches!(self, Self::Db(redb::Error::DatabaseAlreadyOpen))
+    }
+}
+
 macro_rules! from_redb {
     ($($t:ty),*) => {$(
         impl From<$t> for StoreError {

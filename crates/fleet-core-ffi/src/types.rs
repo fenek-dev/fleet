@@ -21,6 +21,33 @@ pub enum SecurityModeArg {
     AgentOnly,
 }
 
+/// What `install_agent` does when the server already has a Fleet agent
+/// (design §10.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ExistingAgentAction {
+    /// Change nothing; answer `FleetError::ExistingAgent`.
+    Ask,
+    /// Same fleet: pin the running agent's keys and verify a signed
+    /// `agent.health`; no upload, no restart.
+    Adopt,
+    /// Other fleet: stop it, archive its state, install with this
+    /// fleet's genesis.
+    Replace,
+    /// Same fleet, repair or upgrade: state, policy and keys are kept.
+    Reinstall,
+}
+
+impl From<ExistingAgentAction> for fleet_core::install::ExistingAction {
+    fn from(v: ExistingAgentAction) -> Self {
+        match v {
+            ExistingAgentAction::Ask => Self::Ask,
+            ExistingAgentAction::Adopt => Self::Adopt,
+            ExistingAgentAction::Replace => Self::Replace,
+            ExistingAgentAction::Reinstall => Self::Reinstall,
+        }
+    }
+}
+
 impl From<SecurityModeArg> for SecurityMode {
     fn from(v: SecurityModeArg) -> Self {
         match v {
@@ -274,6 +301,23 @@ pub enum FleetError {
     /// A remote install step failed; `message` holds untrusted server text.
     #[error("install: {message}")]
     Install { message: String },
+    /// The server already has a Fleet agent; nothing was changed. The app
+    /// asks the operator (adopt / replace / reinstall) and calls
+    /// `install_agent` again with the choice (design §10.1).
+    #[error("this server already has a Fleet agent")]
+    ExistingAgent {
+        units_present: bool,
+        exec_active: bool,
+        gate_active: bool,
+        state_present: bool,
+        /// The agent's public keys could be read (adopt is possible).
+        keys_known: bool,
+        /// A verified session with the agent's keys opened: this Mac is in
+        /// its roster (same fleet).
+        same_fleet: bool,
+        /// A Fleet sshd drop-in moved `AuthorizedKeysFile`.
+        ssh_switched: bool,
+    },
     #[error("no such file")]
     FileNotFound,
     #[error("permission denied")]

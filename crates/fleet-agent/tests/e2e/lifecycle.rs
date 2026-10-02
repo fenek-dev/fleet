@@ -353,3 +353,67 @@ fn uninstall_prepare_confirm_then_schedule() {
         assert!(has(&e.cmds, SYSTEMD_RUN, "--keep-audit"));
     });
 }
+
+fn input_for(fx: &Fixture) -> InstallInput {
+    InstallInput {
+        genesis: fx.genesis.clone(),
+        policy_toml: policy_toml(fx.fleet, 1, Pol::default()),
+        server_id: fx.server.clone(),
+        admin_user: Some("admin".into()),
+    }
+}
+
+fn exists(p: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
+}
+
+/// `install` over a running agent fails with a clear message and writes
+/// nothing; `keys` reads only the key files.
+#[test]
+fn install_over_running_agent_refuses_cleanly() {
+    use fleet_agent::install::{InstallError, InstallMode};
+    let fx = Fixture::new(1, 0);
+    for mode in [InstallMode::Fresh, InstallMode::KeepState, InstallMode::Replace] {
+        let e = install::install_with(&fx.paths, &input_for(&fx), mode).unwrap_err();
+        assert!(matches!(e, InstallError::AgentRunning), "{mode:?}: {e}");
+        assert!(e.to_string().contains("stop fleet-exec.service"));
+    }
+    assert!(!exists(&fx.paths.root.join("var/lib/fleet-audit")));
+    assert!(exists(&fx.paths.state_db));
+    assert_eq!(install::read_public_keys(&fx.paths).unwrap(), fx.keys);
+}
+
+/// Stopped agent: `--keep-state` keeps roster and keys, `--replace`
+/// archives the database (never deletes it), clears pending work, keeps
+/// the keys and stores the new genesis.
+#[test]
+fn install_keep_state_and_replace_when_stopped() {
+    use fleet_agent::install::{InstallError, InstallMode};
+    let mut fx = Fixture::new(1, 0);
+    fx.exec = None;
+    let input = input_for(&fx);
+    assert!(matches!(
+        install::install_with(&fx.paths, &input, InstallMode::Fresh),
+        Err(InstallError::AlreadyInstalled)
+    ));
+    let kept = install::install_with(&fx.paths, &input, InstallMode::KeepState).unwrap();
+    assert_eq!(kept, fx.keys);
+
+    std::fs::write(fx.paths.pending_dir.join("x.bin"), b"old").unwrap();
+    let replaced = install::install_with(&fx.paths, &input, InstallMode::Replace).unwrap();
+    assert_eq!(replaced, fx.keys, "keys are kept");
+    assert!(!exists(&fx.paths.pending_dir.join("x.bin")));
+    let archive = fx.paths.root.join("var/lib/fleet-audit");
+    let dirs: Vec<_> = std::fs::read_dir(&archive).unwrap().flatten().collect();
+    assert_eq!(dirs.len(), 1);
+    assert!(exists(&dirs[0].path().join("state.redb")));
+    // The fresh database holds the new roster again.
+    let store = fleet_agent::store::schema::open_versioned(&fx.paths.state_db).unwrap();
+    assert!(
+        store
+            .meta()
+            .get(fleet_agent::store::MetaKey::Roster)
+            .unwrap()
+            .is_some()
+    );
+}

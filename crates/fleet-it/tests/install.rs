@@ -146,6 +146,7 @@ fn app_install_on_fresh_server() {
                     genesis: &genesis,
                     policy_toml: &policy,
                     sudo_password: None,
+                    existing: install::ExistingAction::Ask,
                 },
                 &ssh,
                 &mut progress,
@@ -340,6 +341,240 @@ fn app_install_on_fresh_server() {
         conn.disconnect().await;
     });
     log("fresh ssh + noise session + signed agent.health ok");
+}
+
+fn genesis_for(fleet: FleetId, macs: &[(&Mac, &str)]) -> fleet_proto::SignedRoster {
+    let recovery = Ed25519Signer::generate().unwrap();
+    let recovery_ssh = Ed25519Signer::generate().unwrap();
+    let escrow = fleet_crypto::noise::StaticKeypair::generate().unwrap();
+    sign_root(
+        Roster {
+            fleet_id: fleet,
+            epoch: 0,
+            version: 1,
+            prev_hash: [0; 32],
+            issued_at_ms: fleet_core::now_ms(),
+            devices: macs.iter().map(|(m, n)| m.entry_with_monitor_ssh(n)).collect(),
+            recovery_key: recovery.public(),
+            recovery_ssh_key: recovery_ssh.public(),
+            recovery_escrow_key: escrow.public(),
+            recovery_delay_s: 0,
+            prev_recovery: None,
+        },
+        macs[0].0.id,
+        &macs[0].0.keys.root,
+    )
+    .unwrap()
+}
+
+/// A signed `agent.health` over a fresh SSH connection, Noise session and
+/// the given pinned keys; `Err` when the agent refuses this Mac.
+async fn health_of(
+    target: &SshTarget,
+    host_key: &HostKey,
+    mac: &Mac,
+    fleet: FleetId,
+    server: &ServerId,
+    keys: install::InstalledAgent,
+    attempts: u32,
+) -> Result<(), String> {
+    let ssh = P256SshSigner(RoleSigner::new(&mac.keys, KeyRole::Ssh).unwrap());
+    let (conn, _) = SshConnection::connect(target, &ssh, Some(host_key.clone()))
+        .await
+        .map_err(|e| format!("ssh: {e}"))?;
+    let mut last = String::new();
+    for _ in 0..attempts {
+        let stream = conn.open_agent_channel(false).await.map_err(|e| e.to_string())?;
+        let cfg = SessionConfig {
+            mode: SessionMode::Normal,
+            noise: &mac.noise,
+            pinned_agent_noise: keys.noise_static,
+            pinned_agent_signing: keys.signing_key,
+            fleet_id: fleet,
+            server_id: server.clone(),
+            device_id: mac.id,
+            key: KeyKind::Device,
+            signer: CommandSigner::P256(&mac.keys.device),
+        };
+        match tokio::time::timeout(Duration::from_secs(30), Session::connect_bridged(stream, cfg))
+            .await
+        {
+            Ok(Ok(mut s)) => {
+                let r = s
+                    .request(Op::AgentHealth, server, Actor::Human, None)
+                    .await
+                    .map_err(|e| e.to_string());
+                conn.disconnect().await;
+                return match r.map(|r| r.result) {
+                    Ok(Ok(Payload::AgentHealth(_))) => Ok(()),
+                    other => Err(format!("{other:?}")),
+                };
+            }
+            Ok(Err(e)) => last = e.to_string(),
+            Err(_) => last = "session timed out".into(),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    conn.disconnect().await;
+    Err(last)
+}
+
+/// An agent that is already installed (design §10.1): the install changes
+/// nothing until the operator chooses.
+///
+/// - `Ask` (the old behavior failed with a raw redb lock error): reports
+///   the running agent and its keys, changes nothing.
+/// - Adopt (same fleet, this Mac in the roster): keys read from the key
+///   files, no restart, signed health works.
+/// - Reinstall: units restarted, state and keys kept, same roster.
+/// - Replace (another fleet): units stopped, old database archived, keys
+///   kept, the new fleet's Mac connects and the old fleet's Mac is refused.
+#[test]
+#[ignore = "needs Docker and a .deb; see the module docs"]
+fn existing_agent_adopt_reinstall_replace() {
+    let image = std::env::var("FLEET_IT_IMAGE").unwrap_or_else(|_| "fleet-it:debian12".into());
+    let c = Container::start(&image).expect("container");
+    let mac_a = Mac::generate().unwrap();
+    let mac_b = Mac::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let ak = dir.path().join("authorized_keys");
+    std::fs::write(
+        &ak,
+        format!("{} a\n{} b\n", mac_a.ssh_public().unwrap(), mac_b.ssh_public().unwrap()),
+    )
+    .unwrap();
+    c.cp_into(&ak, "/root/ak").unwrap();
+    c.exec(&["sh", "-c", "install -m 0600 -o ops -g ops /root/ak /home/ops/.ssh/authorized_keys"])
+        .unwrap();
+    c.exec(&[
+        "sh",
+        "-c",
+        "echo 'ops ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/fleet-pool && chmod 0440 /etc/sudoers.d/fleet-pool",
+    ])
+    .unwrap();
+    let target = SshTarget::new("127.0.0.1", c.ssh_port, ADMIN);
+    let rt = fleet_it::runtime();
+    // The key sshd actually presents (it offers several types).
+    let host_key = rt.block_on(async {
+        let ssh = P256SshSigner(RoleSigner::new(&mac_a.keys, KeyRole::Ssh).unwrap());
+        for _ in 0..20 {
+            if let Ok(o) = install::probe(&target, &ssh).await {
+                return o.key;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        panic!("probe");
+    });
+    let fleet_a = FleetId([0xa1; 16]);
+    let fleet_b = FleetId([0xb2; 16]);
+    let genesis_a = genesis_for(fleet_a, &[(&mac_a, "Mac A")]);
+    let genesis_b = genesis_for(fleet_b, &[(&mac_b, "Mac B")]);
+    let server = ServerId::new("srv_itest03").unwrap();
+    let pol = |f| policy_toml(f, 1).replace("srv_itest01", "srv_itest03");
+    let (pol_a, pol_b) = (pol(fleet_a), pol(fleet_b));
+    let art = artifact();
+    assert!(
+        install::ArtifactKind::of(&art) == install::ArtifactKind::Deb,
+        "set FLEET_IT_INSTALL_ARTIFACT to a .deb"
+    );
+    let pid = || {
+        c.exec(&["systemctl", "show", "-p", "MainPID", "--value", "fleet-exec"])
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+
+    let run = |mac: &Mac,
+               genesis: &fleet_proto::SignedRoster,
+               policy: &str,
+               existing: install::ExistingAction| {
+        rt.block_on(async {
+            let ssh = P256SshSigner(RoleSigner::new(&mac.keys, KeyRole::Ssh).unwrap());
+            let mut progress = |_: InstallStage| {};
+            // The sshd inside the container may need a moment.
+            let mut last = None;
+            for _ in 0..20 {
+                let r = install::install_agent(
+                    InstallRequest {
+                        server_id: &server,
+                        target: &target,
+                        host_key: host_key.clone(),
+                        admin_user: ADMIN,
+                        artifact: install::ArtifactSource::File(&art),
+                        bundled_pins: &Default::default(),
+                        genesis,
+                        policy_toml: policy,
+                        sudo_password: None,
+                        existing,
+                    },
+                    &ssh,
+                    &mut progress,
+                )
+                .await;
+                match r {
+                    Err(InstallError::Ssh(_)) => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        last = Some(r);
+                    }
+                    r => return r,
+                }
+            }
+            last.unwrap()
+        })
+    };
+
+    // Fresh install of fleet A.
+    let keys = run(&mac_a, &genesis_a, &pol_a, install::ExistingAction::Ask).expect("fresh");
+    rt.block_on(health_of(&target, &host_key, &mac_a, fleet_a, &server, keys, 30))
+        .expect("health after the first install");
+    let pid0 = pid();
+
+    // Ask: the running agent is reported, nothing is changed.
+    match run(&mac_a, &genesis_a, &pol_a, install::ExistingAction::Ask) {
+        Err(InstallError::ExistingAgent(info)) => {
+            assert!(info.units_present && info.exec_active && info.gate_active && info.state_present);
+            assert_eq!(info.keys, Some(keys));
+            assert!(!info.ssh_switched);
+        }
+        other => panic!("expected ExistingAgent, got {other:?}"),
+    }
+    assert_eq!(pid(), pid0, "Ask must not touch the running agent");
+
+    // Adopt: same keys, no restart, signed health.
+    let adopted = run(&mac_a, &genesis_a, &pol_a, install::ExistingAction::Adopt).expect("adopt");
+    assert_eq!(adopted, keys);
+    assert_eq!(pid(), pid0, "Adopt must not restart the agent");
+    rt.block_on(health_of(&target, &host_key, &mac_a, fleet_a, &server, adopted, 3))
+        .expect("health after adopt");
+    // Mac B (another fleet) is refused by this agent.
+    assert!(
+        rt.block_on(health_of(&target, &host_key, &mac_b, fleet_b, &server, adopted, 2)).is_err(),
+        "a Mac outside the roster must not get a session"
+    );
+
+    // Reinstall: restarted, state and keys kept.
+    let again = run(&mac_a, &genesis_a, &pol_a, install::ExistingAction::Reinstall)
+        .expect("reinstall");
+    assert_eq!(again, keys, "keys are kept");
+    c.exec(&["systemctl", "is-active", "--quiet", "fleet-exec", "fleet-gate"]).unwrap();
+    assert_ne!(pid(), pid0, "Reinstall restarts the agent");
+    rt.block_on(health_of(&target, &host_key, &mac_a, fleet_a, &server, again, 30))
+        .expect("Mac A still in the kept roster after reinstall");
+
+    // Replace by fleet B.
+    let replaced = run(&mac_b, &genesis_b, &pol_b, install::ExistingAction::Replace)
+        .expect("replace");
+    assert_eq!(replaced, keys, "key files are kept");
+    c.exec(&["systemctl", "is-active", "--quiet", "fleet-exec", "fleet-gate"]).unwrap();
+    rt.block_on(health_of(&target, &host_key, &mac_b, fleet_b, &server, replaced, 30))
+        .expect("Mac B in the new roster");
+    assert!(
+        rt.block_on(health_of(&target, &host_key, &mac_a, fleet_a, &server, replaced, 2)).is_err(),
+        "Mac A is not in the new fleet's roster"
+    );
+    // The old database is archived, never deleted.
+    let archived = c.exec(&["sh", "-c", "ls /var/lib/fleet-audit/replaced-*/"]).unwrap();
+    assert!(archived.contains("state.redb"), "{archived}");
 }
 
 /// One-time password setup (design §10.1): a server with no authorized key
@@ -622,6 +857,7 @@ fn password_bootstrap_then_sudo_install() {
                         genesis,
                         policy_toml: policy,
                         sudo_password: pw.as_ref(),
+                        existing: install::ExistingAction::Ask,
                     },
                     ssh,
                 )

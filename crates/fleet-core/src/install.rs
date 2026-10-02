@@ -137,6 +137,49 @@ pub enum InstallError {
     Password(#[from] crate::secret::SecretError),
     #[error("rng")]
     Rng,
+    /// The server already has a Fleet agent and the operator has not said
+    /// what to do about it ([`ExistingAction`]); nothing was changed.
+    #[error("this server already has a Fleet agent")]
+    ExistingAgent(Box<ExistingAgent>),
+    /// Adoption needs the agent's key files, which could not be read.
+    #[error("the existing agent's keys could not be read; choose Replace or Reinstall")]
+    ExistingKeysUnreadable,
+}
+
+/// What to do when the server already has a Fleet agent (design §10.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExistingAction {
+    /// Stop with [`InstallError::ExistingAgent`] and change nothing.
+    #[default]
+    Ask,
+    /// Same fleet: read and pin the running agent's keys; no upload, no
+    /// restart, no state change.
+    Adopt,
+    /// Other fleet: stop the units, archive the old state database, install
+    /// with the new genesis.
+    Replace,
+    /// Same fleet, repair or upgrade: stop the units, install the package,
+    /// keep roster, policy, keys and history.
+    Reinstall,
+}
+
+/// What preflight found of an earlier install (fixed-path read-only
+/// commands; every field is derived from exit codes or hex keys, never
+/// from free text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingAgent {
+    /// `fleet-exec.service` is installed.
+    pub units_present: bool,
+    pub exec_active: bool,
+    pub gate_active: bool,
+    /// `/var/lib/fleet/exec/signing.key` exists (an install ran).
+    pub state_present: bool,
+    /// Public keys from `fleet-agent keys` (key files only; the state
+    /// database is locked by a running exec). `None`: not readable.
+    pub keys: Option<InstalledAgent>,
+    /// A Fleet sshd drop-in moved `AuthorizedKeysFile` to
+    /// `/etc/fleet/authorized_keys` (SSH switchover done).
+    pub ssh_switched: bool,
 }
 
 impl InstallError {
@@ -394,6 +437,8 @@ pub struct InstallRequest<'a> {
     /// One-time password for `sudo -S` when the user has no passwordless
     /// sudo. Written to the sudo channel's stdin only; never stored.
     pub sudo_password: Option<&'a SecretString>,
+    /// What to do if an agent is already installed.
+    pub existing: ExistingAction,
 }
 
 /// How privileged steps run.
@@ -537,6 +582,67 @@ async fn sudo_preflight<'a>(
             Ok(mode)
         }
     }
+}
+
+/// Fixed unit and path names probed for an earlier install.
+const EXEC_UNIT: &str = "fleet-exec.service";
+const GATE_UNIT: &str = "fleet-gate.service";
+const TEST: &str = "/usr/bin/test";
+const SIGNING_KEY: &str = "/var/lib/fleet/exec/signing.key";
+const SSHD_DROPINS: [&str; 2] = [
+    "/etc/ssh/sshd_config.d/00-fleet.conf",
+    "/etc/ssh/sshd_config.d/10-fleet.conf",
+];
+
+/// Looks for an earlier install. Read-only; `None` when there is none.
+async fn detect_existing(
+    conn: &SshConnection,
+    sudo: SudoMode<'_>,
+    user: &str,
+) -> Result<Option<ExistingAgent>, InstallError> {
+    // Exit code only; sudo is not needed to ask systemd or stat /etc.
+    let ok = |tokens: Vec<&str>| {
+        let cmd = command_line(&tokens);
+        async move {
+            let out = conn
+                .exec_capture(&cmd?, MAX_OUTPUT, Duration::from_secs(30))
+                .await?;
+            Ok::<bool, InstallError>(out.status == Some(0))
+        }
+    };
+    let units_present = ok(vec![SYSTEMCTL, "cat", EXEC_UNIT]).await?;
+    let exec_active = ok(vec![SYSTEMCTL, "is-active", "--quiet", EXEC_UNIT]).await?;
+    let gate_active = ok(vec![SYSTEMCTL, "is-active", "--quiet", GATE_UNIT]).await?;
+    let mut ssh_switched = false;
+    for p in SSHD_DROPINS {
+        ssh_switched |= ok(vec![TEST, "-e", p]).await?;
+    }
+    // /var/lib/fleet/exec is root-only.
+    let state_present = run_sudo(conn, "state check", sudo, user, &[TEST, "-e", SIGNING_KEY])
+        .await
+        .is_ok();
+    if !(units_present || state_present || exec_active || gate_active) {
+        return Ok(None);
+    }
+    // Only the key files are read; a running exec keeps its database
+    // locked, and an older agent without `keys` simply yields `None`.
+    let keys = match run_sudo(conn, "fleet-agent keys", sudo, user, &[INSTALLED_AGENT, "keys"])
+        .await
+    {
+        Ok(out) => parse_keys(&out.stdout).ok().map(|(n, s)| InstalledAgent {
+            noise_static: n,
+            signing_key: s,
+        }),
+        Err(_) => None,
+    };
+    Ok(Some(ExistingAgent {
+        units_present,
+        exec_active,
+        gate_active,
+        state_present,
+        keys,
+        ssh_switched,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,6 +799,18 @@ async fn install_agent_inner(
         let arch = parse_arch(&String::from_utf8_lossy(&uname.stdout))?;
         // Passwordless sudo, or the one-time password verified now.
         let sudo = sudo_preflight(&conn, &req.target.user, req.sudo_password).await?;
+        // An earlier install: never installed over silently. The operator
+        // chose what happens (`ExistingAction`); the default changes nothing.
+        let existing = detect_existing(&conn, sudo, &req.target.user).await?;
+        if let Some(info) = &existing {
+            match req.existing {
+                ExistingAction::Ask => return Err(InstallError::ExistingAgent(Box::new(info.clone()))),
+                ExistingAction::Adopt => {
+                    return info.keys.ok_or(InstallError::ExistingKeysUnreadable);
+                }
+                ExistingAction::Replace | ExistingAction::Reinstall => {}
+            }
+        }
         let bundled = if let ArtifactSource::Bundled(dir) = req.artifact {
             let path = pick_bundled(dir, arch)?;
             let bytes = read_checked(&path).await?;
@@ -750,6 +868,7 @@ async fn install_agent_inner(
         let policy_path = format!("/tmp/fleet-policy.{suffix}.toml");
         let temp = [bin.clone(), genesis_path.clone(), policy_path.clone()];
         let user = req.target.user.as_str();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
 
         let outcome = async {
             let sftp = tokio::time::timeout(SFTP_OPEN_TIMEOUT, Sftp::open(&conn))
@@ -808,6 +927,21 @@ async fn install_agent_inner(
             }
 
             progress(InstallStage::Installing);
+            // Replace / Reinstall: the old agent must not hold its state
+            // database (or run old code) while the new one is installed.
+            // Stopped only now, after the upload verified, so a failed
+            // transfer leaves the running agent alone.
+            if existing.as_ref().is_some_and(|e| e.units_present) {
+                run_sudo(
+                    &conn,
+                    "systemctl stop",
+                    sudo,
+                    user,
+                    &[SYSTEMCTL, "stop", EXEC_UNIT, GATE_UNIT],
+                )
+                .await?;
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             let agent = match kind {
                 ArtifactKind::Deb => {
                     run_sudo(&conn, "dpkg -i", sudo, user, &[DPKG, "-i", value(&bin)?]).await?;
@@ -846,25 +980,25 @@ async fn install_agent_inner(
                     INSTALLED_AGENT.to_string()
                 }
             };
-            let out = run_sudo(
-                &conn,
-                "fleet-agent install",
-                sudo,
-                user,
-                &[
-                    value(&agent)?,
-                    "install",
-                    "--genesis",
-                    value(&genesis_path)?,
-                    "--policy",
-                    value(&policy_path)?,
-                    "--server-id",
-                    server_id,
-                    "--admin-user",
-                    admin,
-                ],
-            )
-            .await?;
+            let mut install_cmd = vec![
+                value(&agent)?,
+                "install",
+                "--genesis",
+                value(&genesis_path)?,
+                "--policy",
+                value(&policy_path)?,
+                "--server-id",
+                server_id,
+                "--admin-user",
+                admin,
+            ];
+            if existing.is_some() {
+                install_cmd.push(match req.existing {
+                    ExistingAction::Replace => "--replace",
+                    _ => "--keep-state",
+                });
+            }
+            let out = run_sudo(&conn, "fleet-agent install", sudo, user, &install_cmd).await?;
             let (noise_static, signing_key) = parse_keys(&out.stdout)?;
 
             progress(InstallStage::Starting);
@@ -905,6 +1039,17 @@ async fn install_agent_inner(
         }
         .await;
 
+        if outcome.is_err() && stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            // Don't leave a server we stopped without its agent.
+            let _ = run_sudo(
+                &conn,
+                "systemctl start",
+                sudo,
+                user,
+                &[SYSTEMCTL, "start", EXEC_UNIT, GATE_UNIT],
+            )
+            .await;
+        }
         progress(InstallStage::CleaningUp);
         // Best effort; the files are the login user's, no sudo needed.
         let mut t = vec![RM, "-f", "--"];
@@ -944,9 +1089,28 @@ mod tests {
             "sudo -n dpkg -i /tmp/x.deb"
         );
         assert!(command_line(&["rm", "-f", "/tmp/a b"]).is_err());
-        for bin in [SUDO, SHA256SUM, DPKG, SYSTEMCTL, RM, CAT, UNAME, GETENT, INSTALL, ID] {
+        for bin in [SUDO, SHA256SUM, DPKG, SYSTEMCTL, RM, CAT, UNAME, GETENT, INSTALL, ID, TEST] {
             assert!(bin.starts_with("/usr/bin/") && is_token(bin));
         }
+    }
+
+    #[test]
+    fn existing_agent_probe_commands_are_safe_tokens() {
+        for tokens in [
+            vec![SYSTEMCTL, "cat", EXEC_UNIT],
+            vec![SYSTEMCTL, "is-active", "--quiet", EXEC_UNIT],
+            vec![SYSTEMCTL, "is-active", "--quiet", GATE_UNIT],
+            vec![TEST, "-e", SIGNING_KEY],
+            vec![SYSTEMCTL, "stop", EXEC_UNIT, GATE_UNIT],
+            vec![INSTALLED_AGENT, "keys"],
+        ] {
+            command_line(&tokens).unwrap();
+        }
+        for p in SSHD_DROPINS {
+            command_line(&[TEST, "-e", p]).unwrap();
+        }
+        // Nothing is replaced or adopted unless the operator chose it.
+        assert_eq!(ExistingAction::default(), ExistingAction::Ask);
     }
 
     #[test]

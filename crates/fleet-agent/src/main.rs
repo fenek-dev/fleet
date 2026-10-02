@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         }
         Mode::Exec => run_exec(paths, dev),
         Mode::Install(args) => run_install(&paths, &args, dev),
+        Mode::Keys => run_keys(&paths),
         Mode::Revert(id) => run_revert(&paths, id),
         Mode::Uninstall(opts) => run_uninstall(&paths, opts, dev),
         Mode::UserKeys(op, home) => {
@@ -99,11 +100,25 @@ fn run_install(paths: &Paths, a: &InstallArgs, dev: bool) -> Result<(), String> 
         server_id: ServerId::new(a.server_id.clone()).map_err(|_| "invalid --server-id")?,
         admin_user: a.admin_user.clone(),
     };
-    let out = install::install(paths, &input).map_err(|e| e.to_string())?;
+    if a.mode == install::InstallMode::Replace && !dev {
+        // The old fleet's armed auto-revert timers must not fire against
+        // the new state (best effort; the units are already stopped).
+        use fleet_ops::CommandRunner as _;
+        let _ = fleet_ops::SystemRunner.run_blocking(
+            fleet_ops::CommandSpec::new(fleet_agent::paths::SYSTEMCTL).args([
+                "stop",
+                "fleet-revert-*.timer",
+                "fleet-agent-restart-*.timer",
+            ]),
+        );
+    }
+    let out = install::install_with(paths, &input, a.mode).map_err(|e| e.to_string())?;
     // Monitor sessions authenticate with their own SSH key, which must be
     // in the file sshd reads: still ~/.ssh/authorized_keys (design §5.9,
     // §10.1). Done here too because Agent-only never syncs keys later.
+    // A kept roster already did this (and may be newer than the genesis).
     if let Some(admin) = &a.admin_user
+        && a.mode != install::InstallMode::KeepState
         && fsutil::current_uid().is_ok_and(|u| u == 0)
     {
         use fleet_agent::userkeys::{AsUser, Direct, UserKeys};
@@ -119,6 +134,14 @@ fn run_install(paths: &Paths, a: &InstallArgs, dev: bool) -> Result<(), String> 
             eprintln!("fleet-agent: monitor keys in ~/.ssh/authorized_keys: {e}");
         }
     }
+    println!("noise_static={}", hex::encode(out.noise_static.0));
+    println!("signing_key={}", hex::encode(out.signing_key.0));
+    Ok(())
+}
+
+/// `fleet-agent keys`: the public keys, from the key files only.
+fn run_keys(paths: &Paths) -> Result<(), String> {
+    let out = install::read_public_keys(paths).map_err(|e| e.to_string())?;
     println!("noise_static={}", hex::encode(out.noise_static.0));
     println!("signing_key={}", hex::encode(out.signing_key.0));
     Ok(())
