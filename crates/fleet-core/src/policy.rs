@@ -55,13 +55,45 @@ fn setting_key(server: &ServerId) -> String {
     format!("policy/{server}")
 }
 
+/// Flag: the server runs a policy this Mac never saw (adopted agent,
+/// reinstall without a cached copy). Mac-side checks treat it as the
+/// strictest until a real policy is pushed.
+fn unknown_key(server: &ServerId) -> String {
+    format!("policy-unknown/{server}")
+}
+
 /// Records `policy_toml` as pushed to `server` (install, `policy.update`).
 pub fn remember_pushed(
     cache: &crate::cache::Cache,
     server: &ServerId,
     policy_toml: &str,
 ) -> Result<(), crate::cache::CacheError> {
-    cache.set_setting(&setting_key(server), policy_toml.as_bytes())
+    cache.set_setting(&setting_key(server), policy_toml.as_bytes())?;
+    cache.set_setting(&unknown_key(server), b"")
+}
+
+/// The server keeps a policy this Mac didn't push: an already cached copy
+/// stays as it is; without one the policy is marked unknown (never the
+/// default, which may be looser than what the server enforces).
+pub fn keep_or_mark_unknown(
+    cache: &crate::cache::Cache,
+    server: &ServerId,
+) -> Result<(), crate::cache::CacheError> {
+    if pushed(cache, server).is_some() {
+        return Ok(());
+    }
+    cache.set_setting(&unknown_key(server), b"1")
+}
+
+/// The server's policy is unknown to this Mac (see
+/// [`keep_or_mark_unknown`]); `false` once any policy is pushed.
+pub fn is_unknown(cache: &crate::cache::Cache, server: &ServerId) -> bool {
+    pushed(cache, server).is_none()
+        && cache
+            .setting(&unknown_key(server))
+            .ok()
+            .flatten()
+            .is_some_and(|v| !v.is_empty())
 }
 
 /// The policy last pushed to `server`, if this Mac pushed one.
@@ -98,6 +130,23 @@ mod tests {
         let text = to_toml(&p).unwrap();
         assert_eq!(Policy::from_toml(&text).unwrap(), p);
         assert_eq!(p.security, SecurityMode::AgentOnly);
+    }
+
+    #[test]
+    fn kept_policy_is_unknown_unless_cached() {
+        let cache = crate::cache::Cache::open_in_memory().unwrap();
+        let s = ServerId::new("srv_abc123def456").unwrap();
+        assert!(!is_unknown(&cache, &s));
+        keep_or_mark_unknown(&cache, &s).unwrap();
+        assert!(is_unknown(&cache, &s), "no cached copy: unknown, not default");
+        let toml = to_toml(&default_policy(FleetId([7; 16]), s.clone(), SecurityMode::Managed))
+            .unwrap();
+        remember_pushed(&cache, &s, &toml).unwrap();
+        assert!(!is_unknown(&cache, &s), "a pushed policy clears it");
+        // With a cached copy it stays as it is.
+        keep_or_mark_unknown(&cache, &s).unwrap();
+        assert!(!is_unknown(&cache, &s));
+        assert!(pushed(&cache, &s).is_some());
     }
 
     #[test]

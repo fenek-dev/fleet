@@ -561,6 +561,30 @@ fn existing_agent_adopt_reinstall_replace() {
     rt.block_on(health_of(&target, &host_key, &mac_a, fleet_a, &server, again, 30))
         .expect("Mac A still in the kept roster after reinstall");
 
+    // A pending change (its rollback snapshot) blocks Replace and Reinstall
+    // before anything is uploaded or stopped.
+    let pid1 = pid();
+    c.exec(&["sh", "-c", "echo x > /var/lib/fleet/exec/pending/zz.bin"]).unwrap();
+    for action in [install::ExistingAction::Replace, install::ExistingAction::Reinstall] {
+        let r = run(&mac_b, &genesis_b, &pol_b, action);
+        assert!(matches!(r, Err(InstallError::PendingChange)), "{action:?}: {r:?}");
+    }
+    c.exec(&["test", "-e", "/var/lib/fleet/exec/pending/zz.bin"]).unwrap();
+    c.exec(&["rm", "-f", "/var/lib/fleet/exec/pending/zz.bin"]).unwrap();
+    assert_eq!(pid(), pid1, "refusal must not stop the agent");
+
+    // A failure after the units were stopped (the agent rejects this
+    // policy: wrong server id) leaves the original fleet's state in place,
+    // nothing archived, and both units running again.
+    let bad_policy = pol_b.replace("srv_itest03", "srv_other99");
+    let r = run(&mac_b, &genesis_b, &bad_policy, install::ExistingAction::Replace);
+    assert!(matches!(r, Err(InstallError::Remote { .. })), "{r:?}");
+    let st = c.exec(&["systemctl", "is-active", "fleet-exec", "fleet-gate"]).unwrap();
+    assert_eq!(st.split_whitespace().collect::<Vec<_>>(), ["active", "active"]);
+    assert!(c.exec(&["sh", "-c", "ls /var/lib/fleet-audit 2>/dev/null | wc -l"]).unwrap().trim() == "0");
+    rt.block_on(health_of(&target, &host_key, &mac_a, fleet_a, &server, again, 30))
+        .expect("original roster intact after the failed replace");
+
     // Replace by fleet B.
     let replaced = run(&mac_b, &genesis_b, &pol_b, install::ExistingAction::Replace)
         .expect("replace");

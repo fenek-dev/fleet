@@ -55,6 +55,19 @@ pub enum InstallError {
     AgentRunning,
     #[error("no agent keys found (key file {0} is missing)")]
     NoKeys(String),
+    /// A pending change's rollback snapshot would be lost.
+    #[error(
+        "a change is pending on this server: confirm or wait for the pending change to revert, \
+         then try again"
+    )]
+    PendingChange,
+    /// A revert or restart timer/service is still active (or systemd could
+    /// not be asked).
+    #[error(
+        "a revert or restart is still running (fleet-revert-* / fleet-agent-restart-* units): \
+         wait for it to finish, then try again"
+    )]
+    RevertActive,
 }
 
 /// What `install` does when a roster is already stored.
@@ -66,10 +79,11 @@ pub enum InstallMode {
     /// Repair or upgrade: a stored roster, policy and keys are left
     /// untouched (a missing roster is installed normally).
     KeepState,
-    /// A different fleet takes over: the old state database is archived
-    /// (never deleted) and pending changes, staged builds and the update
-    /// record are cleared; the key files are kept. The caller stops both
-    /// units first.
+    /// A different fleet takes over: the old state database (and leftover
+    /// markers, staged builds, update record) is archived, never deleted;
+    /// the key files are kept. Refused while a change is pending. The
+    /// caller stops both units first. Transactional: a failure restores
+    /// the original database.
     Replace,
 }
 
@@ -79,32 +93,120 @@ fn archive_dir(paths: &Paths) -> std::path::PathBuf {
     crate::uninstall::host(paths, crate::uninstall::AUDIT_KEEP_DIR)
 }
 
-/// Moves `state.redb*` to `<archive>/replaced-<ms>/` and empties the
-/// directories holding the old fleet's pending work. Keys stay.
-fn reset_state(paths: &Paths) -> Result<(), InstallError> {
+/// The old fleet's database files moved into the archive. Everything
+/// fallible is done before the swap; until [`Swap::finish`] the original
+/// can be put back with [`Swap::rollback`].
+struct Swap {
+    dest: std::path::PathBuf,
+    /// `(original, archived)` pairs.
+    moved: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+fn is_state_file(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.starts_with("state.redb"))
+}
+
+/// Moves `state.redb*` to `<archive>/replaced-<ms>/` (keys stay). On a
+/// failure part-way the files already moved are put back.
+fn begin_swap(paths: &Paths) -> Result<Swap, InstallError> {
     let dest = archive_dir(paths).join(format!("replaced-{}", crate::now_ms()));
     ensure_dir(&archive_dir(paths), 0o700)?;
     ensure_dir(&dest, 0o700)?;
-    for e in std::fs::read_dir(&paths.exec_dir)?.flatten() {
-        let name = e.file_name();
-        if name.to_str().is_some_and(|n| n.starts_with("state.redb")) {
-            std::fs::rename(e.path(), dest.join(&name))?;
+    let mut swap = Swap {
+        dest,
+        moved: Vec::new(),
+    };
+    let names: Vec<_> = std::fs::read_dir(&paths.exec_dir)?
+        .flatten()
+        .filter(|e| is_state_file(&e.file_name()))
+        .collect();
+    for e in names {
+        let to = swap.dest.join(e.file_name());
+        if let Err(err) = std::fs::rename(e.path(), &to) {
+            swap.rollback(paths);
+            return Err(err.into());
         }
+        swap.moved.push((e.path(), to));
     }
-    for dir in [&paths.pending_dir, &paths.reverted_dir, &paths.staging_dir] {
-        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            match std::fs::symlink_metadata(&p) {
-                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&p)?,
-                Ok(_) => std::fs::remove_file(&p)?,
-                Err(_) => {}
+    Ok(swap)
+}
+
+impl Swap {
+    /// Drops whatever new database was created and restores the original.
+    fn rollback(self, paths: &Paths) {
+        for e in std::fs::read_dir(&paths.exec_dir).into_iter().flatten().flatten() {
+            if is_state_file(&e.file_name()) {
+                let _ = std::fs::remove_file(e.path());
             }
         }
+        for (orig, archived) in self.moved.iter().rev() {
+            let _ = std::fs::rename(archived, orig);
+        }
+        let _ = std::fs::remove_dir(&self.dest);
     }
-    match std::fs::remove_file(&paths.update_state) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
+
+    /// The swap succeeded: leftovers of the old fleet (reverted markers,
+    /// staged builds, the update record) go into the archive too; nothing
+    /// is deleted. Best effort: none of it is needed by the new state.
+    fn finish(self, paths: &Paths) {
+        let sweep = |dir: &Path, name: &str| {
+            let to = self.dest.join(name);
+            if ensure_dir(&to, 0o700).is_err() {
+                return;
+            }
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let _ = std::fs::rename(e.path(), to.join(e.file_name()));
+            }
+        };
+        sweep(&paths.pending_dir, "pending");
+        sweep(&paths.reverted_dir, "reverted");
+        sweep(&paths.staging_dir, "staging");
+        let _ = std::fs::rename(&paths.update_state, self.dest.join("update.bin"));
     }
+}
+
+/// Pending (or claimed) auto-revert changes: their rollback snapshots are
+/// the only way back from an unconfirmed SSH or firewall change.
+pub fn pending_changes(paths: &Paths) -> usize {
+    std::fs::read_dir(&paths.pending_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .count()
+}
+
+const LIST_UNITS_ARGS: [&str; 7] = [
+    "list-units",
+    "--plain",
+    "--no-legend",
+    "--no-pager",
+    "--state=active,activating,deactivating",
+    "fleet-revert-*",
+    "fleet-agent-restart-*",
+];
+
+/// Waits (up to 30 s) until no revert or restart timer or service is
+/// active, so nothing already triggered is still running against the state
+/// about to change. Fails closed.
+fn wait_quiescent(runner: &dyn fleet_ops::CommandRunner) -> Result<(), InstallError> {
+    for _ in 0..30 {
+        let out = runner
+            .run_blocking(
+                fleet_ops::CommandSpec::new(crate::paths::SYSTEMCTL)
+                    .args(LIST_UNITS_ARGS)
+                    .timeout(std::time::Duration::from_secs(10)),
+            )
+            .map_err(|_| InstallError::RevertActive)?;
+        if out.code != Some(0) {
+            return Err(InstallError::RevertActive);
+        }
+        if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Err(InstallError::RevertActive)
 }
 
 /// The public halves of the key files, read without opening the state
@@ -217,13 +319,30 @@ fn open_store(paths: &Paths) -> Result<crate::store::Store, InstallError> {
 }
 
 pub fn install(paths: &Paths, input: &InstallInput) -> Result<InstallOutput, InstallError> {
-    install_with(paths, input, InstallMode::Fresh)
+    install_with(paths, input, InstallMode::Fresh, None)
 }
 
+/// `runner` (systemd) is used to wait out revert/restart units before a
+/// `KeepState` / `Replace` over an existing install; `None` skips that
+/// (development roots, tests).
 pub fn install_with(
     paths: &Paths,
     input: &InstallInput,
     mode: InstallMode,
+    runner: Option<&dyn fleet_ops::CommandRunner>,
+) -> Result<InstallOutput, InstallError> {
+    install_hooked(paths, input, mode, runner, &|| Ok(()))
+}
+
+/// [`install_with`] with a step run after the database swap and before the
+/// new fleet is stored (tests inject a failure there to check the rollback).
+#[doc(hidden)]
+pub fn install_hooked(
+    paths: &Paths,
+    input: &InstallInput,
+    mode: InstallMode,
+    runner: Option<&dyn fleet_ops::CommandRunner>,
+    after_swap: &dyn Fn() -> Result<(), InstallError>,
 ) -> Result<InstallOutput, InstallError> {
     // Validate everything before touching the filesystem.
     verify_genesis(&input.genesis, crate::now_ms()).map_err(InstallError::Genesis)?;
@@ -260,15 +379,22 @@ pub fn install_with(
     ensure_dir(&paths.exec_dir, 0o700)?;
     // A running agent holds the database lock: find out first, before
     // anything else is written, so a refusal leaves nothing half-done.
-    let mut store = open_store(paths)?;
+    let store = open_store(paths)?;
     let has_roster = store.meta().get(MetaKey::Roster)?.is_some();
     if has_roster && mode == InstallMode::Fresh {
         return Err(InstallError::AlreadyInstalled);
     }
-    if mode == InstallMode::Replace {
-        drop(store);
-        reset_state(paths)?;
-        store = open_store(paths)?;
+    // Replace / keep-state over an install: never while a change is
+    // pending (its rollback snapshot is the way back from an unconfirmed
+    // SSH or firewall change) or a revert/restart is running. Checked with
+    // the database lock held, before anything is changed.
+    if mode == InstallMode::Replace || (mode == InstallMode::KeepState && has_roster) {
+        if pending_changes(paths) > 0 {
+            return Err(InstallError::PendingChange);
+        }
+        if let Some(r) = runner {
+            wait_quiescent(r)?;
+        }
     }
     let keep_roster = has_roster && mode == InstallMode::KeepState;
     ensure_dir(&paths.pending_dir, 0o700)?;
@@ -330,6 +456,26 @@ pub fn install_with(
             signing_key: signer.public(),
         });
     }
+    // Everything that can fail has run. Replace now swaps the database
+    // (archive the old one, create the new) and restores the original if
+    // storing the new fleet fails.
+    let mut swap = None;
+    let store = if mode == InstallMode::Replace {
+        drop(store);
+        let s = begin_swap(paths)?;
+        match open_store(paths) {
+            Ok(st) => {
+                swap = Some(s);
+                st
+            }
+            Err(e) => {
+                s.rollback(paths);
+                return Err(e);
+            }
+        }
+    } else {
+        store
+    };
     let roster = encode(&input.genesis);
     let policy = encode(&StoredPolicy {
         toml: input.policy_toml.clone(),
@@ -347,7 +493,17 @@ pub fn install_with(
         changes.push((MetaKey::AdminUser, Some(u.as_bytes())));
         crate::uninstall::record_admin(paths, u);
     }
-    store.meta().update(&changes)?;
+    let stored = after_swap().and_then(|()| store.meta().update(&changes).map_err(Into::into));
+    drop(store);
+    if let Err(e) = stored {
+        if let Some(s) = swap {
+            s.rollback(paths);
+        }
+        return Err(e);
+    }
+    if let Some(s) = swap {
+        s.finish(paths);
+    }
 
     Ok(InstallOutput {
         noise_static: noise.public(),
@@ -357,6 +513,37 @@ pub fn install_with(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use fleet_ops::{CommandOutput, CommandRunner, CommandSpec, LocalBoxFuture, RunError};
+
+    struct Fixed(Option<i32>, &'static str);
+    impl CommandRunner for Fixed {
+        fn run(&self, _: CommandSpec) -> LocalBoxFuture<'_, Result<CommandOutput, RunError>> {
+            unimplemented!()
+        }
+        fn run_blocking(&self, _: CommandSpec) -> Result<CommandOutput, RunError> {
+            Ok(CommandOutput {
+                code: self.0,
+                stdout: self.1.as_bytes().to_vec(),
+                stderr: vec![],
+                truncated: false,
+            })
+        }
+    }
+
+    #[test]
+    fn quiescence_fails_closed() {
+        assert!(wait_quiescent(&Fixed(Some(0), "")).is_ok());
+        assert!(matches!(
+            wait_quiescent(&Fixed(Some(1), "")),
+            Err(InstallError::RevertActive)
+        ));
+        assert!(matches!(
+            wait_quiescent(&Fixed(None, "")),
+            Err(InstallError::RevertActive)
+        ));
+    }
+
     #[test]
     fn usermod_appends_to_fleet() {
         assert_eq!(
