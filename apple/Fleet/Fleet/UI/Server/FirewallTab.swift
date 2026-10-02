@@ -79,9 +79,15 @@ struct FirewallTab: View {
         FirewallRulesetArgs(managed: managed, rules: managed ? drafts.map(\.args) : [])
     }
 
+    /// Fleet's table doesn't exist on the server yet (`firewall.get` then
+    /// reports bans-only, no rules, version 0). Nothing is enforced, bans
+    /// included, until a first apply creates it.
+    private var tableAbsent: Bool { fw?.version == 0 }
+
     private var dirty: Bool {
         guard let base = baseArgs else { return false }
-        return base != proposed
+        // Creating the table is a change even when the ruleset looks equal.
+        return tableAbsent || base != proposed
     }
 
     private var problems: [String] { firewallCheck(ruleset: proposed, sshPort: server.port) }
@@ -128,17 +134,24 @@ struct FirewallTab: View {
                 Button("Add rule", systemImage: "plus") { drafts.append(RuleDraft()) }
                     .disabled(!managed || locked)
                     .accessibilityIdentifier("firewall.addRule")
-                Button("Revert edits") { resetDrafts() }.disabled(!dirty)
+                Button("Revert edits") { resetDrafts() }.disabled(baseArgs == proposed)
                     .accessibilityIdentifier("firewall.revertEdits")
-                Button("Preview diff") { preview() }.disabled(!dirty)
+                Button("Preview diff") { preview() }.disabled(baseArgs == proposed)
                     .accessibilityIdentifier("firewall.previewDiff")
-                Button("Apply…") { askApply(fw) }
+                Button(tableAbsent ? "Set up…" : "Apply…") { askApply(fw) }
                     .buttonStyle(.borderedProminent).tint(.accent)
                     .disabled(!dirty || !problems.isEmpty || revert.phase == .confirming || locked)
                     .help(lockReason)
                     .accessibilityIdentifier("firewall.apply")
             }
         } content: {
+            if tableAbsent {
+                Label("Not set up yet: Fleet's table doesn't exist on this server, so nothing is filtered or banned. "
+                      + "Choose Bans only (keeps your existing firewall, adds intrusion bans) or Managed, then Set up.",
+                      systemImage: "info.circle")
+                    .font(.caption11).foregroundStyle(Color.textSecondary)
+                    .accessibilityIdentifier("firewall.notSetUp")
+            }
             Text(managed ? "table inet fleet · policy drop · IPv4 + IPv6" : "table inet fleet · bans only")
                 .font(.caption11).foregroundStyle(Color.textMuted)
                 .accessibilityIdentifier("firewall.tableSubtitle")
@@ -494,9 +507,13 @@ struct FirewallTab: View {
         let set = proposed
         let version = fw.version
         let modeChange = fw.managed != set.managed
+        let absent = fw.version == 0
         pending = PendingAction(
-            title: "Apply firewall changes to \(server.name)?",
-            message: (modeChange ? "The table switches to \(set.managed ? "Managed (default drop)" : "bans only"). " : "")
+            title: absent ? "Set up Fleet's firewall table on \(server.name)?"
+                : "Apply firewall changes to \(server.name)?",
+            message: (absent
+                      ? "Creates table inet fleet in \(set.managed ? "Managed (default drop)" : "bans-only") mode. "
+                      : modeChange ? "The table switches to \(set.managed ? "Managed (default drop)" : "bans only"). " : "")
                 + "The change reverts automatically unless Fleet can reconnect and confirm it within the window.",
             button: "Apply") { apply(set, version: version) }
     }
