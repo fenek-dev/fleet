@@ -29,6 +29,15 @@ struct AddServerSheet: View {
     @State private var run = InstallRun()
     @State private var health: AgentHealthRow?
     @State private var error: String?
+    /// One-time server password (design §10.1): used only to add this Mac's
+    /// key and to answer `sudo` during the install. Never stored; cleared
+    /// from the field the moment the install starts.
+    @State private var password = ""
+    @State private var usePassword = false
+    /// The server refused this Mac's key at the probe: the password adds it.
+    @State private var keyRefused = false
+    /// This run adds the key first (shows that step).
+    @State private var addingKey = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -151,6 +160,11 @@ struct AddServerSheet: View {
                 if prompt.viaJumpUnpinned {
                     StatusPill(label: "Jump host keys above are new too and will be pinned", tone: .warn)
                 }
+                if keyRefused {
+                    Text("The server doesn't accept this Mac's SSH key yet. Nothing was sent to it besides the host key exchange. After you trust the fingerprint, you can enter the user's password once to add the key.")
+                        .font(.secondary).foregroundStyle(Color.textSecondary)
+                        .accessibilityIdentifier("addServer.keyRefusedHint")
+                }
             }
             HStack {
                 Button("Reject") { reject() }
@@ -168,8 +182,8 @@ struct AddServerSheet: View {
     private var installStep: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(Self.bundledAgentDir != nil
-                 ? "Fleet installs its bundled agent, matched to the server's architecture (Debian 12+ / Ubuntu 22.04+). The user needs passwordless sudo (or be root)."
-                 : "Choose the agent package (`fleet-agent_*.deb`) or a `fleet-agent` binary. The user needs passwordless sudo (or be root).")
+                 ? "Fleet installs its bundled agent, matched to the server's architecture (Debian 12+ / Ubuntu 22.04+). The user needs passwordless sudo (or be root), or the password below."
+                 : "Choose the agent package (`fleet-agent_*.deb`) or a `fleet-agent` binary. The user needs passwordless sudo (or be root), or the password below.")
                 .font(.base).foregroundStyle(Color.textSecondary)
             HStack {
                 Text(artifact?.lastPathComponent
@@ -197,6 +211,7 @@ struct AddServerSheet: View {
             }
             .formStyle(.grouped)
             securityModeHint
+            passwordBox
             HStack {
                 Button("Later") { dismiss() }
                     .accessibilityIdentifier("addServer.later")
@@ -204,8 +219,33 @@ struct AddServerSheet: View {
                 Button("Install") { install() }
                     .accessibilityIdentifier("addServer.install")
                     .buttonStyle(.borderedProminent).tint(.accent)
-                    .disabled(!canInstall)
+                    .disabled(!canInstall || (keyRefused && password.isEmpty))
             }
+        }
+    }
+
+    /// One-time password: adds this Mac's key when the server refused it,
+    /// and answers `sudo`. Not stored.
+    @ViewBuilder
+    private var passwordBox: some View {
+        if usePassword {
+            VStack(alignment: .leading, spacing: 6) {
+                SecureField("Password for \(user)", text: $password)
+                    .textContentType(.password)
+                    .accessibilityIdentifier("addServer.password")
+                Text("Used once to add this Mac's key and for sudo during install. Not stored.")
+                    .font(.secondary).foregroundStyle(Color.textSecondary)
+                if !keyRefused {
+                    Button("Don't use a password") { usePassword = false; password = "" }
+                        .buttonStyle(.link)
+                        .accessibilityIdentifier("addServer.noPassword")
+                }
+            }
+            .card(padding: 12)
+        } else {
+            Button("Set up with password…") { usePassword = true }
+                .buttonStyle(.link)
+                .accessibilityIdentifier("addServer.usePassword")
         }
     }
 
@@ -228,6 +268,10 @@ struct AddServerSheet: View {
             .font(.secondary).foregroundStyle(Color.textSecondary)
     }
 
+    private var steps: [(InstallStep, String)] {
+        (addingKey ? [(InstallStep.addingKey, "Add SSH key")] : []) + Self.steps
+    }
+
     private static let steps: [(InstallStep, String)] = [
         (.connecting, "Connect"),
         (.uploading, "Upload"),
@@ -247,8 +291,9 @@ struct AddServerSheet: View {
         // failed step is the last real one before it.
         let failed = run.working
         return VStack(alignment: .leading, spacing: 8) {
-            ForEach(Self.steps.indices, id: \.self) { i in
-                let (s, label) = Self.steps[i]
+            let steps = steps
+            ForEach(steps.indices, id: \.self) { i in
+                let (s, label) = steps[i]
                 let isFailed = error != nil && failed == s
                 HStack(spacing: 10) {
                     Group {
@@ -328,6 +373,10 @@ struct AddServerSheet: View {
     // MARK: actions
 
     private func resume() {
+        if let p = TestHooks.serverPassword {
+            password = p
+            usePassword = true
+        }
         guard let s = existing, serverId == nil else { return }
         serverId = s.id
         user = s.user
@@ -362,9 +411,22 @@ struct AddServerSheet: View {
         guard let api = core.api, let id = serverId else { return }
         step = .probing
         error = nil
+        keyRefused = false
         Task {
             do {
                 prompt = try await api.probeHostKey(serverId: id)
+                step = .hostKey
+            } catch FleetError.SshKeyRefused {
+                // Key not authorized yet: read the host key without
+                // authenticating, so the operator confirms the fingerprint
+                // before any password is sent.
+                do {
+                    prompt = try await api.probeHostKeyOnly(serverId: id)
+                    keyRefused = true
+                    usePassword = true
+                } catch {
+                    self.error = error.fleetMessage
+                }
                 step = .hostKey
             } catch {
                 self.error = error.fleetMessage
@@ -418,19 +480,48 @@ struct AddServerSheet: View {
             Task { @MainActor in run.setArtifact(a) }
         })
         let admin = adminUser.trimmingCharacters(in: .whitespaces)
+        // The password moves out of the view state into a wipeable buffer;
+        // nothing else holds it once the install call returns.
+        let secret = usePassword && !password.isEmpty ? SecretBytes(password) : nil
+        password = ""
+        let addKey = keyRefused && secret != nil
+        addingKey = addKey
         Task {
+            defer { secret?.wipe() }
             do {
                 health = try await api.installAgent(
                     serverId: id, adminUser: admin.isEmpty ? nil : admin,
                     artifactPath: file?.path, bundledDir: Self.bundledAgentDir?.path,
                     bundledPins: BundledArtifacts.agentPins,
-                    securityMode: securityMode, listener: relay)
+                    securityMode: securityMode, password: secret?.data, addKey: addKey,
+                    listener: relay)
                 core.reload()
                 step = .done
             } catch {
+                switch error as? FleetError {
+                case .PasswordRefused, .SudoPasswordRequired, .SudoPasswordRefused:
+                    usePassword = true
+                default: break
+                }
                 self.error = error.fleetMessage
             }
         }
+    }
+}
+
+/// The one-time password as bytes that are zeroed after use. A Swift
+/// `String` can't be wiped, so the field's text is copied here and the
+/// field is cleared at once.
+private final class SecretBytes: @unchecked Sendable {
+    private(set) var data: Data
+
+    init(_ text: String) { data = Data(text.utf8) }
+
+    func wipe() {
+        data.withUnsafeMutableBytes { raw in
+            if let base = raw.baseAddress { memset_s(base, raw.count, 0, raw.count) }
+        }
+        data = Data()
     }
 }
 

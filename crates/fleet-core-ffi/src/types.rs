@@ -237,6 +237,19 @@ pub enum FleetError {
     /// The server refused this Mac's SSH key (not in `authorized_keys`).
     #[error("SSH key refused")]
     SshKeyRefused,
+    /// The server refused the one-time password.
+    #[error("password refused")]
+    PasswordRefused,
+    /// The server doesn't take password logins (or needs more than a
+    /// password); `message` says what to do (add the key manually).
+    #[error("password login unavailable: {message}")]
+    PasswordLoginUnavailable { message: String },
+    /// `sudo` needs a password and none was given.
+    #[error("sudo password required")]
+    SudoPasswordRequired,
+    /// `sudo` refused the password.
+    #[error("sudo password refused")]
+    SudoPasswordRefused,
     /// The server's host key differs from the pinned one.
     #[error("host key changed")]
     HostKeyChanged,
@@ -322,6 +335,12 @@ impl From<fleet_core::ssh::SshError> for FleetError {
         use fleet_core::ssh::SshError as E;
         match e {
             E::AuthRejected => Self::SshKeyRefused,
+            E::WrongPassword => Self::PasswordRefused,
+            e @ (E::PasswordAuthDisabled | E::KeyboardInteractiveUnsupported(_)) => {
+                Self::PasswordLoginUnavailable {
+                    message: e.to_string(),
+                }
+            }
             E::HostKeyChanged { .. } => Self::HostKeyChanged,
             E::HostKeyUnconfirmed => Self::HostKeyNotConfirmed,
             E::Timeout => Self::Timeout,
@@ -343,6 +362,8 @@ impl From<fleet_core::install::InstallError> for FleetError {
         match e {
             E::Ssh(s) => s.into(),
             E::Sftp(s) => s.into(),
+            E::SudoPasswordRequired => Self::SudoPasswordRequired,
+            E::SudoPasswordRejected => Self::SudoPasswordRefused,
             // Carries untrusted server stderr.
             other => Self::Install {
                 message: text::text(other.to_string()),

@@ -1,9 +1,12 @@
 //! Agent install on an existing server over SSH (design §10.1).
 //!
 //! The operator's access is this Mac's SSH key (Secure Enclave), which the
-//! operator has already put in the admin user's `authorized_keys`; no
-//! passwords are handled. The host key must be pinned before anything is
-//! uploaded (first-use confirmation happens in the app).
+//! operator has put in the admin user's `authorized_keys`, or which
+//! [`crate::bootstrap::bootstrap_key`] added with a one-time password.
+//! That password (if given) is also what answers `sudo -S` below; it is
+//! never stored and never on a command line. The host key must be pinned
+//! before anything is uploaded or any password sent (first-use
+//! confirmation happens in the app).
 //!
 //! 1. Upload over SFTP, each file created with `O_EXCL` under a random name
 //!    in `/tmp`: the agent artifact (a `.deb` package or a bare binary), the
@@ -29,6 +32,7 @@
 //! `-`). No quoting is ever needed or attempted; anything else is refused
 //! before it reaches the wire (security rule 4).
 
+use crate::secret::SecretString;
 use crate::sftp::{Sftp, SftpError};
 use crate::ssh::{ExecOutput, HostKey, SshConnection, SshError, SshSigner, SshTarget};
 use fleet_proto::{Ed25519Public, ServerId, SignedRoster, X25519Public, encode};
@@ -107,6 +111,30 @@ pub enum InstallError {
     StepTimeout(&'static str),
     #[error("agent install printed no keys")]
     NoKeys,
+    /// `sudo` needs a password and none was given.
+    #[error(
+        "the user has no passwordless sudo: enter the user's password (used once for sudo, not \
+         stored) or enable passwordless sudo"
+    )]
+    SudoPasswordRequired,
+    /// `sudo` refused the password.
+    #[error("sudo refused the password; check it and try again")]
+    SudoPasswordRejected,
+    /// The user may not run `sudo` at all.
+    #[error("user {0} is not allowed to use sudo on this server (not in the sudoers file)")]
+    NotInSudoers(String),
+    /// `~/.ssh` or `authorized_keys` is not something Fleet will edit.
+    #[error("not adding the key: {0}")]
+    UnsafeAuthorizedKeys(String),
+    /// The key was written but the server still refuses it.
+    #[error(
+        "the key was added to authorized_keys, but the server still refuses it (check \
+         AuthorizedKeysFile in sshd_config and that the home directory is not group/world \
+         writable)"
+    )]
+    KeyNotAccepted,
+    #[error("password: {0}")]
+    Password(#[from] crate::secret::SecretError),
     #[error("rng")]
     Rng,
 }
@@ -235,6 +263,8 @@ pub fn verify_pin(
 /// Progress for the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallStage {
+    /// One-time password setup: adding this Mac's SSH key (design §10.1).
+    AddingKey,
     Connecting,
     /// Server checked; the artifact that will be uploaded.
     Artifact(ArtifactInfo),
@@ -330,6 +360,140 @@ pub struct InstallRequest<'a> {
     pub bundled_pins: &'a std::collections::BTreeMap<String, String>,
     pub genesis: &'a SignedRoster,
     pub policy_toml: &'a str,
+    /// One-time password for `sudo -S` when the user has no passwordless
+    /// sudo. Written to the sudo channel's stdin only; never stored.
+    pub sudo_password: Option<&'a SecretString>,
+}
+
+/// How privileged steps run.
+#[derive(Clone, Copy)]
+enum SudoMode<'a> {
+    /// Root login: no sudo.
+    Root,
+    /// `sudo -n` (passwordless).
+    Passwordless,
+    /// `sudo -S -k -p ''` with the password on stdin.
+    Password(&'a SecretString),
+}
+
+/// Fixed sudo prefix for password mode (a constant: the empty quoted
+/// prompt is why this one string is not built by [`command_line`]).
+/// `-k` ignores cached credentials so sudo always consumes the password
+/// line and nothing stays readable on stdin for the command it runs.
+const SUDO_STDIN_PREFIX: &str = "/usr/bin/sudo -S -k -p ''";
+const TRUE: &str = "/usr/bin/true";
+
+/// Why sudo failed, from its stderr (untrusted text, matched by phrase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SudoFailure {
+    /// `sudo -n` / `sudo -S` wants a (different) password.
+    Password,
+    NotSudoer,
+    Other,
+}
+
+/// Classifies sudo's stderr (sudo and sudo-rs wording).
+pub fn classify_sudo(stderr: &str) -> SudoFailure {
+    let s = stderr.to_ascii_lowercase();
+    if s.contains("is not in the sudoers")
+        || s.contains("not allowed to run sudo")
+        || s.contains("may not run sudo")
+        || s.contains("is not allowed to execute")
+    {
+        SudoFailure::NotSudoer
+    } else if s.contains("sorry, try again")
+        || s.contains("incorrect password")
+        || s.contains("no password was provided")
+        || s.contains("a password is required")
+        || s.contains("authentication failed")
+        || s.contains("incorrect authentication")
+    {
+        SudoFailure::Password
+    } else {
+        SudoFailure::Other
+    }
+}
+
+fn sudo_error(failure: SudoFailure, user: &str, had_password: bool) -> Option<InstallError> {
+    match failure {
+        SudoFailure::NotSudoer => Some(InstallError::NotInSudoers(user.to_string())),
+        SudoFailure::Password if had_password => Some(InstallError::SudoPasswordRejected),
+        SudoFailure::Password => Some(InstallError::SudoPasswordRequired),
+        SudoFailure::Other => None,
+    }
+}
+
+/// Runs `tokens` with privileges per `mode`. With a password, the command
+/// is [`SUDO_STDIN_PREFIX`] + the validated tokens and the password line
+/// goes to the channel's stdin.
+async fn run_sudo(
+    conn: &SshConnection,
+    step: &'static str,
+    mode: SudoMode<'_>,
+    user: &str,
+    tokens: &[&str],
+) -> Result<ExecOutput, InstallError> {
+    match mode {
+        SudoMode::Root => run(conn, step, tokens).await,
+        SudoMode::Passwordless => {
+            let mut t = vec![SUDO, "-n"];
+            t.extend_from_slice(tokens);
+            run(conn, step, &t).await
+        }
+        SudoMode::Password(secret) => {
+            let cmd = format!("{SUDO_STDIN_PREFIX} {}", command_line(tokens)?);
+            let stdin = secret.sudo_stdin();
+            let out = conn
+                .exec_capture_stdin(&cmd, Some(&stdin[..]), MAX_OUTPUT, STEP_TIMEOUT)
+                .await?;
+            if out.status == Some(0) {
+                return Ok(out);
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if let Some(e) = sudo_error(classify_sudo(&stderr), user, true) {
+                return Err(e);
+            }
+            let mut e = remote_failure(step, &out);
+            if let InstallError::Remote { stderr, .. } = &mut e {
+                *stderr = secret.scrub(stderr);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Decides how privileged steps run: root needs nothing; otherwise
+/// `sudo -n true` must work, or the one-time password must pass
+/// `sudo -S true` (checked before anything is uploaded).
+async fn sudo_preflight<'a>(
+    conn: &SshConnection,
+    user: &str,
+    password: Option<&'a SecretString>,
+) -> Result<SudoMode<'a>, InstallError> {
+    if user == "root" {
+        return Ok(SudoMode::Root);
+    }
+    let out = conn
+        .exec_capture(
+            &command_line(&[SUDO, "-n", TRUE])?,
+            MAX_OUTPUT,
+            Duration::from_secs(30),
+        )
+        .await?;
+    if out.status == Some(0) {
+        return Ok(SudoMode::Passwordless);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    match (classify_sudo(&stderr), password) {
+        (SudoFailure::Other, _) => Err(remote_failure("sudo", &out)),
+        (SudoFailure::NotSudoer, _) => Err(InstallError::NotInSudoers(user.to_string())),
+        (SudoFailure::Password, None) => Err(InstallError::SudoPasswordRequired),
+        (SudoFailure::Password, Some(p)) => {
+            let mode = SudoMode::Password(p);
+            run_sudo(conn, "sudo", mode, user, &[TRUE]).await?;
+            Ok(mode)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +569,18 @@ pub async fn probe(
     Ok(obs)
 }
 
+/// Connects without a pin and **without authenticating** the final hop,
+/// and reports the host keys seen. For a server that doesn't accept this
+/// Mac's key yet: the operator confirms the fingerprint before the
+/// one-time password is sent ([`crate::bootstrap::bootstrap_key`]).
+pub async fn probe_host_key_only(
+    target: &SshTarget,
+    ssh_key: &dyn SshSigner,
+) -> Result<crate::ssh::HostKeyObservation, InstallError> {
+    Ok(SshConnection::probe_host_key_only(target, ssh_key, &crate::ssh::SshOptions::default())
+        .await?)
+}
+
 async fn read_artifact(path: &Path, limit: Duration) -> Result<Vec<u8>, InstallError> {
     tokio::time::timeout(limit, tokio::fs::read(path))
         .await
@@ -459,6 +635,8 @@ pub async fn install_agent(
         check_distro(&String::from_utf8_lossy(&os.stdout))?;
         let uname = run(&conn, "uname", &[UNAME, "-m"]).await?;
         let arch = parse_arch(&String::from_utf8_lossy(&uname.stdout))?;
+        // Passwordless sudo, or the one-time password verified now.
+        let sudo = sudo_preflight(&conn, &req.target.user, req.sudo_password).await?;
         let bundled = if let ArtifactSource::Bundled(dir) = req.artifact {
             let path = pick_bundled(dir, arch)?;
             let bytes = read_checked(&path).await?;
@@ -515,11 +693,7 @@ pub async fn install_agent(
         let genesis_path = format!("/tmp/fleet-genesis.{suffix}");
         let policy_path = format!("/tmp/fleet-policy.{suffix}.toml");
         let temp = [bin.clone(), genesis_path.clone(), policy_path.clone()];
-        let sudo: &[&str] = if req.target.user == "root" {
-            &[]
-        } else {
-            &[SUDO, "-n"]
-        };
+        let user = req.target.user.as_str();
 
         let outcome = async {
             let sftp = tokio::time::timeout(SFTP_OPEN_TIMEOUT, Sftp::open(&conn))
@@ -580,60 +754,78 @@ pub async fn install_agent(
             progress(InstallStage::Installing);
             let agent = match kind {
                 ArtifactKind::Deb => {
-                    let mut t = sudo.to_vec();
-                    t.extend([DPKG, "-i", value(&bin)?]);
-                    run(&conn, "dpkg -i", &t).await?;
+                    run_sudo(&conn, "dpkg -i", sudo, user, &[DPKG, "-i", value(&bin)?]).await?;
                     INSTALLED_AGENT.to_string()
                 }
                 ArtifactKind::Binary => {
                     // /tmp is often noexec (CIS hardening, Fleet's own
                     // Strict profile): copy into the root-owned agent
                     // directory and run it from there.
-                    let mut t = sudo.to_vec();
-                    t.extend([INSTALL, "-d", "-m", "0755", "-o", "root", "-g", "root", "/usr/lib/fleet"]);
-                    run(&conn, "install directory", &t).await?;
-                    let mut t = sudo.to_vec();
-                    t.extend([
-                        INSTALL,
-                        "-m",
-                        "0755",
-                        "-o",
-                        "root",
-                        "-g",
-                        "root",
-                        value(&bin)?,
-                        INSTALLED_AGENT,
-                    ]);
-                    run(&conn, "install agent binary", &t).await?;
+                    run_sudo(
+                        &conn,
+                        "install directory",
+                        sudo,
+                        user,
+                        &[INSTALL, "-d", "-m", "0755", "-o", "root", "-g", "root", "/usr/lib/fleet"],
+                    )
+                    .await?;
+                    run_sudo(
+                        &conn,
+                        "install agent binary",
+                        sudo,
+                        user,
+                        &[
+                            INSTALL,
+                            "-m",
+                            "0755",
+                            "-o",
+                            "root",
+                            "-g",
+                            "root",
+                            value(&bin)?,
+                            INSTALLED_AGENT,
+                        ],
+                    )
+                    .await?;
                     INSTALLED_AGENT.to_string()
                 }
             };
-            let mut t = sudo.to_vec();
-            t.extend([
-                value(&agent)?,
-                "install",
-                "--genesis",
-                value(&genesis_path)?,
-                "--policy",
-                value(&policy_path)?,
-                "--server-id",
-                server_id,
-                "--admin-user",
-                admin,
-            ]);
-            let out = run(&conn, "fleet-agent install", &t).await?;
+            let out = run_sudo(
+                &conn,
+                "fleet-agent install",
+                sudo,
+                user,
+                &[
+                    value(&agent)?,
+                    "install",
+                    "--genesis",
+                    value(&genesis_path)?,
+                    "--policy",
+                    value(&policy_path)?,
+                    "--server-id",
+                    server_id,
+                    "--admin-user",
+                    admin,
+                ],
+            )
+            .await?;
             let (noise_static, signing_key) = parse_keys(&out.stdout)?;
 
             progress(InstallStage::Starting);
-            let mut t = sudo.to_vec();
-            t.extend([
-                SYSTEMCTL,
-                "enable",
-                "--now",
-                "fleet-exec.service",
-                "fleet-gate.service",
-            ]);
-            run(&conn, "systemctl enable", &t).await?;
+            run_sudo(
+                &conn,
+                "systemctl enable",
+                sudo,
+                user,
+                &[
+                    SYSTEMCTL,
+                    "enable",
+                    "--now",
+                    "fleet-exec.service",
+                    "fleet-gate.service",
+                ],
+            )
+            .await?;
 
             // `fleet-agent install` put the admin user in group `fleet`;
             // only a fresh login carries it, and that is what the app's
@@ -699,6 +891,59 @@ mod tests {
         for bin in [SUDO, SHA256SUM, DPKG, SYSTEMCTL, RM, CAT, UNAME, GETENT, INSTALL, ID] {
             assert!(bin.starts_with("/usr/bin/") && is_token(bin));
         }
+    }
+
+    #[test]
+    fn sudo_stderr_classes() {
+        for s in [
+            "Sorry, try again.\nsudo: 1 incorrect password attempt",
+            "sudo: no password was provided",
+            "sudo: a password is required",
+            "Authentication failed, try again.",
+        ] {
+            assert_eq!(classify_sudo(s), SudoFailure::Password, "{s}");
+        }
+        for s in [
+            "alice is not in the sudoers file.  This incident will be reported.",
+            "Sorry, user alice may not run sudo on host.",
+        ] {
+            // Not-a-sudoer wins over the retry noise that follows it.
+            assert_eq!(classify_sudo(s), SudoFailure::NotSudoer, "{s}");
+        }
+        assert_eq!(classify_sudo("sudo: command not found"), SudoFailure::Other);
+        assert!(matches!(
+            sudo_error(SudoFailure::Password, "u", true),
+            Some(InstallError::SudoPasswordRejected)
+        ));
+        assert!(matches!(
+            sudo_error(SudoFailure::Password, "u", false),
+            Some(InstallError::SudoPasswordRequired)
+        ));
+        assert!(sudo_error(SudoFailure::Other, "u", true).is_none());
+    }
+
+    #[test]
+    fn sudo_prefix_is_fixed_and_password_never_in_tokens() {
+        // The one literal with quotes; every other token stays validated.
+        assert_eq!(SUDO_STDIN_PREFIX, "/usr/bin/sudo -S -k -p ''");
+        assert!(is_token(TRUE) && TRUE.starts_with("/usr/bin/"));
+        // A password-looking value can't become a token.
+        assert!(command_line(&[DPKG, "-i", "p@ss word'"]).is_err());
+    }
+
+    #[test]
+    fn errors_never_contain_the_secret() {
+        let secret = SecretString::from_string("s3cr3t-pw".into()).unwrap();
+        for e in [
+            InstallError::SudoPasswordRequired,
+            InstallError::SudoPasswordRejected,
+            InstallError::NotInSudoers("alice".into()),
+        ] {
+            assert!(!e.to_string().contains("s3cr3t"));
+        }
+        let mut stderr = "sudo: echoed s3cr3t-pw".to_string();
+        stderr = secret.scrub(&stderr);
+        assert!(!stderr.contains("s3cr3t"));
     }
 
     #[test]

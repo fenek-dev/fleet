@@ -36,7 +36,7 @@ fi
 # marker is scanned as ASCII (`strings -a` and raw grep) and UTF-16LE (raw
 # bytes with NULs stripped via `tr -d '\000'`, portable to macOS grep).
 # A scanner error (not just "no match") fails the check.
-markers=(FLEET_TEST_SIGNER FLEET_DATA_DIR TEST-APPROVE FLEET_TEST_AGENT_ARTIFACT FLEET_TEST_AUTO_PAIR approvals.log ssh_pubkey)
+markers=(FLEET_TEST_SIGNER FLEET_DATA_DIR TEST-APPROVE FLEET_TEST_AGENT_ARTIFACT FLEET_TEST_AUTO_PAIR FLEET_TEST_SERVER_PASSWORD approvals.log ssh_pubkey)
 
 scan_err() { echo "FAIL: scanner error ($1) on $bin" >&2; exit 1; }
 

@@ -1,18 +1,23 @@
 //! SSH transport (design §3.2, §5.5 step 1, §5.9) on `russh`.
 //!
-//! One [`SshConnection`] per server. Client auth is public-key only, and the
+//! One [`SshConnection`] per server. Client auth is public-key, and the
 //! private key never enters russh: russh hands us the exact bytes to sign
 //! (`authenticate_publickey_with`, the ssh-agent path) and an [`SshSigner`]
 //! signs them — the Secure Enclave on a Mac, [`Ed25519Signer`] for the
-//! recovery SSH key. Host keys are pinned: a mismatch is a hard
-//! [`SshError::HostKeyChanged`]; with no pin the connection proceeds and
-//! the [`HostKeyObservation`] says `FirstUse` so the app can show the
+//! recovery SSH key. The one exception is the operator's one-time password
+//! ([`SshAuth::Password`], design §10.1): it is only sent to a **pinned**
+//! host key, answers a single `password` or one password-style
+//! keyboard-interactive prompt, and is never stored. Host keys are pinned:
+//! a mismatch is a hard [`SshError::HostKeyChanged`]; with no pin the
+//! connection proceeds (key auth, or [`SshConnection::probe_host_key_only`])
+//! and the [`HostKeyObservation`] says `FirstUse` so the app can show the
 //! fingerprint and store the pin.
 
+use crate::secret::SecretString;
 use crate::signer::SignerError;
 use fleet_crypto::sig::{self, Ed25519Signer, Signer};
 use fleet_proto::{Ed25519Public, P256Public, Signature};
-use russh::client::{self, Handle, Msg};
+use russh::client::{self, Handle, KeyboardInteractiveAuthResponse, Msg};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{Channel, ChannelMsg, ChannelReadHalf, ChannelStream, ChannelWriteHalf};
@@ -351,6 +356,18 @@ pub enum SshError {
     HostKeyUnconfirmed,
     #[error("server refused our key")]
     AuthRejected,
+    /// The server refused the one-time password.
+    #[error("the server refused the password")]
+    WrongPassword,
+    /// The server offers neither `password` nor keyboard-interactive.
+    #[error(
+        "the server does not accept password login (PasswordAuthentication is off); add this \
+         Mac's SSH key to the user's authorized_keys manually"
+    )]
+    PasswordAuthDisabled,
+    /// Keyboard-interactive asked for more than one password (OTP, 2FA…).
+    #[error("password login needs more than a password: {0}; add this Mac's SSH key manually")]
+    KeyboardInteractiveUnsupported(String),
     #[error("signer: {0}")]
     Signer(SignerError),
     #[error("channel request refused")]
@@ -371,6 +388,180 @@ impl From<AuthSignError> for SshError {
 }
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// How the final hop authenticates. Jump hops always use `jump_key`.
+pub enum SshAuth<'a> {
+    /// This Mac's SSH key (or the recovery key).
+    Key(&'a dyn SshSigner),
+    /// The one-time password; needs a pinned host key.
+    Password {
+        secret: &'a SecretString,
+        jump_key: &'a dyn SshSigner,
+    },
+}
+
+impl SshAuth<'_> {
+    fn jump_key(&self) -> &dyn SshSigner {
+        match self {
+            Self::Key(k) => *k,
+            Self::Password { jump_key, .. } => *jump_key,
+        }
+    }
+}
+
+/// What the final hop does after the key exchange.
+enum Mode<'a> {
+    Auth(&'a SshAuth<'a>),
+    /// Stop after the host key: nothing is authenticated or sent.
+    HostKeyOnly,
+}
+
+/// Phrases that mark a prompt as a second factor, not the password.
+const OTP_WORDS: [&str; 10] = [
+    "verification",
+    "code",
+    "otp",
+    "token",
+    "one-time",
+    "one time",
+    "duo",
+    "2fa",
+    "authenticator",
+    "passcode",
+];
+
+/// What to do with one keyboard-interactive round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KiAction {
+    /// No prompts (a banner round): answer with nothing.
+    Empty,
+    /// Exactly one password-style prompt: answer with the password.
+    Password,
+    /// The password was sent and PAM asks again: it was wrong.
+    WrongPassword,
+    /// Anything else (multi-prompt, OTP, expired password): stop.
+    Refuse(String),
+}
+
+/// Classifies a keyboard-interactive round (`prompts` = text and echo flag).
+/// Only a single non-echoing password prompt is ever answered.
+/// `answered`: the password was already sent in an earlier round.
+pub fn classify_ki(prompts: &[(String, bool)], answered: bool) -> KiAction {
+    match prompts {
+        [] => KiAction::Empty,
+        [(text, echo)] => {
+            let lower = text.to_ascii_lowercase();
+            if answered {
+                if lower.contains("new password")
+                    || lower.contains("retype")
+                    || lower.contains("expired")
+                {
+                    return KiAction::Refuse(
+                        "the password has expired; change it on the server first".into(),
+                    );
+                }
+                if lower.contains("password") && !*echo {
+                    return KiAction::WrongPassword;
+                }
+            } else if *echo {
+                return KiAction::Refuse("the prompt is not a password prompt".into());
+            } else if lower.contains("password")
+                && !OTP_WORDS.iter().any(|w| lower.contains(w))
+            {
+                return KiAction::Password;
+            }
+            KiAction::Refuse("the server asks for something other than a password".into())
+        }
+        many => KiAction::Refuse(format!(
+            "the server asks {} questions (one-time code or multi-factor login)",
+            many.len()
+        )),
+    }
+}
+
+/// Password auth on a handle with a pinned host key. Prefers plain
+/// `password`; falls back to keyboard-interactive (PAM setups with
+/// `PasswordAuthentication no`) answering one password prompt.
+async fn password_auth(
+    handle: &mut Handle<HostKeyCheck>,
+    user: &str,
+    secret: &SecretString,
+) -> Result<(), SshError> {
+    let methods = match handle.authenticate_none(user.to_string()).await? {
+        client::AuthResult::Success => return Ok(()),
+        client::AuthResult::Failure {
+            remaining_methods, ..
+        } => remaining_methods,
+    };
+    // `MethodKind` isn't exported by russh; its wire names are.
+    let offers = |name: &str| methods.iter().any(|m| <&str>::from(m) == name);
+    if offers("password") {
+        return match handle
+            .authenticate_password(user.to_string(), secret.expose())
+            .await?
+        {
+            client::AuthResult::Success => Ok(()),
+            client::AuthResult::Failure {
+                partial_success: true,
+                ..
+            } => Err(SshError::KeyboardInteractiveUnsupported(
+                "the server wants a second factor after the password".into(),
+            )),
+            client::AuthResult::Failure { .. } => Err(SshError::WrongPassword),
+        };
+    }
+    if !offers("keyboard-interactive") {
+        return Err(SshError::PasswordAuthDisabled);
+    }
+    let mut resp = handle
+        .authenticate_keyboard_interactive_start(user.to_string(), None)
+        .await?;
+    let mut answered = false;
+    for _ in 0..4 {
+        match resp {
+            KeyboardInteractiveAuthResponse::Success => return Ok(()),
+            KeyboardInteractiveAuthResponse::Failure {
+                partial_success, ..
+            } => {
+                return Err(if partial_success {
+                    SshError::KeyboardInteractiveUnsupported(
+                        "the server wants a second factor after the password".into(),
+                    )
+                } else if answered {
+                    SshError::WrongPassword
+                } else {
+                    SshError::PasswordAuthDisabled
+                });
+            }
+            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                let ps: Vec<(String, bool)> =
+                    prompts.into_iter().map(|p| (p.prompt, p.echo)).collect();
+                resp = match classify_ki(&ps, answered) {
+                    KiAction::Empty => {
+                        handle
+                            .authenticate_keyboard_interactive_respond(Vec::new())
+                            .await?
+                    }
+                    KiAction::Password => {
+                        answered = true;
+                        handle
+                            .authenticate_keyboard_interactive_respond(vec![
+                                secret.expose().to_string(),
+                            ])
+                            .await?
+                    }
+                    KiAction::WrongPassword => return Err(SshError::WrongPassword),
+                    KiAction::Refuse(why) => {
+                        return Err(SshError::KeyboardInteractiveUnsupported(why));
+                    }
+                };
+            }
+        }
+    }
+    Err(SshError::KeyboardInteractiveUnsupported(
+        "too many prompts".into(),
+    ))
+}
 
 /// One authenticated SSH connection (plus the jump connection it rides on).
 pub struct SshConnection {
@@ -396,12 +587,40 @@ impl SshConnection {
         pinned_host_key: Option<HostKey>,
         opts: &SshOptions,
     ) -> Result<(SshConnection, HostKeyObservation), SshError> {
-        Self::hop(target, auth, pinned_host_key, opts).await
+        Self::connect_auth(target, &SshAuth::Key(auth), pinned_host_key, opts).await
+    }
+
+    /// Connects with `auth` for the final hop. [`SshAuth::Password`] is
+    /// refused with [`SshError::HostKeyUnconfirmed`] unless `pinned_host_key`
+    /// is set: the password only ever goes to a pinned key.
+    pub async fn connect_auth(
+        target: &SshTarget,
+        auth: &SshAuth<'_>,
+        pinned_host_key: Option<HostKey>,
+        opts: &SshOptions,
+    ) -> Result<(SshConnection, HostKeyObservation), SshError> {
+        Self::hop(target, auth.jump_key(), &Mode::Auth(auth), pinned_host_key, opts).await
+    }
+
+    /// Reads the host keys (jump hops authenticate with `jump_key`, the
+    /// final hop is not authenticated at all) and disconnects. For servers
+    /// that don't accept this Mac's key yet, so the operator can confirm the
+    /// fingerprint before a password is ever sent.
+    pub async fn probe_host_key_only(
+        target: &SshTarget,
+        jump_key: &dyn SshSigner,
+        opts: &SshOptions,
+    ) -> Result<HostKeyObservation, SshError> {
+        let (conn, obs) =
+            Self::hop(target, jump_key, &Mode::HostKeyOnly, None, opts).await?;
+        conn.disconnect().await;
+        Ok(obs)
     }
 
     fn hop<'a>(
         target: &'a SshTarget,
-        auth: &'a dyn SshSigner,
+        jump_key: &'a dyn SshSigner,
+        mode: &'a Mode<'a>,
         pinned: Option<HostKey>,
         opts: &'a SshOptions,
     ) -> BoxFut<'a, Result<(SshConnection, HostKeyObservation), SshError>> {
@@ -409,14 +628,22 @@ impl SshConnection {
             // The jump host has its own timeout; this one covers our hop.
             let (jump, via) = match &target.proxy_jump {
                 Some(j) => {
-                    let (c, o) = Self::hop(j, auth, j.host_key.clone(), opts).await?;
+                    let key_auth = SshAuth::Key(jump_key);
+                    let (c, o) = Self::hop(
+                        j,
+                        jump_key,
+                        &Mode::Auth(&key_auth),
+                        j.host_key.clone(),
+                        opts,
+                    )
+                    .await?;
                     (Some(Box::new(c)), Some(Box::new(o)))
                 }
                 None => (None, None),
             };
             timeout(
                 opts.connect_timeout,
-                Self::handshake(target, auth, pinned, opts, jump, via),
+                Self::handshake(target, mode, pinned, opts, jump, via),
             )
             .await
             .map_err(|_| SshError::Timeout)?
@@ -425,12 +652,16 @@ impl SshConnection {
 
     async fn handshake(
         target: &SshTarget,
-        auth: &dyn SshSigner,
+        mode: &Mode<'_>,
         pinned: Option<HostKey>,
         opts: &SshOptions,
         jump: Option<Box<SshConnection>>,
         via: Option<Box<HostKeyObservation>>,
     ) -> Result<(SshConnection, HostKeyObservation), SshError> {
+        // A password is only ever sent to a host key the operator pinned.
+        if matches!(mode, Mode::Auth(SshAuth::Password { .. })) && pinned.is_none() {
+            return Err(SshError::HostKeyUnconfirmed);
+        }
         let config = Arc::new(client::Config {
             keepalive_interval: Some(opts.keepalive_interval),
             keepalive_max: opts.keepalive_max,
@@ -481,12 +712,25 @@ impl SshConnection {
         } else {
             HostKeyStatus::FirstUse
         };
-        let public = auth.public_key().to_russh()?;
-        let res = handle
-            .authenticate_publickey_with(target.user.clone(), public, None, &mut AuthSigner(auth))
-            .await?;
-        if !res.success() {
-            return Err(SshError::AuthRejected);
+        match mode {
+            Mode::HostKeyOnly => {}
+            Mode::Auth(SshAuth::Key(auth)) => {
+                let public = auth.public_key().to_russh()?;
+                let res = handle
+                    .authenticate_publickey_with(
+                        target.user.clone(),
+                        public,
+                        None,
+                        &mut AuthSigner(*auth),
+                    )
+                    .await?;
+                if !res.success() {
+                    return Err(SshError::AuthRejected);
+                }
+            }
+            Mode::Auth(SshAuth::Password { secret, .. }) => {
+                password_auth(&mut handle, &target.user, secret).await?;
+            }
         }
         Ok((
             SshConnection {
@@ -624,8 +868,29 @@ impl SshConnection {
         max_output: usize,
         limit: Duration,
     ) -> Result<ExecOutput, SshError> {
+        self.exec_capture_stdin(command, None, max_output, limit)
+            .await
+    }
+
+    /// Like [`Self::exec_capture`], writing `stdin` to the command first and
+    /// then closing its stdin (EOF). For `sudo -S`: the secret travels on the
+    /// channel, never on the command line. The caller keeps `stdin` in a
+    /// zeroizing buffer.
+    pub async fn exec_capture_stdin(
+        &self,
+        command: &str,
+        stdin: Option<&[u8]>,
+        max_output: usize,
+        limit: Duration,
+    ) -> Result<ExecOutput, SshError> {
         let mut ch = self.open_session().await?;
         ch.exec(true, command).await?;
+        if let Some(data) = stdin {
+            // The command may already have exited (and closed the channel)
+            // without reading; its status still tells the story.
+            let _ = ch.data(data).await;
+            let _ = ch.eof().await;
+        }
         let run = async {
             let mut out = ExecOutput::default();
             let mut replied = false;
@@ -734,6 +999,84 @@ impl PtyChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn p(text: &str, echo: bool) -> (String, bool) {
+        (text.to_string(), echo)
+    }
+
+    #[test]
+    fn ki_answers_only_one_password_prompt() {
+        assert_eq!(classify_ki(&[], false), KiAction::Empty);
+        for ok in ["Password: ", "alice@host's password:", "Password:"] {
+            assert_eq!(classify_ki(&[p(ok, false)], false), KiAction::Password, "{ok}");
+        }
+        // Echoed prompt, OTP wording, or no "password" at all: refused.
+        for bad in [
+            p("Password: ", true),
+            p("Verification code: ", false),
+            p("Password + OTP token: ", false),
+            p("Duo passcode or option (1-3): ", false),
+            p("Enter PIN: ", false),
+        ] {
+            assert!(
+                matches!(classify_ki(std::slice::from_ref(&bad), false), KiAction::Refuse(_)),
+                "{bad:?}"
+            );
+        }
+        // Several questions: refused, with the count in the message.
+        match classify_ki(&[p("Password: ", false), p("Code: ", false)], false) {
+            KiAction::Refuse(m) => assert!(m.contains('2')),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn ki_second_round_means_wrong_or_expired() {
+        assert_eq!(
+            classify_ki(&[p("Password: ", false)], true),
+            KiAction::WrongPassword
+        );
+        assert!(matches!(
+            classify_ki(&[p("New password: ", false)], true),
+            KiAction::Refuse(m) if m.contains("expired")
+        ));
+        assert!(matches!(
+            classify_ki(&[p("Verification code: ", false)], true),
+            KiAction::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn password_error_texts_name_the_fix() {
+        let e = SshError::PasswordAuthDisabled.to_string();
+        assert!(e.contains("authorized_keys") && e.contains("manually"));
+        assert!(
+            SshError::KeyboardInteractiveUnsupported("x".into())
+                .to_string()
+                .contains("manually")
+        );
+    }
+
+    #[tokio::test]
+    async fn password_needs_a_pinned_host_key() {
+        let secret = SecretString::from_string("pw-pw-pw".into()).unwrap();
+        let key = P256SshSigner(fleet_crypto::sig::SoftwareP256Signer::generate().unwrap());
+        let target = SshTarget::new("127.0.0.1", 1, "ops");
+        // Refused before any connection is attempted (port 1 is closed).
+        let err = SshConnection::connect_auth(
+            &target,
+            &SshAuth::Password {
+                secret: &secret,
+                jump_key: &key,
+            },
+            None,
+            &SshOptions::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(err, SshError::HostKeyUnconfirmed), "{err}");
+    }
 
     #[test]
     fn mpint_encoding() {

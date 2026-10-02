@@ -307,6 +307,51 @@ impl Sftp {
         result
     }
 
+    /// Writes `data` to `path` (created if missing, else replaced) through a
+    /// new `O_EXCL` temp file in the same directory with permission bits
+    /// `mode`, renamed into place: readers see the old or the new file,
+    /// never a partial one, and a dropped connection leaves the old file
+    /// (and at worst a `.fleet-*.tmp`). The caller has checked what is at
+    /// `path` (a rename replaces a symlink, never follows it). Without
+    /// `posix-rename@openssh.com` only a missing target can be written.
+    pub async fn write_atomic(&self, path: &str, data: &[u8], mode: u32) -> Result<(), SftpError> {
+        let path = remote_path(path)?;
+        let (dir, name) = split_parent(&path)?;
+        let mut suffix = [0u8; 8];
+        fleet_crypto::random_bytes(&mut suffix).map_err(|_| SftpError::Failed("rng".into()))?;
+        let tmp = join(dir, &format!(".{name}.fleet-{}.tmp", hex::encode(suffix)))?;
+        let mut attrs = FileAttributes::empty();
+        attrs.permissions = Some(mode & 0o7777);
+        let mut f = self
+            .s
+            .open_with_flags_and_attributes(
+                tmp.clone(),
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
+                attrs,
+            )
+            .await?;
+        let result = async {
+            f.write_all(data)
+                .await
+                .map_err(|e| SftpError::Failed(e.to_string()))?;
+            f.shutdown()
+                .await
+                .map_err(|e| SftpError::Failed(e.to_string()))?;
+            // The server's umask may have narrowed the create mode.
+            self.chmod(&tmp, mode).await?;
+            if self.posix_rename {
+                self.posix_rename(&tmp, &path).await
+            } else {
+                self.rename(&tmp, &path).await
+            }
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.s.remove_file(tmp).await;
+        }
+        result
+    }
+
     pub async fn rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
         Ok(self.s.rename(remote_path(from)?, remote_path(to)?).await?)
     }

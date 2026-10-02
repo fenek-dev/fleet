@@ -33,6 +33,14 @@ enum TestHooks {
         return URL(fileURLWithPath: p)
     }()
 
+    /// `FLEET_TEST_SERVER_PASSWORD=<pw>`: prefills the one-time password
+    /// field in Add server (UI tests of the password setup; the value is a
+    /// fixture of the test server, never a real password).
+    static let serverPassword: String? = {
+        guard let p = env["FLEET_TEST_SERVER_PASSWORD"], !p.isEmpty else { return nil }
+        return p
+    }()
+
     private static let logLock = NSLock()
 
     /// True (and logs) when the test signer stands in for a Touch ID
@@ -113,6 +121,7 @@ enum TestHooks {
     static var signer: Bool { false }
     static var autoPairing: Bool { false }
     static var agentArtifact: URL? { nil }
+    static var serverPassword: String? { nil }
     static func approve(_ reason: String) -> Bool { false }
     static func export(_ name: String, _ text: String) {}
 #endif

@@ -12,6 +12,7 @@ A native macOS app for managing a personal fleet of 10–100 Debian/Ubuntu serve
 ## Decisions already made (don't reopen without asking)
 
 - **Scope:** Debian/Ubuntu only (Debian 12+, Ubuntu 22.04+), systemd, one operator. No Kubernetes, no teams, no other distributions.
+- **Access:** SSH key auth only, plus one exception: a one-time server password in Add server (after the host key is pinned) to install this Mac's key and answer `sudo` during the agent install. Never stored, logged or reachable by MCP; zeroized.
 - **Transport:** one SSH connection per server (`russh`). The agent channel is an SSH exec channel running `fleet-agent bridge`, which talks to a Unix socket. Terminal sessions use PTY channels; files use SFTP.
 - **End-to-end encryption:** Noise `Noise_XX_25519_ChaChaPoly_BLAKE2s` (the `snow` crate) inside the SSH channel.
 - **Agent processes:** the unprivileged `fleet-gate` (sandboxed, no network access) handles the handshake and filtering. The root `fleet-exec` re-verifies every signature, the policy and freshness itself, and never trusts the gate.
