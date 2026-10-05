@@ -115,7 +115,11 @@ final class MCPTests: XCTestCase {
             let b = element("sidebar.lock")
             guard b.waitForExistence(timeout: 10) else { return (false, "no sidebar.lock") }
             let was = b.label
-            if b.label == (verb == "lock" ? "Lock" : "Unlock") { b.click() }
+            if verb == "unlock" {
+                unlockIfLocked()
+            } else if b.label == "Lock" {
+                b.click()
+            }
             snap("after-\(verb)")
             return (true, "label was \(was)")
         case "idle8h":  // Settings → General → Lock after idle: 8 hours
@@ -245,8 +249,14 @@ final class MCPTests: XCTestCase {
     private func unlockIfLocked() -> Bool {
         let b = element("sidebar.lock")
         guard b.waitForExistence(timeout: 10), b.label == "Unlock" else { return false }
-        b.click()
-        Thread.sleep(forTimeInterval: 1)
+        // A click right after activation is sometimes dropped: retry until
+        // the footer says "Lock".
+        for _ in 0..<3 where b.label == "Unlock" {
+            b.click()
+            let deadline = Date().addingTimeInterval(4)
+            while Date() < deadline, b.label == "Unlock" { Thread.sleep(forTimeInterval: 0.3) }
+        }
+        XCTAssertEqual(b.label, "Lock", "app did not unlock")
         return true
     }
 

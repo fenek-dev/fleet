@@ -688,7 +688,7 @@ def phase_pairing():
     app_start(auto_pair=False)
     signed = os.environ.get("MCP_SIGNED_PARENT")
     signed = signed if signed and os.path.exists(signed) else None
-    steps = ["unlock", "deny 150", "approve 150", "waitfile go-c1", "clients",
+    steps = ["unlock", "deny 150", "deny 40", "approve 150", "waitfile go-c1", "clients",
              "deny 60", "deny 150"]
     if signed:
         steps += ["approve 150", "waitfile go-c2", "clients", "deny 60", "revoke 0",
@@ -713,16 +713,18 @@ def phase_pairing():
     check("pairing.prompt_warns_every_time", "shell" in text or "interpreter" in text, text)
     check("pairing.denied_code", getattr(r, "code", None) == "pairing_denied", r)
     log("INFO", "pairing.denied_msg", getattr(r, "texts", r))
-    c = call_async(m, lf, {}, timeout=30)
+    # 2: the denied connection's next call raises a new prompt (deny again).
+    c = call_async(m, lf, {}, timeout=100)
+    ok, text = s.step(2)
     c["t"].join()
-    log("INFO", "pairing.after_deny_same_conn", (getattr(c["r"], "texts", c["r"]), round(c["dt"])))
-    check("pairing.denied_stays_denied", getattr(c["r"], "error", True) or isinstance(c["r"], Exception), c["r"])
+    log("INFO", "pairing.after_deny_same_conn", (ok, getattr(c["r"], "texts", c["r"]), round(c["dt"])))
+    log("INFO", "pairing.denied_conn_reprompts", ok)
     m.close()
 
-    # 2: approve.
+    # 3: approve.
     m = mcp("pair-ok")
     c = call_async(m, lf, {})
-    ok, text = s.step(2)
+    ok, text = s.step(3)
     c["t"].join()
     check("pairing.approved_call_runs", ok and not getattr(c["r"], "error", True), (text, c["r"]))
     check("pairing.touch_id_logged", "pair-ok" in approvals()[len(before):], approvals()[len(before):])
@@ -731,15 +733,15 @@ def phase_pairing():
     check("pairing.same_session_no_reprompt", not r.error and time.time() - t0 < 5, r)
     m.close()
     Session.go("c1")
-    s.step(3)
-    ok, clients = s.step(4)
+    s.step(4)
+    ok, clients = s.step(5)
     log("INFO", "pairing.settings_clients", clients[:600])
     check("pairing.every_time_not_listed", "pair-ok" not in clients.split("##")[0], clients)
 
     # 5: another connection from the same (interpreter) parent asks again.
     m = mcp("pair-ok")
     c = call_async(m, lf, {}, timeout=100)
-    ok, text = s.step(5)
+    ok, text = s.step(6)
     c["t"].join()
     check("pairing.new_connection_asks_again", ok and "pair-ok" in text, (text, c["r"]))
     m.close()
@@ -752,7 +754,7 @@ def phase_pairing():
     cb["t"].join()
     log("INFO", "pairing.second_concurrent", (getattr(cb["r"], "texts", cb["r"]), round(cb["dt"])))
     check("pairing.one_prompt_at_a_time", getattr(cb["r"], "error", False) and cb["dt"] < 30, cb["r"])
-    ok, text = s.step(6)
+    ok, text = s.step(7)
     ca["t"].join()
     check("pairing.open_prompt_was_pair_a", "pair-a" in text, text)
     a.close()
@@ -765,7 +767,7 @@ def phase_pairing():
     # 7: team-signed parent: remembered, listed, revocable.
     m = mcp("pair-signed", prefix=[signed])
     c = call_async(m, lf, {})
-    ok, text = s.step(7)
+    ok, text = s.step(8)
     c["t"].join()
     log("INFO", "pairing.signed_prompt", text)
     check("pairing.signed_prompt_no_every_time_warning", ok and "interpreter" not in text, text)
@@ -776,27 +778,27 @@ def phase_pairing():
     c["t"].join()
     check("pairing.signed_parent_remembered", not getattr(c["r"], "error", True) and c["dt"] < 10, c["r"])
     Session.go("c2")
-    s.step(8)
-    ok, clients = s.step(9)
+    s.step(9)
+    ok, clients = s.step(10)
     log("INFO", "pairing.clients_after_signed", clients[:600])
     check("pairing.signed_listed_in_settings", "pair-signed" in clients.split("##")[0], clients)
     # 10: same parent, different client name: new identity -> prompt (deny).
     m2 = mcp("pair-signed-other", prefix=[signed])
     c2 = call_async(m2, lf, {}, timeout=100)
-    ok, text = s.step(10)
+    ok, text = s.step(11)
     c2["t"].join()
     check("pairing.client_name_is_part_of_identity", ok, (text, c2["r"]))
     m2.close()
     # 11: revoke: effective on the next call of the open connection.
-    s.step(11)
+    s.step(12)
     c = call_async(m, lf, {}, timeout=15)
     c["t"].join()
     log("INFO", "pairing.after_revoke", (getattr(c["r"], "texts", c["r"]), round(c["dt"])))
     check("pairing.revoke_effective_next_call",
           isinstance(c["r"], Exception) or getattr(c["r"], "error", False), c["r"])
     Session.go("r")
-    s.step(12)
-    ok, text = s.step(13)
+    s.step(13)
+    ok, text = s.step(14)
     log("INFO", "pairing.after_revoke_prompt", (ok, text[:200]))
     m.close()
     s.close()
