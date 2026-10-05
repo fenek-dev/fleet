@@ -124,9 +124,18 @@ final class FleetAreaTests: FleetUITestCase {
         tap("addServer.trust", timeout: 60)
         tap("addServer.chooseArtifact", timeout: 120)
         tap("addServer.install")
-        let done = wait("addServer.done", timeout: 240)
-        snap("add-\(name)-done")
-        done.click()
+        let done = element("addServer.done"), err = element("addServer.error")
+        let end = Date().addingTimeInterval(170)
+        var n = 0
+        while Date() < end && !done.exists && !err.exists {
+            Thread.sleep(forTimeInterval: 2)
+            n += 1
+            if n % 20 == 0 { snap("add-\(name)-progress-\(n)") }
+        }
+        snap("add-\(name)-end")
+        if done.exists { done.click(); return }
+        dumpTexts("add-\(name)-stuck")
+        XCTFail("install of \(name) did not finish: \(err.exists ? err.label : "no error shown")")
     }
 
     // MARK: tests
@@ -141,9 +150,17 @@ final class FleetAreaTests: FleetUITestCase {
         guard let ports = file("ports", timeout: 300)?.split(separator: ",").map(String.init),
               ports.count == 3 else { return XCTFail("no ports file") }
         unlock()
-        let tags = ["web, eu", "web, docker", "db"]
-        for (i, p) in ports.enumerated() {
-            addPoolServer(name: Self.names[i], port: p, tags: tags[i])
+        addPoolServer(name: Self.names[0], port: ports[0], tags: Self.tags[0])
+    }
+
+    static let tags = ["web, eu", "web, docker", "db"]
+
+    func test01bAddMore() throws {
+        guard let ports = file("ports")?.split(separator: ",").map(String.init),
+              ports.count == 3 else { return XCTFail("no ports file") }
+        unlock()
+        for i in 1..<3 where !exists("sidebar.server.\(Self.names[i])", timeout: 3) {
+            addPoolServer(name: Self.names[i], port: ports[i], tags: Self.tags[i])
         }
         wait("fleet.table")
         wait("fleet.digest", timeout: 120)
