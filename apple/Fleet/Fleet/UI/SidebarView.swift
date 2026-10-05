@@ -44,6 +44,7 @@ struct SidebarView: View {
             .buttonStyle(.plain)
             .accessibilityIdentifier("sidebar.palette")
             .padding(.horizontal, 12)
+            .focusEffectDisabled()
             .padding(.top, 8)
             .padding(.bottom, 20)
 
@@ -206,6 +207,7 @@ private struct SidebarRow<Content: View>: View {
     let height: CGFloat
     let action: () -> Void
     @ViewBuilder var content: () -> Content
+    @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
@@ -215,10 +217,13 @@ private struct SidebarRow<Content: View>: View {
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .frame(height: height)
-                .background(selected ? Color.selected : .clear, in: RoundedRectangle(cornerRadius: 7))
+                .background(selected ? Color.selected : hovering ? Color.selected.opacity(0.5) : .clear,
+                            in: RoundedRectangle(cornerRadius: 7))
                 .contentShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .onHover { hovering = $0 }
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
@@ -251,25 +256,31 @@ private struct FooterCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             TimelineView(.periodic(from: .now, by: 30)) { _ in
-                HStack(spacing: 10) {
-                    Image(systemName: lock.isLocked ? "lock.fill" : "lock.open")
-                        .foregroundStyle(lock.isLocked ? Tone.warn.text : Color.textSecondary)
-                    VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 10) {
+                        Image(systemName: lock.isLocked ? "lock.fill" : "lock.open")
+                            .foregroundStyle(lock.isLocked ? Tone.warn.text : Color.textSecondary)
+                            .frame(width: 16)
                         Text(Self.macName)
-                            .font(.base.weight(.medium)).foregroundStyle(Color.text).lineLimit(1)
-                        Text(subtitle).font(.caption11).foregroundStyle(Color.textMuted)
-                            .accessibilityIdentifier("sidebar.lockState")
-                    }
-                    Spacer()
-                    Button(lock.isLocked ? "Unlock" : "Lock") {
-                        if lock.isLocked {
-                            Task { await lock.unlock() }
-                        } else {
-                            lock.lock()
+                            .font(.base.weight(.medium)).foregroundStyle(Color.text)
+                            .lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 0)
+                        Button(lock.isLocked ? "Unlock" : "Lock") {
+                            if lock.isLocked {
+                                Task { await lock.unlock() }
+                            } else {
+                                lock.lock()
+                            }
                         }
+                        .buttonStyle(.fleetSecondary)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("sidebar.lock")
                     }
-                    .controlSize(.small)
-                    .accessibilityIdentifier("sidebar.lock")
+                    // Own line: beside the button it wrapped at the 240 px sidebar width.
+                    Text(subtitle).font(.caption11).foregroundStyle(Color.textMuted)
+                        .lineLimit(1)
+                        .padding(.leading, 26)
+                        .accessibilityIdentifier("sidebar.lockState")
                 }
             }
             HStack(spacing: 10) {

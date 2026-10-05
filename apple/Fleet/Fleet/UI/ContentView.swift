@@ -69,11 +69,15 @@ struct ContentView: View {
         NavigationSplitView {
             SidebarView(selection: $selection) { paletteShown = true }
                 .navigationSplitViewColumnWidth(Metrics.sidebarWidth)
+                .toolbar(removing: .sidebarToggle)
         } detail: {
             VStack(spacing: 0) {
                 if lock.isLocked { LockedBanner() }
                 detail
             }
+            // The empty (hidden) title bar would otherwise leave a strip
+            // above every screen header.
+            .ignoresSafeArea(.container, edges: .top)
         }
         .overlay(alignment: .top) {
             if paletteShown {

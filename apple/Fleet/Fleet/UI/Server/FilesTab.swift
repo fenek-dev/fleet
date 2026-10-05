@@ -157,6 +157,7 @@ struct FilesTab: View {
                 .background(Color.control, in: Capsule())
                 .accessibilityIdentifier("files.sftpBadge")
             Button { go(parent(of: dir)) } label: { Image(systemName: "chevron.up") }
+                .buttonStyle(.fleetSecondary)
                 .disabled(dir == "/")
                 .help("Parent directory")
                 .accessibilityIdentifier("files.parent")
@@ -164,14 +165,18 @@ struct FilesTab: View {
             Spacer()
             if loading { ProgressView().controlSize(.small) }
             Button { Task { await list() } } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.fleetSecondary)
                 .help("Refresh")
                 .accessibilityIdentifier("files.refresh")
             Button { newName = ""; newFolder = true } label: { Image(systemName: "folder.badge.plus") }
+                .buttonStyle(.fleetSecondary)
                 .help("New folder")
                 .accessibilityIdentifier("files.newFolder")
             Button("Upload…", systemImage: "arrow.up.doc") { pickUpload() }
+                .buttonStyle(.fleetPrimary)
                 .accessibilityIdentifier("files.upload")
         }
+        .focusEffectDisabled()
     }
 
     private func detailBar(_ f: RemoteFileRow) -> some View {
@@ -187,9 +192,11 @@ struct FilesTab: View {
                 .accessibilityIdentifier("files.versionCount")
             Spacer()
             Button("History") { openHistory(f) }
+                .buttonStyle(.fleetSecondary)
                 .disabled((versionCount ?? 0) == 0)
                 .accessibilityIdentifier("files.history")
             Button("Edit") { edit(f) }
+                .buttonStyle(.fleetPrimary)
                 .accessibilityIdentifier("files.edit")
         }
         .font(.secondary)
@@ -270,7 +277,8 @@ struct FilesTab: View {
         return HStack(spacing: 2) {
             Button("/") { go("/") }.buttonStyle(.plain)
             ForEach(Array(parts.enumerated()), id: \.offset) { i, p in
-                Text("/").foregroundStyle(Color.textMuted)
+                // The root button is already a "/"; separators go between parts only.
+                if i > 0 { Text("/").foregroundStyle(Color.textMuted) }
                 Button(p) { go("/" + parts[0...i].joined(separator: "/")) }.buttonStyle(.plain)
             }
         }
@@ -324,7 +332,9 @@ struct FilesTab: View {
         }
         .font(.base)
         .scrollContentBackground(.hidden)
+        .alternatingRowBackgrounds(.disabled)
         .background(Color.card, in: RoundedRectangle(cornerRadius: 12))
+        .tableEmptyState(entries.isEmpty && !loading, "This folder is empty", systemImage: "folder")
         .overlay(RoundedRectangle(cornerRadius: 12)
             .stroke(dropTargeted ? Color.accent : Color.border, lineWidth: dropTargeted ? 2 : 1))
         .dropDestination(for: URL.self) { urls, _ in

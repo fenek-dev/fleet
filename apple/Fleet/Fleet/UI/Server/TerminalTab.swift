@@ -414,7 +414,9 @@ struct TerminalTab: View {
                     Text(server.state == .ready ? "Open a session backed by tmux on the server."
                                                : "Connect to the server first.")
                 } actions: {
-                    Button("New terminal") { newTab() }.disabled(server.state != .ready)
+                    Button("New terminal") { newTab() }
+                        .buttonStyle(.fleetPrimary)
+                        .disabled(server.state != .ready)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(TerminalController.bg)
@@ -515,7 +517,7 @@ struct TerminalTab: View {
                     .accessibilityIdentifier("terminal.broadcastBanner")
             }
             Spacer()
-            Text("Secure Enclave key · ecdsa-sha2-nistp256")
+            Text("\(core.usesSoftwareKeys ? "Software key" : "Secure Enclave key") · ecdsa-sha2-nistp256")
             if let c = current, c.cols > 0 {
                 Text("\(c.cols) × \(c.rows)").accessibilityIdentifier("terminal.size")
             }

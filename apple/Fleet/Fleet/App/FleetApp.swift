@@ -29,6 +29,7 @@ struct FleetApp: App {
                 .task { start() }
                 .onChange(of: core.status, initial: true) { startServices() }
         }
+        .windowStyle(.hiddenTitleBar)
         .commands {
             // Settings is a screen of the main window, not a separate scene.
             CommandGroup(replacing: .appSettings) {

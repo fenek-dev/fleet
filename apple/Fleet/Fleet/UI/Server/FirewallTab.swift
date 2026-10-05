@@ -128,7 +128,7 @@ struct FirewallTab: View {
                     Text("Managed").tag(true)
                     Text("Bans only").tag(false)
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 200)
+                .fleetSegmented().labelsHidden().frame(width: 200)
                 .disabled(locked)
                 .accessibilityIdentifier("firewall.mode")
                 Button("Add rule", systemImage: "plus") { drafts.append(RuleDraft()) }
@@ -180,7 +180,7 @@ struct FirewallTab: View {
                 Label(p, systemImage: "exclamationmark.triangle").font(.secondary)
                     .foregroundStyle(Tone.critical.text)
             }
-            Text("Drag to reorder. SSH (tcp/\(server.port)) must stay allowed; enrolled Macs keep SSH through the exempt set even with a source-restricted rule.")
+            Text("Drag to reorder. SSH (tcp/\(String(server.port))) must stay allowed; enrolled Macs keep SSH through the exempt set even with a source-restricted rule.")
                 .font(.caption11).foregroundStyle(Color.textMuted)
         }
     }
@@ -301,6 +301,7 @@ struct FirewallTab: View {
                     Text("None").font(.secondary).foregroundStyle(Color.textMuted)
                 }
             }
+            .fillingHeight()
             AdminSection(title: "Never ban") {
                 Button("Save") { askSaveExempt() }
                     .disabled(banConfig == nil || exemptLines == banConfig?.exempt || locked)
@@ -310,14 +311,18 @@ struct FirewallTab: View {
                     .font(.mono(11)).frame(height: 90)
                     .scrollContentBackground(.hidden)
                     .background(Color.track, in: RoundedRectangle(cornerRadius: 8))
-                Text("One CIDR per line. Learned: \((bans?.learnedExempt ?? []).joined(separator: ", "))")
+                let learned = bans?.learnedExempt ?? []
+                Text(learned.isEmpty ? "One CIDR per line."
+                     : "One CIDR per line. Learned: \(learned.joined(separator: ", "))")
                     .font(.caption11).foregroundStyle(Color.textMuted)
                 if let c = banConfig {
                     Text("Ban after \(c.threshold) failures in \(c.windowS) s")
                         .font(.caption11).foregroundStyle(Color.textMuted)
                 }
             }
+            .fillingHeight()
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: container ports

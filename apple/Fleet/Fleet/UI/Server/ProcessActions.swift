@@ -27,7 +27,7 @@ struct ProcessActions: ViewModifier {
             .confirmAction($pending)
             .popover(isPresented: $renicing) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Priority of \(process.name) (\(process.pid))").font(.system(size: 13, weight: .semibold))
+                    Text(verbatim: "Priority of \(process.name) (\(process.pid))").font(.system(size: 13, weight: .semibold))
                     Stepper("nice \(nice)", value: $nice, in: -20...19)
                     Text("Lower is higher priority; below 0 takes CPU from everything else.")
                         .font(.caption11).foregroundStyle(Color.textMuted)

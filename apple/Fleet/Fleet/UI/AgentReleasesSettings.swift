@@ -27,101 +27,121 @@ struct AgentReleasesSettings: View {
     }
 
     var body: some View {
-        Form {
-            Section("Import a build") {
-                HStack {
-                    Text(artifact?.lastPathComponent ?? "No file chosen")
-                        .foregroundStyle(artifact == nil ? Color.textMuted : Color.primary)
-                    Spacer()
-                    Button("Choose…") { choose() }.disabled(busy)
-                        .accessibilityIdentifier("releases.choose")
-                }
-                if let hash {
-                    LabeledContent("BLAKE3 of the binary") {
-                        Text(hash).font(.mono(11)).textSelection(.enabled)
-                    }
-                }
-                TextField("Version (major.minor.patch)", text: $version)
-                    .accessibilityIdentifier("releases.version")
-                Picker("Architecture", selection: $target) {
-                    Text("x86_64 (amd64)").tag("x86_64")
-                    Text("aarch64 (arm64)").tag("aarch64")
-                }
-                TextField("Independent build's BLAKE3 (b3sum output)", text: $attested)
-                    .accessibilityIdentifier("releases.attested")
-                    .font(.mono(11))
-                Text("Rebuild the same source on a second machine or CI (pinned toolchain, "
-                     + "--locked) and paste its hash. The app signs only when both builds agree.")
-                    .font(.secondary).foregroundStyle(Color.textMuted)
-                if hash != nil && !attested.isEmpty && !attestationMatches {
-                    Text("The hashes differ: this build is not reproducible or not the same source.")
-                        .foregroundStyle(Tone.critical.text)
-                }
-                Button("Sign release…") { sign() }
-                    .accessibilityIdentifier("releases.sign")
-                    .disabled(busy || !attestationMatches || version.isEmpty)
-            }
-            Section("Signed releases") {
-                if releases.isEmpty {
-                    Text("None yet.").foregroundStyle(Color.textMuted)
-                }
-                ForEach(releases, id: \.blake3) { r in
+        // The Settings screen supplies the page title.
+        ScrollView {
+          VStack(alignment: .leading, spacing: 20) {
+            SectionCard(icon: "square.and.arrow.down", title: "Import a build") {
+                VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("v\(r.version) (\(r.target))")
-                            Text(r.blake3.prefix(16) + "…  " + (r.artifactPath as NSString).lastPathComponent)
-                                .font(.secondary).foregroundStyle(Color.textMuted)
-                        }
+                        Text(artifact?.lastPathComponent ?? "No file chosen")
+                            .foregroundStyle(artifact == nil ? Color.textMuted : Color.text)
                         Spacer()
-                        Button("Roll out to all servers…") { rollout(r) }
-                            .accessibilityIdentifier("releases.rollout")
-                            .disabled(busy || progress.isRunning || core.servers.isEmpty)
+                        Button("Choose…") { choose() }.disabled(busy)
+                            .buttonStyle(.fleetSecondary)
+                            .accessibilityIdentifier("releases.choose")
+                    }
+                    if let hash {
+                        LabeledContent("BLAKE3 of the binary") {
+                            Text(hash).font(.mono(11)).textSelection(.enabled)
+                        }
+                    }
+                    TextField("Version (major.minor.patch)", text: $version)
+                        .accessibilityIdentifier("releases.version")
+                    Picker("Architecture", selection: $target) {
+                        Text("x86_64 (amd64)").tag("x86_64")
+                        Text("aarch64 (arm64)").tag("aarch64")
+                    }
+                    .frame(maxWidth: 320, alignment: .leading)
+                    TextField("Independent build's BLAKE3 (b3sum output)", text: $attested)
+                        .accessibilityIdentifier("releases.attested")
+                        .font(.mono(11))
+                    Text("Rebuild the same source on a second machine or CI (pinned toolchain, "
+                         + "--locked) and paste its hash. The app signs only when both builds agree.")
+                        .font(.secondary).foregroundStyle(Color.textMuted)
+                    if hash != nil && !attested.isEmpty && !attestationMatches {
+                        Text("The hashes differ: this build is not reproducible or not the same source.")
+                            .foregroundStyle(Tone.critical.text)
+                    }
+                    Button("Sign release…") { sign() }
+                        .buttonStyle(.fleetPrimary)
+                        .accessibilityIdentifier("releases.sign")
+                        .disabled(busy || !attestationMatches || version.isEmpty)
+                }
+            }
+            SectionCard(icon: "shippingbox", title: "Signed releases") {
+                VStack(alignment: .leading, spacing: 10) {
+                    if releases.isEmpty {
+                        Text("None yet.").foregroundStyle(Color.textMuted)
+                    }
+                    ForEach(releases, id: \.blake3) { r in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("v\(r.version) (\(r.target))").foregroundStyle(Color.text)
+                                Text(r.blake3.prefix(16) + "…  " + (r.artifactPath as NSString).lastPathComponent)
+                                    .font(.secondary).foregroundStyle(Color.textMuted)
+                            }
+                            Spacer()
+                            Button("Roll out to all servers…") { rollout(r) }
+                                .buttonStyle(.fleetSecondary)
+                                .accessibilityIdentifier("releases.rollout")
+                                .disabled(busy || progress.isRunning || core.servers.isEmpty)
+                        }
                     }
                 }
             }
-            Section("Roll back an agent") {
-                Text("Swaps the previous agent build back in on one server and restarts it. "
-                     + "Needs Touch ID. Refused while an update is still awaiting confirmation.")
-                    .font(.secondary).foregroundStyle(Color.textMuted)
-                Picker("Server", selection: $rollbackServer) {
-                    Text("Choose…").tag(String?.none)
-                    ForEach(core.servers.filter(\.agentPinned), id: \.id) {
-                        Text($0.name).tag(Optional($0.id))
+            SectionCard(icon: "arrow.uturn.backward", title: "Roll back an agent") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Swaps the previous agent build back in on one server and restarts it. "
+                         + "Needs Touch ID. Refused while an update is still awaiting confirmation.")
+                        .font(.secondary).foregroundStyle(Color.textMuted)
+                    Picker("Server", selection: $rollbackServer) {
+                        Text("Choose…").tag(String?.none)
+                        ForEach(core.servers.filter(\.agentPinned), id: \.id) {
+                            Text($0.name).tag(Optional($0.id))
+                        }
                     }
-                }
-                .accessibilityIdentifier("releases.rollbackServer")
-                HStack {
-                    Button("Roll back…") { confirmRollback = true }
-                        .disabled(busy || rollbackServer == nil)
-                        .accessibilityIdentifier("releases.rollback")
-                    if let rollbackNote {
-                        Text(rollbackNote).font(.secondary).foregroundStyle(Tone.ok.text)
-                            .accessibilityIdentifier("releases.rollbackDone")
+                    .frame(maxWidth: 320, alignment: .leading)
+                    .accessibilityIdentifier("releases.rollbackServer")
+                    HStack {
+                        Button("Roll back…") { confirmRollback = true }
+                            .buttonStyle(.fleetSecondary)
+                            .disabled(busy || rollbackServer == nil)
+                            .accessibilityIdentifier("releases.rollback")
+                        if let rollbackNote {
+                            Text(rollbackNote).font(.secondary).foregroundStyle(Tone.ok.text)
+                                .accessibilityIdentifier("releases.rollbackDone")
+                        }
                     }
                 }
             }
             if progress.total > 0 {
-                Section("Rollout") {
-                    if let c = progress.canaryPassed {
-                        Text("Phase passed after \(c)").font(.secondary)
-                    }
-                    ForEach(progress.rows) { row in
-                        LabeledContent(row.id, value: row.status.map { "\($0)" } ?? "queued")
-                    }
-                    if let s = progress.summary {
-                        Text("\(s.succeeded) updated, \(s.failed) failed, \(s.skipped) skipped"
-                             + (s.stop.map { " — stopped: \($0)" } ?? ""))
-                    }
-                    if progress.isRunning {
-                        Button("Stop") { progress.cancel() }
+                SectionCard(icon: "arrow.up.circle", title: "Rollout") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let c = progress.canaryPassed {
+                            Text("Phase passed after \(c)").font(.secondary)
+                        }
+                        ForEach(progress.rows) { row in
+                            LabeledContent(row.id, value: row.status.map { "\($0)" } ?? "queued")
+                        }
+                        if let s = progress.summary {
+                            Text("\(s.succeeded) updated, \(s.failed) failed, \(s.skipped) skipped"
+                                 + (s.stop.map { " — stopped: \($0)" } ?? ""))
+                        }
+                        if progress.isRunning {
+                            Button("Stop") { progress.cancel() }
+                                .buttonStyle(.fleetSecondary)
+                        }
                     }
                 }
             }
             if let error {
                 Text(error).foregroundStyle(Tone.critical.text)
             }
+          }
+          .padding(.horizontal, 32)
+          .padding(.vertical, 20)
+          .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .formStyle(.grouped)
         .task(id: core.fleetRevision) { load() }
         .confirmationDialog(
             "Roll back the agent on \(rollbackName)?", isPresented: $confirmRollback,

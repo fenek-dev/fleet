@@ -113,17 +113,19 @@ struct AddServerSheet: View {
                 TextField("Tags", text: $tags, prompt: Text("web, eu-central"))
                     .accessibilityIdentifier("addServer.tags")
             }
-            .formStyle(.grouped)
+            .fleetForm()
             sshKeyBox
             HStack {
                 Button("Cancel") { dismiss() }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("addServer.cancel")
                 Spacer()
                 Button("Add only") { add(connect: false) }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("addServer.addOnly")
                 Button("Add and connect") { add(connect: true) }
                     .accessibilityIdentifier("addServer.addConnect")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .keyboardShortcut(.defaultAction)
             }
         }
@@ -150,6 +152,7 @@ struct AddServerSheet: View {
                 .help("Copy for ~/.ssh/authorized_keys")
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .card(padding: 12)
     }
 
@@ -166,14 +169,16 @@ struct AddServerSheet: View {
                         .textSelection(.enabled)
                         .accessibilityIdentifier("addServer.fingerprint")
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .card(padding: 12)
                 ForEach(prompt.jumps, id: \.self) { j in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Jump host \(j.host):\(j.port) · \(j.algorithm)")
+                        Text(verbatim: "Jump host \(j.host):\(j.port) · \(j.algorithm)")
                             .font(.secondary).foregroundStyle(Color.textMuted)
                         Text(j.fingerprint).font(.mono(13)).foregroundStyle(Color.text)
                             .textSelection(.enabled)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .card(padding: 12)
                 }
                 if prompt.viaJumpUnpinned {
@@ -187,11 +192,12 @@ struct AddServerSheet: View {
             }
             HStack {
                 Button("Reject") { reject() }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("addServer.reject")
                 Spacer()
                 Button("Trust and continue") { trust() }
                     .accessibilityIdentifier("addServer.trust")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
             }
         }
     }
@@ -213,9 +219,11 @@ struct AddServerSheet: View {
                 Spacer()
                 if artifact != nil, Self.bundledAgentDir != nil, TestHooks.agentArtifact == nil {
                     Button("Use bundled") { artifact = nil }
+                        .buttonStyle(.fleetSecondary)
                         .accessibilityIdentifier("addServer.useBundled")
                 }
                 Button("Choose…") { chooseArtifact() }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("addServer.chooseArtifact")
             }
             .card(padding: 12)
@@ -228,16 +236,17 @@ struct AddServerSheet: View {
                 }
                 .accessibilityIdentifier("addServer.security")
             }
-            .formStyle(.grouped)
+            .fleetForm()
             securityModeHint
             passwordBox
             HStack {
                 Button("Later") { dismiss() }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("addServer.later")
                 Spacer()
                 Button("Install") { install() }
                     .accessibilityIdentifier("addServer.install")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .disabled(!canInstall || (keyRefused && password.isEmpty))
             }
         }
@@ -249,7 +258,7 @@ struct AddServerSheet: View {
     private var passwordBox: some View {
         if usePassword {
             VStack(alignment: .leading, spacing: 6) {
-                SecureField("Password for \(user)", text: $password)
+                SecureField("Password for \(user)", text: $password, prompt: Text("Server password"))
                     .textContentType(.password)
                     .accessibilityIdentifier("addServer.password")
                 Text("Used once to add this Mac's key and for sudo during install. Not stored.")
@@ -260,6 +269,7 @@ struct AddServerSheet: View {
                         .accessibilityIdentifier("addServer.noPassword")
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .card(padding: 12)
         } else {
             Button("Set up with password…") { usePassword = true }
@@ -312,18 +322,20 @@ struct AddServerSheet: View {
                 .accessibilityIdentifier("addServer.existing.facts")
             HStack {
                 Button("Cancel") { heldSecret?.wipe(); heldSecret = nil; dismiss() }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("addServer.existing.cancel")
                 Spacer()
                 if info?.sameFleet == true {
                     Button("Reinstall anyway") { install(existing: .reinstall) }
+                        .buttonStyle(.fleetSecondary)
                         .accessibilityIdentifier("addServer.existing.reinstall")
                     Button("Use existing agent") { install(existing: .adopt) }
                         .accessibilityIdentifier("addServer.existing.adopt")
-                        .buttonStyle(.borderedProminent).tint(.accent)
+                        .buttonStyle(.fleetPrimary)
                 } else {
                     Button("Replace agent") { install(existing: .replace) }
                         .accessibilityIdentifier("addServer.existing.replace")
-                        .buttonStyle(.borderedProminent).tint(Tone.critical.text)
+                        .buttonStyle(.fleetDestructive)
                 }
             }
         }
@@ -411,10 +423,12 @@ struct AddServerSheet: View {
             if error != nil {
                 HStack {
                     Button("Close") { dismiss() }
+                        .buttonStyle(.fleetSecondary)
                         .accessibilityIdentifier("addServer.close")
                     Spacer()
                     if !run.installed {
                         Button("Try again") { error = nil; step = .install }
+                            .buttonStyle(.fleetSecondary)
                             .accessibilityIdentifier("addServer.retry")
                     }
                 }
@@ -425,9 +439,13 @@ struct AddServerSheet: View {
     private var doneStep: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let health {
-                LabeledContent("Agent", value: health.agentVersion)
-                LabeledContent("Roster", value: "epoch \(health.rosterEpoch) · v\(health.rosterVersion)")
-                LabeledContent("Policy", value: "v\(health.policyVersion)")
+                VStack(alignment: .leading, spacing: 8) {
+                    LabeledContent("Agent", value: health.agentVersion)
+                    LabeledContent("Roster", value: "epoch \(health.rosterEpoch) · v\(health.rosterVersion)")
+                    LabeledContent("Policy", value: "v\(health.policyVersion)")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .card(padding: 12)
             }
             Text("The server is connected over a verified agent session.")
                 .foregroundStyle(Color.textSecondary)
@@ -435,7 +453,7 @@ struct AddServerSheet: View {
                 Spacer()
                 Button("Done") { dismiss() }
                     .accessibilityIdentifier("addServer.done")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .keyboardShortcut(.defaultAction)
             }
         }

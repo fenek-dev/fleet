@@ -110,7 +110,7 @@ struct LogsTab: View {
             Picker("Source", selection: $source) {
                 ForEach(Source.allCases) { Text($0.rawValue).tag($0) }
             }
-            .pickerStyle(.segmented).labelsHidden()
+            .fleetSegmented().labelsHidden()
             .frame(width: 320)
             .padding(.horizontal, 24).padding(.top, 16)
             .accessibilityIdentifier("logs.source")
@@ -149,7 +149,7 @@ private struct JournalLogsView: View {
                     Text("7 d").tag(168.0)
                 }
                 .labelsHidden().frame(width: 90)
-                Button("Search") { Task { await search() } }.keyboardShortcut(.defaultAction)
+                Button("Search") { Task { await search() } }.buttonStyle(.fleetPrimary).keyboardShortcut(.defaultAction)
                 Spacer()
                 statusPill
                 Toggle("Live", isOn: Binding(get: { model.following }, set: { live($0) }))
@@ -183,9 +183,10 @@ private struct JournalLogsView: View {
                             Text(time(e.row.timeUs)).foregroundStyle(Color.textMuted)
                             Text(e.row.unit ?? e.row.identifier ?? "–")
                                 .foregroundStyle(Color.accentText).lineLimit(1)
-                                .frame(width: 150, alignment: .leading)
+                                .frame(width: 104, alignment: .leading)
                             Text(e.row.message).foregroundStyle(color(e.row.priority))
                                 .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .font(.mono(11))
                         .id(e.id)

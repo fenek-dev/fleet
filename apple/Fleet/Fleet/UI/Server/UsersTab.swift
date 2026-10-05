@@ -33,9 +33,9 @@ struct NewUserSheet: View {
             }
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel") { dismiss() }.buttonStyle(.fleetSecondary)
                 Button("Create…") { create(name, groupList, shell, comment); dismiss() }
-                    .buttonStyle(.borderedProminent).tint(.accent).disabled(name.isEmpty)
+                    .buttonStyle(.fleetPrimary).disabled(name.isEmpty)
             }
         }
         .padding(20)
@@ -71,6 +71,7 @@ struct UsersTab: View {
             TabHeader(title: "Users", loading: loading, error: error, refresh: { Task { await load() } }) {
                 Toggle("System accounts", isOn: $showSystem)
                 Button("New user…", systemImage: "person.badge.plus") { creating = true }
+                    .buttonStyle(.fleetPrimary)
             }
             AutoRevertBanner(model: revert, what: "SSH keys changed", retry: retryConfirm,
                              revertNow: revertNow)
@@ -78,7 +79,7 @@ struct UsersTab: View {
                 VStack(spacing: 12) {
                     Table(users, selection: $selection) {
                         TableColumn("User") { u in Text(u.name) }
-                        TableColumn("UID") { u in Text("\(u.uid)") }.width(60)
+                        TableColumn("UID") { u in Text(verbatim: "\(u.uid)") }.width(60)
                         TableColumn("Groups") { u in Text(u.groups.joined(separator: ", ")).lineLimit(1) }
                         TableColumn("Shell") { u in Text(u.shell).font(.mono(11)) }.width(130)
                         TableColumn("Last login") { u in Text(fmtDate(u.lastLoginMs)) }.width(140)
@@ -93,7 +94,7 @@ struct UsersTab: View {
                     .tableCard()
                     Table(Indexed.wrap(data?.groups ?? [])) {
                         TableColumn("Group") { g in Text(g.value.name) }
-                        TableColumn("GID") { g in Text("\(g.value.gid)") }.width(60)
+                        TableColumn("GID") { g in Text(verbatim: "\(g.value.gid)") }.width(60)
                         TableColumn("Members") { g in Text(g.value.members.joined(separator: ", ")).lineLimit(1) }
                     }
                     .tableCard()
@@ -125,7 +126,7 @@ struct UsersTab: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let u = selected {
                     Text(u.name).font(.system(size: 15, weight: .semibold))
-                    Text("\(u.home) · uid \(u.uid)").font(.caption11).foregroundStyle(Color.textMuted)
+                    Text(verbatim: "\(u.home) · uid \(u.uid)").font(.caption11).foregroundStyle(Color.textMuted)
                     HStack {
                         Button(u.locked ? "Unlock" : "Lock") { askLock(u) }
                         Button("Delete…") { askDelete(u) }

@@ -166,7 +166,7 @@ struct HardeningAuditSection: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(levelName(r.level)).font(.base).foregroundStyle(Color.textSecondary)
                 HStack(spacing: 8) {
-                    StatusPill(label: "\(model.passing(r)) checks passing", tone: .ok)
+                    StatusPill(label: "\(model.passing(r)) checks passing", tone: model.passing(r) == 0 ? .neutral : .ok)
                         .accessibilityIdentifier("hardening.passingCount")
                     StatusPill(label: "\(model.toFix(r).count) to fix",
                                tone: model.toFix(r).isEmpty ? .neutral : .warn)
@@ -201,6 +201,9 @@ struct HardeningAuditSection: View {
             Text(f.title).lineLimit(2)
             Spacer()
             Text(f.severity).font(.caption11).foregroundStyle(Color.textMuted)
+                .frame(width: 56, alignment: .leading)
+            // Fixed-width action slot keeps the severity column aligned on rows without buttons.
+            HStack(spacing: 6) {
             if open {
                 if isAccepted {
                     Button("Undo") { accept(f.module, false) }
@@ -220,6 +223,8 @@ struct HardeningAuditSection: View {
                         .accessibilityIdentifier("hardening.accept.\(f.module)")
                 }
             }
+            }
+            .frame(width: 120, alignment: .trailing)
         }
         .font(.secondary)
     }

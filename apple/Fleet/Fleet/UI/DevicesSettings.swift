@@ -34,7 +34,7 @@ struct DevicesSettings: View {
                 SettingsCard {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Fleet fingerprint").font(.base.weight(.medium)).foregroundStyle(Color.text)
+                            Text("Fleet fingerprint").font(Typeface.ui(14, .semibold)).foregroundStyle(Color.text)
                             Text("Keep this with the recovery code: a recovery shows it for comparison.")
                                 .font(.secondary).foregroundStyle(Color.textMuted)
                         }
@@ -46,7 +46,7 @@ struct DevicesSettings: View {
                 if let r = lastResult {
                     SettingsCard {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Last change").font(.base.weight(.medium))
+                            Text("Last change").font(Typeface.ui(14, .semibold))
                             Text("Roster v\(r.version): \(r.current) servers updated, \(r.queued) queued.")
                                 .foregroundStyle(Color.textSecondary)
                             ForEach(r.failed, id: \.self) { Text($0).foregroundStyle(Tone.critical.text) }
@@ -87,7 +87,7 @@ struct DevicesSettings: View {
                 Image(systemName: "checkmark.shield").font(.system(size: 18))
                     .foregroundStyle(Color.textSecondary)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Device roster v\(s.version)").font(.base.weight(.medium))
+                    Text("Device roster v\(s.version)").font(Typeface.ui(14, .semibold))
                         .foregroundStyle(Color.text)
                         .accessibilityIdentifier("devices.rosterTitle")
                     Text(rosterSubtitle(updated: updated))
@@ -140,7 +140,8 @@ struct DevicesSettings: View {
                 }
                 Spacer(minLength: 12)
                 HStack(spacing: 6) {
-                    Chip(text: "Secure Enclave keys")
+                    // Only this Mac's key backend is known locally.
+                    Chip(text: d.thisMac && core.usesSoftwareKeys ? "Software keys" : "Secure Enclave keys")
                     Chip(text: "Full admin")
                 }
                 Text(activity(d)).font(.secondary).foregroundStyle(Color.textSecondary)

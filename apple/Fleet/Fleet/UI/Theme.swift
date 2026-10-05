@@ -159,6 +159,12 @@ extension View {
             .background(Color.card, in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.border))
     }
+
+    /// Segmented picker with a neutral active segment: the spec keeps the
+    /// accent for primary actions, not filters.
+    func fleetSegmented() -> some View {
+        pickerStyle(.segmented).tint(Color(hex: 0x45464c))
+    }
 }
 
 /// Status is always a dot plus a label; color is never the only signal.
@@ -228,8 +234,9 @@ enum Format {
     }
 
     static func bytes(_ b: UInt64) -> String {
-        // ByteCountFormatter spells zero out ("Zero KB").
-        if b == 0 { return "0 KB" }
+        // ByteCountFormatter spells zero out ("Zero KB"); "0 bytes" matches
+        // how it words every other sub-KB size.
+        if b == 0 { return "0 bytes" }
         return ByteCountFormatter.string(fromByteCount: Int64(clamping: b), countStyle: .memory)
     }
 

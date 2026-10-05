@@ -64,6 +64,7 @@ extension View {
 /// Section card with a title and optional trailing controls.
 struct AdminSection<Content: View, Trailing: View>: View {
     let title: String
+    var fillsHeight = false
     @ViewBuilder var trailing: () -> Trailing
     @ViewBuilder var content: () -> Content
 
@@ -76,8 +77,15 @@ struct AdminSection<Content: View, Trailing: View>: View {
             }
             content()
         }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: fillsHeight ? .infinity : nil, alignment: .topLeading)
         .card()
+    }
+
+    /// Stretches to the row height, so side-by-side cards line up.
+    func fillingHeight() -> Self {
+        var s = self
+        s.fillsHeight = true
+        return s
     }
 }
 
@@ -227,7 +235,7 @@ struct AutoRevertBanner: View {
                         .accessibilityIdentifier("autorevert.revertNow")
                 }
                 if let retry, canRetry {
-                    Button("Confirm change") { retry() }.buttonStyle(.borderedProminent).tint(.accent)
+                    Button("Confirm change") { retry() }.buttonStyle(.fleetPrimary)
                 }
                 if model.phase != .confirming && model.phase != .reverting {
                     Button("Dismiss") { model.dismiss() }

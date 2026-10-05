@@ -45,18 +45,20 @@ struct ConfigHistoryTab: View {
             HSplitView {
                 Table(versions, selection: $selection) {
                     TableColumn("Path") { v in Text(v.path).font(.mono(11)).lineLimit(1).truncationMode(.head) }
-                    TableColumn("Ver") { v in Text("\(v.version)") }.width(44)
-                    TableColumn("When") { v in Text(fmtDate(v.timeMs)) }.width(140)
-                    TableColumn("By") { v in Text(v.source).lineLimit(1) }.width(130)
+                    TableColumn("Ver") { v in Text(verbatim: String(v.version)) }.width(36)
+                    TableColumn("When") { v in Text(fmtDate(v.timeMs)) }.width(160)
+                    TableColumn("By") { v in Text(v.source).lineLimit(1) }.width(90)
                     TableColumn("") { v in
                         if v.deleted { StatusPill(label: "deleted", tone: .warn) }
                         else if v.secret { StatusPill(label: "secret", tone: .neutral) }
                     }
-                    .width(80)
+                    .width(70)
                 }
                 .tableCard()
                 .frame(minWidth: 520)
-                detail.frame(minWidth: 380)
+                // Capped so the list (long paths) keeps the larger share;
+                // the split view ignores ideal widths.
+                detail.frame(minWidth: 380, maxWidth: 460)
             }
             if history?.truncated == true {
                 Text("Older versions exist.").font(.caption11).foregroundStyle(Color.textMuted)
@@ -98,6 +100,7 @@ struct ConfigHistoryTab: View {
             }
             Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .card()
     }
 

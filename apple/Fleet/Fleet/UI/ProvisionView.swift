@@ -118,6 +118,7 @@ struct ProvisionView: View {
             Text(subtitle).font(.secondary).foregroundStyle(Color.textMuted).lineLimit(1)
             Spacer()
             Button("Export as cloud-init") { cloudInitShown = true }
+                .buttonStyle(.fleetSecondary)
                 .accessibilityIdentifier("provision.exportCloudInit")
         }
         .padding(.horizontal, 24)
@@ -659,7 +660,7 @@ private struct ProfileFormView: View {
                         Text("Caddy").tag(WebServerRow.caddy)
                         Text("nginx").tag(WebServerRow.nginx)
                     }
-                    .pickerStyle(.segmented)
+                    .fleetSegmented()
                     .frame(maxWidth: 220)
                     .padding(.leading, 20)
                     .accessibilityIdentifier("provision.webServer")

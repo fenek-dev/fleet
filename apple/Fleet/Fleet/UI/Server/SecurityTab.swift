@@ -314,7 +314,7 @@ struct SecurityTab: View {
         section("Listening ports") {
             ForEach(Indexed.wrap(ports)) { p in
                 HStack {
-                    Text("\(p.value.proto) \(p.value.addr):\(p.value.port)").font(.mono(11))
+                    Text(verbatim: "\(p.value.proto) \(p.value.addr):\(p.value.port)").font(.mono(11))
                         .frame(width: 200, alignment: .leading)
                     Text(p.value.process ?? "–").frame(width: 110, alignment: .leading)
                     Spacer()

@@ -286,11 +286,12 @@ struct FleetVulnerabilitiesView: View {
             Button("Update data", systemImage: "arrow.down.circle") {
                 Task { await intel.updateFeeds() }
             }
+            .buttonStyle(.fleetSecondary)
             .disabled(intel.status?.updating == true)
             Button("Scan fleet", systemImage: "shield.lefthalf.filled") {
                 Task { if let api = core.api { await intel.scanFleet(api) } }
             }
-            .buttonStyle(.borderedProminent).tint(.accent)
+            .buttonStyle(.fleetPrimary)
             .disabled(intel.scanning)
         }
         .padding(.horizontal, 24)

@@ -60,6 +60,7 @@ struct CommandPalette: View {
     var openSheet: (PaletteSheet) -> Void = { _ in }
     @State private var query = ""
     @State private var highlighted = 0
+    @State private var hovered: String?
     @State private var snippets: [SnippetRow] = []
     @State private var runbooks: [RunbookRow] = []
     @FocusState private var focused: Bool
@@ -222,8 +223,10 @@ struct CommandPalette: View {
                             .font(.base)
                             .padding(.horizontal, 12)
                             .frame(height: 34)
-                            .background(i == highlighted ? Color.selected : .clear,
+                            .background(i == highlighted ? Color.selected
+                                        : hovered == a.id ? Color.selected.opacity(0.5) : .clear,
                                         in: RoundedRectangle(cornerRadius: 8))
+                            .onHover { hovered = $0 ? a.id : nil }
                             .contentShape(Rectangle())
                             .accessibilityElement(children: .combine)
                             .accessibilityAddTraits(.isButton)
@@ -253,7 +256,8 @@ struct CommandPalette: View {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.border))
         .shadow(radius: 30)
         .onAppear {
-            focused = true
+            // The field isn't in the window yet during onAppear; set focus next turn.
+            DispatchQueue.main.async { focused = true }
             snippets = (try? core.api?.listSnippets()) ?? []
             runbooks = (try? core.api?.listRunbooks()) ?? []
         }

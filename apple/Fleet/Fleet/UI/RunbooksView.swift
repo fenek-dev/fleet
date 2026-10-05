@@ -17,67 +17,30 @@ struct RunbooksView: View {
     @State private var bulkShown = false
 
     var body: some View {
-        List {
-            Section {
-                ForEach(snippets, id: \.id) { s in
-                    HStack(alignment: .top) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(s.name).foregroundStyle(Color.text)
-                            Text(s.command).lineLimit(2)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(Color.textSecondary)
-                        }
-                        Spacer()
-                        Button("Run…") { runningSnippet = s }
-                        Button("Edit") { editingSnippet = s }
-                        Button(role: .destructive) { delete(snippet: s) } label: { Image(systemName: "trash") }
-                    }
-                    .controlSize(.small)
+        VStack(spacing: 0) {
+            ScreenHeader("Runbooks", subtitle: "Snippets and typed multi-step runbooks") {
+                Button("Run on servers…") { bulkShown = true }
+                    .buttonStyle(.fleetSecondary)
+                Button("New snippet") {
+                    editingSnippet = SnippetRow(id: "", name: "", description: "", command: "", updatedMs: 0)
                 }
-            } header: {
-                HStack {
-                    Text("Snippets")
-                    Spacer()
-                    Button("New snippet") {
-                        editingSnippet = SnippetRow(id: "", name: "", description: "", command: "", updatedMs: 0)
-                    }
+                .buttonStyle(.fleetSecondary)
+                Button("New runbook") {
+                    editingRunbook = RunbookRow(
+                        id: "", name: "", description: "", targets: [], params: [],
+                        steps: [], scheduleMinutes: nil, lastRunMs: nil, updatedMs: 0)
                 }
+                .buttonStyle(.fleetPrimary)
             }
-            Section {
-                ForEach(runbooks, id: \.id) { r in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(r.name).foregroundStyle(Color.text)
-                            Text(subtitle(r)).font(.secondary).foregroundStyle(Color.textMuted)
-                        }
-                        Spacer()
-                        Button("Run…") { runningRunbook = r }
-                        Button("Edit") { editingRunbook = r }
-                        Button(role: .destructive) { delete(runbook: r) } label: { Image(systemName: "trash") }
-                    }
-                    .controlSize(.small)
-                }
-            } header: {
-                HStack {
-                    Text("Runbooks")
-                    Spacer()
-                    Button("New runbook") {
-                        editingRunbook = RunbookRow(
-                            id: "", name: "", description: "", targets: [], params: [],
-                            steps: [], scheduleMinutes: nil, lastRunMs: nil, updatedMs: 0)
-                    }
-                }
-            }
-            if let error {
-                Text(error).foregroundStyle(Tone.critical.text)
+            if snippets.isEmpty && runbooks.isEmpty && error == nil {
+                ContentUnavailableView("No snippets or runbooks yet", systemImage: "list.bullet",
+                                       description: Text("Create a snippet or a runbook to run it on your servers."))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                list
             }
         }
-        .scrollContentBackground(.hidden)
         .background(Color.window)
-        .navigationTitle("Runbooks")
-        .toolbar {
-            Button("Run on servers…") { bulkShown = true }
-        }
         .task {
             reload()
             consumeIntent()
@@ -96,6 +59,56 @@ struct RunbooksView: View {
         }
         .sheet(item: $runningSnippet) { s in RunSnippetSheet(snippet: s) }
         .sheet(item: $runningRunbook) { r in RunRunbookSheet(runbook: r) { reload() } }
+    }
+
+    private var list: some View {
+        List {
+            if !snippets.isEmpty {
+            Section {
+                ForEach(snippets, id: \.id) { s in
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(s.name).foregroundStyle(Color.text)
+                            Text(s.command).lineLimit(2)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(Color.textSecondary)
+                        }
+                        Spacer()
+                        Button("Run…") { runningSnippet = s }
+                            .buttonStyle(.fleetSecondary)
+                        Button("Edit") { editingSnippet = s }
+                            .buttonStyle(.fleetSecondary)
+                        Button(role: .destructive) { delete(snippet: s) } label: { Image(systemName: "trash") }
+                    }
+                    .controlSize(.small)
+                }
+            } header: { Text("Snippets") }
+            }
+            if !runbooks.isEmpty {
+            Section {
+                ForEach(runbooks, id: \.id) { r in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(r.name).foregroundStyle(Color.text)
+                            Text(subtitle(r)).font(.secondary).foregroundStyle(Color.textMuted)
+                        }
+                        Spacer()
+                        Button("Run…") { runningRunbook = r }
+                            .buttonStyle(.fleetSecondary)
+                        Button("Edit") { editingRunbook = r }
+                            .buttonStyle(.fleetSecondary)
+                        Button(role: .destructive) { delete(runbook: r) } label: { Image(systemName: "trash") }
+                    }
+                    .controlSize(.small)
+                }
+            } header: { Text("Runbooks") }
+            }
+            if let error {
+                Text(error).foregroundStyle(Tone.critical.text)
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(Color.window)
     }
 
     private func subtitle(_ r: RunbookRow) -> String {

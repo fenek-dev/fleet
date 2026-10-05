@@ -27,6 +27,14 @@ extension ButtonStyle where Self == FleetButtonStyle {
     static var fleetDestructive: FleetButtonStyle { .init(kind: .destructive) }
 }
 
+extension View {
+    /// Form that blends with the window: no grouped box, leading edge flush
+    /// with the surrounding headers.
+    func fleetForm() -> some View {
+        formStyle(.columns).scrollContentBackground(.hidden)
+    }
+}
+
 /// A Settings section page: 20 px title, description, optional trailing
 /// action, then the scrolling content (28/32 px padding, 20 px gaps).
 struct SettingsPage<Content: View, Trailing: View>: View {

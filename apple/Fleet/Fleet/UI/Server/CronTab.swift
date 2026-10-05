@@ -45,8 +45,8 @@ struct CrontabEditor: View {
             if let error { Text(error).foregroundStyle(Tone.critical.text).font(.secondary) }
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
-                Button("Save…") { askSave() }.buttonStyle(.borderedProminent).tint(.accent).disabled(busy)
+                Button("Cancel") { dismiss() }.buttonStyle(.fleetSecondary)
+                Button("Save…") { askSave() }.buttonStyle(.fleetPrimary).disabled(busy)
             }
         }
         .padding(20)
@@ -96,7 +96,7 @@ struct CronTab: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 TabHeader(title: "Cron", loading: loading, error: error, refresh: { Task { await load() } }) {
-                    TextField("User", text: $openUser).frame(width: 120)
+                    TextField("User", text: $openUser).frame(width: 120).focusEffectDisabled(false)
                     Button("Edit user crontab…") { Task { await open(openUser) } }.disabled(openUser.isEmpty)
                 }
                 ForEach(Indexed.wrap(tabs)) { t in tabCard(t.value) }
@@ -109,8 +109,11 @@ struct CronTab: View {
                         TableColumn("Next") { t in Text(fmtDate(t.value.nextMs)) }.width(150)
                         TableColumn("Last") { t in Text(fmtDate(t.value.lastMs)) }.width(150)
                     }
-                    .frame(minHeight: 220)
+                    // Sized to the rows (header + ~28 pt each) so no empty striped area shows below them.
+                    .frame(height: timers.isEmpty ? 120 : CGFloat(timers.count) * 28 + 36)
                     .scrollContentBackground(.hidden)
+                    .alternatingRowBackgrounds(.disabled)
+                    .tableEmptyState(timers.isEmpty && !loading, "No systemd timers", systemImage: "timer")
                 }
             }
             .padding(24)
@@ -125,7 +128,7 @@ struct CronTab: View {
     private func tabCard(_ t: CronTabRow) -> some View {
         AdminSection(title: t.user.map { "User \($0)" } ?? t.source) {
             if t.user != nil {
-                Button("Edit…") { editing = t }.controlSize(.small)
+                Button("Edit…") { editing = t }.buttonStyle(.fleetSecondary)
             } else {
                 Text("read-only").font(.caption11).foregroundStyle(Color.textMuted)
             }
@@ -133,12 +136,13 @@ struct CronTab: View {
             if t.entries.isEmpty {
                 Text("No entries").font(.secondary).foregroundStyle(Color.textMuted)
             }
-            ForEach(Indexed.wrap(t.entries)) { e in
+            // Blank entries would render as empty rows; comments only show when non-empty.
+            ForEach(Indexed.wrap(t.entries.filter { !$0.schedule.isEmpty || !$0.command.isEmpty })) { e in
                 HStack(alignment: .firstTextBaseline) {
                     Text(e.value.schedule).font(.mono(11)).frame(width: 140, alignment: .leading)
                     Text(e.value.command).font(.mono(11)).lineLimit(2).textSelection(.enabled)
                     Spacer()
-                    if let c = e.value.comment { Text(c).font(.caption11).foregroundStyle(Color.textMuted) }
+                    if let c = e.value.comment, !c.isEmpty { Text(c).font(.caption11).foregroundStyle(Color.textMuted) }
                 }
             }
         }

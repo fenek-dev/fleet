@@ -52,7 +52,13 @@ enum ChartMetric: String, CaseIterable, Identifiable {
 
     /// Short y-axis tick (never scientific notation).
     func axisLabel(_ x: Double) -> String {
-        if self == .network { return String(format: "%.0f Mbit/s", x * 8 / 1_000_000) }
+        if self == .network {
+            // Unit follows the tick so low-traffic ticks stay distinguishable.
+            let bits = x * 8
+            if bits >= 1_000_000 { return String(format: "%.1f Mbit/s", bits / 1_000_000) }
+            if bits >= 1_000 { return String(format: "%.0f kbit/s", bits / 1_000) }
+            return String(format: "%.0f bit/s", bits)
+        }
         return isPercent ? "\(Int(x.rounded()))%" : Format.bytes(UInt64(max(0, x))) + "/s"
     }
 
@@ -265,7 +271,7 @@ struct OverviewTab: View {
                     if let e = error ?? ctx.factsError ?? metrics.historyError {
                         Text(e).font(.base).foregroundStyle(Tone.warn.text)
                     }
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 16)], spacing: 16) {
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 16), GridItem(.flexible(), spacing: 16)], spacing: 16) {
                         ForEach(ChartMetric.overview) { m in chart(m) }
                     }
                     section("Top processes", caption: "By CPU · live") { processTable }
@@ -519,7 +525,13 @@ struct OverviewTab: View {
             containers = try await api.dockerContainers(serverId: server.id, all: false)
             containersError = nil
         } catch {
-            if containers == nil { containersError = "Docker unavailable: \(error.fleetMessage)" }
+            guard containers == nil else { return }
+            // `Unsupported`: no Docker socket (not installed or stopped).
+            if case .Agent(let code) = error as? FleetError, code == "Unsupported" {
+                containersError = "Docker isn't available on this server."
+            } else {
+                containersError = "Docker unavailable: \(error.fleetMessage)"
+            }
         }
     }
 
@@ -561,7 +573,17 @@ struct OverviewTab: View {
                     .lineStyle(StrokeStyle(lineWidth: 1.5))
             }
             .chartYScale(domain: m.isPercent ? 0...100 : 0...max(1, pts.map(\.value).max() ?? 1))
-            .chartXAxis { AxisMarks(values: .automatic(desiredCount: 4)) }
+            .chartXScale(domain: Date().addingTimeInterval(-range)...Date())
+            .chartXAxis {
+                // Ticks kept off the domain edges, where labels get truncated.
+                AxisMarks(values: [5.0 / 6, 0.5, 1.0 / 6].map { Date().addingTimeInterval(-range * $0) }) {
+                    AxisGridLine()
+                    AxisValueLabel(format: range > 86400
+                                   ? Date.FormatStyle().month(.abbreviated).day()
+                                   : Date.FormatStyle().hour().minute(),
+                                   anchor: .top)
+                }
+            }
             .chartYAxis {
                 AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { v in
                     AxisGridLine()
@@ -570,7 +592,9 @@ struct OverviewTab: View {
                     }
                 }
             }
-            .frame(height: 72)
+            // Inset so edge tick labels aren't clipped by the card.
+            .padding(.horizontal, 18)
+            .frame(height: 96)
         }
         .card()
         .accessibilityElement(children: .contain)

@@ -285,6 +285,7 @@ struct SudoPasswordButton: View {
 
     var body: some View {
         Button("Sudo password…") { reveal() }
+            .buttonStyle(.fleetSecondary)
             .accessibilityIdentifier("server.sudoPassword")
             .popover(isPresented: Binding(get: { shown != nil || error != nil },
                                           set: { if !$0 { shown = nil; error = nil } })) {

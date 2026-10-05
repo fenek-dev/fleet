@@ -44,8 +44,12 @@ fn escape(s: &str, keep_newlines: bool) -> String {
     out
 }
 
-/// One line: every control and bidi character escaped.
+/// One line: every control and bidi character escaped, except tab, which
+/// becomes a space (crontab and config lines are tab-separated).
 pub fn line(s: String) -> String {
+    if s.contains('\t') {
+        return escape(&s.replace('\t', " "), false);
+    }
     escape(&s, false)
 }
 
@@ -75,6 +79,7 @@ mod tests {
         assert_eq!(line("x\ny\r".into()), "x\\x0Ay\\x0D");
         assert_eq!(line("evil\u{202E}txt.sh".into()), "evil\\u{202E}txt.sh");
         assert_eq!(line("\u{2066}a\u{2069}".into()), "\\u{2066}a\\u{2069}");
+        assert_eq!(line("17\t*\troot\x1b".into()), "17 * root\\x1B");
         assert_eq!(line("c1\u{85}".into()), "c1\\x85");
         assert_eq!(line("del\x7f".into()), "del\\x7F");
         assert_eq!(line("Ünïcödé 日本".into()), "Ünïcödé 日本");

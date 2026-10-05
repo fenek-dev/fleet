@@ -58,12 +58,42 @@ struct TimelineList: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(items) { i in
+            ForEach(days) { day in
+                Text(day.start.formatted(date: .complete, time: .omitted))
+                    .font(Typeface.ui(11, .semibold)).foregroundStyle(Color.textMuted)
+                    .padding(.top, 10).padding(.bottom, 4)
+                ForEach(day.items) { i in row(i) }
+            }
+        }
+    }
+
+    private struct Day: Identifiable {
+        let start: Date
+        var items: [TimelineItemRow]
+        var id: Date { start }
+    }
+
+    /// Consecutive items on the same calendar day (the list is newest first).
+    private var days: [Day] {
+        var out: [Day] = []
+        for i in items {
+            let start = Calendar.current.startOfDay(
+                for: Date(timeIntervalSince1970: TimeInterval(i.timeMs) / 1000))
+            if out.last?.start == start { out[out.count - 1].items.append(i) } else {
+                out.append(Day(start: start, items: [i]))
+            }
+        }
+        return out
+    }
+
+    private func row(_ i: TimelineItemRow) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(IntelFormat.time(i.timeMs))
+                    Text(Date(timeIntervalSince1970: TimeInterval(i.timeMs) / 1000)
+                        .formatted(date: .omitted, time: .shortened))
                         .font(.caption11).monospacedDigit()
                         .foregroundStyle(Color.textMuted)
-                        .frame(width: 130, alignment: .leading)
+                        .frame(width: 70, alignment: .leading)
                     Image(systemName: i.category.symbol)
                         .foregroundStyle(tone(i).text)
                         .frame(width: 18)
@@ -89,7 +119,6 @@ struct TimelineList: View {
                 .font(.base)
                 .padding(.vertical, 6)
                 Divider().overlay(Color.divider)
-            }
         }
     }
 
@@ -152,7 +181,7 @@ private struct TimelineChrome<Content: View>: View {
             Picker("Show", selection: $filter) {
                 ForEach(TimelineFilter.allCases) { Text($0.rawValue).tag($0) }
             }
-            .pickerStyle(.segmented)
+            .fleetSegmented()
             .labelsHidden()
             .frame(maxWidth: 640)
             if let row {
@@ -227,20 +256,12 @@ struct FleetTimelineView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Timeline").font(.toolbarTitle).foregroundStyle(Color.text)
-                    Text("Events and operations across the fleet, newest first")
-                        .font(.secondary).foregroundStyle(Color.textMuted)
-                }
+            ScreenHeader("Timeline", subtitle: "Events and operations across the fleet, newest first") {
                 if loading { ProgressView().controlSize(.small) }
-                Spacer()
                 Button("Refresh", systemImage: "arrow.clockwise") { Task { await load() } }
+                    .buttonStyle(.fleetSecondary)
                     .disabled(loading)
             }
-            .padding(.horizontal, 24)
-            .frame(height: 60)
-            .background(Color.header)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let error { Text(error).font(.base).foregroundStyle(Tone.warn.text) }

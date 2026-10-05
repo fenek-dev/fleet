@@ -51,7 +51,13 @@ struct FleetSearchView: View {
                     if let error {
                         Text(error).font(.base).foregroundStyle(Tone.warn.text)
                     }
-                    if let result { results(result) }
+                    if let result {
+                        results(result)
+                    } else if !loading && error == nil {
+                        ContentUnavailableView("Search the fleet", systemImage: "magnifyingglass",
+                                               description: Text("Find packages, ports, processes, users, files and logs across every connected server."))
+                            .frame(maxWidth: .infinity, minHeight: 280)
+                    }
                 }
                 .padding(24)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -74,7 +80,7 @@ struct FleetSearchView: View {
                     .onSubmit { Task { await search() } }
                 if loading { ProgressView().controlSize(.small) }
                 Button("Search") { Task { await search() } }
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .disabled(loading || term.trimmingCharacters(in: .whitespaces).isEmpty || kinds.isEmpty)
             }
             HStack(spacing: 6) {

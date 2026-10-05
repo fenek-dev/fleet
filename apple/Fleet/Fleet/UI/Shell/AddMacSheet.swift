@@ -53,7 +53,7 @@ struct AddMacSheet: View {
                 Picker("", selection: $mode) {
                     ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
-                .pickerStyle(.segmented)
+                .fleetSegmented()
                 .accessibilityIdentifier("addMac.mode")
                 switch mode {
                 case .scan:

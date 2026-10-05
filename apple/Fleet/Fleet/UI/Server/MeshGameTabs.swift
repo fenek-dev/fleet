@@ -66,9 +66,9 @@ struct MeshCreateSheet: View {
             HStack {
                 if running { ProgressView().controlSize(.small); Text("Working…").font(.secondary) }
                 Spacer()
-                Button(result == nil ? "Cancel" : "Close") { dismiss() }.disabled(running)
+                Button(result == nil ? "Cancel" : "Close") { dismiss() }.buttonStyle(.fleetSecondary).disabled(running)
                 Button("Create mesh…") { ask() }
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .disabled(running || picked.count < 2 || UInt16(port) == nil)
             }
         }
@@ -224,9 +224,9 @@ struct GameInstallSheet: View {
             }
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel") { dismiss() }.buttonStyle(.fleetSecondary)
                 Button("Install…") { install(name, template); dismiss() }
-                    .buttonStyle(.borderedProminent).tint(.accent).disabled(name.isEmpty)
+                    .buttonStyle(.fleetPrimary).disabled(name.isEmpty)
             }
         }
         .padding(20)
@@ -335,6 +335,7 @@ struct GamesTab: View {
         VStack(alignment: .leading, spacing: 12) {
             TabHeader(title: "Game servers", loading: loading, error: error, refresh: { Task { await load() } }) {
                 Button("Install…", systemImage: "plus") { installing = true }
+                    .buttonStyle(.fleetPrimary)
             }
             Table(games) {
                 TableColumn("Name") { g in Text(g.name) }
@@ -361,6 +362,8 @@ struct GamesTab: View {
                 .width(40)
             }
             .tableCard()
+            .tableEmptyState(games.isEmpty && !loading, "No game servers", systemImage: "gamecontroller",
+                             hint: "Install one from a template.")
         }
         .padding(24)
         .task(id: server.id) { await load() }

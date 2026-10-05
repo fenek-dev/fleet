@@ -137,8 +137,9 @@ struct FleetTableView: View {
         return core.groups.first { $0.id == groupId }?.name ?? "Group"
     }
 
-    private var subtitle: String {
-        var s = "\(core.servers.count) servers · \(core.groups.count) groups"
+    private func subtitle(_ shown: Int) -> String {
+        var s = "\(shown) \(shown == 1 ? "server" : "servers")"
+        if groupId == nil { s += " · \(core.groups.count) \(core.groups.count == 1 ? "group" : "groups")" }
         let versions = Set(store.facts.values.compactMap(\.agentVersion))
         if versions.count == 1, let v = versions.first { s += " · agents on \(v)" }
         else if versions.count > 1 { s += " · \(versions.count) agent versions" }
@@ -239,35 +240,40 @@ struct FleetTableView: View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.toolbarTitle).foregroundStyle(Color.text)
-                Text(subtitle)
+                Text(subtitle(all.count))
                     .font(.secondary).foregroundStyle(Color.textMuted)
+                    .lineLimit(1)
                     .accessibilityIdentifier("fleet.subtitle")
             }
+            Spacer(minLength: 0)
+            // Trailing, so the subtitle length can't shift it.
             Picker("Filter", selection: $filter) {
                 ForEach(FleetFilter.allCases) { f in
                     Text(filterLabel(f, all)).tag(f)
                 }
             }
-            .pickerStyle(.segmented)
+            .fleetSegmented()
             .labelsHidden()
+            .focusEffectDisabled()
             .frame(width: 380)
             .accessibilityIdentifier("fleet.filter")
-            Spacer()
             Button("Run command", systemImage: "terminal") { showBulk = true }
+                .buttonStyle(.fleetSecondary)
                 .disabled(core.servers.isEmpty)
                 .help(selected.isEmpty ? "Run on every connected server"
                                        : "Run on the \(selected.count) selected servers")
                 .accessibilityIdentifier("fleet.runCommand")
             Button("Add server", systemImage: "plus") { showAdd = true }
+                .buttonStyle(.fleetSecondary)
                 .accessibilityIdentifier("fleet.addServer")
             Button("Provision server", systemImage: "plus") { selection = .provision }
                 .accessibilityIdentifier("fleet.provision")
-                .buttonStyle(.borderedProminent)
-                .tint(.accent)
+                .buttonStyle(.fleetPrimary)
         }
         .padding(.horizontal, 24)
         .frame(height: 60)
         .background(Color.header)
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.border).frame(height: 1) }
     }
 
     private func filterLabel(_ f: FleetFilter, _ all: [FleetRow]) -> String {
@@ -286,9 +292,10 @@ struct FleetTableView: View {
                 .font(.base).foregroundStyle(Color.textSecondary)
             HStack {
                 Button("Add server", systemImage: "plus") { showAdd = true }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("fleet.empty.add")
                 Button("Provision server") { selection = .provision }
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .accessibilityIdentifier("fleet.empty.provision")
             }
         }
@@ -301,13 +308,13 @@ struct FleetTableView: View {
 
     private func summary(_ all: [FleetRow]) -> some View {
         let online = all.filter { $0.state == .ready }.count
-        let offline = all.filter { $0.state == .offline }
+        let notOnline = all.filter { $0.state != .ready }
         let warnings = core.alerts.values.filter { ($0.alert?.severity) == .warning }.count
         let critical = core.criticalCount
         let secKnown = store.facts.values.contains { $0.updates != nil }
         return HStack(spacing: 16) {
             SummaryCard(title: "Online", value: "\(online)", suffix: "/ \(all.count)",
-                        note: onlineNote(offline), id: "online")
+                        note: onlineNote(notOnline, total: all.count), id: "online")
             SummaryCard(title: "Open alerts", value: "\(core.alerts.count)", suffix: nil,
                         note: warnings > 0 ? "\(critical) critical · \(warnings) warnings"
                                            : "\(critical) critical",
@@ -317,22 +324,27 @@ struct FleetTableView: View {
             SummaryCard(title: "Security updates",
                         value: secKnown ? "\(store.securityUpdateTotal)" : "–", suffix: nil,
                         note: secKnown
-                            ? "Across \(store.securityUpdateServers) servers"
+                            ? (store.securityUpdateServers == 0 ? "Nothing pending"
+                                : "Across \(store.securityUpdateServers) \(store.securityUpdateServers == 1 ? "server" : "servers")")
                             : "Reading package lists",
                         actionTitle: store.securityUpdateTotal > 0 ? "Roll out" : nil,
                         action: { rollOutSecurity() }, id: "security")
             SummaryCard(title: "Reboot required",
                         value: secKnown ? "\(store.rebootRequiredCount)" : "–", suffix: nil,
-                        note: secKnown ? "Kernel updates installed" : "Reading package lists",
+                        note: secKnown
+                            ? (store.rebootRequiredCount == 0 ? "Nothing pending" : "Kernel updates installed")
+                            : "Reading package lists",
                         id: "reboot")
         }
     }
 
-    private func onlineNote(_ offline: [FleetRow]) -> String {
-        guard let first = offline.first else { return "All servers connected" }
+    private func onlineNote(_ notOnline: [FleetRow], total: Int) -> String {
+        guard let first = notOnline.first else { return total == 0 ? "No servers" : "All servers connected" }
         let dur = FleetRow.offlineSuffix(first.row.lastSeenMs).replacingOccurrences(of: " · ", with: "")
-        let base = "\(first.name) unreachable" + (dur.isEmpty ? "" : " for \(dur)")
-        return offline.count > 1 ? base + " · +\(offline.count - 1) more" : base
+        let base = first.state == .offline
+            ? "\(first.name) unreachable" + (dur.isEmpty ? "" : " for \(dur)")
+            : "\(first.name) \(first.state.label.lowercased())"
+        return notOnline.count > 1 ? base + " · +\(notOnline.count - 1) more" : base
     }
 
     /// Security upgrade on every connected server that has one pending.
@@ -413,7 +425,7 @@ struct FleetTableView: View {
                     Text(r.host).font(.mono(11)).foregroundStyle(Color.textMuted)
                 }
             }
-            .width(min: 150, ideal: 200)
+            .width(min: 130)
             TableColumn("Group", value: \.group) { r in
                 VStack(alignment: .leading, spacing: 1) {
                     Text(r.group.isEmpty ? "–" : r.group).foregroundStyle(Color.text)
@@ -423,28 +435,28 @@ struct FleetTableView: View {
                     }
                 }
             }
-            .width(min: 90, ideal: 130)
+            .width(min: 80)
             TableColumn("Status", value: \.health) { r in
                 StatusPill(label: r.statusLabel, tone: r.statusTone)
             }
-            .width(min: 120, ideal: 160)
+            .width(min: 110)
             TableColumn("CPU · 1 h", value: \.cpu) { r in cpuCell(r) }
-                .width(min: 120, ideal: 140)
+                .width(min: 120)
             TableColumn("Memory", value: \.mem) { r in
                 barCell(r.row.memPercent, hot: false)
             }
-            .width(min: 100, ideal: 120)
+            .width(min: 100)
             TableColumn("Disk", value: \.disk) { r in
                 barCell(r.row.diskPercent, hot: (r.row.diskPercent ?? 0) >= 85)
             }
-            .width(min: 100, ideal: 120)
+            .width(min: 100)
             TableColumn("Updates", value: \.updates) { r in updatesCell(r) }
-                .width(min: 80, ideal: 90)
+                .width(min: 80)
             TableColumn("Uptime", value: \.uptime) { r in
                 Text(r.state == .ready ? Format.uptime(r.uptime < 0 ? nil : UInt64(r.uptime)) : "—")
                     .monospacedDigit().foregroundStyle(Color.text)
             }
-            .width(min: 60, ideal: 70)
+            .width(min: 60)
         }
         .accessibilityIdentifier("fleet.table")
         .contextMenu(forSelectionType: String.self) { ids in
@@ -476,7 +488,11 @@ struct FleetTableView: View {
             if let id = ids.first { selection = .server(id) }
         }
         .font(.base)
-        .frame(minHeight: 420)
+        .alternatingRowBackgrounds(.disabled)
+        // Header + one two-line row each (measured ~28 + 39 px), so no
+        // filler rows show; the page scrolls vertically, not the table.
+        .frame(height: 30 + 40 * CGFloat(max(rows.count, 1)))
+        .scrollIndicators(.never, axes: .vertical)
         .scrollContentBackground(.hidden)
         .background(Color.card, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.border))
@@ -573,7 +589,7 @@ private struct SummaryCard: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.secondary).foregroundStyle(Color.textSecondary)
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(value).font(.system(size: 26, weight: .semibold)).monospacedDigit()
+                Text(value).font(Typeface.ui(28, .semibold)).monospacedDigit()
                     .foregroundStyle(valueTone ?? Color.text)
                 if let suffix {
                     Text(suffix).font(.base).foregroundStyle(Color.textMuted)
@@ -629,7 +645,7 @@ struct StatusBanners: View {
                                 .textSelection(.enabled)
                         }
                         ForEach(p.jumps, id: \.self) { j in
-                            Text("via \(j.host):\(j.port) \(j.algorithm) \(j.fingerprint)").font(.mono(11))
+                            Text(verbatim: "via \(j.host):\(j.port) \(j.algorithm) \(j.fingerprint)").font(.mono(11))
                                 .foregroundStyle(Color.textSecondary)
                                 .textSelection(.enabled)
                         }

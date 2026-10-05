@@ -339,10 +339,14 @@ pub fn build_digest(items: &[TimelineItemRow], since_ms: u64) -> DigestRow {
                     c.detail.clone(),
                 )
             };
+            // Timers and restarts cycle through activating/inactive/active
+            // all day; only a unit that ended up failed is worth a warning
+            // (the timeline detail is "from → to"). Config edits always are.
+            let routine = c.category == TimelineCategory::Service && !c.detail.ends_with("→ failed");
             lines.push(DigestLineRow {
                 title,
                 detail,
-                tone: NoteTone::Warn,
+                tone: if routine { NoteTone::Ok } else { NoteTone::Warn },
                 server_id: Some(c.server_id.clone()),
             });
         }
@@ -491,6 +495,11 @@ mod tests {
         assert_eq!(d.lines[1].title, "2 failed logins blocked");
         assert_eq!(d.lines[1].detail, "2 IPs banned across 2 servers");
         assert_eq!(d.lines[2].title, "nginx changed on b");
+        assert_eq!(d.lines[2].tone, NoteTone::Ok);
+        let failed = [item("b", 16, C::Service, "nginx", "active → failed", None)];
+        assert_eq!(build_digest(&failed, 5).lines[0].tone, NoteTone::Warn);
+        let config = [item("b", 17, C::Config, "/etc/ssh/sshd_config", "", None)];
+        assert_eq!(build_digest(&config, 5).lines[0].tone, NoteTone::Warn);
     }
 
     #[test]

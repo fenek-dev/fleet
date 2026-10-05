@@ -30,6 +30,9 @@ private struct CaptureShield: NSViewRepresentable {
 struct EnrollmentView: View {
     @Environment(CoreBridge.self) private var core
     @Environment(AppLock.self) private var lock
+    /// Back to the chooser; offered only on the first step, before any key
+    /// material exists.
+    var back: (() -> Void)?
 
     private enum Step: Int, CaseIterable {
         case name, words, verify, passphrase, finishing, done
@@ -102,6 +105,7 @@ struct EnrollmentView: View {
         .padding(.horizontal, 24)
         .frame(height: 60)
         .background(Color.header)
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.border).frame(height: 1) }
     }
 
     // MARK: steps
@@ -115,14 +119,19 @@ struct EnrollmentView: View {
                 TextField("This Mac", text: $deviceName)
                     .accessibilityIdentifier("onboarding.deviceName")
             }
-            .formStyle(.grouped)
+            .fleetForm()
             Text("Next you get a 24-word recovery code. It is the only way back in if every Mac is lost. Write it down by hand.")
                 .font(.base).foregroundStyle(Color.textSecondary)
             HStack {
+                if let back {
+                    Button("Back") { back() }
+                        .buttonStyle(.fleetSecondary)
+                        .accessibilityIdentifier("onboarding.back")
+                }
                 Spacer()
                 Button("Continue") { begin() }
                     .accessibilityIdentifier("onboarding.continue")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .disabled(fleetName.trimmingCharacters(in: .whitespaces).isEmpty
                               || deviceName.trimmingCharacters(in: .whitespaces).isEmpty)
             }
@@ -154,7 +163,7 @@ struct EnrollmentView: View {
                 Spacer()
                 Button("I wrote them down") { newChallenge() }
                     .accessibilityIdentifier("onboarding.wroteDown")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
             }
         }
     }
@@ -175,14 +184,15 @@ struct EnrollmentView: View {
                         .accessibilityLabel("Word \(pos + 1)")
                 }
             }
-            .formStyle(.grouped)
+            .fleetForm()
             HStack {
                 Button("Show words again") { step = .words; error = nil }
+                    .buttonStyle(.fleetSecondary)
                     .disabled(words.isEmpty)
                 Spacer()
                 Button("Check") { verify() }
                     .accessibilityIdentifier("onboarding.check")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .keyboardShortcut(.defaultAction)
             }
         }
@@ -194,12 +204,12 @@ struct EnrollmentView: View {
             Text("A passphrase you memorize and never write down. With it, recovery takes effect at once and the paper alone is useless. Without it, recovery waits 72 hours and a compromised Mac can veto it.")
                 .font(.base).foregroundStyle(Color.textSecondary)
             Form {
-                SecureField("Passphrase", text: $passphrase)
+                SecureField("Passphrase", text: $passphrase, prompt: Text("Optional"))
                     .accessibilityIdentifier("onboarding.passphrase")
-                SecureField("Repeat", text: $passphraseAgain)
+                SecureField("Repeat", text: $passphraseAgain, prompt: Text("Repeat passphrase"))
                     .accessibilityIdentifier("onboarding.passphraseAgain")
             }
-            .formStyle(.grouped)
+            .fleetForm()
             Text("For immediate recovery the passphrase must be strong: at least 12 characters using 3 of lowercase, uppercase, digits and symbols, or at least 5 different words of 3+ letters. A weaker passphrase still protects the code but keeps the 72 h delay.")
                 .font(.secondary).foregroundStyle(Color.textMuted)
             if passphrase.isEmpty {
@@ -213,7 +223,7 @@ struct EnrollmentView: View {
                 Spacer()
                 Button("Create fleet") { finish() }
                     .accessibilityIdentifier("onboarding.createFleet")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .disabled(passphrase != passphraseAgain)
             }
             Text("Touch ID signs the fleet's first device roster with this Mac's root key.")
@@ -251,7 +261,7 @@ struct EnrollmentView: View {
                     }
                 }
                     .accessibilityIdentifier("onboarding.openFleet")
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
             }
         }
     }

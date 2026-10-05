@@ -259,7 +259,7 @@ struct OpEditor: View {
             Text("Operation").tag(false)
             Text("Shell").tag(true)
         }
-        .pickerStyle(.segmented)
+        .fleetSegmented()
         .accessibilityIdentifier("bulk.runType")
         if draft.kind != .shell {
             Picker("Operation", selection: $draft.kind) {
@@ -285,7 +285,7 @@ struct OpEditor: View {
                 Text("Security only").tag(true)
                 Text("All upgradable").tag(false)
             }
-            .pickerStyle(.segmented)
+            .fleetSegmented()
             .accessibilityIdentifier("bulk.scope")
         case .container:
             TextField("Container", text: $draft.container)
@@ -311,7 +311,7 @@ struct OpEditor: View {
                 Text("After a delay").tag(false)
                 Text("In a daily window").tag(true)
             }
-            .pickerStyle(.segmented)
+            .fleetSegmented()
             .accessibilityIdentifier("bulk.rebootWhen")
             if draft.rebootWindow {
                 RebootWindowFields(start: $draft.windowStart, end: $draft.windowEnd)
@@ -494,28 +494,36 @@ struct BulkProgressView: View {
             if let step = progress.step {
                 Text(step).font(.secondary).foregroundStyle(Color.textSecondary)
             }
-            Table(progress.rows, selection: $selectedRow) {
-                TableColumn("") { r in statusIcon(r.status) }
-                    .width(24)
-                TableColumn("Server") { r in Text(name(r.id)).fontWeight(.medium) }
-                    .width(min: 90, ideal: 120)
-                TableColumn("Stage") { r in
-                    Text(r.stage).foregroundStyle(Color.textSecondary)
+            if progress.rows.isEmpty {
+                // An empty Table still draws its header and a stray scroller.
+                Text("Nothing has run yet.").font(.secondary).foregroundStyle(Color.textMuted)
+            } else {
+                Table(progress.rows, selection: $selectedRow) {
+                    TableColumn("") { r in statusIcon(r.status) }
+                        .width(24)
+                    TableColumn("Server") { r in Text(name(r.id)).fontWeight(.medium) }
+                        .width(min: 90, ideal: 120)
+                    TableColumn("Stage") { r in
+                        Text(r.stage).foregroundStyle(Color.textSecondary)
+                    }
+                    .width(70)
+                    TableColumn("Status") { r in
+                        Text(statusText(r))
+                            .lineLimit(1)
+                            .help(r.detail)
+                            .foregroundStyle(color(r.status))
+                    }
+                    TableColumn("Time") { r in
+                        Text(elapsed(r)).foregroundStyle(Color.textMuted).monospacedDigit()
+                    }
+                    .width(50)
                 }
-                .width(70)
-                TableColumn("Status") { r in
-                    Text(statusText(r))
-                        .lineLimit(1)
-                        .help(r.detail)
-                        .foregroundStyle(color(r.status))
-                }
-                TableColumn("Time") { r in
-                    Text(elapsed(r)).foregroundStyle(Color.textMuted).monospacedDigit()
-                }
-                .width(50)
+                .accessibilityIdentifier("bulk.rows")
+                .alternatingRowBackgrounds(.disabled)
+                .scrollContentBackground(.hidden)
+                // Fit the rows (header + 28 pt each) so no filler rows show; scroll past 8.
+                .frame(height: 32 + 28 * CGFloat(min(progress.rows.count, 8)))
             }
-            .accessibilityIdentifier("bulk.rows")
-            .frame(minHeight: 200)
             if let id = selectedRow, let r = progress.rows.first(where: { $0.id == id }),
                !r.detail.isEmpty {
                 ScrollView {
@@ -786,13 +794,18 @@ struct BulkRunSheet: View {
             header
             Divider()
             HSplitView {
-                form.frame(minWidth: 360, idealWidth: 440)
+                form.frame(minWidth: 360, idealWidth: 440, maxHeight: .infinity)
                 VStack(alignment: .leading, spacing: 12) {
                     BulkProgressView(progress: progress, controls: true)
                 }
                 .padding(16)
-                .frame(minWidth: 460)
+                // The progress table is sized to its rows: pin the pane to
+                // the top so the split view still fills the sheet.
+                .frame(minWidth: 460, maxHeight: .infinity, alignment: .top)
             }
+            .frame(maxHeight: .infinity)
+            Divider()
+            footer
         }
         .frame(minWidth: 960, minHeight: 640)
         .background(Color.window)
@@ -832,13 +845,38 @@ struct BulkRunSheet: View {
                 runbookName = ""
                 saveShown = true
             }
+            .buttonStyle(.fleetSecondary)
             .disabled(effectiveTargets.isEmpty || preview == nil)
             .accessibilityIdentifier("bulk.saveRunbook")
-            Button("Close") { dismiss() }
-                .accessibilityIdentifier("bulk.close")
-                .keyboardShortcut(.cancelAction)
         }
         .padding(16)
+    }
+
+    /// Always visible, so Run is never scrolled out of the form.
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Spacer()
+            // "Close", not "Cancel": dismissing doesn't stop a running rollout.
+            Button("Close") { dismiss() }
+                .buttonStyle(.fleetSecondary)
+                .accessibilityIdentifier("bulk.close")
+                .keyboardShortcut(.cancelAction)
+            Button("Dry run") { run(dryRun: true) }
+                .buttonStyle(.fleetSecondary)
+                .disabled(runDisabled)
+                .help(preview?.hasPlan == true ? "Fetches the plan from each server" : "Shows the command for each server")
+                .accessibilityIdentifier("bulk.dryRun")
+            Button("Run on \(effectiveTargets.count) server\(effectiveTargets.count == 1 ? "" : "s")") { confirmShown = true }
+                .buttonStyle(.fleetPrimary)
+                .disabled(runDisabled)
+                .accessibilityIdentifier("bulk.run")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(Color.header)
+    }
+
+    private var runDisabled: Bool {
+        effectiveTargets.isEmpty || preview == nil || progress.isRunning
     }
 
     private var subtitle: String {
@@ -904,17 +942,6 @@ struct BulkRunSheet: View {
             }
             Section {
                 dryRunCard
-                HStack {
-                    Button("Dry run") { run(dryRun: true) }
-                        .help(preview?.hasPlan == true ? "Fetches the plan from each server" : "Shows the command for each server")
-                        .accessibilityIdentifier("bulk.dryRun")
-                    Spacer()
-                    Button("Run on \(effectiveTargets.count) servers") { confirmShown = true }
-                        .accessibilityIdentifier("bulk.run")
-                        .buttonStyle(.borderedProminent)
-                        .disabled(effectiveTargets.isEmpty || preview == nil || progress.isRunning)
-                }
-                .disabled(effectiveTargets.isEmpty || preview == nil || progress.isRunning)
             }
         }
         .formStyle(.grouped)

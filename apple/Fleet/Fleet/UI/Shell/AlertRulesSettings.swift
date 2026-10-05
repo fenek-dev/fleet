@@ -206,7 +206,7 @@ struct AlertRulesSettings: View {
                         Text(s.name).tag(String?.some(s.id))
                     }
                 }
-                .frame(maxWidth: 320)
+                .frame(maxWidth: 320, alignment: .leading)
                 .accessibilityIdentifier("alertRules.server")
                 Spacer()
                 Menu {
@@ -221,7 +221,7 @@ struct AlertRulesSettings: View {
                 .disabled(loaded == nil || busy)
                 .accessibilityIdentifier("alertRules.add")
                 Button("Save with Touch ID") { save() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.fleetPrimary)
                     .disabled(!dirty || busy || locked)
                     .accessibilityIdentifier("alertRules.save")
             }

@@ -29,9 +29,12 @@ struct TabHeader<Trailing: View>: View {
                 if loading { ProgressView().controlSize(.small) }
                 Spacer()
                 trailing()
+                    .buttonStyle(.fleetSecondary)
                 Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.fleetSecondary)
                     .help("Refresh")
             }
+            .focusEffectDisabled()
             if let error {
                 Text(error).font(.base).foregroundStyle(Tone.warn.text)
             }
@@ -49,8 +52,24 @@ extension View {
     func tableCard() -> some View {
         self.font(.base)
             .scrollContentBackground(.hidden)
+            // Zebra stripes would continue into the empty area below the rows.
+            .alternatingRowBackgrounds(.disabled)
             .background(Color.card, in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.border))
+    }
+
+    /// Empty state centred in a table card while there are no rows.
+    func tableEmptyState(_ show: Bool, _ title: String, systemImage: String, hint: String? = nil) -> some View {
+        overlay {
+            if show {
+                ContentUnavailableView {
+                    Label(title, systemImage: systemImage)
+                } description: {
+                    if let hint { Text(hint) }
+                }
+                .allowsHitTesting(false)
+            }
+        }
     }
 }
 
@@ -80,7 +99,7 @@ struct ServicesTab: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             TabHeader(title: "Services", loading: loading, error: error, refresh: { Task { await load() } }) {
-                TextField("Filter", text: $filter).frame(width: 200)
+                TextField("Filter", text: $filter).frame(width: 200).focusEffectDisabled(false)
             }
             HSplitView {
                 Table(shown, selection: $selection) {
@@ -95,6 +114,8 @@ struct ServicesTab: View {
                     if let u = units.first(where: { names.first == $0.name }) { actionMenu(u) }
                 }
                 .tableCard()
+                .tableEmptyState(shown.isEmpty && !loading, filter.isEmpty ? "No services" : "No matching services",
+                                 systemImage: "gearshape.2")
                 .frame(minWidth: 480)
                 detail.frame(minWidth: 260, maxWidth: 340)
             }
@@ -233,7 +254,7 @@ struct PackagesTab: View {
                 Button("apt update") { Task { await refresh() } }.disabled(busy)
                 Button("Upgrade security") { confirm = true }.disabled(busy || securityCount == 0)
                 Button("Upgrade all") { confirm = false }
-                    .buttonStyle(.borderedProminent).tint(.accent)
+                    .buttonStyle(.fleetPrimary)
                     .disabled(busy || (list?.packages.isEmpty ?? true))
             }
             if let l = list {
@@ -256,6 +277,8 @@ struct PackagesTab: View {
                 TableColumn("Origin") { p in Text(p.origin).lineLimit(1) }
             }
             .tableCard()
+            .tableEmptyState((list?.packages.isEmpty ?? false) && !busy, "All packages are up to date",
+                             systemImage: "checkmark.circle")
             if let r = result {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Last run: \(r.changes.count) change\(r.changes.count == 1 ? "" : "s")\(r.rebootRequired ? " · reboot required" : "")")

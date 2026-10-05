@@ -58,6 +58,11 @@ pub enum DockerError {
     /// use.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The Docker socket does not exist: Docker is not installed, or its
+    /// service and socket units are stopped.
+    #[error("docker socket missing: {0}")]
+    SocketMissing(String),
+    /// Socket present but the daemon is not answering.
     #[error("docker unavailable: {0}")]
     Unavailable(String),
     #[error("timed out")]
@@ -72,6 +77,7 @@ impl From<DockerError> for OpError {
             DockerError::NotFound(_) => ErrorCode::NotFound,
             DockerError::Conflict(_) => ErrorCode::Busy,
             DockerError::Timeout => ErrorCode::Timeout,
+            DockerError::SocketMissing(_) => ErrorCode::Unsupported,
             DockerError::Unavailable(_) | DockerError::Other(_) => ErrorCode::Internal,
         };
         OpError::new(code).with_detail(clip(&e.to_string(), 300))

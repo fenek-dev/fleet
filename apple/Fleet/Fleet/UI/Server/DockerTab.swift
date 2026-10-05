@@ -265,24 +265,34 @@ struct DockerTab: View {
     @State private var stats = DockerStatsModel()
     @State private var loading = false
     @State private var error: String?
+    /// The agent answered `Unsupported`: no Docker socket (not installed or stopped).
+    @State private var noDocker = false
     @State private var notice: String?
     @State private var pending: PendingAction?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             TabHeader(title: "Docker", loading: loading, error: error, refresh: { Task { await load() } }) {
-                Picker("", selection: $section) {
-                    ForEach(Section.allCases) { Text($0.rawValue).tag($0) }
+                if !noDocker {
+                    Picker("", selection: $section) {
+                        ForEach(Section.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .fleetSegmented().labelsHidden().frame(width: 460)
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 460)
             }
-            if let notice { Text(notice).font(.secondary).foregroundStyle(Tone.ok.text) }
-            switch section {
-            case .containers: containersView
-            case .images: imagesView
-            case .volumes: volumesView
-            case .networks: networksView
-            case .compose: composeView
+            if noDocker {
+                ContentUnavailableView("Docker isn't available on this server", systemImage: "shippingbox",
+                                       description: Text("It isn't installed, or docker.service is stopped. Install it with the Docker role in provisioning, or start the service, then refresh."))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                if let notice { Text(notice).font(.secondary).foregroundStyle(Tone.ok.text) }
+                switch section {
+                case .containers: containersView
+                case .images: imagesView
+                case .volumes: volumesView
+                case .networks: networksView
+                case .compose: composeView
+                }
             }
         }
         .padding(24)
@@ -328,6 +338,7 @@ struct DockerTab: View {
                 if let c = containers.first(where: { ids.first == $0.id }) { containerMenu(c) }
             }
             .tableCard()
+            .tableEmptyState(containers.isEmpty && !loading, "No containers", systemImage: "shippingbox")
         }
     }
 
@@ -370,6 +381,7 @@ struct DockerTab: View {
                         run { try await $0.dockerImagePull(serverId: server.id, image: r) }
                     }
                 }
+                .buttonStyle(.fleetSecondary)
                 .disabled(pullRef.isEmpty)
                 Spacer()
                 Button("Prune…") {
@@ -382,6 +394,7 @@ struct DockerTab: View {
                         }
                     }
                 }
+                .buttonStyle(.fleetSecondary)
             }
             Table(images) {
                 TableColumn("Tags") { i in Text(i.tags.isEmpty ? "<none>" : i.tags.joined(separator: ", ")).lineLimit(1) }
@@ -402,6 +415,7 @@ struct DockerTab: View {
                 .width(80)
             }
             .tableCard()
+            .tableEmptyState(images.isEmpty && !loading, "No images", systemImage: "square.stack.3d.up")
         }
     }
 
@@ -426,6 +440,7 @@ struct DockerTab: View {
             .width(80)
         }
         .tableCard()
+        .tableEmptyState(volumes.isEmpty && !loading, "No volumes", systemImage: "externaldrive")
     }
 
     private var networksView: some View {
@@ -436,6 +451,7 @@ struct DockerTab: View {
             TableColumn("ID") { n in Text(String(n.id.prefix(12))).font(.mono(11)) }.width(110)
         }
         .tableCard()
+        .tableEmptyState(networks.isEmpty && !loading, "No networks", systemImage: "network")
     }
 
     // MARK: compose
@@ -446,6 +462,7 @@ struct DockerTab: View {
                 HStack {
                     Spacer()
                     Button("Deploy project…", systemImage: "plus") { deploying = "" }
+                        .buttonStyle(.fleetPrimary)
                 }
                 if projects.isEmpty && !loading {
                     Text("No Compose projects under /srv.").foregroundStyle(Color.textMuted)
@@ -532,8 +549,14 @@ struct DockerTab: View {
             case .compose: projects = try await api.composeList(serverId: server.id)
             }
             error = nil
+            noDocker = false
         } catch {
-            self.error = error.fleetMessage
+            if case .Agent(let code) = error as? FleetError, code == "Unsupported" {
+                noDocker = true
+                self.error = nil
+            } else {
+                self.error = error.fleetMessage
+            }
         }
     }
 }

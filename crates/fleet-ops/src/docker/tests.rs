@@ -431,8 +431,12 @@ fn bollard_conversions() {
 fn unavailable_socket_is_an_error_not_a_panic() {
     let d = BollardDocker::with_socket("/nonexistent/docker.sock");
     let e = block(d.list_containers(true)).unwrap_err();
-    assert!(matches!(e, DockerError::Unavailable(_)));
-    assert_eq!(OpError::from(e).code(), ErrorCode::Internal);
+    assert!(matches!(e, DockerError::SocketMissing(_)));
+    assert_eq!(OpError::from(e).code(), ErrorCode::Unsupported);
+    assert_eq!(
+        OpError::from(DockerError::Unavailable("refused".into())).code(),
+        ErrorCode::Internal
+    );
 }
 
 // ---- compose ----

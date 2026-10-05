@@ -28,6 +28,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 struct SettingsView: View {
     @Binding var selection: NavItem?
     @AppStorage(SettingsSection.storageKey) private var raw = SettingsSection.devices.rawValue
+    @State private var hovered: SettingsSection?
 
     private var section: SettingsSection { SettingsSection(rawValue: raw) ?? .devices }
 
@@ -56,10 +57,15 @@ struct SettingsView: View {
                         .padding(.horizontal, 12)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .frame(height: 32)
-                        .background(on ? Color.selected : .clear, in: RoundedRectangle(cornerRadius: 7))
+                        .background(on ? Color.selected : hovered == s ? Color.selected.opacity(0.5) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 7))
                         .contentShape(RoundedRectangle(cornerRadius: 7))
                 }
                 .buttonStyle(.plain)
+                .focusEffectDisabled()
+                .onHover { inside in
+                    if inside { hovered = s } else if hovered == s { hovered = nil }
+                }
                 .accessibilityAddTraits(on ? .isSelected : [])
                 .accessibilityIdentifier("settings.nav.\(s.rawValue)")
             }

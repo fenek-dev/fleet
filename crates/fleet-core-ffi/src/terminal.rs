@@ -67,10 +67,13 @@ impl Drop for TerminalSession {
 }
 
 /// `tmux new-session -A` attaches to `fleet-<slot>` or creates it; the
-/// shell fallback runs when tmux is missing. Only `slot` varies.
+/// shell fallback runs when tmux is missing. Only `slot` varies. The status
+/// bar is restyled per session (tmux's default bright green clashes with the
+/// app); the user's global tmux options are left alone.
 pub fn tmux_command(slot: u32) -> String {
     format!(
         "command -v tmux >/dev/null 2>&1 && exec tmux new-session -A -s fleet-{slot} \
+         \\; set-option status-style bg=colour236,fg=colour250 \
          || exec \"${{SHELL:-/bin/sh}}\" -l"
     )
 }

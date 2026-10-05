@@ -142,7 +142,7 @@ struct GeneralSettings: View {
                 )) {
                     ForEach(Self.options, id: \.1) { Text($0.0).tag($0.1) }
                 }
-                .frame(maxWidth: 320)
+                .frame(maxWidth: 320, alignment: .leading)
                 .accessibilityIdentifier("settings.general.idleLock")
                 Text("While locked only the monitor key works: telemetry and events, nothing that changes a server.")
                     .font(.secondary).foregroundStyle(Color.textMuted)

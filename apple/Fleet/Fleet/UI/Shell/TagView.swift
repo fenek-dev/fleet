@@ -24,7 +24,7 @@ struct TagView: View {
                                 HStack(spacing: 14) {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(s.name).foregroundStyle(Color.text).font(.base.weight(.medium))
-                                        Text("\(s.host):\(s.port)").font(.mono(11)).foregroundStyle(Color.textMuted)
+                                        Text(verbatim: "\(s.host):\(s.port)").font(.mono(11)).foregroundStyle(Color.textMuted)
                                     }
                                     Spacer()
                                     ForEach(s.tags.filter { $0 != tag }, id: \.self) { Chip(text: $0) }

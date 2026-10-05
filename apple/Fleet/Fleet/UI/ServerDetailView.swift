@@ -173,17 +173,21 @@ struct ServerDetailView: View {
                 Spacer()
                 if !s.agentPinned {
                     Button("Install agent…", systemImage: "shippingbox") { installing = true }
+                        .buttonStyle(.fleetPrimary)
                         .accessibilityIdentifier("server.installAgent")
                 }
                 if s.agentPinned {
                     SudoPasswordButton(serverId: s.id, serverName: s.name)
                 }
                 Button("Reconnect", systemImage: "arrow.clockwise") { core.reconnect(s.id) }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("server.reconnect")
                 Button("Terminal", systemImage: "terminal") { tab = .terminal }
+                    .buttonStyle(.fleetSecondary)
                     .accessibilityIdentifier("server.terminal")
                     .disabled(s.state != .ready)
                 Button("Run command") { running = true }
+                    .buttonStyle(.fleetPrimary)
                     .accessibilityIdentifier("server.runCommand")
                     .disabled(s.state != .ready || !s.agentPinned)
             }
@@ -212,9 +216,12 @@ struct ServerDetailView: View {
                     }
                 } label: {
                     tabLabel(ServerTab.more.contains(tab) ? tab.rawValue : "More",
-                             active: ServerTab.more.contains(tab))
+                             active: ServerTab.more.contains(tab), chevron: true)
                 }
-                .menuStyle(.borderlessButton)
+                // `.button` + plain draws the SwiftUI label as is; the
+                // borderless style re-renders it as an accent-tinted AppKit title.
+                .menuStyle(.button)
+                .buttonStyle(.plain)
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .accessibilityIdentifier("serverTab.more")
@@ -228,8 +235,11 @@ struct ServerDetailView: View {
     }
 
     /// 38 px high, 2 px accent underline on the active tab.
-    private func tabLabel(_ title: String, active: Bool) -> some View {
-        Text(title)
+    private func tabLabel(_ title: String, active: Bool, chevron: Bool = false) -> some View {
+        HStack(spacing: 4) {
+            Text(title)
+            if chevron { Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)) }
+        }
             .font(.system(size: 13, weight: .medium))
             .foregroundStyle(active ? Color.text : Color.textSecondary)
             .frame(height: 38)

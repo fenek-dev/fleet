@@ -56,7 +56,7 @@ impl BollardDocker {
             return Ok(d.clone());
         }
         let d = Docker::connect_with_unix(&self.socket, TIMEOUT_S, bollard::API_DEFAULT_VERSION)
-            .map_err(|e| DockerError::Unavailable(e.to_string()))?;
+            .map_err(map_err)?;
         *self.conn.borrow_mut() = Some(d.clone());
         Ok(d)
     }
@@ -73,7 +73,7 @@ fn map_err(e: BError) -> DockerError {
             _ => DockerError::Other(format!("{status_code}: {}", clip(&message, 300))),
         },
         BError::RequestTimeoutError => DockerError::Timeout,
-        BError::SocketNotFoundError(s) => DockerError::Unavailable(s),
+        BError::SocketNotFoundError(s) => DockerError::SocketMissing(s),
         BError::HyperResponseError { .. } | BError::IOError { .. } => {
             DockerError::Unavailable(clip(&e.to_string(), 300))
         }

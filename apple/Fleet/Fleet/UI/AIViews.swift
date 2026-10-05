@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// What AI clients did, from the mirrored audit logs.
@@ -71,8 +72,20 @@ struct AISettings: View {
                 }
             }
             SectionCard(icon: "terminal", title: "Setup") {
-                Text("Add to your MCP client: command `\(fleetctlPath)` with argument `mcp`.")
-                    .font(.secondary).textSelection(.enabled)
+                HStack(alignment: .top, spacing: 8) {
+                    Text("Add to your MCP client: command `\(fleetctlPath)` with argument `mcp`.")
+                        .font(.secondary).textSelection(.enabled)
+                    Spacer(minLength: 0)
+                    Button("Copy path", systemImage: "doc.on.doc") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(fleetctlPath, forType: .string)
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.textSecondary)
+                    .help("Copy the fleetctl path")
+                    .accessibilityIdentifier("ai.copyFleetctlPath")
+                }
                 if let p = ai.socketPath {
                     LabeledContent("Socket", value: p).font(.caption11)
                         .accessibilityIdentifier("ai.socketPath")
