@@ -11,3 +11,4 @@ xcuserdata/
 /build/
 .serena/
 /dist/
+__pycache__/
